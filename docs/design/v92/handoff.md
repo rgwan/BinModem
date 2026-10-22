@@ -159,74 +159,54 @@ agr-rx.raw（对端收到）  25.0–26.5 s  67–74 个帧同步  ← SUVd 在�
 ### 3.2.1 探针与钩子（关键工具）：对端内部状态，无扰动
 
 gdb watchpoint 会单步整个进程，8 kHz + DSP 就不是调制解调器了。改成在用户态移植里
-**每块采一次**（`agrsm-softmodem/src/glue.c`，commits `2bfe72b`/`b7b54c1`）：
+**每块采一次**（`agrsm-softmodem/src/glue.c`）：
 
 ```bash
-export AGRSM_PHASE4_PROBE=/tmp/p4.txt    # 检测器/接收机状态，一行一个变化
-export AGRSM_EVT_TRACE=/tmp/evt.txt      # 对端"收到序列"的事件，含内容
-export AGRSM_SCR_TRACE=/tmp/scr.txt      # 送进解扰器的切片字节 + 出来的比特
+export AGRSM_PHASE4_PROBE=/tmp/p4.txt   # 检测器/接收机状态，一行一个变化
+export AGRSM_EVT_TRACE=/tmp/evt.txt     # "收到序列"事件（含内容）
+export AGRSM_SCR_TRACE=/tmp/scr.txt     # 进解扰器的切片字节 + 出来的比特
+export AGRSM_BOX_TRACE=/tmp/box.txt     # 引擎内部邮箱 0x70 的 (code,arg,arg)
 ```
 
-- `AGRSM_PHASE4_PROBE` 字段：`acq`(0x863c) `n`(0x8648) `len`(0x864c) `pos`(0x8640)
-  `shift`(0x8614) `mode`(0x8664) `took`(0x865d) `cp`/`suv`(0x11752/53) `latch`(0x8654)
-  `det`(0x862c) `scr`(0x8628) `cfg`(0xba27/30/34/38) `dmod`(0xba2a/b) `cnt`/`deadline`。
-- **安全前提**：`gGlobalPtr` 前 3 秒不指向引擎状态，读写都会出事。两个钩子都先验
-  `[0x8628]` 是否等于 `DescramblerX18X23`/`X5X23`（引擎起来后才有的签名）才动手；
-  探针也只在那之后才读。
-- `[0x8610]` 就是 `V92ClientControlEventHandler`：**case 9 = 收到序列**，调
-  `FUN_0006a010(len, buf)`；`[0x8628]` 是解扰器，被 `V34RxDataMPDetector` 每一批先调用。
+- 探针字段：`acq`(0x863c) `n`(0x8648) `len`(0x864c) `pos`(0x8640) `shift`(0x8614)
+  `caps`(0x11718) `cfg`(0xba27/30/34/38) `dmod`(0xba2a/b) `det`(0x862c) `tick/pwr`(0xba50/60/64)
+  `b25/b26/b27`(0xba25/26/27)。
+- **安全前提**：`gGlobalPtr` 前 3 秒不指向引擎状态；三个钩子都先验 `[0x8628]` 是否为
+  `DescramblerX18X23/X5X23`（引擎起来后才有的签名）才读写。不校验会写坏引擎（踩过）。
+- `[0x8610]` = `V92ClientControlEventHandler`：**case 9 = 收到序列** → `FUN_0006a010(len, buf)`；
+  `FUN_0006a010` 用 **`len == 4` 判 SUV**（存 0x11ade，置 `[0x11753]`）、否则判 CP
+  （存 0x11ad8，置 `[0x11752]`，并调 `V92DataModeEncoderParseCPData`）。
+  我们 SUVd 去掉 start bit 正好 16+16 = **4 字节** ✓（第三次独立印证帧正确）。
 
-### 3.2.2 探针拿到的结论（本轮）
+### 3.2.2 对端 Phase 4 的完整画像（本轮实测）
 
-**① `FUN_0006a010(len, buf)` 就是分类器：`len == 4` 判 SUV、否则判 CP。**
-
-```c
-if (type == 4) { /* 存到 0x11ade（SUV 信息字），置 [0x11753] */ }
-else           { /* 存到 0x11ad8（CP），置 [0x11752]，还调 V92DataModeEncoderParseCPData */ }
-```
-
-所以**对端认为 SUVd 的数据长度是 4 字节**；我们的 SUVd 去掉 start bit 正好是
-16(信息字) + 16(CRC) = **4 字节** ✓ —— 又一条独立印证我们帧是对的。
-（DIL 期那 230 次 `len=6` 被判成 CP，正好解释探针里 17.9–24.5 s 的 `cp=1`。）
-
-**② 对端的序列检测器在 V.92 相位 4 里根本没被喂。** `AGRSM_SCR_TRACE` 显示
-`V34RxData` 的解扰器调用次数：
-
-| 轮次 | 16–20 s（相位 3） | 相位 4 |
+| 观测 | V.92（卡住） | V.90（能通） |
 |---|---|---|
-| V.92（卡住） | 每秒 ~170 次 | **0 次** |
-| V.90（能通） | 每秒 ~160 次 | 20 s 有 64 次，24/26 s 各 1 次 |
+| `V34RxData` 调用（喂检测器的唯一入口） | 相位 3 每秒 ~170 次，**相位 4 = 0** | 相位 3 ~160 次，相位 4 只有 24/26 s 各 1 次 |
+| 解调器模式（`[0xba1c]/[0xba20]` 回调对） | 12 s Idle → 相位 3 **RcvOnly** → 相位 4 **FullDuplex** | **PCM 解调器完全没用**（callbacks = 0） |
+| 检测器 | `det=MP`、`mode=1`、`len=4`、`acq/n` 恒 0 | — |
+| 解扰多项式 | `x18x23` ✓ | — |
+| 能力字 `[0x11718]` | `0xa01f9fb5`（对端要检的 bit 0/2/5/8/12 全置） | 0（不用） |
+| 切片段前置条件 | `[0xba25]=1`、`[0xba30]=2` → 条件成立，块处理在跑（`[0xba50]` 24 s 起循环 0..3） | — |
+| `[0x11a50]`（V.34 指针分发的解码器槽） | **全程 0**（指针路径没人用） | — |
 
-⇒ V.90 在相位 4 里同样几乎不用这条链（它的 Phase 4 不需要 SUVd），所以**"V.90 能通"
-不能证明这条链是通的**；而 V.92 必须靠它收 SUVd，它却没跑。
+**结论一：对端在 V.92 相位 4 走的是它的 PCM client 解调器（FullDuplex），不是 V.34 数据泵；
+而唯一那个序列检测器（`V34RxDataMPDetector`）只有 `V34RxData` 能喂，`V34RxData` 的调用者
+只有 `V34TrainingDecoder`(指针槽=0)、`V34DataAssembler`、`V90TrainingDecoderGetRcvdMaps`
+（只被两个 **相位 3** 状态直接调）、`V90DataModeDecoder`。所以相位 4 里检测器拿不到比特。**
 
-**③ 由此推翻前面两条软结论**：`shift`(0x8614) 在相位 4 里的变化是**共享 scratch 的假象**，
-不代表"被喂了"；`acq/n/len` 恒为 0/0/4 才是真状态（检测器 arm 好、等着、永不触发）。
-其余仍然成立：帧结构对（与 Agere 长度公式逐字节相同）、多项式对（`scr=x18x23`）、
-arm 对（`det=MP`、`mode=1`）、分类器对（len==4 ⇒ SUV）。
+**结论二（新，很关键）：我们的 CPd 确实被对端"看见"了。** 把下游改成只发 SUVd
+（`V92_NO_CP` 实验，已回滚）后，对端**不再能退出 `TxSendTRN2uState`**，改报
+**`60096211`**（`V92ClientPhase4TxSendTRN2uState` 的异常），且提前到 25.88 s；
+正常轮它 24.75 s 就退出 TRN2u 并 arm 了 10 s 的 SUV-wait 窗口。⇒ 相位 4 里我们发的 CPd
+对它能"往下走"是有作用的，说明它的下游接收**至少能解出 CPd**，缺的是 **SUV 那一档**。
 
-**④ 接收链的路标已找到**：`V34RxData`（→ 检测器）的调用者是
-`V34TrainingDecoder`、`V34DataAssembler`、`V90TrainingDecoderGetRcvdMaps`、`V90DataModeDecoder`。
-其中 `V34TrainingDecoder` 是**被函数指针装上去的**：`V34DecoderSetTrainingMode`（0x30d20）把
-`V34TrainingDecoder` 写进 `[0x11a50]`。而 `V90TrainingDecoderGetRcvdMaps` 的调用者只有两处：
-`V90ClientPhase3RxWaitSbarState` 与 **`V92ClientPhase3RxWaitSdBarState`** —— 正好解释了
-为什么相位 3 有 170 次/秒的 `V34RxData`、相位 4 是 0 次。
-（探针里 `[0x11a50]` 的符号比对失败，全是 `other`，说明相位 4 用的不是这个槽——下一步要
-找出相位 4 真正用的解码器槽位与安装者，`V90TrainingDecoderGetRcvdMaps` 会被装到别处。）
-
-**下一步（唯一一条）**：**查 V.92 相位 4 里对端的接收解码器是谁、由谁装。**
-候选落点：`[0x11a50]` 之外的同族槽（V.34/V.90 各自一套），以及
-`PCMClientDemodulator`（`0xba1c/0xba20` 回调、模式经 `[0xba30]` 由
-`PCMClientDemodulatorCommitUpdate` 提交）是否本该接进这条链。
-**验收**：说出对端在 V.92 相位 4 里该由哪个函数调 `V34RxData`，以及它为什么没被装上。
-
-仍成立的老结论（供对照）：
-`V34RxData` 的调用者是 `V34DataAssembler`、`V90DataModeDecoder`、`FUN_00046870/46940/55270/554a0`，
-全是 V.34/V.90 **数据泵**里的函数。要找的是：对端的相位 4 状态机有没有把
-`PCMClientDemodulator`（0xba1c/0xba20 的回调、模式由 `[0xba30]` 经
-`PCMClientDemodulatorCommitUpdate` 提交）接到这条链上，以及 `V34DataAssemblerReset`
-（0x3d945 附近）被谁在什么条件下调用。**验收**：说出对端在相位 4 里该由哪个函数调
-`V34RxData`，以及为什么没调。
+**下一步（唯一一条）**：**查 `FUN_0006a010(len, buf)` 里 SUV 分支还要求什么。**
+`len==4` 只是进 SUV 分支的门票；它还要把 4 字节信息字存到 `0x11ade` 并置 `[0x11753]`，
+而 `RxWaitSUV` 的推进还要求 `[0x8800]==0`。两个具体怀疑：
+1. **4 字节内容**：我们对端那个窗口里 `[0x11adf] & 0x40`（= SUVd bit 32 静默位）与
+   `param_2[1] < 0`（= bit 33 ack 位）的判读是否与我们发的 ack=0/静默=0 一致；
+2. **`[0x8800]`**：RxWaitSUV 推进的第二条件，至今没人读过它是什么。
 
 ### 3.3 Phase 4 之后（本轮已接线，未验证）
 
