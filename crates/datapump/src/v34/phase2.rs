@@ -600,6 +600,13 @@ impl Modem {
             None => Self::retrain(self.role, self.fs, far),
         };
         modem.pcm_declined = self.pcm_declined;
+        // The digital modem's tone B comes back at the power it had the
+        // first time (8.2/V.90), so what the first time heard stands, and
+        // anything much quieter is something else.
+        modem.tone_b_level = self.tone_b_level;
+        if let Some(level) = self.tone_b_level {
+            modem.presence.floor = level * TONE_B_FLOOR;
+        }
         modem.pcm_up_declined = self.pcm_up_declined;
         modem.far_flags = self.far_flags;
         modem.full_phase2_only = true;
@@ -612,19 +619,6 @@ impl Modem {
         self.pcm_declined = true;
     }
 
-    /// This end's INFO0 as it goes out: INFO0d from a digital modem.
-    /// What a digital modem puts on the line for INFO0d.
-    ///
-    /// V.90 has it go straight on to Tone B, which is the same carrier with
-    /// no reversals, and a few explicit zero bits say the same thing: eight
-    /// symbols of carrier at the same level. They matter to the far end's
-    /// differential detector. The last thing INFO0d leaves in a bit history
-    /// is its fill, four reversals, and an analogue modem that treats fill
-    /// bits as the sign of a repeated INFO0 -- as the one this was tested
-    /// against does -- reads them as exactly that and starts its own
-    /// recovery, which costs a round of tones and the reversal timing that
-    /// phase 2's probing is built on. Zero bits first leave the history at
-    /// zero, which is what Tone B itself would have left there.
     /// Ask for V.90 data mode rather than PCM upstream in INFO1a from now on,
     /// even of a V.92 digital modem that has offered it.
     ///
