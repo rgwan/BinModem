@@ -193,10 +193,33 @@ fn up_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
     FILE.get_or_init(|| {
         let path = std::env::var_os("V92_UP_TRACE")?;
-        let file = std::fs::File::create(path).ok()?;
+        let path = std::path::PathBuf::from(path);
+        let file = std::fs::File::create(&path).ok()?;
+        write_anchor(&path);
         Some(Arc::new(Mutex::new(file)))
     })
     .clone()
+}
+
+/// The wall clock, as seconds since the epoch, for a trace file's anchor.
+///
+/// Two processes on one machine share this clock, so writing it beside a trace
+/// is what lets the received stream and the far end's own capture be lined up
+/// without guessing an offset from the content.
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Record `<path>.t0` beside a trace, once, at the moment it is opened.
+fn write_anchor(path: &std::path::Path) {
+    use std::io::Write;
+    let mut side = path.to_path_buf().into_os_string();
+    side.push(".t0");
+    if let Ok(mut file) = std::fs::File::create(std::path::Path::new(&side)) {
+        let _ = writeln!(file, "{:.6}", epoch_now());
+    }
 }
 
 /// Where to write the line samples this end receives, when `V92_RX_TRACE` names
@@ -208,7 +231,9 @@ fn rx_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
     FILE.get_or_init(|| {
         let path = std::env::var_os("V92_RX_TRACE")?;
-        let file = std::fs::File::create(path).ok()?;
+        let path = std::path::PathBuf::from(path);
+        let file = std::fs::File::create(&path).ok()?;
+        write_anchor(&path);
         Some(Arc::new(Mutex::new(file)))
     })
     .clone()

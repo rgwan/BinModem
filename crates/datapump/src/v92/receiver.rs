@@ -1057,6 +1057,12 @@ impl Receiver {
             eprintln!("V92TRACE: train_near(from {from} search {search}) best {best:?}");
         }
         let Some((snr, start)) = best else { return false };
+        // The winner's taps are what the whole of Phase 4 will be sliced with,
+        // so they are the fit worth keeping a record of.
+        if let Some(path) = std::env::var_os("V92_EQ_TRACE") {
+            let _ = self.fit_window(start, TRAIN_WINDOW);
+            self.dump_fit(std::path::Path::new(&path), start, TRAIN_WINDOW);
+        }
         if snr < TRAINED_SNR_DB {
             self.trained = false;
             return false;
@@ -1085,6 +1091,36 @@ impl Receiver {
         self.snr_db = snr;
         self.events.push_back(Heard::Trained { snr_db: snr });
         true
+    }
+
+    /// Write out everything the winning fit was made of: where it started, the
+    /// sequence it was fitted against, what the equaliser produced, and the
+    /// error between them.
+    ///
+    /// A fifteen-decibel fit on a line that is a straight wire is the sort of
+    /// number that can be argued about forever; the residual cannot. Either it
+    /// is noise, or it has the shape of the sequence the reference is missing.
+    pub fn dump_fit(&self, path: &std::path::Path, from: usize, window: usize) {
+        use std::io::Write;
+        let end = (from + window).min(self.history.len());
+        let Some(reference) = reference(from, end, self.reference_mode) else { return };
+        let Ok(mut file) = std::fs::File::create(path) else { return };
+        let _ = writeln!(file, "# from {from} window {window} snr {:.3} taps {}", self.snr_db, self.taps.len());
+        let _ = write!(file, "taps");
+        for tap in &self.taps {
+            let _ = write!(file, " {tap:.9}");
+        }
+        let _ = writeln!(file);
+        let _ = writeln!(file, "# n reference model error");
+        for n in self.taps.len() - 1..reference.len() {
+            let mut model = 0.0;
+            for (k, &tap) in self.taps.iter().enumerate() {
+                if from + n >= k {
+                    model += tap * self.history[from + n - k];
+                }
+            }
+            let _ = writeln!(file, "{n} {:.9} {model:.9} {:.9}", reference[n], reference[n] - model);
+        }
     }
 
     /// Fit the equaliser at an alignment that has already been verified, without
