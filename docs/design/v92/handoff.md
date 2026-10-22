@@ -205,7 +205,22 @@ else           { /* 存到 0x11ad8（CP），置 [0x11752]，还调 V92DataModeE
 其余仍然成立：帧结构对（与 Agere 长度公式逐字节相同）、多项式对（`scr=x18x23`）、
 arm 对（`det=MP`、`mode=1`）、分类器对（len==4 ⇒ SUV）。
 
-**下一步（唯一一条）**：**查谁本该在 V.92 相位 4 里调 `V34RxData`。**
+**④ 接收链的路标已找到**：`V34RxData`（→ 检测器）的调用者是
+`V34TrainingDecoder`、`V34DataAssembler`、`V90TrainingDecoderGetRcvdMaps`、`V90DataModeDecoder`。
+其中 `V34TrainingDecoder` 是**被函数指针装上去的**：`V34DecoderSetTrainingMode`（0x30d20）把
+`V34TrainingDecoder` 写进 `[0x11a50]`。而 `V90TrainingDecoderGetRcvdMaps` 的调用者只有两处：
+`V90ClientPhase3RxWaitSbarState` 与 **`V92ClientPhase3RxWaitSdBarState`** —— 正好解释了
+为什么相位 3 有 170 次/秒的 `V34RxData`、相位 4 是 0 次。
+（探针里 `[0x11a50]` 的符号比对失败，全是 `other`，说明相位 4 用的不是这个槽——下一步要
+找出相位 4 真正用的解码器槽位与安装者，`V90TrainingDecoderGetRcvdMaps` 会被装到别处。）
+
+**下一步（唯一一条）**：**查 V.92 相位 4 里对端的接收解码器是谁、由谁装。**
+候选落点：`[0x11a50]` 之外的同族槽（V.34/V.90 各自一套），以及
+`PCMClientDemodulator`（`0xba1c/0xba20` 回调、模式经 `[0xba30]` 由
+`PCMClientDemodulatorCommitUpdate` 提交）是否本该接进这条链。
+**验收**：说出对端在 V.92 相位 4 里该由哪个函数调 `V34RxData`，以及它为什么没被装上。
+
+仍成立的老结论（供对照）：
 `V34RxData` 的调用者是 `V34DataAssembler`、`V90DataModeDecoder`、`FUN_00046870/46940/55270/554a0`，
 全是 V.34/V.90 **数据泵**里的函数。要找的是：对端的相位 4 状态机有没有把
 `PCMClientDemodulator`（0xba1c/0xba20 的回调、模式由 `[0xba30]` 经
