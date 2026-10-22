@@ -183,6 +183,37 @@ fn tracing() -> bool {
     *TRACE.get_or_init(|| std::env::var_os("V92_TRACE").is_some())
 }
 
+/// Where to write the upstream bit stream, when `V92_UP_TRACE` names a file.
+///
+/// Phase 4's upstream is the one direction this end has never had a readout
+/// for: a sequence that does not parse leaves nothing behind, so what the far
+/// end actually sent has to be written down to be looked at offline.
+fn up_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("V92_UP_TRACE")?;
+        let file = std::fs::File::create(path).ok()?;
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
+}
+
+/// Where to write the line samples this end receives, when `V92_RX_TRACE` names
+/// a file: one `symbol_index level` line each. Offline that is the whole of the
+/// upstream problem -- a receiver can be fitted against it without a bench run
+/// per hypothesis.
+fn rx_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("V92_RX_TRACE")?;
+        let file = std::fs::File::create(path).ok()?;
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
+}
+
 /// How phases 3 and 4 are going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -1148,6 +1179,12 @@ impl Modem {
             );
             self.peak = 0.0;
         }
+        if let Some(file) = rx_trace_file() {
+            use std::io::Write;
+            if let Ok(mut file) = file.lock() {
+                let _ = writeln!(file, "{} {input:.8}", self.now);
+            }
+        }
         self.rx.feed(input);
         while let Some(heard) = self.rx.heard() {
             self.heard(heard);
@@ -1741,6 +1778,16 @@ impl Modem {
         }
         let Some(reader) = self.upstream.as_mut() else { return };
         let bits: Vec<bool> = reader.feed(level).into_iter().collect();
+        if let Some(file) = up_trace_file() {
+            use std::io::Write;
+            let mut out = String::with_capacity(bits.len() + 12);
+            for bit in &bits {
+                out.push(if *bit { '1' } else { '0' });
+            }
+            if let Ok(mut file) = file.lock() {
+                let _ = writeln!(file, "{} {level:.6} {}", self.now, out);
+            }
+        }
         for bit in bits {
             if let Some(finder) = self.up_finder.as_mut()
                 && let Some(family) = finder.feed(bit)
