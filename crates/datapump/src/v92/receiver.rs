@@ -37,6 +37,8 @@ use std::collections::VecDeque;
 use dsp::Complex;
 
 use super::up_signals::{self, RU_PERIOD};
+use crate::v32::Mode;
+
 use super::UP_INTERVALS;
 
 /// The mean square a window needs before any of its shape means anything.
@@ -242,6 +244,10 @@ fn nearest(levels: &[f64], value: f64) -> Option<(f64, f64)> {
 /// The digital modem's upstream receiver.
 #[derive(Debug, Clone)]
 pub struct Receiver {
+    /// The polynomial the training reference is generated with: `Answer`
+    /// (GPA) for what an analogue modem sends, `Call` (GPC) for a digital
+    /// modem's own downstream training (6.3/V.92).
+    reference_mode: Mode,
     /// Every sample, for training, the epsilon estimator and the channel
     /// estimate. The oldest fall off the front.
     history: VecDeque<f64>,
@@ -281,6 +287,7 @@ impl Receiver {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            reference_mode: Mode::Answer,
             history: VecDeque::with_capacity(HISTORY),
             events: VecDeque::new(),
             recent: VecDeque::new(),
@@ -345,6 +352,13 @@ impl Receiver {
     }
 
     /// What the slicer is deciding between, and where the fit put it.
+    /// Which polynomial the training reference uses: `Answer` for an
+    /// analogue modem's TRN1u, `Call` for a digital modem's TRN1d.
+    pub fn set_reference_mode(&mut self, mode: Mode) -> &mut Self {
+        self.reference_mode = mode;
+        self
+    }
+
     pub fn set_slicer(&mut self, slicer: Slicer) {
         self.slicer = slicer;
     }
@@ -637,7 +651,7 @@ impl Receiver {
         // much of the window as it overruns. 1200 of TRN1u's 2040 minimum is
         // twenty-five equations per tap.
         let end = (from + TRAIN_WINDOW).min(self.history.len());
-        let Some(reference) = reference(from, end) else {
+        let Some(reference) = reference(from, end, self.reference_mode) else {
             return false;
         };
         let received: Vec<f64> = self.history.iter().copied().collect();
@@ -701,11 +715,15 @@ impl Receiver {
 }
 
 /// TRN1u's symbols from `from` onwards, as many as the history holds.
-fn reference(from: usize, length: usize) -> Option<Vec<f64>> {
+fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f64>> {
     if length <= from + TRAIN_TAPS {
         return None;
     }
-    let mut trn = up_signals::Trn1u::new();
+    // "The polynomial goes with the role, not with who dialled": the analogue
+    // modem's TRN1u is GPA and the digital modem's TRN1d is GPC (6.3/V.92).
+    // Reading the other end's training with the wrong one is reading a
+    // different sequence.
+    let mut trn = up_signals::Trn1u::with_mode(mode);
     let mut out = Vec::with_capacity(length - from);
     for _ in 0..(length - from) {
         out.push(trn.next_symbol());

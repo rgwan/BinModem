@@ -138,7 +138,14 @@ impl Trn1u {
     /// (6.3), so the role V.32 names when it picks the taps -- `Answer` for
     /// 1 + x^-5 + x^-23 -- is fixed here and is not the caller's to choose.
     pub fn new() -> Self {
-        Self { scrambler: Scrambler::new(Mode::Answer), last: false }
+        Self::with_mode(Mode::Answer)
+    }
+
+    /// The same run with either polynomial: `Answer` is GPA, which is the
+    /// analogue modem's whatever end dialled, and `Call` is GPC, which is the
+    /// digital modem's (6.3/V.92).
+    pub fn with_mode(mode: Mode) -> Self {
+        Self { scrambler: Scrambler::new(mode), last: false }
     }
 
     /// Begin another segment, which under [`TRN1U_RESET_EACH_SEGMENT`] zeroes
@@ -377,7 +384,14 @@ impl TwoPointReader {
     /// receiver that has just found a preamble wants. The first symbol fed
     /// becomes the reference and yields no bit.
     pub fn differential() -> Self {
-        Self { differential: true, ..Self::new() }
+        Self::differential_with(Mode::Answer)
+    }
+
+    /// The same, descrambling with the polynomial that goes with the far
+    /// end's role: `Answer` for an analogue modem's Ja and CPt, `Call` for a
+    /// digital modem's Jd and Jp (6.3/V.92).
+    pub fn differential_with(mode: Mode) -> Self {
+        Self { differential: true, descrambler: Scrambler::new(mode), ..Self::new() }
     }
 
     /// Switch to differential decoding, replaying the symbol the switch lands
