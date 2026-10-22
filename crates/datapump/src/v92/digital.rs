@@ -231,6 +231,10 @@ pub struct Settings {
     /// Whether both ends have the 1664-point constellation the downstream's
     /// top rates need.
     pub wide: bool,
+    /// What the analogue modem said it can build, from INFO1a bits 12:17
+    /// (Table 18). CPd's filters have to be inside these or the far end cannot
+    /// use the parameters and will not acknowledge them (9.6.2.1.3).
+    pub limits: FilterLimits,
     pub habits: Habits,
 }
 
@@ -238,7 +242,15 @@ impl Settings {
     /// From INFO1a as the analogue modem sent it (Table 18).
     #[must_use]
     pub fn new(law: Law, asked: &Info1aPcmUp, round_trip: f64, wide: bool) -> Self {
-        Self { law, uinfo: asked.uinfo, far_md: asked.md_length, round_trip, wide, habits: Habits::default() }
+        Self {
+            law,
+            uinfo: asked.uinfo,
+            far_md: asked.md_length,
+            round_trip,
+            wide,
+            limits: FilterLimits::from_info1a(asked.sections, asked.ltot_code, asked.lmax_code),
+            habits: Habits::default(),
+        }
     }
 
     /// This end's Jd (Table 21): every downstream rate, and the look-ahead.
@@ -375,11 +387,23 @@ impl Source {
     }
 
     /// Put a Phase 4 sequence on the line: SUVd, CPd or Ed, as bits.
+    ///
+    /// Only the *ask* goes here, and the sequence already on the line is left
+    /// alone: `start` fills the queue from `self.last` at the boundary where
+    /// that one ends. Clearing the queue here instead -- which is what this did
+    /// -- emptied a sequence that was still going out, so the very next symbol
+    /// found the queue empty, reported the sequence finished, and the exchange
+    /// asked for the next one, which emptied it again. Each sequence got exactly
+    /// one symbol onto the line, and since the first bit of both SUVd and CPd is
+    /// the first bit of the frame sync, a Phase 4 that meant to repeat them put
+    /// a run of scrambled **ones** there instead. An Agere SV92PP never found a
+    /// frame sync in it, kept sending SUVu with the acknowledge bit clear, and
+    /// after the ten seconds its wait allows raised
+    /// `V34 exception: 60096212` -- its Phase 4 state waiting for an SUVd.
     pub fn send(&mut self, out: Out, bits: Vec<bool>) {
         debug_assert!(matches!(out, Out::Suvd | Out::Cpd | Out::Ed));
-        self.last = bits.clone();
+        self.last = bits;
         self.change(out);
-        self.bits.extend(bits);
     }
 
     /// And B1d's codewords, one octet a symbol.
@@ -410,8 +434,11 @@ impl Source {
         self.out = out;
         self.count = 0;
         self.bits.clear();
-        if !matches!(out, Out::Suvd | Out::Cpd | Out::Ed) {
-            self.last.clear();
+        match out {
+            // A Phase 4 sequence is handed in whole by `Source::send` and goes
+            // out once; 9.6.1.1.1's repetition is the exchange's business.
+            Out::Suvd | Out::Cpd | Out::Ed => self.bits.extend(self.last.clone()),
+            _ => self.last.clear(),
         }
         if out != Out::B1d {
             self.codes.clear();
@@ -430,6 +457,16 @@ impl Source {
         self.symbol.is_multiple_of(INTERVALS as u64)
     }
 
+    /// The bits of the signal in flight, for an arm that has to hold it one
+    /// more repetition until a frame boundary.
+    fn last_bits(&self) -> Vec<bool> {
+        match self.out {
+            Out::Jd => self.jd.clone(),
+            Out::Jp | Out::JpPrime => self.jp.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Ask for `out` at the next place the signal now on the line can end.
     pub fn change(&mut self, out: Out) {
         self.pending = Some(out);
@@ -438,9 +475,14 @@ impl Source {
     /// One codeword out.
     pub fn next(&mut self) -> f64 {
         let level = self.next_level();
-        if self.out != Out::Silence {
-            self.symbol += 1;
-        }
+        // Silence occupies data frame intervals like anything else: the frame
+        // count is V.90 8.4.4's "first symbol of Sd is interval 0", and every
+        // later frame-structured signal -- Ri above all -- is measured against
+        // it. A silence that did not advance it left the next signal starting
+        // mid-frame, which rotated Ri's + + + - - - by however long the silence
+        // had lasted, and an Agere SV92PP answered a rotated Ri with nothing at
+        // all for two seconds and then a retrain.
+        self.symbol += 1;
         level
     }
 
@@ -449,7 +491,9 @@ impl Source {
         loop {
             match self.out {
                 Out::Silence => {
-                    if let Some(next) = self.pending.take() {
+                    if self.at_frame_boundary()
+                        && let Some(next) = self.pending.take()
+                    {
                         self.start(next);
                         continue;
                     }
@@ -501,9 +545,13 @@ impl Source {
                             // (9.5.1.1.8) and the same for Jp': a whole
                             // repetition, not a bit count.
                             _ => match self.pending.take() {
-                                Some(next) => {
+                                Some(next) if self.at_frame_boundary() => {
                                     self.start(next);
                                     continue;
+                                }
+                                Some(next) => {
+                                    self.pending = Some(next);
+                                    self.bits.extend(self.last_bits());
                                 }
                                 None => {
                                     let bits = if self.out == Out::Jd { self.jd.clone() } else { self.jp.clone() };
@@ -574,7 +622,7 @@ impl Source {
                     // Sent once, not repeated (V.90 8.4.1): what follows it is
                     // the analogue modem's CPt, and 9.5.1.1.12 cuts the DIL
                     // short at a segment boundary when that comes first.
-                    if self.count >= self.dil.len() {
+                    if self.count >= self.dil.len() && self.at_frame_boundary() {
                         let next = self.pending.take().unwrap_or(Out::Silence);
                         self.start(next);
                         continue;
@@ -1367,6 +1415,23 @@ impl Modem {
         let Some(from) = self.trn2_from else { return };
         match self.design_upstream(from) {
             Some(parameters) => {
+                if tracing() {
+                    let f = &parameters.filters;
+                    eprintln!(
+                        "V92TRACE: CPd drn {} gain {:.4} moduli {:?} sets {:?} filters z1 {} p1 {} z2 {} p2 {} limits {:?}/{:?}/{:?}",
+                        parameters.drn,
+                        parameters.gain,
+                        parameters.moduli,
+                        parameters.sets.iter().map(|s| s.len()).collect::<Vec<_>>(),
+                        f.z1.len(),
+                        f.p1.len(),
+                        f.z2.len(),
+                        f.p2.len(),
+                        self.settings.limits.sections,
+                        self.settings.limits.total,
+                        self.settings.limits.most
+                    );
+                }
                 self.cpd = Some(Cpd::from(&parameters));
                 self.note(format!(
                     "V.92: upstream drn {}, {:.1} kbit/s",
@@ -1392,7 +1457,7 @@ impl Modem {
             eprintln!("V92TRACE: no channel estimate ({} symbols)", received.len());
             return None;
         };
-        let limits = FilterLimits::from_info1a(3, 3, 3);
+        let limits = self.settings.limits;
         let designed = match design(&channel, &limits) {
             Ok(designed) => designed,
             Err(why) => {
@@ -1791,6 +1856,7 @@ impl Default for Modem {
             far_md: 0,
             round_trip: 0.0,
             wide: true,
+            limits: FilterLimits::from_info1a(0, 0, 0),
             habits: Habits::PROMPT,
         })
     }
@@ -1810,6 +1876,7 @@ mod tests {
             far_md: 0,
             round_trip: 0.0,
             wide: true,
+            limits: FilterLimits::from_info1a(0, 0, 0),
             habits: Habits::PROMPT,
         }
     }
@@ -1855,6 +1922,117 @@ mod tests {
         match found {
             Some(DownFamily::Suvd(read)) => assert_eq!(read, suvd),
             other => panic!("SUVD did not read back: {other:?}"),
+        }
+    }
+
+    /// The line a Phase 4 exchange actually puts out: whole sequences, repeated
+    /// -- not one symbol of each.
+    ///
+    /// The exchange asks for a new sequence every time one ends, and the only
+    /// thing `Source` has to get right in that dance is not to end one before
+    /// its bits are done. It used to clear the queue in `send`, which ended
+    /// whatever sequence was in the middle of going out, so each sequence got
+    /// exactly one symbol onto the line -- and since bit 0 of both SUVd and CPd
+    /// is a frame-sync one, what actually went out was a run of scrambled ones
+    /// with no frame sync in it anywhere. An Agere SV92PP read that as nothing
+    /// at all, kept answering SUVu with the acknowledge bit clear, and ten
+    /// seconds later raised `V34 exception: 60096212`.
+    #[test]
+    fn a_phase_4_exchange_repeats_whole_sequences() {
+        let settings = settings();
+        let mut source = Source::new(&settings);
+        source.change(Out::Trn2d);
+        for _ in 0..TRN2D_LEAST {
+            source.next();
+        }
+        let suvd = Suvd { silence: false, ack: false };
+        let mut reader = TwoPointReader::differential_with(Mode::Call);
+        let mut finder = DownFinder::new();
+        let mut found = 0;
+        source.send(Out::Suvd, suvd.to_bits(INTERVALS));
+        for _ in 0..2000 {
+            let level = source.next();
+            // Exactly what `phase4_out` does: as soon as the last one ended,
+            // ask for the same sequence again (9.6.1.1.1 repeats the SUVd
+            // until a CPu arrives).
+            if source.take_finished().is_some() {
+                source.send(Out::Suvd, suvd.to_bits(INTERVALS));
+            }
+            if let Some(bit) = reader.feed(level)
+                && let Some(DownFamily::Suvd(read)) = finder.feed(bit)
+            {
+                assert_eq!(read, suvd);
+                found += 1;
+            }
+        }
+        // Two thousand symbols of a fifty-four symbol sequence: thirty-odd of
+        // them, less the reader's own settling.
+        assert!(found > 25, "only {found} SUVd sequences reached the line");
+    }
+
+    /// And CPd, which is the one Phase 4 sequence with state in it: if its bits
+    /// do not read back, the far end cannot use the parameters and will not
+    /// acknowledge them (9.6.2.1.3) -- which on the bench looks exactly like a
+    /// far end that has not heard anything at all.
+    #[test]
+    fn cpd_reads_back_as_the_parameters_it_was_built_from() {
+        let settings = settings();
+        // The slowest rung of 6.1's ladder, which is what this end asks for
+        // first: K = 36 bits over twelve intervals, eight levels each.
+        let parameters = {
+            let mut taps = vec![0.0f64; 16];
+            taps[0] = 1.0;
+            let channel = Channel::estimate(&[1.0, -1.0, 1.0, 1.0, -1.0, 1.0], &[1.0, -1.0, 1.0, 1.0, -1.0, 1.0], 4)
+                .expect("a flat channel");
+            let designed = design(&channel, &settings.limits).expect("designable");
+            choose(&designed, 1e-6, 1, Trellis::Sixteen).expect("the slowest rung").parameters
+        };
+        assert_eq!(parameters.drn, 1);
+        let cpd = Cpd::from(&parameters);
+        // The sequence itself first, so that a failure below says whether it is
+        // the bits or the framing around them.
+        let bits = cpd.to_bits(INTERVALS);
+        let direct = Cpd::from_bits(&bits);
+        assert!(direct.is_some(), "Cpd::from_bits refused its own bits, {} of them", bits.len());
+        assert_eq!(direct.as_ref().map(|c| c.drn), Some(cpd.drn));
+        assert_eq!(direct.as_ref().map(|c| c.moduli), Some(cpd.moduli));
+        // And through the finder, with no line in between.
+        let mut wire = DownFinder::new();
+        let mut through = None;
+        for &bit in &bits {
+            if let Some(family) = wire.feed(bit) {
+                through = Some(family);
+                break;
+            }
+        }
+        assert!(through.is_some(), "the finder missed a CPd of {} bits", bits.len());
+        let mut source = Source::new(&settings);
+        source.change(Out::Trn2d);
+        for _ in 0..TRN2D_LEAST {
+            source.next();
+        }
+        let mut reader = TwoPointReader::differential_with(Mode::Call);
+        let mut finder = DownFinder::new();
+        let mut found = None;
+        source.send(Out::Cpd, cpd.to_bits(INTERVALS));
+        // CPd is the longest sequence in the protocol -- a full 6.4 chain --
+        // so the window is its own length and a good margin over.
+        for _ in 0..(4 * bits.len() + 400) {
+            let level = source.next();
+            let Some(bit) = reader.feed(level) else { continue };
+            if let Some(family) = finder.feed(bit) {
+                found = Some(family);
+                break;
+            }
+        }
+        match found {
+            Some(DownFamily::Cpd(read)) => {
+                assert_eq!(read.drn, cpd.drn, "drn");
+                assert_eq!(read.ack, cpd.ack, "ack");
+                assert_eq!(read.moduli, cpd.moduli, "moduli");
+                assert_eq!(read.sets, cpd.sets, "constellation sets");
+            }
+            other => panic!("CPD did not read back: {other:?}"),
         }
     }
 

@@ -16,6 +16,7 @@ use datapump::v90::ucode::Law;
 use datapump::v92::analogue;
 use datapump::v92::digital;
 use datapump::v92::epsilon;
+use datapump::v92::FilterLimits;
 
 use std::collections::VecDeque;
 
@@ -29,6 +30,7 @@ fn digital_settings(far_md: u8) -> digital::Settings {
         far_md,
         round_trip: 0.0,
         wide: true,
+        limits: FilterLimits::from_info1a(0, 0, 0),
         habits: digital::Habits::PROMPT,
     }
 }
