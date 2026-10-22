@@ -36,10 +36,11 @@ use std::collections::VecDeque;
 
 use crate::v32::{Mode, Scrambler};
 use crate::v34::info::Info1aPcmUp;
-use crate::v90::sequences::{Cp, CpFinder, Descriptor, DescriptorFinder, Jd, JA_UNIT_BITS};
+use crate::v90::sequences::{Cp, CpFinder, Descriptor, DescriptorFinder, Jd, JA_UNIT_BITS, Layout};
 use crate::v90::ucode::{self, Law};
 use crate::v92::receiver::{Heard, Receiver, Symbol};
-use crate::v92::sequences::{J, Jp, JP_PRIME_BITS};
+use crate::v92::UP_INTERVALS;
+use crate::v92::sequences::{J, JP_PRIME_BITS, Jp};
 use crate::v92::up_signals::TwoPointReader;
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
@@ -453,8 +454,15 @@ pub struct Modem {
     cpt: Option<Cp>,
     /// Where TRN1u began, in receiver history indices.
     trn_from: Option<u64>,
-    /// Consecutive zero bits decoded, which is how E1u is seen (8.5.2).
-    zeroes: usize,
+    /// The length of one CPt repetition in bits, once one has been read, and
+    /// how far through the next repetition the reader has got. E1u is twelve
+    /// zeroes in the place where that repetition's synchronisation would be,
+    /// so where they arrive is the whole of telling them from a CPt's own
+    /// zero-filled fields (8.5.2).
+    cp_len: usize,
+    cp_pos: usize,
+    /// Zeroes seen so far at the start of the repetition.
+    e1u_zeroes: usize,
     /// Bits the Ja reader has produced, and ones in the last stretch of them.
     ja_bits: u64,
     ja_ones: u64,
@@ -493,7 +501,9 @@ impl Modem {
             trn_from: None,
             ja_bits: 0,
             ja_ones: 0,
-            zeroes: 0,
+            cp_len: 0,
+            cp_pos: 0,
+            e1u_zeroes: 0,
             now: 0,
             ja_deadline,
             su_deadline: None,
@@ -736,7 +746,9 @@ impl Modem {
                 // its first symbol is upstream interval 0.
                 self.reader = TwoPointReader::differential();
                 self.cps = CpFinder::v92(JA_UNIT_BITS);
-                self.zeroes = 0;
+                self.cp_len = 0;
+                self.cp_pos = 0;
+                self.e1u_zeroes = 0;
                 self.notes.push("V.92: second S-bar-u, 107 on".into());
             }
             _ => {}
@@ -765,19 +777,7 @@ impl Modem {
                 let Some(bit) = self.reader.feed(symbol.value) else {
                     return;
                 };
-                if let Some(cp) = self.cps.feed(bit) {
-                    self.heard_cp(cp);
-                }
-                // 8.5.2: E1u is twelve decoded zeroes where a CPt's
-                // synchronisation would be. A CPt ends on a twelve-symbol
-                // boundary with at least one zero of fill, so only a run
-                // longer than that counts.
-                self.zeroes = if bit { 0 } else { self.zeroes + 1 };
-                if self.zeroes >= E1U_ZEROES && self.cpt.is_some() && self.stage == Stage::Ri {
-                    self.notes.push("V.92: E1u".into());
-                    self.source.change(Out::RiBar);
-                    self.stage = Stage::RiBar;
-                }
+                self.cpt_bit(bit);
             }
             _ => {}
         }
@@ -825,7 +825,50 @@ impl Modem {
             // the source does at the next segment boundary.
             self.source.change(Out::Ri);
             self.stage = Stage::Ri;
-            self.zeroes = 0;
+            self.cp_pos = 0;
+            self.e1u_zeroes = 0;
+        }
+    }
+
+    /// One decoded bit of the CPt series, and where it falls in the repetition.
+    ///
+    /// 8.5.2 makes E1u "a data frame of scrambled, differentially encoded
+    /// zeroes ... used to signal the end of CPt", and 9.5.1.1.13 has it arrive
+    /// in the place the next CPt would have begun. Counting *any* twelve
+    /// zeroes in a row is not enough to see it: every CPt has seventeen ones in
+    /// front of it and then sixteen-bit words, and the reserved and shaping
+    /// fields of Table 23 are whole words of zeroes -- so a run of sixteen
+    /// comes round with every repetition, and an E1u that was looked for that
+    /// way would be found in the middle of the very series it is meant to end
+    /// (which is exactly what an earlier version of this did, and why Ri went
+    /// out for one symbol instead of 384). So the length of one repetition is
+    /// taken from the CPt that was read, and only the twelve bits where its
+    /// synchronisation belongs are counted.
+    fn cpt_bit(&mut self, bit: bool) {
+        if let Some(cp) = self.cps.feed(bit) {
+            // A sequence is found by its CRC, so the bit just fed is its last:
+            // the next one is the first of the next repetition.
+            self.cp_len = cp.to_bits_in(Layout::V92, UP_INTERVALS).len();
+            self.cp_pos = 0;
+            self.e1u_zeroes = 0;
+            self.heard_cp(cp);
+            return;
+        }
+        if self.cp_len == 0 {
+            return;
+        }
+        if self.cp_pos < E1U_ZEROES {
+            self.e1u_zeroes = if bit { 0 } else { self.e1u_zeroes + 1 };
+            if self.e1u_zeroes == E1U_ZEROES && self.cpt.is_some() && self.stage == Stage::Ri {
+                self.notes.push("V.92: E1u".into());
+                self.source.change(Out::RiBar);
+                self.stage = Stage::RiBar;
+            }
+        }
+        self.cp_pos += 1;
+        if self.cp_pos >= self.cp_len {
+            self.cp_pos = 0;
+            self.e1u_zeroes = 0;
         }
     }
 }
@@ -887,7 +930,7 @@ mod tests {
             let cp = cp.map(|cp| {
                 let mut sender = TwoPointSender::after(Trn1u::new());
                 sender.preamble();
-                sender.push(&cp.to_bits_in(Layout::V92, 1));
+                sender.push(&cp.to_bits_in(Layout::V92, UP_INTERVALS));
                 sender
             });
             Self { trn, ja: Some(ja), cp, second_trn: Trn1u::new() }
