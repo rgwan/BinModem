@@ -488,6 +488,13 @@ pub struct Modem {
     cpt: Option<Cp>,
     /// Where TRN1u began, in receiver history indices.
     trn_from: Option<u64>,
+    /// And where the **second** TRN1u is expected to begin. Its fit is the one
+    /// that reads CPt: the 24.5T S-bar-u between them moves the far end's
+    /// symbols half a symbol, and the taps fitted before it are half a symbol
+    /// out for everything after.
+    refit_from: Option<u64>,
+    /// How many times that refit has moved its anchor on.
+    refit_tries: u8,
     /// The length of one CPt repetition in bits, once one has been read, and
     /// how far through the next repetition the reader has got. E1u is twelve
     /// zeroes in the place where that repetition's synchronisation would be,
@@ -547,6 +554,8 @@ impl Modem {
             descriptor: None,
             cpt: None,
             trn_from: None,
+            refit_from: None,
+            refit_tries: 0,
             ja_bits: 0,
             ja_ones: 0,
             cp_bits: 0,
@@ -667,6 +676,46 @@ impl Modem {
     }
 
     fn timers(&mut self) {
+        // The second TRN1u carries the equaliser's refit at the new phase:
+        // "the second TRN1u also lets the digital modem refine its equalizer at
+        // the new phase", which is what the 24.5T S-bar-u left behind. Without
+        // it every CPt is read half a symbol out -- 19 dB on a two-point stream
+        // rather than 160, see `Receiver`'s table -- and its CRC never passes.
+        if self.stage == Stage::Dil
+            && let Some(from) = self.refit_from
+            && self.rx.symbols() >= from + TRAIN_AFTER
+        {
+            let base = self.rx.symbols() - self.rx.history_len() as u64;
+            let at = from.saturating_sub(base);
+            let before = self.rx.fitted();
+            let baseline = before.snr();
+            let now = self.rx.train_near(at, TRAIN_SEARCH).then(|| self.rx.snr_db());
+            match now {
+                // Only a fit that reads the line better than the one already in
+                // place is the refit: on a clean line a window that is not
+                // TRN1u at all can clear the gate by luck, and the CPt this is
+                // for would then be read through the wrong taps.
+                Some(snr) if snr > baseline + 0.5 => {
+                    self.refit_from = None;
+                    self.notes.push(format!("V.92: refit at the new phase, {snr:.1} dB"));
+                    // The reader and the CPt finder are left alone: a CPt is a
+                    // whole frame with a CRC, so those that cross the refit are
+                    // thrown out by it and the next repetition is read with the
+                    // new taps.
+                }
+                _ => {
+                    self.rx.restore(&before);
+                    // Move the anchor on and try again, a couple of times: each
+                    // try is a hundred and thirty least squares, and where the
+                    // far end's second TRN1u begins is not as well known as
+                    // TRN1d's was. Two retries cover the wait between our Jp'
+                    // and the far end starting it; past that there is nothing
+                    // to fit and the first fit stands.
+                    self.refit_tries += 1;
+                    self.refit_from = (self.refit_tries < 3).then_some(from + TRAIN_AFTER / 2);
+                }
+            }
+        }
         // D2/D3: once enough of TRN1u has gone by, the fit is made.
         if self.stage == Stage::Training
             && let Some(from) = self.trn_from
@@ -780,7 +829,7 @@ impl Modem {
         self.notes.push(format!("V.92: TRN1u expected from symbol {from}"));
     }
 
-    fn su_reversal(&mut self, _at: u64) {
+    fn su_reversal(&mut self, at: u64) {
         match self.stage {
             Stage::AwaitSu => {
                 // D7: the Su-to-S-bar-u reversal, which is what Jp's epsilon
@@ -804,7 +853,13 @@ impl Modem {
                 self.source.change(Out::JpPrime);
                 self.stage = Stage::Dil;
                 // D10: the second TRN1u starts 24T after this reversal and
-                // its first symbol is upstream interval 0.
+                // its first symbol is upstream interval 0. The fit that will
+                // read CPt is taken inside it, once 1300 of its symbols are in.
+                // From the reversal itself, not from when it was noticed: the
+                // hunt reports where Su turned, and the far end's TRN1u starts
+                // 24T after that.
+                self.refit_from = Some(at + 24 + TRAIN_AFTER);
+                self.refit_tries = 0;
                 self.reader = TwoPointReader::differential();
                 self.cps = CpFinder::v92(JA_UNIT_BITS);
                 self.cp_len = 0;

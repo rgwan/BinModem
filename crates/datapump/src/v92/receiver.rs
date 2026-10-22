@@ -143,6 +143,24 @@ pub const TRAIN_TRIES: usize = 3;
 /// symbol timing recovery on the upstream, which this receiver does not have
 /// yet: it slices at the network's instants whatever the far end's clock says.
 ///
+/// What a receiver's equaliser was, for [`Receiver::fitted`] and
+/// [`Receiver::restore`].
+#[derive(Debug, Clone)]
+pub struct Fitted {
+    taps: Vec<f64>,
+    snr_db: f64,
+    trained: bool,
+    at: usize,
+}
+
+impl Fitted {
+    /// The figure the fit it describes reached.
+    #[must_use]
+    pub fn snr(&self) -> f64 {
+        self.snr_db
+    }
+}
+
 /// The signal to noise a successful training has to reach.
 ///
 /// Twenty was the figure the synthetic bursts reached, where the line is the
@@ -507,6 +525,29 @@ impl Receiver {
 
     /// How many samples of history the receiver holds.
     #[must_use]
+    /// The taps and the signal to noise they were fitted at.
+    ///
+    /// A second fit -- the one the second TRN1u carries, at the phase the
+    /// 24.5T S-bar-u left -- can land on a window that is not TRN1u at all and
+    /// still clear the gate by luck on a clean synthetic line. Keeping the
+    /// figure it started from is what lets the caller put the first fit back.
+    #[must_use]
+    pub fn fitted(&self) -> Fitted {
+        Fitted { taps: self.taps.clone(), snr_db: self.snr_db, trained: self.trained, at: self.trained_at }
+    }
+
+    /// Put back what [`Self::fitted`] returned.
+    ///
+    /// A failed fit is not a no-op: `train_near` turns training *off* when it
+    /// cannot reach its gate, and a caller that is only trying a second fit must
+    /// be able to put back a receiver that was working.
+    pub fn restore(&mut self, fitted: &Fitted) {
+        self.taps.clone_from(&fitted.taps);
+        self.snr_db = fitted.snr_db;
+        self.trained = fitted.trained;
+        self.trained_at = fitted.at;
+    }
+
     pub fn history_len(&self) -> usize {
         self.history.len()
     }
