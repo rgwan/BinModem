@@ -922,6 +922,70 @@ mod tests {
         }
     }
 
+    /// A CPt read back through a band-limited line, after TRN1u has trained the
+    /// equaliser: 24 ones, then Table 23's frame repeated (8.5.1).
+    ///
+    /// This is the chain the digital modem uses on a real call, and it is what
+    /// an Agere SV92PP's "CPt sent" ran into: the far end's transmit filter
+    /// puts the two-point transitions between the sample instants, and the
+    /// fit is the only thing that puts them back.
+    #[test]
+    fn a_cpt_reads_back_through_a_band_limited_line() {
+        use crate::v90::sequences::{Cp, CpFinder, Layout};
+        use crate::v92::up_signals::{TwoPointReader, TwoPointSender};
+
+        let cp = Cp { drn: 80, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let bits = cp.to_bits_in(Layout::V92, UP_INTERVALS);
+
+        // The far end: TRN1u, then the CPt with its preamble, as the line would
+        // carry it -- a three tap channel and a light low-pass, which is what a
+        // 3.4 kHz transmit filter looks like at 8 kHz.
+        let mut trn = crate::v92::up_signals::Trn1u::new();
+        let mut line: Vec<f64> = (0..2400).map(|_| trn.next_symbol()).collect();
+        let mut sender = TwoPointSender::after(trn);
+        sender.preamble();
+        for _ in 0..4 {
+            sender.push(&bits);
+        }
+        while let Some(level) = sender.next_symbol() {
+            line.push(level);
+        }
+        let mut filtered = Vec::with_capacity(line.len());
+        let (mut a1, mut a2) = (0.0, 0.0);
+        for &x in &line {
+            // A one pole low-pass near 3.4 kHz at 8 kHz, then a short channel.
+            a1 += 0.55 * (x - a1);
+            a2 += 0.55 * (a1 - a2);
+            filtered.push(a2);
+        }
+
+        let mut rx = Receiver::new();
+        for &level in &filtered {
+            rx.feed(level);
+        }
+        // Train where TRN1u began, as `heard_ru` does from the reversal.
+        assert!(rx.train_near(0, 64), "the fit should take: {:.1} dB", rx.snr_db());
+        let mut rx = Receiver::new();
+        let mut reader = TwoPointReader::differential_with(Mode::Answer);
+        let mut finder = CpFinder::v92(UP_INTERVALS);
+        let mut found = 0;
+        for &level in &filtered {
+            rx.feed(level);
+            while let Some(Heard::Symbol(symbol)) = rx.heard() {
+                if let Some(bit) = reader.feed(symbol.value)
+                    && finder.feed(bit).is_some()
+                {
+                    found += 1;
+                }
+            }
+            // Only after the training window, so the equaliser is in place.
+            if rx.symbols() >= 1400 && !rx.is_trained() {
+                rx.train_near(0, 64);
+            }
+        }
+        assert!(found > 0, "no CPt came back out of the chain, {:.1} dB", rx.snr_db());
+    }
+
     /// The training fit, over a channel with noise: TRN1u is known, so this is
     /// least squares and nothing else. 25 dB is the plan's gate at 1e-4 of
     /// noise.
