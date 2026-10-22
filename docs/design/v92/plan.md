@@ -1,5 +1,8 @@
 # V.92 implementation plan
 
+> **Handing over?** Read [`handoff.md`](handoff.md) first: where the work stands, what to do next, the
+> nine things that cost the most to find, and what each of the three simulated peers actually does.
+
 ITU-T V.92 (11/2000), "Enhancements to Recommendation V.90", built in BinModem from the Recommendation and
 real captures only. 62 work packages in 18 waves. Both ends of every feature are ours, so every feature is
 proved call-to-call over `v90::network::Network` before it is ever offered to a live line.
