@@ -179,19 +179,33 @@ Agere 侧：Jd detected / Jp detected / Jd' detected / "CPt sent" / PCM phase 3 
 - 所以瓶颈是**接收机在网络采样时刻切片，不管对端的符号钟**。半符号偏就是
   "两个相邻符号之和"，任何均衡器都补不回来；CPt 的 CRC 需要约 30 dB。
 
+**ε 已经测出来并发给对端了**（`7814625`）：Agere 的日志从 `Jp detected: 0 1000`
+变成 **`Jp detected: aa57 1000`**（ε ≈ 0.665 符号），说明 9.5.1.1.6-7 这条通路通了。
+但 CPt 仍然解不出，所以下一件事是**核对 ε 的符号与量纲**：
+
+- 现在的估计器在 **均衡器输出**上测 Su 的相位，而均衡器本身已经被拟合成"把收到的
+  TRN1u 映射到我们采样点上的 ±1"，它自己的残余延迟就混进了测量。
+  正确的做法是在**接收机的原始样点**上测（并从抽头算出信道在 f0=1333 Hz 的相位），
+  或直接比较 Agere 自己的 `Timing Offset` / `PCM phase 3` SNR 前后变化来定符号。
+- 判据要硬：ε 改动后 Agere 的 Phase 3 SNR（它日志里的 `Signal/Noise Ratio`）应上升，
+  我们这边的 TRN1u 拟合应离开 15.6 dB，然后 `CPt drn` 出现在 binmodem 日志里。
+
 **下一步（按收益排序）**
 
-1. **上行符号定时恢复**（唯一真正解锁 CPt 的事）：在 `v92::receiver` 的切片前
-   加插值/定时环，或让拟合同时解一个分数延迟（Fractionally-spaced equaliser：
-   2 样点/符号降采样）。验证口径：Agere 的 TRN1u 拟合从 15.6 dB 上到 30 dB 以上，
-   然后 `CPt drn` 出现在 binmodem 日志里、对端不再 clear down。
-2. **失败重训已经接好的部分**：`v90/startup.rs:617` 的 `v92` 分支在
+1. **核对/改正 ε 的符号与量纲**（上面两条），这是唯一还没试过的闭环。
+   次选：让拟合解一个分数延迟（Fractionally-spaced equaliser：2 样点/符号降采样）。
+2. **第二 TRN1u 的重拟合在真机上没有接上**：规范说"the second TRN1u also lets the
+   digital modem refine its equalizer at the new phase"，代码已按此实现
+   （`digital::Modem` 的 `refit_from`），但锚点是猜的、搜索只有 ±64，而真机对端
+   的第二 TRN1u 起点落在猜的范围外，所以它一次都没生效（台架日志里没有
+   `V.92: refit at the new phase`）。要先用相关（而不是逐点拟合）把那段 TRN1u 找出来。
+3. **失败重训已经接好的部分**：`v90/startup.rs:617` 的 `v92` 分支在
    `pcm::Status::Failed` 且 `failed_starts < V90_RETRAINS` 时会 `restart_phase2()`——
    但重训后对端仍回 Table 18，于是又进 V.92 再失败一次。真机要的是
    **第 N 次失败后拒绝 PCM 上行**（`decline_pcm()`，V.90 分支已有这个动作，V.92 没有）。
-3. **重训保住 V.92 旗标**（`v34/phase2.rs::again()`，code-analogue §11.2 的老 TODO）：
+4. **重训保住 V.92 旗标**（`v34/phase2.rs::again()`，code-analogue §11.2 的老 TODO）：
    现在重训后会退成 Table 10（P2TRACE 第二次 `table10 true`）。
-4. 采集文件不可全信：`agr-tx.raw` 上用接收机链连 TRN1u 都拟合不过 0 dB（在线是 15.4），
+5. 采集文件不可全信：`agr-tx.raw` 上用接收机链连 TRN1u 都拟合不过 0 dB（在线是 15.4），
    说明这份 raw 与线路上真正听到的不是同一个信号（或采样率/格式不同）。
    `tests/v92_capture.rs` 的两个诊断就是为这件事留的。
 
