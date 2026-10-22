@@ -1771,8 +1771,9 @@ not listed must not be touched.
     domain. The tests the package asked for at `Network::with_upstream_phase` therefore belong
     with V92-38's call harness, not here.
   - With N = 0 the Recommendation's own order (9.5.2.1.10: TRN1u until Ri, CPt, E1u on R-bar-i) is
-    behind `ZERO_DIL_A10_ORDER`, off by default because our digital modem sends no SCR and only
-    sends Ri after a CPt — so A11's order is what completes a call between the two of them.
+    behind `ZERO_DIL_A10_ORDER`, and it is **on**: the digital modem now sends SCR and then Ri where
+    9.5.1.1.13 puts them, because an Agere SV92PP waiting for a Ri that never came showed that the
+    old "stay silent until a CPt arrives" reading deadlocks against a real far end.
   - The digital modem's E1u detector had to be fixed to make the exchange work: twelve zeroes in a
     row appear inside every CPt (Table 23's reserved and shaping fields are whole sixteen-bit words
     of them), so it now counts only the twelve bits where the next CPt's synchronisation belongs.
