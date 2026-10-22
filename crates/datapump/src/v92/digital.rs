@@ -40,6 +40,7 @@ use crate::v90::sequences::{Cp, CpFinder, Descriptor, DescriptorFinder, Jd, JA_U
 use crate::v90::ucode::{self, Law};
 use crate::v92::receiver::{Heard, Receiver, Symbol};
 use crate::v92::UP_INTERVALS;
+use crate::v92::epsilon;
 use crate::v92::sequences::{J, JP_PRIME_BITS, Jp};
 use crate::v92::up_signals::TwoPointReader;
 
@@ -85,6 +86,11 @@ const JA_WITHIN: f64 = 4.5;
 /// 9.5.1.2.2: Su within 5100 ms plus a round trip of **the start of TRN1d** --
 /// not of Ja, and not of the end of TRN1d.
 const SU_WITHIN: f64 = 5.1;
+
+/// How many of Su's symbols Jp's epsilon is measured over: the 144T Su is four
+/// full periods of the six-symbol shape (9.5.2.1.6), and the phase of its
+/// fundamental is steady over all of them.
+const SU_MEASURE_SYMBOLS: usize = 144;
 
 /// E1u: "a data frame of scrambled, differentially encoded zeroes" (8.5.2),
 /// which is twelve decoded zero bits where a CPt's synchronisation would be.
@@ -488,6 +494,8 @@ pub struct Modem {
     cpt: Option<Cp>,
     /// Where TRN1u began, in receiver history indices.
     trn_from: Option<u64>,
+    /// Su's symbols as the equaliser gave them, for Jp's epsilon.
+    su: Vec<f64>,
     /// And where the **second** TRN1u is expected to begin. Its fit is the one
     /// that reads CPt: the 24.5T S-bar-u between them moves the far end's
     /// symbols half a symbol, and the taps fitted before it are half a symbol
@@ -554,6 +562,7 @@ impl Modem {
             descriptor: None,
             cpt: None,
             trn_from: None,
+            su: Vec::new(),
             refit_from: None,
             refit_tries: 0,
             ja_bits: 0,
@@ -835,7 +844,11 @@ impl Modem {
                 // D7: the Su-to-S-bar-u reversal, which is what Jp's epsilon
                 // is measured against.
                 self.stage = Stage::AwaitSuBar;
-                let epsilon = 0; // v92::epsilon's reading, which is not built.
+                // 9.5.1.1.6-7: the phase is measured on Su, and Jp carries how
+                // much of a symbol is still to be taken up after the half
+                // symbol the 24.5T S-bar-u gives for free.
+                let epsilon = epsilon::measure(&self.su).unwrap_or(0);
+                self.su.clear();
                 let jp = Jp {
                     epsilon,
                     eight_in_training: self.rx.snr_db() >= 20.0,
@@ -872,6 +885,13 @@ impl Modem {
     }
 
     fn symbol(&mut self, symbol: Symbol) {
+        // Su is the only signal Jp's epsilon can be measured on (9.5.1.1.6), so
+        // a run of it is kept while it is what the far end should be sending.
+        // The equaliser's output is what is measured, and Su's own shape is the
+        // reference it is measured against.
+        if self.stage == Stage::AwaitSu && self.su.len() < SU_MEASURE_SYMBOLS {
+            self.su.push(symbol.value);
+        }
         match self.stage {
             Stage::ReadJa => {
                 if let Some(bit) = self.reader.feed(symbol.value) {

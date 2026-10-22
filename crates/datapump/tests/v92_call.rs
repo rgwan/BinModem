@@ -114,10 +114,15 @@ fn phase_3_completes_and_the_digital_end_reaches_phase_4() {
     assert!(call.analogue.far_jd().is_some(), "no Jd: {:?}", call.analogue_notes);
     assert!(call.analogue.jp().is_some(), "no Jp: {:?}", call.analogue_notes);
     assert!(call.analogue.circuit107(), "circuit 107 never came on: {:?}", call.analogue_notes);
-    // 9.5.2.1.7-8: half a symbol at the S-bar-u after Su, then epsilon at the one
-    // after Jp -- which the digital end measured as zero on a clean line.
-    assert_eq!(call.analogue.delays(), &[0.5, 0.0], "the two sub-symbol shifts");
-    assert_eq!(call.analogue.epsilon(), Some(0.0));
+    // 9.5.2.1.7-8: half a symbol at the S-bar-u after Su, then the epsilon Jp
+    // carried at the one after Jp. That epsilon is the digital end's measurement
+    // of Su (9.5.1.1.6-7): whatever the phase turned out to be, both ends have
+    // to be talking about the same number, which is what this holds together.
+    let delays = call.analogue.delays();
+    assert_eq!(delays.first(), Some(&0.5), "the half symbol the S-bar-u gives");
+    let epsilon = call.analogue.epsilon().expect("Jp carried an epsilon");
+    assert_eq!(delays.get(1), Some(&epsilon), "the analogue applied what Jp said");
+    assert!((0.0..1.0).contains(&epsilon), "a fraction of a symbol: {epsilon}");
 }
 
 /// The same call with an MD in it: this end announces 3 x 276 = 828 symbols in
