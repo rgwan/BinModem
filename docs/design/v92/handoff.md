@@ -8,10 +8,12 @@
 
 **Phase 2（能力交换、Table 18）与 Phase 3（模拟端 + 数字端全程）都已跑通并有测试**。
 `v92::analogue` 现在是真状态机，做到 E1u 与 `Status::Phase3Done`；Phase 4 与"PCM 上行承载字节"未做。
+真机台架（Agere SV92PP）已把 Phase 3 跑到 DIL、对端发出 CPt，**我们仍解不出 CPt**（§5.1）。
 分支 `v92-dev`。
 
 ```bash
 cd BinModem && git log --oneline -6
+e2effb3 V.92: what an Agere SV92PP and an HSF engine found in phase 3
 8b8c7ed V.92: the analogue modem's phase 3, Su to E1u
 3544a0c V.92: a handover page
 42010f2 V.92: a call, and Phase 3 through it
@@ -29,7 +31,8 @@ f443f79 V.92: the hunt finds Ru on a real line
 | 模拟端单测 | `cargo test -p datapump --lib v92::analogue` | 4 条：A1 长度、DIL 上的 TRN1u、ε 是分数、TRN1u 够拟合 |
 | 数字端 Phase 3 单测 | `cargo test -p datapump --lib v92::digital` | 4 条：Ru→Phase 4、Ja 只读一次、Jd 自读回、DIL 段边界 |
 | 全量回归 | `cargo test -p datapump --release --no-fail-fast` | 只有 `v90_call` 的 13 条已知红 |
-| V.92 能力交换（实线） | 见 §6 HSF | HSF CONNECT，V.90 数据态 21600/56000，2000 B 0 错 |
+| V.92 能力交换（实线） | 见 §5.1/§6 | HSF 与 Agere 都回 Table 18，V.92 调制器建立 |
+| **V.92 Phase 3（真机对端）** | 见 §5.1 Agere | Ru/TRN1u/Ja/Sd/TRN1d/Jd/Su/Jp/Jp'/DIL 全过，停在解 CPt |
 
 `v92_call.rs` 打印的证据（`--nocapture`，两端各自的笔记）：
 
@@ -129,6 +132,51 @@ CPt for drn 16   Ri at 9144, CPt ends   CPt ends, E1u   E1u sent, phase 3 done
   **1 条**，挂在 `v90_call.rs:430`（两端没进数据态）。已用 `git worktree` 在 HEAD~1 上
   复现，同样红；V.90 的挂断路径，与 V.92 无关。
 
+## 5.1 台架现状（2026-10-23，真机）
+
+命令（Agere，8 kHz 原生、日志最全，**调试首选**）：
+
+```bash
+cd /home/hikari/comm/softmodem && export PKG_CONFIG_PATH=/tmp/alsa-shim/lib/pkgconfig
+export BRIDGE_MOD=V92 BINMODEM_V92_PCM_UP=1 V92_TRACE=1
+python3 interop/agrsm/run_agr_v90.py --ms-args "V92" --pre "AT+PIG=0" \
+        --connect-timeout 45 --hold 4 --verbosity 5 --capture
+```
+
+- **`BRIDGE_MOD=V92` 必须显式给**：Agere 脚本没有 `--bridge-mod`，默认把我们服务端起成
+  `+MS=V90`，那样永远协商不到 V.92（会看到 `AT+MS=V90` 在 binmodem 日志里）。
+- 采集方向别搞反：`caller.raw` 是**我们自己的 TX**（bridge 写的是 `from_binmodem`），
+  对端音频是 `agr-tx.raw`。回放对端要 `tools/binmodem_replay.py <agr-tx.raw> --rate 8000`。
+
+**Agere SV92PP 现在走到哪**（`e2effb3` 之后）：
+
+```
+Table 18 双向（P2TRACE: table18 true / table10 false）
+V.92 phase 3: Ru(679) → TRN1u(15.4 dB) → Ja → Sd/S̄d → TRN1d → Jd → Su → Jp → Jp' → DIL
+Agere 侧：Jd detected / Jp detected / Jd' detected / "CPt sent" / PCM phase 3 finished
+卡点：**我们解不出 Agere 的 CPt**（`CPt reader` 有 bit，但 CRC 从不通过），于是不发 Ri，
+      Agere 在 Phase 4 等 4 s 后 `V34 exception: 6009521a Cleardown`。
+```
+
+**HSF（SoftV92）**：Phase 2 正常（bit70 → Table 18），Phase 3 到 **Jp** 就停——
+桥里 16k→8k 是 3.4 kHz 带限，Su 的 hunt 一次都不匹配（`V92TRACE` 里没有 Su 事件）。
+另外要注意：`AwaitSuBar` 阶段没有专门超时，只有 `start_up_by`（20 s + 6·RTD）兜底，
+而**泵在 `Status::Failed` 时不会真的重训**，所以 HSF 这条路现在会干等到窗口结束，
+不会再自动回落到 V.90 数据态（`agr92b` 那种 `CONNECT 31200/52000` 的回落看不到了）。
+
+**下一步（按收益排序）**
+
+1. **解 CPt**：15.4 dB 的 2 点流按说不该 CRC 全军覆没。先在 `cpt_bit` 里把
+   `CpFinder` 的候选打印出来（`CpFinder::v92(JA_UNIT_BITS)` 的 loose sync 只作用于
+   第一个 CPt），再核对 Agere 的 `CPt sent 80 0 2000 0` 里 drn/type 是不是 Table 23 的
+   位置；必要时用 `agr-tx.raw` 离线跑一个专用解码器比对期望位。
+2. **失败要能重训**：`Status::Failed` 现在只写笔记；泵应该在 Phase 3/4 失败时走
+   `9.7.2.1`（70 ms 静音 + tone A）。这也是 HSF 台架回落到 V.90 的前提。
+3. **重训要保住 V.92 旗标**（`v34/phase2.rs::again()`，code-analogue §11.2 的老 TODO）：
+   现在重训后会退回 Table 10（P2TRACE 里第二次 `table10 true`），V.92 只能试一次。
+4. 上行 SNR 15.4 dB 偏低（Agere 自估 48 dB）：值得查一下 Agere 的 PCM 上行频谱成形
+   （它日志里的 `PCM Spectral Shaping Bits: 0`）与我们的 8 kHz 采样相位。
+
 ## 6. 三个模拟对端的事实
 
 ### HSF（Conexant SoftV92）—— 要 PCM 上行，但台架带限
@@ -147,15 +195,16 @@ cd interop/hsf && BINMODEM_V92_PCM_UP=1 \
   而 V.92 上行是 8000 符号/秒；拟合最高 15.7 dB 且无对齐尖峰，Ja 读不出来。
   用 HSF 只验 Phase 2 与 V.90 数据态。
 
-### Agere SV92PP —— 8 kHz 无 SRC，但 Phase 3 不领跑
+### Agere SV92PP —— 8 kHz 原生，Phase 3 **能**领跑（首选台架）
 ```bash
 python3 interop/agrsm/run_agr_v90.py --ms-args "V92" --pre "AT+PIG=0" \
         --connect-timeout 45 --hold 4
 ```
 - **必须 `AT+PIG=0`**（默认 `+PIG:1` = 忽略 PCM 上行），否则它回 Table 10。
   设了之后回 Table 18，我们的 V.92 调制器会被建立。
-- 8 kHz、无 SRC，Ru/RuReversal 能识别；但它 **Phase 3 起始只发静音、不发 Ru**
-  （约 3.5 s 后 `V34 exception: 60095213` 重训）。**不能做 Phase 3 领跑者**。
+- 8 kHz、无 SRC。**它确实领跑 Phase 3**：`+PIG=0` + 服务端 `BRIDGE_MOD=V92`
+  + `BINMODEM_V92_PCM_UP=1` 之后，Ru/TRN1u/Ja/Su/Jp'/DIL/CPt 全都发（见 §5.1）。
+  旧记录里"只发静音、不发 Ru"是**服务端被起成 V90** 时的现象，别照抄。
 - 日志很富（`--verbosity 3/5`）：`V34 Phase 2 finished, modulation v.92`、
   `PCM phase 3 started`、`PCM Mu-law coding`、`CPt sent ...`、`Rx Data Mode Active!`。
 - **ATI11**（引擎自己的连接报告，判断它到底选了 V.92 还是回落 V.90）：
