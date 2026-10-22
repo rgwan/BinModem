@@ -562,6 +562,30 @@ mod tests {
     }
 
     #[test]
+    fn repeated_sequences_are_heard_repeatedly() {
+        // A far end in its INFO0 recovery sends its sequence again and again
+        // with no gap. The receiver must hear each one, not just the first:
+        // the recovery is only over when the repetition is understood. Some
+        // rates matter here -- the digital modem is at 8 kHz and the analogue
+        // side at 16 kHz in this crate's tests.
+        for fs in [FS, 8000.0] {
+            let bits = capabilities().to_bits();
+            let mut tx = Transmitter::new(Side::Call, fs);
+            let mut rx = Receiver::new(Side::Call, fs);
+            let mut found = 0;
+            for _ in 0..(fs as usize * 2) {
+                if tx.pending() == 0 {
+                    tx.send(&bits);
+                }
+                if rx.feed(tx.next_sample()).is_some() {
+                    found += 1;
+                }
+            }
+            assert!(found >= 20, "found only {found} at {fs} Hz");
+        }
+    }
+
+    #[test]
     fn both_sides_carry_both_their_sequences() {
         let info1c = Info1c { md_length: 12, ..Info1c::default() };
         let found = through(Side::Call, &[capabilities().to_bits(), info1c.to_bits()], |_, x| x);

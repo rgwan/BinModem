@@ -1015,6 +1015,16 @@ impl Modem {
     }
 
     /// Which step of the handshake the line is on.
+    /// The V.34 phase 2 stage under a V.90 server, for bring-up against
+    /// another maker's modem: the phase name above is coarse, and a stall in
+    /// phase 2 has no other way of saying which signal it is waiting for.
+    pub fn phase2_stage(&self) -> Option<&'static str> {
+        match self.pump.as_ref()? {
+            Pump::V90Server(m) => Some(m.modem().v34().phase2().phase()),
+            _ => None,
+        }
+    }
+
     pub fn line_phase(&self) -> &'static str {
         if let Some(fax) = self.fax.as_ref() {
             return fax.phase_name();
@@ -2415,8 +2425,13 @@ impl Modem {
                 self.declared_lapm = negotiation.lapm();
                 self.far_menu = negotiation.far_menu();
                 self.pcm_role = negotiation.pcm_role();
+                // The menu is agreed at the start of V.8's handover silence,
+                // not at its end: what follows has to be listening from the
+                // start and silent until the end (9.2.1.1.1/V.90 conditions
+                // the receiver during exactly those 75 ms).
+                let lead_in = negotiation.handover_remaining();
                 self.negotiation = None;
-                self.start_pump(Some(modulation));
+                self.start_pump_with(Some(modulation), lead_in);
             }
             // 8.1.1: a far end that sent the plain answering tone of V.25 does
             // not speak V.8, and the call goes on "in accordance with Annex
@@ -2442,6 +2457,11 @@ impl Modem {
     /// `chosen` is what V.8 agreed, where it ran. Without one the modulation
     /// is whichever `+MS` named.
     fn start_pump(&mut self, chosen: Option<Modulation>) {
+        self.start_pump_with(chosen, 0.0);
+    }
+
+    /// Build the pump with V.8's handover silence still to run.
+    fn start_pump_with(&mut self, chosen: Option<Modulation>, lead_in: f64) {
         let role = self.role;
         let carrier = match chosen {
             // V.8's joint menu named a V.90 server for this end to be the
@@ -2469,11 +2489,11 @@ impl Modem {
         };
         self.pump = Some(match carrier.as_str() {
             "V90" => {
-                let mut analogue = v90::startup::Analogue::new(self.fs);
+                let mut analogue = v90::startup::Analogue::new(self.fs, lead_in);
                 analogue.set_pinned(self.pinned_rate);
                 Pump::V90(Box::new(analogue))
             }
-            "V90S" => Pump::V90Server(Box::new(v90::server::Line::new(self.fs, v90::server::ours()))),
+            "V90S" => Pump::V90Server(Box::new(v90::server::Line::new(self.fs, v90::server::ours(), lead_in))),
             "V34" => {
                 let role = match role {
                     Role::Calling => v34::phase2::Role::Call,

@@ -1048,6 +1048,9 @@ impl Modem {
     }
 
     fn heard_cp(&mut self, cp: Cp) {
+        if std::env::var_os("PHASE2_TRACE").is_some() {
+            eprintln!("P2TRACE heard_cp {cp:?}");
+        }
         if !cp.data_mode {
             if self.stage == Stage::Phase4Cpt {
                 // 9.4.1.2: "send signal R-bar-i for 24T followed by TRN2d".

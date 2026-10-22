@@ -63,9 +63,9 @@ pub struct Line {
 
 impl Line {
     /// From the end of V.8, with INFO0d saying `info0d`.
-    pub fn new(fs: f64, info0d: Info0d) -> Self {
+    pub fn new(fs: f64, info0d: Info0d, lead_in: f64) -> Self {
         Self {
-            modem: Digital::new(info0d),
+            modem: Digital::new(info0d, lead_in),
             down: Resampler::new(fs, digital::FS),
             up: Resampler::new(digital::FS, fs),
             arrived: Vec::with_capacity(4),

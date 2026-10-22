@@ -58,10 +58,10 @@ pub struct Analogue {
 
 impl Analogue {
     /// From the 75 ms of silence that end phase 1.
-    pub fn new(fs: f64) -> Self {
+    pub fn new(fs: f64, lead_in: f64) -> Self {
         Self {
             fs,
-            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Analogue, fs), fs),
+            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Analogue, fs, lead_in), fs),
             v90: None,
             failed_starts: 0,
             connected_once: false,
@@ -339,13 +339,13 @@ pub struct Digital {
 }
 
 impl Digital {
-    pub fn new(info0d: Info0d) -> Self {
+    pub fn new(info0d: Info0d, lead_in: f64) -> Self {
         let law = if info0d.a_law { Law::A } else { Law::Mu };
         // A full-scale sine is +3.17 dBm0 in G.711.
         let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
         Self {
             law,
-            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Digital(info0d), digital::FS), digital::FS),
+            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Digital(info0d), digital::FS, lead_in), digital::FS),
             v90: None,
             phase2_gain,
             failed_starts: 0,
