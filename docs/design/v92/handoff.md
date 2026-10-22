@@ -5,25 +5,57 @@
 
 ---
 
-## 1. 一句话现状
+## 0. 下一步（新 session 从这里开始）
 
-- **Phase 2、Phase 3（模拟端 + 数字端全程）、Phase 4 的握手代码都已写好并有测试。**
-- **真机台架（Agere SV92PP，全开日志）Phase 3 双向走完**：ε 已送达并被采用
-  （对端 `Jp detected: 4180`），**我们解出对端的 CPt**（`CPt drn 16`）、发 Ri、收 E1u、
-  发 R̄i，**双方都进入 Phase 4**（对端 `PCM phase 4 started`，我们 `phase 4: TRN2d → SUVd`）。
-- **卡在 Phase 4 的握手**：我们 TRN2d（4800T）→ SUVd 之后，对端报 `Jd' detected`
-  —— 在 V.90 8.6.2 里 Jd' 是**数字端请求重训练**的信号 —— 于是它退回 Phase 3 的 CPt，
-  再走一遍 V.34 Phase 2，最后 `Disconnect reason: Training Failed`。
-- 上游数据（B1u）与下游数据（B1d 的 DTE 位）还没接；B1d 目前发常量位流。
+**目标没变**：让 BinModem（数字端）与 Agere SV92PP 走完 V.92 建链并传数据。
+**当前唯一堵点**：对端在 Phase 4 里"等 SUVd"的检测器被 arm 好了、也从没拿到比特，
+10 s 后抛 `V34 exception: 60096212` 冷重启 V.34 phase 2 → `Training Failed`。
 
-```bash
-cd BinModem && git log --oneline -5
-# 本轮：Phase 4 接线（TRN2d/SUVd/CPd/Ed/B1d）、ε 方向定死、换向检测的时步匹配、
-# 第二段 TRN1u 的相关定位与重拟合、Ri 的帧对齐、Agere 反编译（StatusParser）
+**已经排除的（别再重复做）**：我们的帧结构/长度/CRC/字宽（与 Agere 自己的长度公式逐字节相同）、
+解扰多项式（实测 `x18x23`）、检测器 arm（`det=MP`、`mode=1`、`len=4`）、能力字
+（`0xa01f9fb5`，它对端要检的位全置）、TRN2d 长度（3 s A/B 无变化）、
+`[0x8654]` 门闩、`RxWaitSUV` 里的 Ed 检测器、V.90 当对照（它 Phase 4 根本不用这条链）。
+
+**唯一剩下的未知量：谁该每块调用 `[0x897c]`。** 链条已指到具体函数：
+
+```
+PCMClientDataPumpInit 装 [0x8974]=V92ClientControlRcv [0x8978]=V92ClientControlXmt [0x897c]=V90Decoder
+V90Decoder(0x43dc0) 每块分发 → call *[0x13a7c]
+V90DecoderSetDataMode 装 [0x13a7c] = V90DataModeDecoder
+V90DataModeDecoder → V34RxData → DescramblerX18X23 → V34RxDataMPDetector → 事件 9 → 置 [0x11753]
 ```
 
-**开工第一件事**：读 §3。ε 的符号与量纲本轮已用实验定死（§3.1），
-现在唯一没闭环的是 **Phase 4 的握手**：我们发的第一串 Phase 4 信号被对端读成 `Jd'`。
+探针实测：**`[0x13a7c]` 在相位 4（24 s 起）确实是 `V90DataModeDecoder`**，可 `V34RxData`
+在相位 4 **0 次调用**、检测器 `acq/n` 恒 0 ⇒ **装了但槽位没人调**。
+
+**下一步就一件事**：给 `V90Decoder`（运行址 `nm agrsmodemd | grep ' V90Decoder$'`）加一层
+计数钩子（像已经包装的 `Descrambler`/事件/邮箱那样，在 `agr_evt_install` 里换掉 `[0x897c]`），
+同时探 `[0x8974]/[0x8978]/[0x897c]`。跑一轮台架，回答：
+
+- 相位 4 里 `[0x897c]` 被调用了吗？
+- 若没被调 → 关掉它的是哪个标志？（这一步决定是"我们少发了什么"还是"它在等某个事件"）
+
+**验收**：说出相位 4 里 `V90Decoder` 被调用与否，及未调的门条件。
+
+**开工前必做**（否则会白跑）：按 §5.1 的台架命令跑一轮，确认三件事仍然成立——
+`SUVu sent` 一直 ack=0、`V34 exception 60096212` 在 34.8 s 左右、`agr-rx.raw` 里
+SUVd/CPd 干净可读。任何一条不成立都说明基线变了，先查基线。
+
+---
+
+## 1. 一句话现状（2026-10-23 夜）
+
+- **Phase 2 / Phase 3（双向全程）/ Phase 4 握手代码全部已实现并有测试**；
+  `--lib` **657 条**、`v92_call` **5 条**、`v92_upstream` **2 条**。
+- **真机 Agere SV92PP 上 Phase 3 双向走完**，双方进入 Phase 4，对端 `PCM phase 4 started`。
+- **Phase 4 下游信号已确认正确上线且对端能干净收到**：`caller.raw` 里 SUVd 每 0.5 s 74 个帧同步
+  （= 8000/54）、CPd 每 0.5 s 约 1 个；`agr-rx.raw`（对端收到的）里同样可读。
+- **堵点**：对端的序列检测器在相位 4 从不被喂 → 10 s 超时 → `60096212` → V.34 phase 2 冷重启。
+  细节与已排除项见 §3.2。
+- 未做：B1d 的 DTE 位流仍是常量；上游只出比特、无字节出口；从未到 CONNECT。
+
+**这一页的读法**：§0 是下一步；§3.2 是堵点的全部证据链；§3.2.1 是探针工具；
+§5.1 是台架命令与采集口径；§6 是坑清单（**20/21 是本轮新加的**）。
 
 ## 2. 已经能跑的东西
 
@@ -393,6 +425,20 @@ V90DataModeDecoder 的两处调用 → V34RxData → DescramblerX18X23 → V34Rx
     每 0.5 s 应看到 `4000/序列长度` 个帧同步（SUVd 74 个，CPd 约 1 个）。
 21. **读 capture 要按序列长度换算同步数**：CPd 是 3732 bit，0.2 s 窗口里最多 1 个帧同步，
     "syncs = 0/1" 是**对的**，不是读不出来。先算 `8000·窗口/序列长度` 再判。
+22. **改 `datapump` 后必须确认真的重编了**：`cargo build --release -p modem --bin v90-bridge`
+    有时只打印 `Compiling modem`（datapump 没动），台架跑的仍是旧码。稳妥做法：
+    `touch crates/datapump/src/v92/digital.rs` 再 build，或看 run 的时间线是否按预期变了。
+23. **`gGlobalPtr` 前 ~3 s 不指向引擎状态**：探针/钩子读写它之前必须先验
+    `[0x8628]` 是不是 `DescramblerX18X23`/`X5X23`（引擎起来后才有的签名）。
+    **不验就写 `[0x8610]`/`[0x8628]` 会把引擎写坏**（踩过：进程在 0 s 就死）。
+24. **台架偶发 `FileNotFoundError: /dev/pts/N`**：脚本从 `agrsmodemd.log` 里读 PTY 路径，
+    若进程启动即崩（或 devpts 抖动）就取不到。先看 `agrsmodemd.log` 尾部有没有
+    引擎日志；崩了多半是自己的钩子写坏了内存。重跑一次通常就好，别急着改测试台。
+25. **`[0x8614]`（shift 寄存器）不是"被喂了"的证据**：相位 4 里它被共享 scratch 改写，
+    值照样在变，但检测器一次也没被调用。判"有没有被喂"要看 `AGRSM_SCR_TRACE`
+    （解扰器调用次数）和 `acq/n`。
+26. **`scr=x18x23` 之外的 "other" 有两种含义**：装的是别的解扰器，**或者是我们自己的钩子**
+    （`agr_scr_shim`）。加钩子后别再按 "other" 判断装错了。
 
 ## 5. 已知红（开工前就有，别当成你的回归）
 
@@ -409,9 +455,24 @@ V90DataModeDecoder 的两处调用 → V34RxData → DescramblerX18X23 → V34Rx
 ```bash
 cd /home/hikari/comm/softmodem && export PKG_CONFIG_PATH=/tmp/alsa-shim/lib/pkgconfig
 export BRIDGE_MOD=V92 BINMODEM_V92_PCM_UP=1 V92_TRACE=1
+# 对端内部观测（四路，可任意组合；都不影响时序）
+export AGRSM_PHASE4_PROBE=/tmp/p4.txt      # 检测器/接收机/解码器槽，一行一个变化
+export AGRSM_EVT_TRACE=/tmp/evt.txt        # "收到序列"事件（含内容与长度）
+export AGRSM_SCR_TRACE=/tmp/scr.txt        # 解扰器调用：进/出的字节（判"有没有被喂"）
+export AGRSM_BOX_TRACE=/tmp/box.txt        # 引擎内部邮箱 0x70 的 (code,arg,arg)
+export AGRSM_ENGINE_TRACE=/tmp/eng.txt     # 引擎的文本状态日志（SUVu sent / exception）
 python3 interop/agrsm/run_agr_v90.py --ms-args "V92" --pre "AT+PIG=0" \
         --connect-timeout 40 --hold 2 --verbosity 5 --capture
 ```
+
+探针字段速查（`AGRSM_PHASE4_PROBE`）：`acq`(0x863c 已捕获) `n`(0x8648 已收字节)
+`len`(0x864c 期望长度) `pos`(0x8640 比特位置) `shift`(0x8614) `caps`(0x11718 能力字)
+`cfg`(0xba27/30/34/38) `dmod`(0xba2a/b 数据模式) `det`(0x862c 装的是哪个检测器)
+`dec34`(0x11a50 V.34 解码器槽) `dec90`(0x13a7c V.90 解码器槽)。
+
+**基线判据**（每轮先确认这三条，否则先查基线）：
+`SUVu sent` 一直 `2001`（ack=0）；`V34 exception 60096212` 在 ~34.8 s；
+`agr-rx.raw` 里 SUVd 每 0.5 s 有 67–74 个帧同步、CPd 每 0.5 s 约 1 个。
 
 - **`BRIDGE_MOD=V92` 必须显式给**：Agere 脚本没有 `--bridge-mod`，默认把服务端起成
   `+MS=V90`（binmodem 日志里能看到 `AT+MS=V90`），那样永远到不了 V.92。
