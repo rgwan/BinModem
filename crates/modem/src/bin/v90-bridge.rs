@@ -104,7 +104,11 @@ fn main() -> ExitCode {
 
     let mut modem = Modem::new(fs);
     log.say(&format!("BinModem V.90 digital modem at {fs} Hz"));
-    for byte in format!("AT+MS={modulation}\r").bytes() {
+    // BINMODEM_MS overrides the whole +MS argument list, which is how a far
+    // end that cannot do V.8 is met: `V92,0` is automode off, so the pump is
+    // built from that name alone and no V.8 runs at either end.
+    let ms = std::env::var("BINMODEM_MS").unwrap_or_else(|_| modulation.clone());
+    for byte in format!("AT+MS={ms}\r").bytes() {
         modem.feed_dte(byte);
     }
     drain(&mut modem, &mut log);

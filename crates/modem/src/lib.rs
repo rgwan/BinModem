@@ -39,6 +39,20 @@ use ec::stack::Phase;
 use ec::xid::Compression;
 use ec::{Params, Role as EcRole, Stack};
 
+/// Whether a V.92 server offers PCM upstream in its INFO1d, which is what
+/// lets the analogue modem ask for it with a Table 18 INFO1a (9.3).
+///
+/// Off by default while Phase 3 of V.92 is being built: with bit 70 clear the
+/// analogue modem sends V.90's Table 10 instead and the call is V.90 in every
+/// particular. `BINMODEM_V92_PCM_UP=1` turns the offer on, which is how the
+/// PCM-upstream path is exercised against a live analogue modem.
+fn v92_pcm_upstream_wanted() -> bool {
+    match std::env::var("BINMODEM_V92_PCM_UP") {
+        Ok(v) => matches!(v.trim(), "1" | "yes" | "on" | "true"),
+        Err(_) => false,
+    }
+}
+
 /// Which end of the call this modem is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -2290,7 +2304,7 @@ impl Modem {
             // digital half from the end that answers. Over a VoIP call the
             // answering end's samples reach a G.711 encoder, which is as near
             // to the digital network as a sound card gets.
-            if self.at.modulation.carrier == "V90" {
+            if matches!(self.at.modulation.carrier.as_str(), "V90" | "V92") {
                 negotiation = match self.role {
                     Role::Calling => negotiation.offering_pcm(Pcm::ANALOGUE),
                     Role::Answering => negotiation.offering_pcm_on(
@@ -2327,8 +2341,9 @@ impl Modem {
             "V32" | "V32B" => Some(Modulation::V32bis),
             // Offered first, and V.32bis and V.22bis beside it below: a far end
             // without V.34 picks one of those, and the call goes ahead on it.
-            // V.90 rides on V.34's bit, with the PCM category beside it.
-            "V34" | "V90" => Some(Modulation::V34Duplex),
+            // V.90 rides on V.34's bit, with the PCM category beside it, and
+            // V.92 on V.90's: there is no separate V.8 code for it.
+            "V34" | "V90" | "V92" => Some(Modulation::V34Duplex),
             "B103" => None,
             _ => Some(Modulation::V22bis),
         }) else {
@@ -2466,8 +2481,20 @@ impl Modem {
         let carrier = match chosen {
             // V.8's joint menu named a V.90 server for this end to be the
             // analogue half of (9.1.1/V.90).
-            Some(Modulation::V34Duplex) if self.pcm_role == Some(PcmRole::Analogue) => "V90".to_owned(),
-            Some(Modulation::V34Duplex) if self.pcm_role == Some(PcmRole::Digital) => "V90S".to_owned(),
+            // What V.8 agreed is V.34's bit either way; which V.90-family
+            // modulation this end asked to be is what +MS said.
+            Some(Modulation::V34Duplex) if self.pcm_role == Some(PcmRole::Analogue) => {
+                match self.at.modulation.carrier.as_str() {
+                    "V92" => "V92".to_owned(),
+                    _ => "V90".to_owned(),
+                }
+            }
+            Some(Modulation::V34Duplex) if self.pcm_role == Some(PcmRole::Digital) => {
+                match self.at.modulation.carrier.as_str() {
+                    "V92" => "V92S".to_owned(),
+                    _ => "V90S".to_owned(),
+                }
+            }
             Some(Modulation::V34Duplex) => "V34".to_owned(),
             // V.8 cannot tell the two apart, so what it agreed does not
             // change which of them was asked for. Anything else -- a far end
@@ -2483,7 +2510,7 @@ impl Modem {
             // whose far end answered with a plain ANS on to V.32bis's own
             // start-up, and so does a V.8 that was turned off.
             _ => match self.at.modulation.carrier.as_str() {
-                "V34" | "V90" => "V32B".to_owned(),
+                "V34" | "V90" | "V92" => "V32B".to_owned(),
                 other => other.to_owned(),
             },
         };
@@ -2494,6 +2521,21 @@ impl Modem {
                 Pump::V90(Box::new(analogue))
             }
             "V90S" => Pump::V90Server(Box::new(v90::server::Line::new(self.fs, v90::server::ours(), lead_in))),
+            "V92S" => {
+                let pcm_upstream = v92_pcm_upstream_wanted();
+                Pump::V90Server(Box::new(
+                    v90::server::Line::new(self.fs, v90::server::ours(), lead_in)
+                        .with_v92(v90::server::wish(pcm_upstream)),
+                ))
+            }
+            // The analogue half of V.92 is not built yet; a caller that asked
+            // for it is the analogue half of V.90, which is what its INFO0a
+            // then says.
+            "V92" => {
+                let mut analogue = v90::startup::Analogue::new(self.fs, lead_in);
+                analogue.set_pinned(self.pinned_rate);
+                Pump::V90(Box::new(analogue))
+            }
             "V34" => {
                 let role = match role {
                     Role::Calling => v34::phase2::Role::Call,

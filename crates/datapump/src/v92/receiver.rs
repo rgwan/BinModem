@@ -79,7 +79,18 @@ struct Anchor {
     template: [f64; RU_PERIOD],
     kind: Hunt,
     phase: u64,
+    /// Periods the shape has matched in a row. Nothing is reported until
+    /// there are [`HELD_PERIODS`] of them: a six-sample window of noise
+    /// matches a six-sample shape by chance often enough that a single match
+    /// is not a sequence, and a hunt that acts on one fires on a phase 2's
+    /// worth of tones.
+    held: u32,
 }
+
+/// Periods a shape must match in a row before the hunt calls it a signal.
+/// Ru is 384T and Su 144T, so sixty-four and twenty-four periods of it are on
+/// the line; two is the smallest number that is not a coincidence.
+const HELD_PERIODS: u32 = 2;
 
 /// The normalised correlation of a window against a template: +1 identical,
 /// -1 inverted, 0 unrelated.
@@ -390,7 +401,16 @@ impl Receiver {
             }
             let share = correlate(&window, &anchor.template);
             if share > MATCHED {
-                // Still the same signal.
+                // Still the same signal. The first period it is held for is
+                // when it is reported as having been found.
+                anchor.held += 1;
+                if anchor.held == HELD_PERIODS {
+                    match anchor.kind {
+                        Hunt::Ru => self.events.push_back(Heard::Ru { at }),
+                        Hunt::Su => self.events.push_back(Heard::Su { at }),
+                        _ => {}
+                    }
+                }
                 return false;
             }
             if share > -MATCHED {
@@ -400,21 +420,30 @@ impl Receiver {
                 return false;
             }
             // Turned over. The anchor moves with it so that a second reversal
-            // is seen as one.
-            let turned = match anchor.kind {
-                Hunt::Ru => Heard::RuReversal { at },
-                Hunt::Su => Heard::SuReversal { at },
-                _ => return false,
-            };
-            anchor.kind = match anchor.kind {
-                Hunt::Ru => Hunt::RuTurned,
-                Hunt::Su => Hunt::SuTurned,
-                other => other,
-            };
-            anchor.template = window.try_into().unwrap_or([0.0; RU_PERIOD]);
-            self.state = anchor.kind;
-            self.events.push_back(turned);
-            return true;
+            // is seen as one, and a turn of something that was never held is
+            // a coincidence rather than a reversal.
+            if anchor.held >= HELD_PERIODS {
+                let turned = match anchor.kind {
+                    Hunt::Ru => Some(Heard::RuReversal { at }),
+                    Hunt::Su => Some(Heard::SuReversal { at }),
+                    _ => None,
+                };
+                if let Some(turned) = turned {
+                    anchor.kind = match anchor.kind {
+                        Hunt::Ru => Hunt::RuTurned,
+                        Hunt::Su => Hunt::SuTurned,
+                        other => other,
+                    };
+                    anchor.template = window.try_into().unwrap_or([0.0; RU_PERIOD]);
+                    anchor.held = 0;
+                    self.state = anchor.kind;
+                    self.events.push_back(turned);
+                    return true;
+                }
+            }
+            self.anchor = None;
+            self.state = Hunt::Searching;
+            return false;
         }
         // No anchor: look for the shape at any phase.
         let mut best = (0.0f64, Hunt::Searching);
@@ -438,12 +467,9 @@ impl Receiver {
             template: window.try_into().unwrap_or([0.0; RU_PERIOD]),
             kind: best.1,
             phase: at % RU_PERIOD as u64,
+            held: 1,
         });
         self.state = best.1;
-        self.events.push_back(match best.1 {
-            Hunt::Ru => Heard::Ru { at },
-            _ => Heard::Su { at },
-        });
         true
     }
 
@@ -517,6 +543,42 @@ impl Receiver {
         }
         self.trained = false;
         false
+    }
+
+    /// Train on the TRN1u that begins within `search` symbols of `from`.
+    ///
+    /// The hunt reports where a reversal was to within a period, not to the
+    /// symbol, and TRN1u's first symbol starts 24T after it: on a live line
+    /// the anchor is a few symbols out, and a fit against a reference shifted
+    /// by even two symbols is a fit against the wrong signal. So every
+    /// alignment in the window is fitted and the best one wins.
+    pub fn train_near(&mut self, from: u64, search: u64) -> bool {
+        let base = from as usize;
+        let lo = base.saturating_sub(search as usize);
+        let hi = base + search as usize;
+        let mut best: Option<(f64, usize)> = None;
+        for start in lo..=hi {
+            if !self.fit(start) {
+                continue;
+            }
+            if best.is_none_or(|(snr, _)| self.snr_db > snr) {
+                best = Some((self.snr_db, start));
+            }
+        }
+        let Some((snr, start)) = best else { return false };
+        if snr < TRAINED_SNR_DB {
+            self.trained = false;
+            return false;
+        }
+        // Leave the winner's taps in place rather than the last ones tried.
+        if !self.fit(start) {
+            return false;
+        }
+        self.trained = true;
+        self.trained_at = start;
+        self.snr_db = snr;
+        self.events.push_back(Heard::Trained { snr_db: snr });
+        true
     }
 
     /// One least-squares fit of the equaliser against the known sequence
