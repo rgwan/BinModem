@@ -61,15 +61,19 @@ const R_BAR_FRAMES: usize = 4;
 /// TRN2d: "at least 2040T" (9.6.1.1), in whole frames.
 const TRN2D_FRAMES: usize = 340;
 
-/// Symbols of TRN1u that the receiver's fit is taken over. Ja may follow as
-/// soon as 2040T of TRN1u have gone (9.5.1.1.3), and a burst at the start
-/// must not cost the call, so the fit waits for more than the minimum.
-const TRAIN_AFTER: u64 = 700;
+/// Symbols of TRN1u that are allowed to go by before the fit is taken. It is
+/// not a comfort margin: the receiver's history is a window of 4096 samples,
+/// so the stretch that is still in it when the fit is taken is
+/// `history - (this - 4096)` long. Waiting 700 left seven hundred symbols,
+/// fourteen equations per tap, and the fit came out at 17 dB with the
+/// reference reaching past TRN1u's end. Waiting 1800 leaves eighteen hundred
+/// and stays inside TRN1u's 2040T minimum.
+const TRAIN_AFTER: u64 = 1300;
 
 /// Symbols either side of the hunt's reversal estimate that the TRN1u fit is
 /// tried at: the hunt places the reversal to within a period, and TRN1u's
 /// first symbol is 24T after it.
-const TRAIN_SEARCH: u64 = 16;
+const TRAIN_SEARCH: u64 = 64;
 
 /// TRN1u starts 24T after the Ru-to-R-bar-u reversal (9.5.1.1.2).
 const TRN_START: u64 = 24;

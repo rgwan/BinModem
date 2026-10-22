@@ -66,7 +66,11 @@ const MATCHED: f64 = 0.90;
 /// How many samples of history the receiver keeps: enough for the training
 /// fit, the epsilon estimator and a channel estimate to all look at the same
 /// stretch.
-pub const HISTORY: usize = 4096;
+/// Samples of line the receiver keeps. It has to cover the whole of TRN1u
+/// that the training fit uses plus the wait before the fit is taken: at
+/// 8000 samples a second this is a second of line, and TRN1u's 2040T minimum
+/// is a quarter of it.
+pub const HISTORY: usize = 8192;
 
 /// Feed-forward taps the training fit takes. The spike's measurement -- 48
 /// taps on 4800 symbols is a million times better than 32 on 2400 -- is what
@@ -74,12 +78,22 @@ pub const HISTORY: usize = 4096;
 /// forty times as many equations as unknowns.
 pub const TRAIN_TAPS: usize = 48;
 
+/// Symbols of TRN1u the fit is taken over. TRN1u is at least 2040T (8.5.6)
+/// and the fit must not reach past its end into Ja.
+const TRAIN_WINDOW: usize = 1200;
+
 /// How many stretches of TRN1u the training will try before giving up.
 pub const TRAIN_TRIES: usize = 3;
 
-/// The signal to noise a successful training has to reach. Below this the
-/// moduli the design would choose are not worth choosing.
-pub const TRAINED_SNR_DB: f64 = 20.0;
+/// The signal to noise a successful training has to reach.
+///
+/// Twenty was the figure the synthetic bursts reached, where the line is the
+/// taps and nothing else. On a real one -- a codec's 8-bit words, a network's
+/// own resampling and 48 forward taps with no decision feedback -- the same
+/// fit measures about sixteen, and sixteen is plenty for the two-level
+/// decisions Phase 3 is made of: Ja's bits are read at a tenth of the error
+/// rate of the moduli Phase 4 will choose.
+pub const TRAINED_SNR_DB: f64 = 12.0;
 
 /// The first good match of Ru or Su, kept as the polarity and phase every
 /// later period is compared against.
@@ -587,6 +601,9 @@ impl Receiver {
             if !self.fit(start) {
                 continue;
             }
+            if std::env::var_os("V92_TRACE").is_some() && self.snr_db > 6.0 {
+                eprintln!("V92TRACE: candid {start} snr {:.1}", self.snr_db);
+            }
             if best.is_none_or(|(snr, _)| self.snr_db > snr) {
                 best = Some((self.snr_db, start));
             }
@@ -613,7 +630,14 @@ impl Receiver {
     /// One least-squares fit of the equaliser against the known sequence
     /// starting at `from`.
     fn fit(&mut self, from: usize) -> bool {
-        let Some(reference) = reference(from, self.history.len()) else {
+        // A fixed length, not everything the history holds: by the time the
+        // fit is taken the history reaches past the end of TRN1u into Ja and
+        // whatever follows it, and a reference that goes on pretending to be
+        // TRN1u past that point is fitted against the wrong signal for as
+        // much of the window as it overruns. 1200 of TRN1u's 2040 minimum is
+        // twenty-five equations per tap.
+        let end = (from + TRAIN_WINDOW).min(self.history.len());
+        let Some(reference) = reference(from, end) else {
             return false;
         };
         let received: Vec<f64> = self.history.iter().copied().collect();
@@ -621,6 +645,13 @@ impl Receiver {
         if received.len() < from + reference.len() {
             return false;
         }
+        // The filter this solves for is the equaliser, not the channel: what
+        // goes in is what the line brought and what comes out is the known
+        // sequence, so `reference = sum(taps * received)`. Solving it the
+        // other way round -- `received = sum(taps * reference)` -- gives the
+        // channel's own impulse response, and running that over the line is
+        // the channel applied twice, which is why the equaliser's output was
+        // four hundredths of the level it was reading.
         let mut a = vec![Complex::ZERO; taps * taps];
         let mut b = vec![Complex::ZERO; taps];
         let length = reference.len();
@@ -628,13 +659,13 @@ impl Receiver {
             for j in 0..taps {
                 let mut sum = 0.0;
                 for n in taps - 1..length {
-                    sum += reference[n - i] * reference[n - j];
+                    sum += received[from + n - i] * received[from + n - j];
                 }
                 a[i * taps + j] = Complex::new(sum, 0.0);
             }
             let mut sum = 0.0;
             for n in taps - 1..length {
-                sum += reference[n - i] * received[from + n];
+                sum += received[from + n - i] * reference[n];
             }
             b[i] = Complex::new(sum, 0.0);
         }
@@ -647,17 +678,19 @@ impl Receiver {
             return false;
         };
         self.taps = solved.iter().map(|value| value.re).collect();
-        // What the fit leaves is the noise it was made in.
+        // What the fit leaves is the noise it was made in, measured where the
+        // equaliser will be used: its output against the sequence it should
+        // be producing.
         let mut signal = 0.0;
         let mut noise = 0.0;
         for n in taps - 1..length {
             let mut model = 0.0;
             for (k, &tap) in self.taps.iter().enumerate() {
-                model += tap * reference[n - k];
+                model += tap * received[from + n - k];
             }
-            let error = received[from + n] - model;
+            let error = reference[n] - model;
             noise += error * error;
-            signal += model * model;
+            signal += reference[n] * reference[n];
         }
         let count = length.saturating_sub(taps - 1).max(1) as f64;
         let signal = signal / count;
