@@ -201,7 +201,26 @@ export AGRSM_BOX_TRACE=/tmp/box.txt     # 引擎内部邮箱 0x70 的 (code,arg,
 正常轮它 24.75 s 就退出 TRN2u 并 arm 了 10 s 的 SUV-wait 窗口。⇒ 相位 4 里我们发的 CPd
 对它能"往下走"是有作用的，说明它的下游接收**至少能解出 CPd**，缺的是 **SUV 那一档**。
 
-**下一步（唯一一条）**：**查 `FUN_0006a010(len, buf)` 里 SUV 分支还要求什么。**
+**结论三（本轮最后一条，链条已指到具体函数）：对端的解码器入口是 `[0x897c]`。**
+
+```
+PCMClientDataPumpInit 装：  [0x8974]=V92ClientControlRcv  [0x8978]=V92ClientControlXmt
+                            [0x897c]=V90Decoder
+V90Decoder(0x43dc0) 每块分发 →  call *[0x13a7c]
+V90DecoderSetDataMode 装：  [0x13a7c] = V90DataModeDecoder
+V90DataModeDecoder 的两处调用 → V34RxData → DescramblerX18X23 → V34RxDataMPDetector
+```
+
+探针实测 `[0x13a7c]`：12–22 s 是另一个 `V90...` 局部函数，**24 s 起（相位 4）切换成
+`V90DataModeDecoder`（0x0809c950）** —— 也就是**对端确实把那条"会喂检测器"的解码器装上了**。
+可 `V34RxData` 仍然 0 次调用、`acq/n` 恒 0 ⇒ **装了但没被调**，缺的是"谁每块调 `[0x897c]`"。
+
+**下一步（唯一一条）**：查 `PCMClientDataPumpInit` 装的三项里谁每块被调，以及调用
+`[0x897c]`（`V90Decoder`）的那个函数**门条件**是什么（探针加 `[0x8974]/[0x8978]/[0x897c]`，
+再对 `V90Decoder` 的地址下断点或在 glue 里包一层计数）。
+**验收**：说出相位 4 里 `[0x897c]` 被调用与否、若没被调是因为哪个标志。
+
+老的下一步（若上面通了再看）：
 `len==4` 只是进 SUV 分支的门票；它还要把 4 字节信息字存到 `0x11ade` 并置 `[0x11753]`，
 而 `RxWaitSUV` 的推进还要求 `[0x8800]==0`。两个具体怀疑：
 1. **4 字节内容**：我们对端那个窗口里 `[0x11adf] & 0x40`（= SUVd bit 32 静默位）与
