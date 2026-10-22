@@ -125,18 +125,53 @@ agr-rx.raw（对端收到）  25.0–26.5 s  67–74 个帧同步  ← SUVd 在�
   与 `Training failed`。对比 `0xb522`（0x9522/0x9722）走 `...AnsRxWaitForRetrainState`，
   `0xfff21` 走 WaitForRetrain —— 0x96212 没有这条路。
 
+**对端的检测器已经被反编译清楚了（`/tmp/agere-cpddet.c`、`/tmp/agere-mpdet.c`）。**
+
+`V34RxDataSetCPdDetector(buf)` 只是 arm 共用的 MP 检测器：`V34RxDataSetMPDetector()` →
+`[0x8664]=1`（CPd 模式）、`[0x8660]=buf`、`[0x8668]=4`、`[0x864c]=4`、`[0x8648]=0`。
+`V34RxDataMPDetector` 干的事，和我们的 `Cpd::to_bits`/`from_bits` 一一对应：
+
+1. **捕获**：在解扰后的比特流里数连 1（`iVar17`），`iVar17 + 9 + 延续位 > 16` 即"至少 17 个 1"
+   → `[0x863c]=1`、`[0x8640]=local_7c+0x18`。我们的帧同步正好是 17 个 1。
+2. **读头部**：从缓冲头开始看 bit19/20/21（`**buf & 2/4/8`），据此设 `[0x866c]`（哪种可选段）
+   与 `[0x864c]`（总长）。
+3. **算总长**（单位是**去掉 start bit 的数据字节**）：
+   `4 + 12·[bit19] + (8 + 2·ΣL)·[bit20] + (10 + 2·ΣLC)·[bit21]` 字节。
+4. **收齐 + CRC**：`BlockCRC([0x8648], buf, &crc)`，`crc==0` 才报事件 9（"序列收到"）并置
+   `[0x865d]=1`；否则丢弃重来。
+5. `[0x8654]` 是**一次性**门闩，只有 `V34RxDataSetJdDetector` 置 1，CPd/MP 的 setter 清零
+   —— 不是阻塞点。
+
+**这一条把一整类假设排掉了。** 拿台架那条 CPd（12 个 moduli、p1=64、z2=128、一个 8 点星座）
+代入上面的公式：
+
+```
+4 (头部) + 12 (6 个模数字 x 16b) + 8 (4 个长度字 x 16b) + 2x192 (系数) + 10 (5 个星座字) + 2x8 (点)
+= 434 字节 = 3472 bit
+我们 Cpd::to_bits 的信息段            = 3472 bit        ← 逐字节相同
+```
+
+所以**帧结构、字宽（16 数据位 + 1 起始位）、可选段顺序、长度、CRC 覆盖范围都是对的**，
+"我们发的 CPd 不符合 Table 30" 这条不成立。
+
+V.90 台架（`/tmp/agr-v90-interop/234946-run`）照旧 CONNECT 31200、`PCM phase 4 finished`、
+`E detected`，但它的 CPd 是**多电平**（峰值 15996，因为 Jd 已给了速率），V.92 的 CPd 是
+**2 点**（8.8.3：Training 期用 TRN2d 调制）——不是同类，V.90 不能当这个检测器的对照。
+另外 V.90 那份日志里**也没有** `CPd detected`，它的 Phase 4 是走 E 结束的。
+
 **下一步（按代价排序）：**
 
-1. **它的检测器到底要什么。** `V34RxDataSetCPdDetector`（0x5d049 调用）是 V.34/V.90 的
-   CPd 检测器；在 V.90 模式下它对我们的 CPd 是**认的**（V.90 能 CONNECT）。差别只在 V.92
-   Phase 4 前面没有 Sd/S̄d/Jd。所以先反编译这个检测器与它的使能条件，找"PCM/训练"以外的
-   隐形门槛。**验收**：说出它需要一个我们没有的东西（或证明不需要）。
-2. **`[0x8800] == 0` 这个附加条件**：RxWaitSUV 的推进除了 `0x11753` 还要求 `[0x8800]==0`，
-   而 `0x8800` 是什么没人查过。顺带查 `[0x11757]`（决定是否 `DisableUpdate`）。
-3. **对照实验**：把 TRN2d 拉长到 24000 符号（3 s），让对端的检测器在**我们的 TRN2d 中途**
-   就已武装、且之后有更长的 SUVd。若仍不 ack，门槛就在序列本身之外；若 ack 了（`SUVu sent`
-   变成 ack=1），就是相对时序。
-4. 一旦它回了 CPu，后面的 9.6.1.1.4 就在 `Exchange` 里接好了：Ed → E2u → B1u/B1d。
+1. **A/B：把 TRN2d 拉长到 24000 符号（3 s）**，让对端在它自己的 TRN2u 结束（≈24.75 s）时我们
+   仍在发 TRN2d，之后有 3 s 以上的 SUVd。若 `SUVu sent` 变成 ack=1 → 是相对时序；若不变
+   → 门槛在序列之外（接收机没有把比特喂给检测器）。
+   **验收**：`agrsmodemd.log` 里 `SUVu sent` 的第 3 个字段。
+2. **查 `[0x11757]` 的置位者**（0x5a41a，在 `V92ClientControlEventHandler` 里）：它是
+   "SUVd 已收到"的标志，也是 RxWaitSUV 里决定"继续配接收机还是 DisableUpdate"的依据。
+   顺带查 `[0x8800]`（RxWaitSUV 推进的第二个条件，当前无人读过）。
+3. **看检测器有没有被喂比特**：`[0x862c]` 必须等于 `V34RxDataMPDetector`，而它由
+   `V34RxDataSetMPDetector` 装。若对端在 Phase 4 又把 `[0x862c]` 换成 Jd 检测器
+   （`V34RxDataSetJdDetector`，它同时置 `[0x8654]=1`），CPd 永远不会被认——这能解释
+   "`Jd' detected` 出现在 `PCM phase 4 started` 那一行"这个一直没解释的现象。**优先查这条。**
 
 ### 3.3 Phase 4 之后（本轮已接线，未验证）
 
