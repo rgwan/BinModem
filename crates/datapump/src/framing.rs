@@ -7,6 +7,18 @@
 /// a UART does. What it does need is rejection of glitches that look like start
 /// bits, so a candidate edge is confirmed at the half-bit point before the
 /// character is accepted, and the stop bit must come back as mark.
+/// How far past a character's own loudest bit a reading has to be before it is
+/// the ring-down of a burst that has stopped rather than a bit.
+///
+/// A tone that is switched off mid-bit leaves the discriminator's filters
+/// ringing, and what they say for that bit is neither mark nor space. A
+/// shipping V.92 engine ends V.8 signal CJ half a bit into its last octet; read
+/// straight, that octet came out as 0x80 instead of 0x00, the far end never
+/// counted three zero octets, and the call sat in V.8 until both ends timed
+/// out. The margin is a quarter, well inside the swing a filter transient
+/// makes and well outside anything a modulated tone does on a line with echo.
+const RINGING: f64 = 1.25;
+
 /// Whether V8_TRACE in the environment is set, so that a call can be read out
 /// bit by bit when it will not decode.
 fn tracing() -> bool {
@@ -31,6 +43,10 @@ pub struct AsyncFramer {
     pending: Option<u8>,
     /// Samples the pending character has been waiting.
     pending_age: f64,
+    /// The largest reading this character's data bits have given, which is
+    /// the scale the character is in: what counts as a tone, and what counts
+    /// as the ring-down of one that has stopped (`RINGING`).
+    char_peak: f64,
     /// Level of the most recently sampled data bit, for display. Set at each
     /// bit centre and cleared when read, so a scope sees one entry per bit.
     sampled: Option<f64>,
@@ -58,6 +74,7 @@ impl AsyncFramer {
             framing_errors: 0,
             pending: None,
             pending_age: 0.0,
+            char_peak: 0.0,
             sampled: None,
         }
     }
@@ -101,6 +118,7 @@ impl AsyncFramer {
                         self.state = State::Data;
                         self.next_bit = 0;
                         self.value = 0;
+                        self.char_peak = 0.0;
                     }
                 }
             }
@@ -121,15 +139,33 @@ impl AsyncFramer {
                     // out as 0x80 instead of 0x00, the far end never counted
                     // three zero octets, and the call sat in V.8 until both
                     // ends timed out.
-                    let ringing = level.abs() > 1.25;
+                    // Against this character's own scale, not a fixed one:
+                    // the level a caller hands over is in its slicer's units,
+                    // and a line recorded on a tap, or one with a pad on it,
+                    // is several times a normalised tone. A fixed threshold
+                    // read every third bit of a real V.90 capture as ring-down.
+                    // Only the last data bit can be lost this way: a burst
+                    // that stops half a bit into a character has still put
+                    // every earlier bit on the line, and the one whose
+                    // sampling instant falls past the end is the last. Any
+                    // other bit reading out of band is a line's own business
+                    // and is taken as it comes.
+                    let last = self.next_bit + 1 == self.data_bits;
+                    let ringing = last && self.char_peak > 0.0 && level.abs() > RINGING * self.char_peak;
                     if tracing() {
                         eprintln!("framer: bit {} at {:.3} bits level {:+.3}{}",
                                   self.next_bit, self.since_edge / self.sps, level,
                                   if ringing { " (ringing)" } else { "" });
                     }
                     self.sampled = Some(if ringing { 0.0 } else { level });
-                    if !ringing && level > 0.0 {
-                        self.value |= 1 << self.next_bit; // LSB first
+                    if ringing {
+                        // Nothing to learn about the scale from a reading that
+                        // is not a tone.
+                    } else {
+                        self.char_peak = self.char_peak.max(level.abs());
+                        if level > 0.0 {
+                            self.value |= 1 << self.next_bit; // LSB first
+                        }
                     }
                     self.next_bit += 1;
                     if self.next_bit >= self.data_bits {
@@ -140,15 +176,15 @@ impl AsyncFramer {
             State::Stop => {
                 self.since_edge += 1.0;
                 if self.since_edge >= self.sps * (1.5 + self.data_bits as f64) {
+                    // Mark, space or nothing, on this character's scale: a
+                    // stop bit is only *missing* when the line is still firmly
+                    // at space, which is what a framing error or a break looks
+                    // like; a line with nothing on it is idle, and idle is
+                    // mark.
+                    let scale = if self.char_peak > 0.0 { self.char_peak } else { 1.0 };
                     if level > 0.0 {
                         out = Some(self.value as u8);
-                    } else if level > -0.5 {
-                        // Not mark, but not a space either: there is no tone
-                        // here at all, because the far end's carrier has just
-                        // gone. A stop bit is only *missing* when the line is
-                        // still firmly at space, which is what a framing error
-                        // or a break looks like; a line with nothing on it is
-                        // idle, and idle is mark.
+                    } else if level > -0.5 * scale {
                         out = Some(self.value as u8);
                     } else {
                         // Clearly at space. Either a real framing error or a
@@ -197,6 +233,7 @@ impl AsyncFramer {
         self.prev = 1.0;
         self.sampled = None;
         self.pending = None;
+        self.char_peak = 0.0;
     }
 }
 

@@ -3179,3 +3179,50 @@ One measured departure is recorded and not asserted as conformance: between TONE
 starting this modem leaves 93 ms, where 9.2.1.3 asks for 75 +/- 5. The last 35 ms of the tone come back
 about 15 dB down, which is the line's own echo of it, so the true figure depends on where one calls the
 tone over; it is one 2005 modem either way, and nothing in our transmitter was changed to match it.
+
+## 15. Priorities for the branch, and the echo canceller (2026-10)
+
+Written after the experimental branch was merged onto main as `v92-dev`. Section 5's package list and
+section 6's wave order still hold; what follows is the order they are taken in, and one item that is not a
+V.92 package at all.
+
+### 15.1 What is wanted first
+
+1. **PCM upstream, waves 3 to 9.** It is the whole of what V.92 adds to a connection, and it is what
+   `M0` and `M1` gate on: V92-19's chain, V92-20's decoder, V92-21's design, V92-62's numeric choice,
+   V92-22's receiver and V92-26's spike, then the Phase 3 and Phase 4 state machines. Nothing else is worth
+   doing before the spike has said the designed precoder carries the upper half of the ladder.
+2. **The start-up that reaches it** (waves 10 to 11: V92-42, V92-44, V92-46, V92-47). A V.92 that no AT
+   command can ask for is not a product.
+3. **Rate renegotiation and fast parameter exchange** (V92-48, V92-51, V92-53). A PCM-upstream call that
+   cannot renegotiate is at the rate it started with, and on a line that changes that is most of the value.
+4. **Modem-on-hold and Quick Connect: deferred, not dropped.** V92-24 (short Phase 2), V92-25 and
+   V92-55 to V92-59 (hold), and V92-29/V92-31/V92-45/V92-49/V92-52 (short Phase 1, the memo, quick
+   connect in the pumps) are the lowest priority of the set. The reason is not that they are hard, it is
+   that neither changes the rate a call connects at, and V92-18's capture says the one real V.92 pair this
+   project has recorded did not use them either: that modem sent Table 10/V.90 in Phase 2 and took the
+   full V.8 start-up. Packages that only these deferrals leave stranded -- V92-50 and V92-61, the GUI's
+   carrier and the scope -- wait with them.
+5. Everything else keeps its wave.
+
+### 15.2 The echo canceller, in all three modes
+
+A telephone line's hybrid echo arrives at -24 to -30 dB below the transmitter, which is the range the
+interop rigs are already run at (`BRIDGE_HYBRID_DB` defaults to -25, `BRIDGE_CO_HYBRID_DB` to -99 for a
+line the central office has cancelled). The canceller has to work at the near end of that range, and the
+objective is the rate, not the residual: at -24 dB an uncancelled echo costs more than the noise on a
+quiet loop. To be done **while testing V.34, V.90 and V.92**, not before, and as its own commits:
+
+- **V.34:** the analogue modem's canceller under a -24 to -30 dB hybrid with the line's own 1 ms delay,
+  measured as the rate the DIL then chooses. `interop/v90/run_v90.py --line-model phone` at
+  `BRIDGE_HYBRID_DB` of -24, -27 and -30 is the rig; a V.34 call is `--rate` low enough to fall back.
+- **V.90:** the same, on the digital side's echo path (V.92-43 is the package that adds one where V.90 has
+  none), plus the analogue side's, reported as the CONNECT rate curve. The regression the current work
+  already has is -25 dB = 34667 and -20 dB = 14400; the -24 to -30 band is where the curve has to be flat.
+- **V.92:** the upstream is where echo hurts most, because the analogue modem's own transmitter is 24 to
+  48 kbit/s of PCM right beside the levels the digital modem is trying to read. PCM upstream at -24 dB
+  echo is the numbers that decide whether the canceller, the precoder or the fallback ladder takes it.
+- **Where the model lives:** the hybrid is a delay and a gain in the 9600 Hz LPCM domain of the rig
+  (section 15 of the project's own rule 1), never a codeword-domain subtraction.
+- **What is recorded:** a rate-against-echo table per mode in `docs/10-binmodem-v90-interop.md`, so that a
+  change to any canceller shows up as a number rather than as an impression.
