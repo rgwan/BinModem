@@ -1761,6 +1761,21 @@ not listed must not be touched.
   - `on_ri_the_current_cpt_is_finished_and_then_e1u_goes` - never mid-sequence.
   - `the_cpt_we_send_is_one_the_digital_modem_can_send` - drn, Sr and ld against the Jd we read.
   - `with_no_dil_asked_ri_comes_before_cpt_and_e1u_follows_ri_bar`.
+- **Landed** (see `handoff.md` §2-§4), with three readings fixed in the code:
+  - The row that says "read through `v90::downstream::DilReader`, with `RWatch` at UINFO for Ri and
+    R-bar-i" is built without that refactor: Ri and R-bar-i are Ru and R-bar-u's shape at UINFO
+    (8.6.5 with 8.5.5), so `v92::receiver`'s own hunt reports them as `Heard::Ru`/`RuReversal`, and
+    the DIL's symbols are kept raw in `Modem::dil` for V92-39 to read with whatever reader it gets.
+  - The half symbol and epsilon are **recorded**, not applied: `Modem::delays` is the queue
+    `v92::transmit::PcmTransmitter::delay` pulls from, and this module never leaves the symbol
+    domain. The tests the package asked for at `Network::with_upstream_phase` therefore belong
+    with V92-38's call harness, not here.
+  - With N = 0 the Recommendation's own order (9.5.2.1.10: TRN1u until Ri, CPt, E1u on R-bar-i) is
+    behind `ZERO_DIL_A10_ORDER`, off by default because our digital modem sends no SCR and only
+    sends Ri after a CPt — so A11's order is what completes a call between the two of them.
+  - The digital modem's E1u detector had to be fixed to make the exchange work: twelve zeroes in a
+    row appear inside every CPt (Table 23's reserved and shaping fields are whole sixteen-bit words
+    of them), so it now counts only the twelve bits where the next CPt's synchronisation belongs.
 
 #### V92-37: The digital modem, Su to R-bar-i (M)
 
