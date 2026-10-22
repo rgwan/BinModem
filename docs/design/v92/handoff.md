@@ -13,10 +13,14 @@
 - **真机台架（Agere SV92PP）能把 Phase 3 走完**：Ru/TRN1u/Ja/Sd/TRN1d/Jd/Su/Jp/Jp'/DIL 全过，
   Jp 的 ε 已送达对端（对端日志 `Jp detected: aa57 1000`），**卡在我们解不出对端的 CPt**。
 - Phase 4（`down_source`）与"PCM 上行承载字节"未做。
-- 分支 `v92-dev`，HEAD `6066ce6`。
+- 分支 `v92-dev`，HEAD `ac09682`。
 
 ```bash
-cd BinModem && git log --oneline -10
+cd BinModem && git log --oneline -13
+ac09682 V.92: drop a must_use the compiler does not want on fitted()
+7587c73 V.92: the digital modem's header stops calling epsilon a zero
+431570b V.92: plan.md says ZERO_DIL_A10_ORDER is on, because it is
+d1ea3d8 V.92: the handover page, rewritten for the state the bench left it in
 6066ce6 V.92: epsilon reaches the far end now; what it still has to get right
 7814625 V.92: measure epsilon on Su, and stop telling the far end to shift by nothing
 d9f31a2 V.92: refit the equaliser in the second TRN1u, where the phase has moved
@@ -370,7 +374,8 @@ J::from_bits(&window72) -> Option<J>;   // 72 位滑窗，CRC 校验
 | `c4b4081` | 长窗重拟合（1200→4800）+ 定时上限的表（0/¼/½/¾ 符号 → 166/156/**19**/157 dB） |
 | `d9f31a2` | 第二 TRN1u 的重拟合（规范 #4）+ `Receiver::fitted/restore`（失败的 fit 会关训练） |
 | `7814625` | `v92::epsilon` 真正实现：Su 的 6 点 DFT 相位 → Jp 的 ε（台架从 `0 1000` 变成 `aa57 1000`） |
-| `6066ce6` | 台架现状与下一步（本页上一版） |
+| `6066ce6` | 台架现状与下一步（本页的上一版） |
+| `d1ea3d8` / `431570b` | 本页整体重写；`plan.md` 的 `ZERO_DIL_A10_ORDER` 改成"on" |
 
 **留下的东西**：§3.1 的两条路（ε 的符号/量纲核对、第二 TRN1u 的定位）是唯一还没闭环的；
 再往后是 Phase 4。
