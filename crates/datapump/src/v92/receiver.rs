@@ -60,6 +60,22 @@ const RU_SHAPE: [f64; RU_PERIOD] = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
 /// correlation is normalised, and a real zero is a zero at any level.
 const SU_SHAPE: [f64; RU_PERIOD] = [1.0, 0.0, 1.0, -1.0, 0.0, -1.0];
 
+/// Su as a transmitter that band-limits it to its fundamental leaves it.
+///
+/// The two zeroes in [`SU_SHAPE`] are what tells Su from Ru, and they do not
+/// survive a real transmit filter: an Agere SV92PP on an 8 kHz line sends its
+/// Su as the same six-symbol period with those slots filled in, which is very
+/// nearly a sine at 8000/6 Hz. Measured off that modem's own audio, one period
+/// of it correlates 0.911 with Ru's shape and 0.644 with Su's -- so a hunt with
+/// one Su template calls the analogue modem's Su a **Ru**, and the digital
+/// modem waits out its Su deadline with Su on the line, which is exactly what
+/// happened before this template existed.
+///
+/// Against this one the same window correlates 0.99, and Ru's square wave only
+/// 0.58, so the pair separates the two again. Su is therefore a bank of two
+/// shapes: what 8.5.6 prints, and what a filtered one looks like.
+const SU_FILTERED: [f64; RU_PERIOD] = [0.0, 0.866, 0.866, 0.0, -0.866, -0.866];
+
 /// How well a window has to match a shape before it is that sequence. Through
 /// a line that has not smeared a whole symbol the match is better than 0.99;
 /// 0.85 leaves room for one that has smeared a little.
@@ -256,6 +272,24 @@ pub struct Receiver {
     /// a period back: what tells Ru from Su from silence.
     recent: VecDeque<f64>,
     products: VecDeque<(f64, f64)>,
+    /// Which shape this end is waiting for, when the call's own order says so.
+    ///
+    /// Ru and Su are one six-symbol period each and differ only in that Su has
+    /// two symbols at zero (8.5.5, 8.5.6). Nothing tells them apart once a
+    /// transmitter has band-limited them: an Agere SV92PP's Su and its Ru both
+    /// arrive as a 1333 Hz waveform that matches *Ru*'s template at 0.911 and
+    /// *Su*'s at 0.644 -- the same figures for both -- so a receiver choosing
+    /// by shape alone cannot see the analogue modem's Su at all, and reports its
+    /// Ru as Su.
+    ///
+    /// The Recommendation's timetable does know: Ru opens Phase 3 and is the
+    /// only one of the two before TRN1u, Su answers Jd and is the only one of
+    /// the two after it, and Ri's "+ + + - - -" comes after CPt and nothing
+    /// else does. So an end that knows which it must be hearing next can say
+    /// so, and the hunt then looks for that shape only. Left as `None`, the
+    /// hunt goes back to choosing on shape, which is what it wants when the
+    /// timetable cannot say.
+    expected: Option<Hunt>,
     /// Where the hunt has got to: what it has been hearing, and for how long.
     state: Hunt,
     /// What the first good match looked like: the polarity everything after
@@ -292,6 +326,7 @@ impl Receiver {
             events: VecDeque::new(),
             recent: VecDeque::new(),
             products: VecDeque::new(),
+            expected: None,
             state: Hunt::Searching,
             anchor: None,
             taps: Vec::new(),
@@ -336,6 +371,36 @@ impl Receiver {
     pub fn restart_hunt(&mut self) -> &mut Self {
         self.recent.clear();
         self.products.clear();
+        self
+    }
+
+    /// Look for Ru only: what Phase 3's opening is, and what Ri looks like
+    /// after CPt (8.6.5 with 8.5.5).
+    pub fn expect_ru(&mut self) -> &mut Self {
+        self.expect(Hunt::Ru)
+    }
+
+    /// Look for Su only: what answers Jd, and what Sd is shaped like.
+    pub fn expect_su(&mut self) -> &mut Self {
+        self.expect(Hunt::Su)
+    }
+
+    /// Go back to choosing between the two on shape alone.
+    pub fn expect_either(&mut self) -> &mut Self {
+        self.expected = None;
+        self.anchor = None;
+        self.state = Hunt::Searching;
+        self
+    }
+
+    fn expect(&mut self, shape: Hunt) -> &mut Self {
+        if self.expected != Some(shape) {
+            // A window held against the other shape is not a window of this
+            // one: start again rather than let the anchor's kind stand.
+            self.anchor = None;
+            self.state = Hunt::Searching;
+        }
+        self.expected = Some(shape);
         self
     }
 
@@ -498,10 +563,20 @@ impl Receiver {
             self.state = Hunt::Searching;
             return false;
         }
-        // No anchor: look for the shape at any phase.
+        // No anchor: look for the shape at any phase, among those this end is
+        // waiting for.
         let mut best = (0.0f64, Hunt::Searching);
         for phase in 0..RU_PERIOD {
-            for (shape, kind) in [(RU_SHAPE, Hunt::Ru), (SU_SHAPE, Hunt::Su)] {
+            for (shape, kind) in [
+                (RU_SHAPE, Hunt::Ru),
+                (SU_SHAPE, Hunt::Su),
+                (SU_FILTERED, Hunt::Su),
+            ] {
+                if let Some(expected) = self.expected
+                    && kind != expected
+                {
+                    continue;
+                }
                 let mut template = [0.0; RU_PERIOD];
                 for (i, slot) in template.iter_mut().enumerate() {
                     *slot = shape[(i + phase) % RU_PERIOD];
@@ -782,6 +857,69 @@ mod tests {
             found.iter().any(|(e, _)| matches!(e, Heard::SuReversal { .. })),
             "no Su reversal: {found:?}"
         );
+    }
+
+    /// Su as a real analogue modem's transmit filter leaves it -- the same
+    /// six-symbol period with the zeros filled in, so nearly a sine -- is Su
+    /// and not Ru (see [`SU_FILTERED`]). The window an Agere SV92PP sends
+    /// correlates 0.911 with Ru's shape and 0.90 is the gate, so before the
+    /// second template this burst was reported as Ru and the digital modem
+    /// waited out its deadline with Su on the line.
+    #[test]
+    fn a_band_limited_su_is_still_su() {
+        let mut rx = Receiver::new();
+        let mut found = Vec::new();
+        // Level and phase as measured off the Agere engine's own audio.
+        let levels = [-0.071, 0.026, 0.097, 0.071, -0.026, -0.097];
+        for n in 0..400 {
+            let bar = n >= 144;
+            let sign = if bar { -1.0 } else { 1.0 };
+            rx.feed(sign * levels[n % RU_PERIOD]);
+            while let Some(event) = rx.heard() {
+                if !matches!(event, Heard::Symbol(_)) {
+                    found.push((event, n));
+                }
+            }
+        }
+        assert!(
+            found.iter().any(|(e, _)| matches!(e, Heard::Su { .. })),
+            "a filtered Su read as something else: {found:?}"
+        );
+        assert!(!found.iter().any(|(e, _)| matches!(e, Heard::Ru { .. })), "filtered Su read as Ru: {found:?}");
+        // And its turn is still a reversal, which is what Jp is measured from.
+        assert!(found.iter().any(|(e, _)| matches!(e, Heard::SuReversal { .. })), "{found:?}");
+    }
+
+    /// The timetable is worth more than the shape when a transmitter has
+    /// band-limited both sequences into nearly the same waveform: asked for Su,
+    /// the hunt reports Su and never Ru; asked for Ru, the reverse.
+    #[test]
+    fn what_the_timetable_asked_for_is_what_is_reported() {
+        // One period of the waveform an Agere SV92PP puts on the line: Ru's
+        // shape through a filter that fills Su's zeroes, or Su's own -- the
+        // two are the same figures, which is the point.
+        let levels = [-0.071, 0.026, 0.097, 0.071, -0.026, -0.097];
+        for (asked_ru, expect_su) in [(false, true), (true, false)] {
+            let mut rx = Receiver::new();
+            if asked_ru {
+                rx.expect_ru();
+            } else {
+                rx.expect_su();
+            }
+            let mut heard = Vec::new();
+            for n in 0..400 {
+                rx.feed(levels[n % RU_PERIOD]);
+                while let Some(event) = rx.heard() {
+                    if !matches!(event, Heard::Symbol(_)) {
+                        heard.push(event);
+                    }
+                }
+            }
+            let ru = heard.iter().any(|e| matches!(e, Heard::Ru { .. }));
+            let su = heard.iter().any(|e| matches!(e, Heard::Su { .. }));
+            assert_eq!(su, expect_su, "asked for Ru {asked_ru}: {heard:?}");
+            assert_eq!(ru, !expect_su, "asked for Ru {asked_ru}: {heard:?}");
+        }
     }
 
     /// The training fit, over a channel with noise: TRN1u is known, so this is

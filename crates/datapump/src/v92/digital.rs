@@ -53,9 +53,6 @@ const INTERVALS: usize = 6;
 const SD_FRAMES: usize = 64;
 const SD_BAR_FRAMES: usize = 8;
 
-/// TRN1d: "a minimum of 2040T" (V.90 8.4.5), in whole frames.
-const TRN1D_FRAMES: usize = 340;
-
 /// R-bar-i: "4 repetitions of the 6-symbol sequence" (V.90 8.6.4).
 const R_BAR_FRAMES: usize = 4;
 
@@ -85,7 +82,8 @@ const MD_STEP: u64 = 276;
 /// 9.5.1.2.1: Ja within 4500 ms plus a round trip of the end of INFO1a.
 const JA_WITHIN: f64 = 4.5;
 
-/// 9.5.1.2.2: Su within 5100 ms plus a round trip of the start of TRN1d.
+/// 9.5.1.2.2: Su within 5100 ms plus a round trip of **the start of TRN1d** --
+/// not of Ja, and not of the end of TRN1d.
 const SU_WITHIN: f64 = 5.1;
 
 /// E1u: "a data frame of scrambled, differentially encoded zeroes" (8.5.2),
@@ -204,6 +202,9 @@ pub enum Out {
     RiBar,
     /// TRN2d, from the start of Phase 4 (9.6.1.1).
     Trn2d,
+    /// SCR, "the same signal as TRN1d" (V.90 8.6.6), sent when the analogue
+    /// modem asked for no DIL (9.5.1.1.13).
+    Scr,
 }
 
 /// The downstream source: what goes out, a codeword at a time.
@@ -275,7 +276,7 @@ impl Source {
             // "The first symbol of Sd is defined to be transmitted in data
             // frame interval 0" (V.90 8.4.4).
             Out::Sd => self.symbol = 0,
-            Out::Trn1d | Out::Trn2d => self.scrambler.reset(),
+            Out::Trn1d | Out::Trn2d | Out::Scr => self.scrambler.reset(),
             Out::JpPrime => self.bits.extend([false; JP_PRIME_BITS]),
             _ => {}
         }
@@ -337,7 +338,18 @@ impl Source {
                             // Jp' is twelve symbols, and what follows is not
                             // decided until the descriptor has been read.
                             Out::JpPrime => {
-                                let next = self.pending.take().unwrap_or(Out::Silence);
+                                // 9.5.1.1.11: Jp' is followed by the DIL the
+                                // analogue modem's Ja asked for; with none
+                                // asked for it is SCR in its place (9.5.1.1.13
+                                // with V.90 8.6.6). Until this went to `Dil`,
+                                // the DIL was never put on the line at all and
+                                // a far end that had asked for one waited for
+                                // it while this end sat silent.
+                                let next = self.pending.take().unwrap_or(if self.dil.is_empty() {
+                                    Out::Scr
+                                } else {
+                                    Out::Dil
+                                });
                                 self.start(next);
                                 continue;
                             }
@@ -397,6 +409,28 @@ impl Source {
                     let interval = (self.symbol % INTERVALS as u64) as usize;
                     self.count += 1;
                     return self.level(self.uinfo, (interval < 3) ^ bar);
+                }
+                // 9.5.1.1.13 with V.90 8.6.6: with no DIL asked for, the
+                // signal in the DIL's place is SCR -- TRN1d's own -- and it
+                // runs the length TRN1d would have. Then Ri, because the
+                // analogue modem is waiting for it to send CPt (9.5.2.1.10).
+                // And like the DIL, it can be cut short at a frame boundary by
+                // whatever has been asked for since -- the analogue modem's
+                // CPt arriving is what ends it when that comes first.
+                Out::Scr => {
+                    if self.at_frame_boundary() {
+                        if let Some(next) = self.pending.take() {
+                            self.start(next);
+                            continue;
+                        }
+                        if self.count >= self.trn1d_symbols {
+                            self.start(Out::Ri);
+                            continue;
+                        }
+                    }
+                    self.count += 1;
+                    self.sign = self.scrambler.scramble(true);
+                    return self.level(self.uinfo, self.sign);
                 }
                 Out::Trn2d => {
                     if self.count == TRN2D_FRAMES * INTERVALS {
@@ -466,6 +500,10 @@ pub struct Modem {
     /// Bits the Ja reader has produced, and ones in the last stretch of them.
     ja_bits: u64,
     ja_ones: u64,
+    /// And the same for the CPt reader, which is what says whether the far
+    /// end's CPt is being decoded at all.
+    cp_bits: u64,
+    cp_ones: u64,
     /// Symbols since Phase 2 ended.
     now: u64,
     ja_deadline: Option<u64>,
@@ -488,10 +526,20 @@ impl Modem {
     #[must_use]
     pub fn new(settings: Settings) -> Self {
         let ja_deadline = Some(((JA_WITHIN + settings.round_trip) * FS) as u64);
+        let mut rx = Receiver::new();
+        // The training reference is GPA, which is the receiver's default: what
+        // this end fits is the *analogue* modem's TRN1u, and that is the one
+        // sequence in Phase 3 that follows the sender's role rather than the
+        // receiver's (6.3, 9.5.1.1.2).
+        //
+        // Phase 3 opens with Ru and with nothing else (9.5.2.1.1), so the hunt
+        // looks for that shape alone until the reversal -- see
+        // `Receiver::expect_ru`.
+        rx.expect_ru();
         Self {
             settings,
             source: Source::new(&settings),
-            rx: Receiver::new(),
+            rx,
             stage: Stage::AwaitRu,
             reader: TwoPointReader::differential(),
             ja: DescriptorFinder::v92(),
@@ -501,6 +549,8 @@ impl Modem {
             trn_from: None,
             ja_bits: 0,
             ja_ones: 0,
+            cp_bits: 0,
+            cp_ones: 0,
             cp_len: 0,
             cp_pos: 0,
             e1u_zeroes: 0,
@@ -537,7 +587,10 @@ impl Modem {
                 _ => "V.92 phase 3: Jd",
             },
             Stage::AwaitSuBar => "V.92 phase 3: Jp",
-            Stage::Dil => "V.92 phase 3: DIL",
+            Stage::Dil => match self.source.out() {
+                Out::Scr => "V.92 phase 3: SCR",
+                _ => "V.92 phase 3: DIL",
+            },
             Stage::Ri => "V.92 phase 3: Ri",
             Stage::RiBar => "V.92 phase 3: R-bar-i",
             Stage::Phase4 => "V.92 phase 4: TRN2d",
@@ -597,6 +650,11 @@ impl Modem {
         }
         self.timers();
         let out = self.source.next();
+        // The SCR path ends by putting Ri on the line itself, with no CPt to
+        // prompt it: once Ri is going out, the DIL stage is over.
+        if self.stage == Stage::Dil && matches!(self.source.out(), Out::Ri | Out::RiBar) {
+            self.stage = Stage::Ri;
+        }
         if self.source.in_phase4() {
             // 9.6.1.1: TRN2d is Phase 4's first signal, so the moment it
             // starts is the moment Phase 3 is over.
@@ -715,6 +773,9 @@ impl Modem {
         let from = reversal + TRN_START;
         self.trn_from = Some(from);
         self.stage = Stage::Training;
+        // What comes back is Su: Sd is this end's own, and the analogue modem
+        // has no other six-symbol sequence to send here (9.5.2.1.6).
+        self.rx.expect_su();
         self.rx.restart_hunt();
         self.notes.push(format!("V.92: TRN1u expected from symbol {from}"));
     }
@@ -804,10 +865,21 @@ impl Modem {
         self.descriptor = Some(descriptor);
         self.source.change(Out::Sd);
         self.stage = Stage::AwaitSu;
-        // Sd starts the downstream half, and DR2 runs from TRN1d's start,
-        // which is a fifth of the way into what Sd sends.
-        self.su_deadline =
-            Some(self.now + ((SU_WITHIN + self.settings.round_trip) * FS) as u64 + TRN1D_FRAMES as u64 * INTERVALS as u64);
+        // DR2 runs from TRN1d's start, and everything between here and there
+        // has to come off the deadline: Sd is 384T, S-bar-d 48T, and TRN1d is
+        // as long as this end was built to send it. Counting only TRN1d's
+        // 2040T minimum leaves the allowance short by the rest of TRN1d --
+        // 2.9 s with `Habits::LIVE` -- so a far end that uses the 5000 ms
+        // 9.5.2.1.6 allows it before Su is cut off, and the call retrains
+        // instead of connecting. That is what an Agere SV92PP on an 8 kHz
+        // line did: it waited, and this end had already gone back to tone A.
+        let trn1d = (self.settings.habits.trn1d * FS) as u64;
+        self.su_deadline = Some(
+            self.now
+                + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
+                + trn1d
+                + ((SU_WITHIN + self.settings.round_trip) * FS) as u64,
+        );
         if no_dil && !ZERO_DIL_USES_SCR {
             self.source.change(Out::Ri);
         }
@@ -820,13 +892,24 @@ impl Modem {
             self.notes.push(format!("V.92: CPt drn {}, {} set(s)", cp.drn, cp.constellations.len()));
         }
         self.cpt = Some(cp);
-        if self.stage == Stage::Dil {
-            // 9.5.1.1.12: "finish the current DIL segment and send Ri", which
-            // the source does at the next segment boundary.
-            self.source.change(Out::Ri);
-            self.stage = Stage::Ri;
-            self.cp_pos = 0;
-            self.e1u_zeroes = 0;
+        match self.stage {
+            Stage::Dil => {
+                // 9.5.1.1.12: "finish the current DIL segment and send Ri",
+                // which the source does at the next segment boundary.
+                self.source.change(Out::Ri);
+                self.stage = Stage::Ri;
+                self.cp_pos = 0;
+                self.e1u_zeroes = 0;
+            }
+            // With no DIL asked for, Ri has gone out already and this CPt is
+            // the answer to it: R-bar-i ends Phase 3 (9.5.2.1.10 read from this
+            // side, whose CPt is the analogue modem's).
+            Stage::Ri if self.no_dil() => {
+                self.source.change(Out::RiBar);
+                self.stage = Stage::RiBar;
+                self.e1u_zeroes = 0;
+            }
+            _ => {}
         }
     }
 
@@ -844,7 +927,19 @@ impl Modem {
     /// out for one symbol instead of 384). So the length of one repetition is
     /// taken from the CPt that was read, and only the twelve bits where its
     /// synchronisation belongs are counted.
+    /// Whether the analogue modem's Ja asked for no DIL at all, which puts
+    /// 9.5.1.1.13's SCR path and 9.5.2.1.10's order in force.
+    fn no_dil(&self) -> bool {
+        self.descriptor.as_ref().is_some_and(Descriptor::is_empty)
+    }
+
     fn cpt_bit(&mut self, bit: bool) {
+        self.cp_bits += 1;
+        self.cp_ones += u64::from(bit);
+        if tracing() && self.cp_bits % 400 == 0 {
+            eprintln!("V92TRACE: CPt reader {} bits, {} ones", self.cp_bits, self.cp_ones);
+            self.cp_ones = 0;
+        }
         if let Some(cp) = self.cps.feed(bit) {
             // A sequence is found by its CRC, so the bit just fed is its last:
             // the next one is the first of the next repetition.
@@ -902,6 +997,10 @@ mod tests {
             habits: Habits::PROMPT,
         }
     }
+
+    /// TRN1d's minimum, 2040T (V.90 8.4.5): what [`Habits`] must not go under,
+    /// and what the deadline in `heard_ja` has to leave room for.
+    const TRN1D_MINIMUM: usize = 340 * INTERVALS;
 
     const RU_END: u64 = 384;
     const RU_BAR_END: u64 = 408;
@@ -1010,6 +1109,32 @@ mod tests {
         assert_eq!(modem.upstream_rates(), Some(0x7ffff), "mask: {notes:?}");
         assert!(modem.circuit107(), "circuit 107 never came on: {notes:?}");
         assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes:?}", modem.phase());
+    }
+
+    /// 9.5.1.2.2: Su within 5100 ms of the start of TRN1d, however long TRN1d
+    /// is. The deadline is armed when Ja is read, so it has to carry Sd,
+    /// S-bar-d and TRN1d itself -- otherwise a live 3.6 s TRN1d leaves the far
+    /// end about 4 s instead of the 5.1 s it is allowed, and a far end that
+    /// waits before Su (9.5.2.1.6 allows 5000 ms) is cut off.
+    #[test]
+    fn the_su_deadline_carries_the_whole_of_trn1d() {
+        let mut settings = settings();
+        settings.habits = Habits::LIVE;
+        assert!(settings.habits.trn1d * FS >= TRN1D_MINIMUM as f64, "TRN1d is at least 2040T");
+        let mut modem = Modem::new(settings);
+        let ja_read = 8000u64;
+        modem.now = ja_read;
+        modem.heard_ja(Descriptor::none());
+        let deadline = modem.su_deadline.expect("a deadline from Ja");
+        // TRN1d starts after Sd and S-bar-d, and Su is due 5.1 s after that.
+        let expected = ja_read
+            + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
+            + (settings.habits.trn1d * FS) as u64
+            + (SU_WITHIN * FS) as u64;
+        assert_eq!(deadline, expected);
+        // Which is 5.1 s after TRN1d's start, and not 5.1 s after Ja.
+        let trn1d_start = ja_read + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64;
+        assert!(deadline - trn1d_start >= (SU_WITHIN * FS) as u64);
     }
 
     /// Ja is read once and its descriptor kept, with the mask that came in it.

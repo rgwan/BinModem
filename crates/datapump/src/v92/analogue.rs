@@ -133,13 +133,14 @@ const START_UP_RTD: f64 = 6.0;
 /// and E1u on R-bar-i.
 ///
 /// That order needs a far end which sends Ri **before** it has seen a CPt, which
-/// is 9.5.1.1.13's SCR path. Our own digital modem keeps
-/// `v92::digital::ZERO_DIL_USES_SCR` and sends no SCR at all, so with a
-/// descriptor that asks for no DIL it stays silent until a CPt arrives and only
-/// then sends Ri -- which makes A11's order, TRN1u, CPt, Ri, E1u, the one that
-/// completes a call between the two of them. False takes that order for N = 0 as
-/// well; true is the Recommendation's letter, for a far end that sends SCR.
-pub const ZERO_DIL_A10_ORDER: bool = false;
+/// is what 9.5.1.1.13's SCR path does: with no DIL asked for, the digital modem
+/// puts SCR in its place and then Ri. It is true here because that is what a
+/// real digital modem does -- an Agere SV92PP waiting for Ri with SCR on the
+/// line is what showed the difference, and the digital modem in this crate
+/// sends SCR for the same reason. False takes A11's order for N = 0 as well,
+/// which is only the right reading for a far end that stays silent until a CPt
+/// arrives.
+pub const ZERO_DIL_A10_ORDER: bool = true;
 
 /// Whether V92_TRACE in the environment is set, so that a start-up that will not
 /// find its place is legible.
@@ -420,6 +421,10 @@ impl Modem {
         // The digital modem's TRN1d is generated with GPC, not the GPA an
         // analogue modem's own TRN1u uses (6.3, 9.5.1.1.2).
         rx.set_reference_mode(Mode::Call);
+        // A3 asks for Sd and its reversal, and Sd is Su's shape the other way
+        // up (V.90 8.4.4): between the 70 ms of silence and the DIL nothing
+        // else of that shape is due.
+        rx.expect_su();
         let start_up_by = ((START_UP + START_UP_RTD * settings.round_trip) * FS) as u64;
         Self {
             source: Source::new(&settings),
@@ -594,7 +599,11 @@ impl Modem {
                     // A9-A11: the TRN1u that covers the DIL runs until the DIL
                     // has arrived and 2040T have gone by; both bounds are
                     // multiples of twelve, so the segment is one too (8.5.7).
-                    self.begin_cpt();
+                    // With no DIL asked for it does not end here: A10 has it
+                    // run until Ri, and Ri is what starts the CPt.
+                    if !self.zero_dil_a10() {
+                        self.begin_cpt();
+                    }
                 }
             }
             Up::Ja => {
@@ -672,6 +681,9 @@ impl Modem {
     fn begin_trn1u_over_dil(&mut self) {
         self.begin_trn1u();
         self.stage = Stage::Dil;
+        // A11: Ri, and then R-bar-i, are Ru's shape at UINFO (8.6.5 with
+        // 8.5.5) and nothing else of that shape comes before them.
+        self.rx.expect_ru();
         self.notes.push("TRN1u over the DIL, from upstream interval 0".into());
     }
 
