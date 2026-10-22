@@ -1227,6 +1227,12 @@ not listed must not be touched.
 
   Slip re-framing and echo cancellation are deliberately **not** here; they are V92-43 and V92-46, once the
   network can produce slips and echo.
+  **Measured on the spike (V92-26, 2026-10):** the channel estimate is the whole margin. Fitting 32 taps on
+  2400 symbols left the estimate 7.2e-4 out, and the decoder then made 26 bits' worth of bursty errors a
+  call -- enough to look like a decoder fault. The same link with 48 taps on 4800 symbols left it 7.7e-7
+  out and decoded 13 392 bits with none wrong at drn 19, at 16, 32 and 64 states. TRN1u is 2040 symbols at
+  least (8.5.6), so `train_on_trn1u` must use every one of them, and the retries of `TRAIN_TRIES` matter
+  more here than they do downstream.
 - **Tests:**
   - `ru_and_its_reversal_are_found_whatever_the_polarity` - through `Network::up` at four A/D phases.
   - `su_is_found_through_its_zeros_and_its_reversal_timed_to_the_symbol`.
