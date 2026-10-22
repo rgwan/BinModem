@@ -27,10 +27,12 @@
 //! - **Read CPt** behind the DIL, answer **Ri**, and on **E1u** answer
 //!   **R-bar-i** and go to Phase 4 with TRN2d (9.5.1.1.12).
 //!
-//! Two readings are named constants rather than buried: the epsilon is zero
-//! until [`crate::v92::epsilon`] measures one, which is honest on the
-//! straight-wire rigs this is proved on; and the zero-DIL branch is parsed and
-//! taken but not separately timed, because no far end in reach asks for it.
+//! The readings that are the Recommendation's but not its letter are named
+//! constants rather than buried: [`ZERO_DIL_USES_SCR`] for the branch with no
+//! DIL asked for (9.5.1.1.13), and Jp's epsilon, which comes from
+//! [`crate::v92::epsilon`]'s measurement on Su -- on a straight-wire rig it is
+//! whatever the equaliser's own residual delay looks like, which is why the
+//! bench, not this file, is where its sign and scale are settled.
 
 use std::collections::VecDeque;
 
