@@ -96,13 +96,53 @@ pub const HISTORY: usize = 8192;
 /// forty times as many equations as unknowns.
 pub const TRAIN_TAPS: usize = 48;
 
-/// Symbols of TRN1u the fit is taken over. TRN1u is at least 2040T (8.5.6)
-/// and the fit must not reach past its end into Ja.
+/// Symbols of TRN1u the fit is taken over while the arrival point is being
+/// searched for. TRN1u is at least 2040T (8.5.6), and a narrow window keeps the
+/// hundred and thirty fits of that search affordable.
 const TRAIN_WINDOW: usize = 1200;
+
+/// And the window the winner of that search is fitted over again.
+///
+/// 9.5.2.1.2 lets the analogue modem send TRN1u for as long as it likes -- an
+/// Agere SV92PP sends one and a half to three seconds of it -- so there is
+/// usually far more than 1200 symbols of known sequence to fit against. More
+/// equations is a better fit and costs one solve rather than a search, which is
+/// affordable where a long-window *search* would not be: 48 taps over 4800
+/// symbols is eleven million operations, ten milliseconds, once.
+const TRAIN_WINDOW_LONG: usize = 4800;
+
+/// Below this the fit is worth refitting over the longer window. On a line
+/// that is taps and nothing else the narrow window is already at 30 dB and the
+/// refit has nothing to add.
+const TRAIN_REFIT_BELOW: f64 = 24.0;
 
 /// How many stretches of TRN1u the training will try before giving up.
 pub const TRAIN_TRIES: usize = 3;
 
+/// What the fit cannot do, and the measurement that says so.
+///
+/// A forty-eight tap fit over a thousand symbols of TRN1u is the fit's whole
+/// story only when the far end's symbols land on the network's sample instants.
+/// They do not: the analogue modem's clock is its own, so its two-point symbols
+/// arrive at a fraction of a symbol's offset from ours. Measured on the
+/// synthetic line in this module's tests, the same fit gives:
+///
+/// | offset | fit |
+/// |---|---|
+/// | 0 | 166 dB |
+/// | 1/4 symbol | 156 dB |
+/// | **1/2 symbol** | **19 dB** |
+/// | 3/4 symbol | 157 dB |
+///
+/// A half symbol is the worst case and it is not an accident of the
+/// interpolation used to make the test: sampling a two-point stream half a
+/// symbol late is sampling a sum of two symbols, and no equaliser puts back what
+/// that sum removed. That is where the 15.4 dB an Agere SV92PP's TRN1u fits at
+/// comes from -- not from the taps (a 4800-symbol refit takes it to 15.6) and
+/// not from the window. What turns it into the 30 dB a CPt's CRC needs is
+/// symbol timing recovery on the upstream, which this receiver does not have
+/// yet: it slices at the network's instants whatever the far end's clock says.
+///
 /// The signal to noise a successful training has to reach.
 ///
 /// Twenty was the figure the synthetic bursts reached, where the line is the
@@ -709,6 +749,21 @@ impl Receiver {
         if !self.fit(start) {
             return false;
         }
+        // The search was narrow on purpose; the winner is worth a longer window
+        // when the line is a real one. A refit that comes out worse is no
+        // refit: the narrow window is what the search already proved.
+        if snr < TRAIN_REFIT_BELOW
+            && self.history.len() >= start + TRAIN_WINDOW
+            && self.fit_window(start, TRAIN_WINDOW_LONG)
+            && self.snr_db > snr
+        {
+            if std::env::var_os("V92_TRACE").is_some() {
+                eprintln!("V92TRACE: refit at {start} over {TRAIN_WINDOW_LONG}: {:.1} dB", self.snr_db);
+            }
+            self.trained = true;
+            self.trained_at = start;
+            return true;
+        }
         self.trained = true;
         self.trained_at = start;
         self.snr_db = snr;
@@ -719,13 +774,19 @@ impl Receiver {
     /// One least-squares fit of the equaliser against the known sequence
     /// starting at `from`.
     fn fit(&mut self, from: usize) -> bool {
+        self.fit_window(from, TRAIN_WINDOW)
+    }
+
+    /// The same fit over `window` symbols rather than [`TRAIN_WINDOW`], for the
+    /// one refit that follows a search -- see [`TRAIN_WINDOW_LONG`].
+    fn fit_window(&mut self, from: usize, window: usize) -> bool {
         // A fixed length, not everything the history holds: by the time the
         // fit is taken the history reaches past the end of TRN1u into Ja and
         // whatever follows it, and a reference that goes on pretending to be
         // TRN1u past that point is fitted against the wrong signal for as
         // much of the window as it overruns. 1200 of TRN1u's 2040 minimum is
         // twenty-five equations per tap.
-        let end = (from + TRAIN_WINDOW).min(self.history.len());
+        let end = (from + window).min(self.history.len());
         let Some(reference) = reference(from, end, self.reference_mode) else {
             return false;
         };
