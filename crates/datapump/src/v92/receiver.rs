@@ -531,7 +531,6 @@ impl Receiver {
     /// 24.5T S-bar-u left -- can land on a window that is not TRN1u at all and
     /// still clear the gate by luck on a clean synthetic line. Keeping the
     /// figure it started from is what lets the caller put the first fit back.
-    #[must_use]
     pub fn fitted(&self) -> Fitted {
         Fitted { taps: self.taps.clone(), snr_db: self.snr_db, trained: self.trained, at: self.trained_at }
     }
