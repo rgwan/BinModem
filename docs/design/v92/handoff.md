@@ -81,35 +81,62 @@ CPt for drn 16   Ri at 9148, CPt   R-bar-i at 9526, CPt ends   E1u sent, phase 3
    反编译 `StatusParser`（Ghidra，`/tmp/DecompileAgere.java`）确认：状态码 0x4c，属于
    "training progress" 组（`*param_1 == 0x42`）。
 
-### 3.2 当前唯一的堵点：Phase 4 的第一串信号被读成 `Jd'`
+### 3.2 当前唯一的堵点：对端收得到 SUVd/CPd，但一个都没认出来
 
-台架事实（`/tmp/agr-v90-interop/230241-run`）：
+**先说不堵的那一半。** Phase 4 的序列现在已经整条整条地上了线（`c1b05d3`）：
+
+`Source::send` 过去会在交出序列时 `bits.clear()`，把**正在发送的那条序列**清空，于是下一个
+符号就发现队列空了、报"序列结束"，交换层立刻要下一条，又清空一次 —— 每条序列只播得出
+一个符号。SUVd 和 CPd 的第 0 位都是帧同步的第一个 `1`，所以线上实际是**一段扰码全 1**，
+里面一个帧同步都没有。修掉之后（`send` 只写 `last` 和 `pending`，队列交给 `start`）：
 
 ```
-我们:  phase 3: Ri (20.58s) → phase 4: TRN2d (22.82s) → SUVd (23.42s)
-       notes: CPt drn 16 → E1u → upstream reader on TRN2u → TRN2d done, SUVd out
-对端:  PCM phase 3 finished (19.43s) → PCM phase 4 started (20.00s)
-       → Jd' detected → CPt sent (23.21s) → V.34 Phase 2 → Training Failed
+caller.raw（我们发的）  22.0–24.0 s  每 0.5 s 74 个帧同步 = 8000/54，SUVd 背靠背
+                        24.5–29.5 s  密度 0.15–0.19、每 0.5 s 1 个同步 = 3732 bit 的 CPd 重复
+agr-rx.raw（对端收到）  25.0–26.5 s  67–74 个帧同步  ← SUVd 在对端是**干净可读**的
+                        27.5–33.0 s  每 0.5 s 1 个同步  ← CPd 同样可读
 ```
 
-也就是：**对端在 20.0 s 就进了 Phase 4 开始等我们 TRN2d，而我们 22.8 s 才发**，中间 2.8 s
-它收到的都是 Phase 3 的 Ri/R̄i，于是判成"数字端请求重训练"。而我们对端日志的时间戳是
-排空时刻（误差 0.1–1 s），所以这 2.8 s 里有多少是真的，要用 `caller.raw` 与 `agr-rx.raw`
-互相关来核（§5.2 的方法，实测恒差 24192 样点）。
+两份 capture 的时间基 ≈ +3.0 s（`agr-rx` 晚），与 §5.2 的 24192 样点一致。读取工具
+`crates/datapump/examples/v92_capture.rs`（`--levels` / `--sync FROM TO` / `--down` / `--up`）。
 
-下一步按代价排序：
+**堵点。** 对端照旧：`SUVu sent 2001`（ack=0）循环，10 s 后 `V34 exception: 60096212`。
+`StatusParser` 里有 `SUVd detected` / `SUVd' detected` / `CPd detected` 三条串，日志里
+**一条都没出现**，所以是它的检测器不认，不是我们发得不对。
 
-1. **先量这个 2.8 s**：`agr-rx.raw`（引擎收到的）与 `caller.raw`（我们发的）互相关，定出我们
-   TRN2d 的第一符号在对端时间轴上的位置；再看对端从 `phase 4 started` 到 `Jd'` 之间到底
-   收到了什么。**验收**：能说出"对端在哪一个符号上判的 Jd'"。
-2. **我们为什么这么慢**：从 `Ri`（20.58）到 `TRN2d`（22.82）之间有 18000 个符号都停在 Ri，
-   而 R̄i 只有 24 个符号。`RiBar` 是**E1u 检测**触发的，E1u 只认 CPt 重复里那 12 个零；
-   如果对端那时已经在发 TRN2u（4 点），我们拿 2 点读它，就只剩"碰巧 12 个零"。所以要么
-   E1u 的检测该更早（对端发 E1u 的时刻是它收到 Ri 之后），要么 Ri 该更早（CPt 一读到就发）。
-   **验收**：Ri 到 TRN2d 的间距 ≤ 100 个符号。
-3. 若届时仍被读成 `Jd'`：用 Ghidra 找**产生训练进度码 0x4c 的那段**（不是 `StatusParser`，
-   它在 exe 里；产生者在 `agrsm_core.o`）。已知 `AgereLineDet` 不是它（那里的 0x4c 是表索引）。
-   搜索模板：`/tmp/agere-statusparser.c`（已反编译）、`/tmp/agere_core.asm`（全量反汇编）。
+`60096212` 的完整含义（Ghidra + objdump，已闭环，别再追）：
+
+- `V92ClientControlException(0x96212)` → `V34Exception(0x96212 | 0x60000000)` →
+  `V34ReportStatus(0x21, …)` → StatusParser 状态码 `0x21` = `"V34 exception:  %8lx"`。
+  **`0x60000000` 是 V.92 client 控制层加的类位**，不是对端数据。
+- 低 28 位 `0x96212`：`9`=V.92、`6`=phase 4、`21x`=状态序。抛出点只有两处：
+  `V92ClientPhase4RxWaitSUVState`（0x5d242）与它的孪生（0x5d514）。
+- 判据就一条超时：`if ([0x11698] <= [0x11694])` → `[0x116b8]==0` 时抛 0x96212，否则
+  `ClearDown(0x22)`。deadline 在 `V92ClientPhase4TxSendTRN2uState` 里装（0x5d05f）：
+  `[0x11698] = 当前样点位置 + 0x13880` = **80000 样点 = 10 s @ 8 kHz**（`AGR_FS=8000`）。
+  同时清 `[0x11753]`、`[0x11752]`，arm `V34RxDataSetCPdDetector`，装 RxWaitSUV。
+  实测：`SUVu sent`(25.9) → 异常(34.76) = 8.86 s，落在 24.75 起算的 10 s 上。
+- 该状态唯一出口是 `[0x11753] != 0`，而全区只有一处把 `0x11753` 置 1：0x5a077，在
+  "把收到的序列信息字存到 `0x11ade`"的助手（`type==4` 即 SUV）里 —— 也就是**必须解出一个
+  SUVd**。`0x11753` 一直是 0，所以它连 CPu 都没回（9.6.2.1.2 要求收到 SUVd 才回 CPu）。
+- 后果：`V34P2ControlExceptionHandler` 把 0x96212 归一成动作码 **0xb521**（0x22150
+  `cmp $0x96212` → `je 0x22080` → `mov $0xb521`）→ 走 0x21a60：Reset Xmt/Rcv 延迟线、
+  DPSK 重初始化、Xmt/RcvMode=0 → **V.34 phase 2 冷重启** = 日志里的 `V34 phase 2 started`
+  与 `Training failed`。对比 `0xb522`（0x9522/0x9722）走 `...AnsRxWaitForRetrainState`，
+  `0xfff21` 走 WaitForRetrain —— 0x96212 没有这条路。
+
+**下一步（按代价排序）：**
+
+1. **它的检测器到底要什么。** `V34RxDataSetCPdDetector`（0x5d049 调用）是 V.34/V.90 的
+   CPd 检测器；在 V.90 模式下它对我们的 CPd 是**认的**（V.90 能 CONNECT）。差别只在 V.92
+   Phase 4 前面没有 Sd/S̄d/Jd。所以先反编译这个检测器与它的使能条件，找"PCM/训练"以外的
+   隐形门槛。**验收**：说出它需要一个我们没有的东西（或证明不需要）。
+2. **`[0x8800] == 0` 这个附加条件**：RxWaitSUV 的推进除了 `0x11753` 还要求 `[0x8800]==0`，
+   而 `0x8800` 是什么没人查过。顺带查 `[0x11757]`（决定是否 `DisableUpdate`）。
+3. **对照实验**：把 TRN2d 拉长到 24000 符号（3 s），让对端的检测器在**我们的 TRN2d 中途**
+   就已武装、且之后有更长的 SUVd。若仍不 ack，门槛就在序列本身之外；若 ack 了（`SUVu sent`
+   变成 ack=1），就是相对时序。
+4. 一旦它回了 CPu，后面的 9.6.1.1.4 就在 `Exchange` 里接好了：Ed → E2u → B1u/B1d。
 
 ### 3.3 Phase 4 之后（本轮已接线，未验证）
 
@@ -270,6 +297,13 @@ CPt for drn 16   Ri at 9148, CPt   R-bar-i at 9526, CPt ends   E1u sent, phase 3
     （`Mode::Answer`）去读本端下游，解出来是噪声，而这是"我们发的对不对"唯一的离线证据。
 19. **4 点调制只认 L_U 单位**（`Trn2uSize::group_for`）：`level·√points` 与 1、3 比。均衡器输出
     已经把 TRN1u 的 ±L_U 归一成 ±1，所以 TRN2u 的 ±L_U/√5 正好是 0.447/1.342，别再乘一次 L_U。
+20. **交付一条 Phase 4 序列时不许动正在播的队列**：`Source::send` 只写 `last` + `pending`，
+    填充交给 `start`。曾经在 `send` 里 `bits.clear()`，于是下一个符号就"序列结束"，交换层
+    每符号重发一次，每条序列只播得出**第 0 位**——而 SUVd/CPd 的第 0 位都是帧同步的 `1`，
+    线上就成了一段扰码全 1（`caller.raw` 里 22–24 s 的密度正好是 1.000）。离线判据：正常时
+    每 0.5 s 应看到 `4000/序列长度` 个帧同步（SUVd 74 个，CPd 约 1 个）。
+21. **读 capture 要按序列长度换算同步数**：CPd 是 3732 bit，0.2 s 窗口里最多 1 个帧同步，
+    "syncs = 0/1" 是**对的**，不是读不出来。先算 `8000·窗口/序列长度` 再判。
 
 ## 5. 已知红（开工前就有，别当成你的回归）
 
@@ -295,7 +329,9 @@ python3 interop/agrsm/run_agr_v90.py --ms-args "V92" --pre "AT+PIG=0" \
   §6 里"Agere 不发 Ru"的旧结论就是这个假象。
 - 每轮台架约 2 分钟；改完 `datapump` 必须 `cargo build --release -p modem --bin v90-bridge`。
 - 采集方向别搞反：`caller.raw` 是**我们自己的 TX**（bridge 写的是 `from_binmodem`），
-  对端音频是 `agr-tx.raw`。但对端那份 raw **不可全信**：用它跑接收机链连 TRN1u 都拟合
+  对端音频是 `agr-tx.raw`，而 `agr-rx.raw` 是**对端收到的**（= 我们的下游，经 G.711）。
+  `agr-rx.raw` 是可信的：用 `v92_capture --sync` 在里面能干净地读出我们的 SUVd/CPd
+  （每 0.5 s 67–74 个帧同步）——这是"对端到底听没听到"的第一手证据。但对端那份 raw **不可全信**：用它跑接收机链连 TRN1u 都拟合
   不过 0 dB，而在线的同一段是 15.4 dB，说明这份文件与线路上真正听到的不是同一个信号
   （或采样率/格式不同）。`tests/v92_capture.rs` 两个 `#[ignore]` 诊断就是为这件事留的：
 
