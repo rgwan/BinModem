@@ -7,6 +7,22 @@
 /// a UART does. What it does need is rejection of glitches that look like start
 /// bits, so a candidate edge is confirmed at the half-bit point before the
 /// character is accepted, and the stop bit must come back as mark.
+/// Whether a character's last bit may be put aside when it comes back from the
+/// ring-down of a burst that has just stopped.
+///
+/// Off, and the two captures that have a V.8 call in them are why: measured
+/// against a character's own scale, a real V.90 recording's last bits still
+/// cross the margin (the line's echo swings them), and a receiver that puts
+/// them aside makes a whole CI out of a stretch of noise in a short-Phase-1
+/// capture. The case the guard was written for -- a V.92 engine that stops its
+/// carrier half a bit into the last octet of signal CJ -- is carried by the
+/// carrier-loss rules below instead, which need no amplitude judgement at all:
+/// a burst that ends while a character's stop bit is pending still yields the
+/// character, because every data bit was on the line before it stopped. Left
+/// here, off, with its constant, so that a capture which does need it has
+/// somewhere to turn it on.
+const RING_COAST: bool = false;
+
 /// How far past a character's own loudest bit a reading has to be before it is
 /// the ring-down of a burst that has stopped rather than a bit.
 ///
@@ -151,7 +167,7 @@ impl AsyncFramer {
                     // other bit reading out of band is a line's own business
                     // and is taken as it comes.
                     let last = self.next_bit + 1 == self.data_bits;
-                    let ringing = last && self.char_peak > 0.0 && level.abs() > RINGING * self.char_peak;
+                    let ringing = RING_COAST && last && self.char_peak > 0.0 && level.abs() > RINGING * self.char_peak;
                     if tracing() {
                         eprintln!("framer: bit {} at {:.3} bits level {:+.3}{}",
                                   self.next_bit, self.since_edge / self.sps, level,
@@ -184,13 +200,15 @@ impl AsyncFramer {
                     let scale = if self.char_peak > 0.0 { self.char_peak } else { 1.0 };
                     if level > 0.0 {
                         out = Some(self.value as u8);
-                    } else if level > -0.5 * scale {
-                        out = Some(self.value as u8);
                     } else {
-                        // Clearly at space. Either a real framing error or a
-                        // carrier about to disappear, and only the next moment
-                        // tells them apart, so the character waits instead of
-                        // being thrown away.
+                        // At space, or at nothing at all. Either a real framing
+                        // error or a carrier about to disappear, and only the
+                        // next moment tells them apart, so the character waits
+                        // instead of being thrown away. A gap in the middle of
+                        // a burst resolves the other way: the carrier stays
+                        // up, the stop bit really was missing, and the
+                        // character was not whole.
+                        let _ = scale;
                         self.pending = Some(self.value as u8);
                         self.pending_age = 0.0;
                     }

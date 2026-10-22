@@ -257,6 +257,7 @@ mod tests {
     fn parameters(drn: u8, levels: usize, gain: f64) -> Parameters {
         // Each of the twelve intervals carries K/12 bits, which is what a
         // modulus of 2^(K/12) holds exactly.
+        #[allow(clippy::cast_possible_truncation)]
         let m = 1u8 << (up_bits(drn) / UP_INTERVALS as u32);
         Parameters {
             drn,
@@ -292,8 +293,6 @@ mod tests {
     fn a_frame_carries_the_ladder_s_bits_and_no_others() {
         for drn in [1u8, 7, 13, 19] {
             let bits = up_bits(drn);
-            // Every interval on a modulus that holds its share of the frame.
-            let m = 1u8 << (bits / UP_INTERVALS as u32);
             let encoder = UpEncoder::new(&parameters(drn, 128, 1.0)).expect("feasible");
             assert_eq!(encoder.frame_bits(), bits, "drn {drn}");
             assert_eq!(encoder.rate(), crate::v92::up_rate(drn), "drn {drn}");
