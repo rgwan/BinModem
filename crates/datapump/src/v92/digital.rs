@@ -457,8 +457,14 @@ pub struct Modem {
     su_deadline: Option<u64>,
     status: Status,
     md_until: Option<u64>,
+    /// Whether the MD that INFO1a asked for has been waited out. It is sent
+    /// once, between the first Ru and the second (9.5.1.1.1); the second
+    /// reversal is the one that starts TRN1u.
+    md_done: bool,
     /// Circuit 107, raised on the Jp-to-Jp' change (9.5.1.1.9).
     circuit107: bool,
+    /// Largest sample seen since the last trace line.
+    peak: f64,
     notes: Vec<String>,
 }
 
@@ -484,7 +490,9 @@ impl Modem {
             su_deadline: None,
             status: Status::Running,
             md_until: None,
+            md_done: false,
             circuit107: false,
+            peak: 0.0,
             notes: Vec::new(),
         }
     }
@@ -551,15 +559,18 @@ impl Modem {
     /// One network sample in, one codeword out.
     pub fn step(&mut self, input: f64) -> f64 {
         self.now += 1;
+        self.peak = self.peak.max(input.abs());
         if tracing() && self.now % 2000 == 0 {
             eprintln!(
-                "V92TRACE: {} symbols, stage {:?}, out {:?}, input {:.0}, rx trained {}",
+                "V92TRACE: {} symbols, stage {:?}, out {:?}, peak {:.0}, rx trained {}, snr {:.1}",
                 self.now,
                 self.stage,
                 self.source.out(),
-                input,
-                self.rx.is_trained()
+                self.peak,
+                self.rx.is_trained(),
+                self.rx.snr_db()
             );
+            self.peak = 0.0;
         }
         self.rx.feed(input);
         while let Some(heard) = self.rx.heard() {
@@ -584,7 +595,13 @@ impl Modem {
             && let Some(from) = self.trn_from
             && self.rx.symbols() >= from + TRAIN_AFTER
         {
-            if self.rx.train_near(from, TRAIN_SEARCH) {
+            // The fit is indexed against the receiver's history, which is a
+            // window that has long since slid past the reversal: `from` is an
+            // absolute symbol count and has to be brought back to where the
+            // window starts.
+            let base = self.rx.symbols() - self.rx.history_len() as u64;
+            let at = from.saturating_sub(base);
+            if self.rx.train_near(at, TRAIN_SEARCH) {
                 self.stage = Stage::ReadJa;
                 self.notes.push(format!("V.92: TRN1u trained at {:.1} dB", self.rx.snr_db()));
             } else {
@@ -655,10 +672,11 @@ impl Modem {
     fn ru_reversal(&mut self, at: u64) {
         match self.stage {
             Stage::AwaitRu => {
-                if self.settings.far_md > 0 {
+                if self.settings.far_md > 0 && !self.md_done {
                     // 9.5.1.1.1: wait MD (length x 276T, allowing for the 24T
                     // R-bar-u inside it), then hunt Ru again.
                     self.stage = Stage::WaitMd;
+                    self.md_done = true;
                     self.md_until = Some(self.now + u64::from(self.settings.far_md) * MD_STEP);
                     self.rx.restart_hunt();
                     self.notes.push("V.92: waiting out the MD INFO1a asked for".into());

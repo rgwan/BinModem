@@ -40,7 +40,16 @@ use super::up_signals::{self, RU_PERIOD};
 use super::UP_INTERVALS;
 
 /// The mean square a window needs before any of its shape means anything.
-const AUDIBLE: f64 = 0.05;
+///
+/// Only enough that a window of digital silence -- which is exactly zeros on a
+/// digital network -- is not correlated at all: the shape test that follows is
+/// normalised, so the level it is applied at cannot change the answer. This
+/// used to be 0.05, which is a mean square of 0.22 in the levels' own units and
+/// was taken from the same synthetic bursts the rest of this module was proved
+/// on. A real analogue modem on a real line reaches the far end at about a
+/// quarter of full scale -- 0.06 of mean square on a good day -- so the hunt
+/// never fired at all and Phase 3 waited for a Ru that was on the line.
+const AUDIBLE: f64 = 1e-4;
 
 /// Ru's shape over one period: "+++---" (8.5.5).
 const RU_SHAPE: [f64; RU_PERIOD] = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
@@ -52,7 +61,7 @@ const SU_SHAPE: [f64; RU_PERIOD] = [1.0, 0.0, 1.0, -1.0, 0.0, -1.0];
 /// How well a window has to match a shape before it is that sequence. Through
 /// a line that has not smeared a whole symbol the match is better than 0.99;
 /// 0.85 leaves room for one that has smeared a little.
-const MATCHED: f64 = 0.85;
+const MATCHED: f64 = 0.90;
 
 /// How many samples of history the receiver keeps: enough for the training
 /// fit, the epsilon estimator and a channel estimate to all look at the same
@@ -85,12 +94,22 @@ struct Anchor {
     /// is not a sequence, and a hunt that acts on one fires on a phase 2's
     /// worth of tones.
     held: u32,
+    /// Periods that matched neither the shape nor its inverse. The period in
+    /// which one sequence turns into the other straddles the boundary and
+    /// matches nothing, so a single miss is expected there and must not cost
+    /// the anchor: dropping it is what lost the Ru-to-R-bar-u reversal that
+    /// Phase 3 is waiting for.
+    stray: u32,
 }
 
 /// Periods a shape must match in a row before the hunt calls it a signal.
+///
 /// Ru is 384T and Su 144T, so sixty-four and twenty-four periods of it are on
-/// the line; two is the smallest number that is not a coincidence.
-const HELD_PERIODS: u32 = 2;
+/// the line. Two was not enough: a six-sample window of a phase 2's tones
+/// matches a six-sample shape by chance several times a second, and a hunt that
+/// fired on those had the modem chasing Ru through every tone in the call.
+/// Eight periods is six milliseconds, which costs a real Ru nothing.
+const HELD_PERIODS: u32 = 8;
 
 /// The normalised correlation of a window against a template: +1 identical,
 /// -1 inverted, 0 unrelated.
@@ -414,11 +433,17 @@ impl Receiver {
                 return false;
             }
             if share > -MATCHED {
-                // Neither: something else is being sent now.
+                // Neither. One of these is the period the sequence turned over
+                // in; two in a row means something else is being sent now.
+                if anchor.stray < 1 {
+                    anchor.stray += 1;
+                    return false;
+                }
                 self.anchor = None;
                 self.state = Hunt::Searching;
                 return false;
             }
+            anchor.stray = 0;
             // Turned over. The anchor moves with it so that a second reversal
             // is seen as one, and a turn of something that was never held is
             // a coincidence rather than a reversal.
@@ -468,6 +493,7 @@ impl Receiver {
             kind: best.1,
             phase: at % RU_PERIOD as u64,
             held: 1,
+            stray: 0,
         });
         self.state = best.1;
         true
@@ -564,6 +590,9 @@ impl Receiver {
             if best.is_none_or(|(snr, _)| self.snr_db > snr) {
                 best = Some((self.snr_db, start));
             }
+        }
+        if std::env::var_os("V92_TRACE").is_some() {
+            eprintln!("V92TRACE: train_near(from {from} search {search}) best {best:?}");
         }
         let Some((snr, start)) = best else { return false };
         if snr < TRAINED_SNR_DB {

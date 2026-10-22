@@ -1273,9 +1273,22 @@ impl Modem {
                     if self.both_v92() {
                         info1c.set_pcm_upstream(self.wish().pcm_upstream);
                         self.sent_pcm_upstream = info1c.pcm_upstream();
+                        if std::env::var_os("PHASE2_TRACE").is_some() {
+                            eprintln!(
+                                "P2TRACE INFO1d bit70 (PCM upstream offered) = {}",
+                                self.sent_pcm_upstream
+                            );
+                        }
                     }
                     let bits = info1c.to_bits();
                     self.info1c = Info1c::from_bits(&bits);
+                    if std::env::var_os("PHASE2_TRACE").is_some() {
+                        eprintln!(
+                            "P2TRACE INFO1d on the wire: bit70 {} ({} bits)",
+                            self.info1c.is_some_and(|i| i.pcm_upstream()),
+                            bits.len()
+                        );
+                    }
                     self.speaking = Speaking::Carrier;
                     self.tx.stop();
                     self.tx.send(&bits);

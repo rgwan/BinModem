@@ -650,6 +650,15 @@ impl Digital {
             self.connected_once = true;
         }
         let p2 = self.v34.phase2();
+        if std::env::var_os("PHASE2_TRACE").is_some() && p2.status() == phase2::Status::Done {
+            eprintln!(
+                "P2TRACE data mode: both_v92 {} far_flags {:?} table18 {:?} table10 {:?}",
+                p2.both_v92(),
+                p2.far_pcm_flags(),
+                p2.info1a_pcm_up().is_some(),
+                p2.info1a_pcm().is_some()
+            );
+        }
         // V.92 first: a Table 18 INFO1a is PCM upstream, and only one of the
         // two modems is ever built (9.5, 9.6).
         if p2.status() == phase2::Status::Done
