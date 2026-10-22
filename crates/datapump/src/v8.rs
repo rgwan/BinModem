@@ -467,7 +467,31 @@ impl Modem {
     pub fn status(&self) -> Status {
         match self.state {
             State::Done(s) => s,
+            // The menu is settled before the handover silence is over, and
+            // what follows it has to start then: its receiver belongs on the
+            // line from the beginning of the silence even though its
+            // transmitter must wait for the end. Whichever pump replaces this
+            // one is told how much of the silence is left.
+            // Only V.90 has something to do with the silence: 9.2.1.1.1
+            // conditions its receiver during it. Everything else is told at
+            // the end of the silence, as before.
+            State::Handover => match self.chosen {
+                Some(modulation) if self.pcm_role().is_some() => Status::Agreed(modulation),
+                _ => Status::Negotiating,
+            },
             _ => Status::Negotiating,
+        }
+    }
+
+    /// How much of V.8's handover silence is left to run, in seconds.
+    ///
+    /// Only nonzero while [`State::Handover`], which is no longer a state this
+    /// end is stepped in once the menu is agreed -- the pump takes the line
+    /// over and has to keep the silence itself.
+    pub fn handover_remaining(&self) -> f64 {
+        match self.state {
+            State::Handover => (timing::HANDOVER - self.elapsed).max(0.0),
+            _ => 0.0,
         }
     }
 
@@ -542,11 +566,22 @@ impl Modem {
             self.torn = true;
         }
         if let Some(octet) = octet {
+            if Self::tracing() {
+                eprintln!("v8[{:?}]: octet {octet:02x} at {:.3}s",
+                          self.role, (self.total - 1.0) / self.fs);
+            }
             self.heard(octet);
         }
 
         self.advance();
         self.transmit()
+    }
+
+    /// Whether V8_TRACE in the environment is set.
+    fn tracing() -> bool {
+        use std::sync::OnceLock;
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        *TRACE.get_or_init(|| std::env::var_os("V8_TRACE").is_some())
     }
 
     /// An octet came off the line.
@@ -611,7 +646,12 @@ impl Modem {
                 self.last = Some(menu);
             }
             // 8.2.3: JM stops when "all 3 octets of CJ have been received".
-            Heard::Cj => self.cj = v8::CJ.len(),
+            Heard::Cj => {
+                if std::env::var_os("V8_TRACE").is_some() {
+                    eprintln!("v8[{:?}]: CJ at {:.3}s", self.role, self.total);
+                }
+                self.cj = v8::CJ.len();
+            }
             // 7.1: a caller saying what its call is for, before or instead of
             // any menu. Counted only for this end's own function, since that
             // is the only one anything here would answer.
@@ -631,6 +671,12 @@ impl Modem {
     }
 
     fn enter(&mut self, state: State) {
+        if std::env::var_os("V8_TRACE").is_some() {
+            eprintln!(
+                "v8[{:?}]: {:?} -> {:?} at {:.3}s",
+                self.role, self.state, state, self.total
+            );
+        }
         self.state = state;
         self.elapsed = 0.0;
     }
@@ -873,7 +919,7 @@ impl Modem {
             let bits = self.bits.encode(octet);
             self.tx.push_bits(&bits);
         }
-        self.tx.next_sample()
+        MESSAGE_LEVEL * self.tx.next_sample()
     }
 
     /// One sample of ANSam (7.2).
@@ -897,6 +943,18 @@ impl Modem {
 /// rather than about numbers in a computer. This leaves the same headroom the
 /// data pumps are given.
 const ANSAM_LEVEL: f64 = 0.35;
+
+/// How loudly the V.21 signals of clause 8 (CI, CM, CJ, JM) go out.
+///
+/// These are messages between two terminals, not the payload, and they leave
+/// at the answer tone's level rather than at full scale. A receiver that has
+/// just set its gain on ANSam reads a message ten decibels louder than the
+/// tone it was listening to as a square wave with the corners clipped off:
+/// enough of the 300 bit/s sidebands is gone that the menu will not parse.
+/// The packet of JA/JM in V.8 is specified in terms of the same nominal
+/// power as the tones around it, so the same 0.35 as [`ANSAM_LEVEL`] is what
+/// the neighbouring signals lead to.
+const MESSAGE_LEVEL: f64 = 0.35;
 
 #[cfg(test)]
 mod tests {
