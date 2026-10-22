@@ -7,41 +7,30 @@
 
 ## 1. 一句话现状
 
-- **Phase 2（能力交换、Table 18）与 Phase 3（模拟端 + 数字端全程）都已跑通并有测试**。
-- `v92::analogue` 是真状态机：9.5.2.1 的 A1–A11，做到 E1u → `Status::Phase3Done`。
-- `v92::digital` 的 Phase 3 完成，Phase 4 只到 TRN2d 的钩子。
-- **真机台架（Agere SV92PP）能把 Phase 3 走完**：Ru/TRN1u/Ja/Sd/TRN1d/Jd/Su/Jp/Jp'/DIL 全过，
-  Jp 的 ε 已送达对端（对端日志 `Jp detected: aa57 1000`），**卡在我们解不出对端的 CPt**。
-- Phase 4（`down_source`）与"PCM 上行承载字节"未做。
-- 分支 `v92-dev`，HEAD `ac09682`。
+- **Phase 2、Phase 3（模拟端 + 数字端全程）、Phase 4 的握手代码都已写好并有测试。**
+- **真机台架（Agere SV92PP，全开日志）Phase 3 双向走完**：ε 已送达并被采用
+  （对端 `Jp detected: 4180`），**我们解出对端的 CPt**（`CPt drn 16`）、发 Ri、收 E1u、
+  发 R̄i，**双方都进入 Phase 4**（对端 `PCM phase 4 started`，我们 `phase 4: TRN2d → SUVd`）。
+- **卡在 Phase 4 的握手**：我们 TRN2d（4800T）→ SUVd 之后，对端报 `Jd' detected`
+  —— 在 V.90 8.6.2 里 Jd' 是**数字端请求重训练**的信号 —— 于是它退回 Phase 3 的 CPt，
+  再走一遍 V.34 Phase 2，最后 `Disconnect reason: Training Failed`。
+- 上游数据（B1u）与下游数据（B1d 的 DTE 位）还没接；B1d 目前发常量位流。
 
 ```bash
-cd BinModem && git log --oneline -13
-ac09682 V.92: drop a must_use the compiler does not want on fitted()
-7587c73 V.92: the digital modem's header stops calling epsilon a zero
-431570b V.92: plan.md says ZERO_DIL_A10_ORDER is on, because it is
-d1ea3d8 V.92: the handover page, rewritten for the state the bench left it in
-6066ce6 V.92: epsilon reaches the far end now; what it still has to get right
-7814625 V.92: measure epsilon on Su, and stop telling the far end to shift by nothing
-d9f31a2 V.92: refit the equaliser in the second TRN1u, where the phase has moved
-c8d6804 V.92: the bench blocker is upstream timing, and the numbers that say so
-c4b4081 V.92: the fit has a timing ceiling, and a longer window does not move it
-87c3a0d V.92: what a capture says about the CPt, and the test that says the decoder is right
-bd12994 V.92: the bench, as it stands on both engines
-e2effb3 V.92: what an Agere SV92PP and an HSF engine found in phase 3
-3eb5061 V.92: the handover page, after phase 3 both ways
-8b8c7ed V.92: the analogue modem's phase 3, Su to E1u
+cd BinModem && git log --oneline -5
+# 本轮：Phase 4 接线（TRN2d/SUVd/CPd/Ed/B1d）、ε 方向定死、换向检测的时步匹配、
+# 第二段 TRN1u 的相关定位与重拟合、Ri 的帧对齐、Agere 反编译（StatusParser）
 ```
 
-**开工第一件事**：读 §3.1。台架卡在"上行符号定时"，`v92::epsilon` 刚接上但符号/量纲未核对，
-这是唯一还没做过闭环的地方。
+**开工第一件事**：读 §3。ε 的符号与量纲本轮已用实验定死（§3.1），
+现在唯一没闭环的是 **Phase 4 的握手**：我们发的第一串 Phase 4 信号被对端读成 `Jd'`。
 
 ## 2. 已经能跑的东西
 
 | 东西 | 命令 | 结果 |
 |---|---|---|
-| **Phase 3 全程，两端都是本项目的调制解调器** | `cargo test -p datapump --test v92_call -- --nocapture` | 3 条：双向 Phase 3、带 MD、无 Sd 时 AR1 报警 |
-| V.92 各模块单测 | `cargo test -p datapump --lib v92::` | **151 条**全绿（receiver/digital/analogue/epsilon/upstream/…） |
+| **Phase 3 全程，两端都是本项目的调制解调器** | `cargo test -p datapump --test v92_call -- --test-threads=1` | **5 条**：双向 Phase 3、带 MD、无 Sd 时 AR1 报警、**分数符号抖动的线路（0.2/0.3/0.45/0.7）仍然建到 Phase 4 并读出 CPt**、**对端不应用 ε 时靠第二段 TRN1u 重拟合救回** |
+| V.92 各模块单测 | `cargo test -p datapump --lib v92::` | **158 条**全绿（receiver/digital/analogue/epsilon/exchange/upstream/…） |
 | PCM 上行链路（设计+编码+解码） | `cargo test -p datapump --test v92_upstream` | 2 条：drn 19 = 48000 bit/s，13392 bit 0 误码 |
 | 采集诊断（要文件，`#[ignore]`） | 见 §5.1 | 2 条 |
 | 全量回归 | `cargo test -p datapump --release --no-fail-fast` | 只有 `v90_call` 的 13 条已知红（§5） |
@@ -65,6 +54,84 @@ CPt for drn 16   Ri at 9148, CPt   R-bar-i at 9526, CPt ends   E1u sent, phase 3
 ```
 
 ## 3. 下一步（按优先级，每步都有验收口径）
+
+### 3.1 这次解决了什么（已闭环，勿重做）
+
+1. **ε 的测量位置与量纲**。原来在均衡器输出上测、而且测的是 **TRN1d 的尾巴**（`su` 缓冲从
+   Ja 就开始收，收满 144 个就走）。现在按 9.5.1.1.6-7 在**线路原始样点**上测 1333.3 Hz 基波，
+   窗口取"首个 S̄u **之后**那段 Su"的 96 个样点（`SU_AFTER_S_BAR`/`SU_MEASURE_SYMBOLS`），
+   并且带质量门（`epsilon::COHERENT`：非 Su 的窗口直接返回 None，原来那些 TRN1d 符号正是
+   所以 ε = 0xaa57 的来源）。台架实测 lag = 0.2559 符号，重复性好到 0.001。
+2. **ε 的方向是约定，不是测量**。`epsilon::EXTENDS_LATE = false`：Agere 把 ε 当作**提前**。
+   证据是两次台架：ε = 0x4180（正是 lag 本身）→ CPt CRC 过、Phase 3 双向走完；
+   ε = 0xbe80（同一个 lag 取反）→ CPt 一次没过、对端 4 s 后清线。这一条同时说明了
+   `Receiver::expect_step` 要拿 `epsilon::step_direction() * …`。
+3. **第二段 TRN1u 的重拟合**。锚点原来多加了 `TRAIN_AFTER`(1300)（拟合的是 TRN1u 中间某段，
+   参考序列从 0 开始 → 永远对不上），搜索只有 ±64。现在：锚点 = 第二段 TRN1u 的起点估计，
+   用**相关定位**（`Receiver::align_trn1u`，±192，质量 = 归一化相关，实测 0.70–0.94），
+   然后用 `train_verified` 直接拟合（不走 12 dB 门：4 kHz 处线路没有内容，两点流的拟合上限
+   本来就只有 13–15 dB）。同时 `set_frame_origin` 落在这里（9.5.1.1.10 的模 12 计数）。
+4. **换向检测必须匹配"已知时步"**。S̄u 的 24.5T 是**半符号时步**，而 Su 近似单音：
+   "反相 + 半个符号"对单音等于转 30°，原地相关永远看不到（老代码就是这么漏判的）。
+   `turned_share` 同时试**原地取反**和**按 `expect_step` 的时步 re-read**（`reread` 是 6 点 DFT
+   的带限移位，负频 bin 的符号是坑，见 §4）。
+5. **Ri 的帧边界**（V.90 8.4.1）：Ri→R̄i 现在对齐 6 符号帧。对端靠数 R̄i 的 24 个符号确定
+   **TRN2d 的扰码器复位点**（V.90 8.6.5），差 1 个符号，它后续解出来的就全是噪声。
+6. **Agere 的 `Jd' detected` 读法**：它是 V.90 8.6.2 的**重训练请求**，不是 Progress 事件。
+   反编译 `StatusParser`（Ghidra，`/tmp/DecompileAgere.java`）确认：状态码 0x4c，属于
+   "training progress" 组（`*param_1 == 0x42`）。
+
+### 3.2 当前唯一的堵点：Phase 4 的第一串信号被读成 `Jd'`
+
+台架事实（`/tmp/agr-v90-interop/230241-run`）：
+
+```
+我们:  phase 3: Ri (20.58s) → phase 4: TRN2d (22.82s) → SUVd (23.42s)
+       notes: CPt drn 16 → E1u → upstream reader on TRN2u → TRN2d done, SUVd out
+对端:  PCM phase 3 finished (19.43s) → PCM phase 4 started (20.00s)
+       → Jd' detected → CPt sent (23.21s) → V.34 Phase 2 → Training Failed
+```
+
+也就是：**对端在 20.0 s 就进了 Phase 4 开始等我们 TRN2d，而我们 22.8 s 才发**，中间 2.8 s
+它收到的都是 Phase 3 的 Ri/R̄i，于是判成"数字端请求重训练"。而我们对端日志的时间戳是
+排空时刻（误差 0.1–1 s），所以这 2.8 s 里有多少是真的，要用 `caller.raw` 与 `agr-rx.raw`
+互相关来核（§5.2 的方法，实测恒差 24192 样点）。
+
+下一步按代价排序：
+
+1. **先量这个 2.8 s**：`agr-rx.raw`（引擎收到的）与 `caller.raw`（我们发的）互相关，定出我们
+   TRN2d 的第一符号在对端时间轴上的位置；再看对端从 `phase 4 started` 到 `Jd'` 之间到底
+   收到了什么。**验收**：能说出"对端在哪一个符号上判的 Jd'"。
+2. **我们为什么这么慢**：从 `Ri`（20.58）到 `TRN2d`（22.82）之间有 18000 个符号都停在 Ri，
+   而 R̄i 只有 24 个符号。`RiBar` 是**E1u 检测**触发的，E1u 只认 CPt 重复里那 12 个零；
+   如果对端那时已经在发 TRN2u（4 点），我们拿 2 点读它，就只剩"碰巧 12 个零"。所以要么
+   E1u 的检测该更早（对端发 E1u 的时刻是它收到 Ri 之后），要么 Ri 该更早（CPt 一读到就发）。
+   **验收**：Ri 到 TRN2d 的间距 ≤ 100 个符号。
+3. 若届时仍被读成 `Jd'`：用 Ghidra 找**产生训练进度码 0x4c 的那段**（不是 `StatusParser`，
+   它在 exe 里；产生者在 `agrsm_core.o`）。已知 `AgereLineDet` 不是它（那里的 0x4c 是表索引）。
+   搜索模板：`/tmp/agere-statusparser.c`（已反编译）、`/tmp/agere_core.asm`（全量反汇编）。
+
+### 3.3 Phase 4 之后（本轮已接线，未验证）
+
+`v92::digital` 现在有一条完整的 Phase 4 路径，全部有单测，但**只有第一段在台架见过**：
+
+| 段 | 代码 | 依据 | 台架 |
+|---|---|---|---|
+| TRN2d ≥ 2040T（本端发 4800T） | `Out::Trn2d` + `trn2d_symbols` | 9.6.1.1.1 | 见过 |
+| SUVd 反复 | `Out::Suvd` + `Exchange::next_sequence` | 9.6.1.1.1-2 | 见过 |
+| 读 SUVu/CPu | `Trn2uReader`(4 点) + `UpFinder` | 8.7.2-8.7.6 | 未见到 |
+| CPd | `Cpd::from(&Parameters)`，参数由 `design`/`choose` 从第二段 TRN1u 估出 | 9.6.1.1.2，Table 30 | 未发出 |
+| Ed | `Out::Ed`（一帧零） | 8.8.2 | 未发出 |
+| B1d | `v90::encoder::Encoder`，`Mapping::from_cp(CPu)` | 9.6.1.1.5 | 未发出 |
+| B1u 收 | `v92::Decoder::new(&本端 CPd 的参数)` | 6.4 | 未接出 |
+
+两个自检工具（都在，别重写）：`digital::tests::the_phase_4_sequences_read_back_as_themselves`
+（把本端发的 SUVd 用对端同样的 2 点读法读回来，抓扰码器/差分/填充错位）和
+`epsilon::*`（ε 的整条闭环）。
+
+上游速率现在是**最低一档 drn 1 = 24 kbit/s**（`design_upstream` 里的 `SLOWEST`）：选择它靠的
+噪声只有两点流的拟合残差可读，而它在 4 kHz 的零点上被抬高到 13 dB —— 台架上"没有一档能承载"
+就是这个原因，所以先用最慢一档把链路打通，再往上调。
 
 ### 3.1 解锁台架：上行符号定时（**主线**）
 
@@ -137,7 +204,7 @@ CPt for drn 16   Ri at 9148, CPt   R-bar-i at 9526, CPt ends   E1u sent, phase 3
 短 Phase 1（QTS/ANSpcm，V92-31/49）、Quick Connect（V92-50）、MOH（V92-43）、
 速率重协商（V92-40）、掉线重建。**HSF 不需要 QC**（见 §6），别先去写它。
 
-## 4. 十三个坑（都真踩过，别重犯）
+## 4. 十九个坑（都真踩过，别重犯）
 
 1. **多项式跟角色走**（6.3/V.92）：模拟端 TRN1u/Ja/CPt = **GPA（`Mode::Answer`，默认）**；
    数字端 TRN1d/Jd/Jp = **GPC（`Mode::Call`）**。接口：`Receiver::set_reference_mode`、
@@ -190,6 +257,19 @@ CPt for drn 16   Ri at 9148, CPt   R-bar-i at 9526, CPt ends   E1u sent, phase 3
   hunt 直接报 `Heard::Ru` / `RuReversal`；Sd 同理报成 `Heard::Su`。
 - **`JpPrime` 之后必须走 `Out::Dil`**（描述符要了 DIL）或 `Out::Scr`（没要），
   以前这条出口只去 `Silence`，DIL 从来没上过线。
+
+14. **一段信号只发一次，别循环**（DIL、TRN2d）：`Source` 里凡是"一次"的信号，循环会让对端的
+    时间表整体漂移（V.90 8.4.1）。DIL 发完就静音等 CPt，TRN2d 发够 2040T 等 SUVd。
+15. **所有信号切换都对齐 6 符号帧**（V.90 8.4.1）：`Source::at_frame_boundary()`。对端靠数
+    符号定位下一段（尤其 R̄i 的 24 个符号 → TRN2d 扰码器复位点），差 1 个符号就是全盘噪声。
+16. **`rem_euclid(1.0)` 会吃掉时步的符号**：`-0.5` 变成 `+0.5`，"早半符号"就成了"晚半符号"，
+    换向检测从此只认对一半。时步要按**形状周期**归一（`RU_PERIOD`），不是 1。
+17. **带限移位的负频 bin**：`reread`（6 点 DFT 做分数符号移位）必须把 k>N/2 当**负频**处理
+    （`k - N`），否则每次移位都多转整数圈——整符号时看不出来，分数符号时全错。
+18. **SUVd/CPd 的读回自检要用对端的多项式**（`Mode::Call`）：用解自己上行的那只 reader
+    （`Mode::Answer`）去读本端下游，解出来是噪声，而这是"我们发的对不对"唯一的离线证据。
+19. **4 点调制只认 L_U 单位**（`Trn2uSize::group_for`）：`level·√points` 与 1、3 比。均衡器输出
+    已经把 TRN1u 的 ±L_U 归一成 ±1，所以 TRN2u 的 ±L_U/√5 正好是 0.447/1.342，别再乘一次 L_U。
 
 ## 5. 已知红（开工前就有，别当成你的回归）
 

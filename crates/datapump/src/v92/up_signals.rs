@@ -707,6 +707,43 @@ impl Trn2uReader {
     }
 }
 
+/// `x`, delayed by `delay` symbols, the way a line does it: a band-limited
+/// interpolation, which is what an analogue transmitter's sub-symbol timing step
+/// amounts to (9.5.2.1.8's "interpolating output").
+///
+/// Hamming-windowed sinc, sixteen taps either side. Nearly flat to Nyquist,
+/// which matters for Su: two thirds of its power is at 4000 Hz, and an
+/// interpolator that rolled that off would be delaying a different signal from
+/// the one it claims to.
+#[cfg(test)]
+pub(crate) fn fractional_delay(x: &[f64], delay: f64) -> Vec<f64> {
+    const HALF: i64 = 16;
+    let coefficients: Vec<f64> = (-HALF..=HALF)
+        .map(|k| {
+            let t = k as f64 - delay;
+            let sinc = if t.abs() < 1e-12 {
+                1.0
+            } else {
+                (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t)
+            };
+            let window = 0.54 + 0.46 * (std::f64::consts::PI * t / (HALF as f64 + 1.0)).cos();
+            sinc * window
+        })
+        .collect();
+    (0..x.len())
+        .map(|n| {
+            let mut sum = 0.0;
+            for (i, &h) in coefficients.iter().enumerate() {
+                let index = n as i64 - (i as i64 - HALF);
+                if let Some(&sample) = x.get(index as usize) {
+                    sum += h * sample;
+                }
+            }
+            sum
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

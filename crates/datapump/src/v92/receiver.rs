@@ -76,10 +76,27 @@ const SU_SHAPE: [f64; RU_PERIOD] = [1.0, 0.0, 1.0, -1.0, 0.0, -1.0];
 /// shapes: what 8.5.6 prints, and what a filtered one looks like.
 const SU_FILTERED: [f64; RU_PERIOD] = [0.0, 0.866, 0.866, 0.0, -0.866, -0.866];
 
+/// Periods a shape may go on matching neither itself nor its inverse before
+/// the hunt gives up on it: see the stray handling in [`Receiver::recognise`].
+const STRAY_PERIODS: u32 = 5;
+
 /// How well a window has to match a shape before it is that sequence. Through
 /// a line that has not smeared a whole symbol the match is better than 0.99;
 /// 0.85 leaves room for one that has smeared a little.
 const MATCHED: f64 = 0.90;
+
+/// And the gate for [`turned_share`]: see there.
+const TURNED_MATCHED: f64 = 0.75;
+
+/// The coarser grid the shapes themselves are looked for on.
+///
+/// It is the same problem one level up: Ru is three symbols up and three down,
+/// so a far end half a symbol off the network's instants puts a smoothed version
+/// of that shape on the line -- a trapezoid rather than a square -- and its
+/// correlation against the printed shape is 0.89, which is below [`MATCHED`].
+/// Measured, a two-point rig half a symbol out never found Ru at all and the
+/// call never started. Four steps is a quarter of a symbol either way.
+const ACQUIRE_STEPS: usize = 4;
 
 /// How many samples of history the receiver keeps: enough for the training
 /// fit, the epsilon estimator and a channel estimate to all look at the same
@@ -99,7 +116,7 @@ pub const TRAIN_TAPS: usize = 48;
 /// Symbols of TRN1u the fit is taken over while the arrival point is being
 /// searched for. TRN1u is at least 2040T (8.5.6), and a narrow window keeps the
 /// hundred and thirty fits of that search affordable.
-const TRAIN_WINDOW: usize = 1200;
+pub const TRAIN_WINDOW: usize = 1200;
 
 /// And the window the winner of that search is fitted over again.
 ///
@@ -118,6 +135,13 @@ const TRAIN_REFIT_BELOW: f64 = 24.0;
 
 /// How many stretches of TRN1u the training will try before giving up.
 pub const TRAIN_TRIES: usize = 3;
+
+/// Symbols of TRN1u the alignment search correlates over.
+///
+/// A few hundred symbols of a scrambled two-point sequence is a spike against
+/// anything else on the line, and the window still has to fit inside the
+/// second TRN1u, which is 2040T at its shortest (9.5.2.1.9).
+pub const ALIGN_WINDOW: usize = 512;
 
 /// What the fit cannot do, and the measurement that says so.
 ///
@@ -216,7 +240,148 @@ fn correlate(window: &[f64], template: &[f64; RU_PERIOD]) -> f64 {
     together / (window_power * template_power).sqrt().max(1e-30)
 }
 
-/// What the hunt is currently hearing.
+/// The anchor's six samples with `by` taken off the time axis -- `out[n]` is
+/// `template[n - by]` -- which is what this part of the received sequence looks
+/// like once the far end has stepped its transmitter.
+///
+/// It is a shift in the *band-limited* sense, which for a sequence that repeats
+/// every six samples is exact: one period is all six bins, and a delay by `by`
+/// samples multiplies bin k by `exp(-2*pi*i*k*by/6)`. That matters here and a
+/// cubic through the six samples would not do: Su puts two thirds of its power
+/// at 4000 Hz, which is Nyquist, and an interpolator that quietly attenuates
+/// that part (a cubic leaves twelve percent of it) turns the half-symbol step
+/// the S-bar-u makes into a correlation of -0.5 instead of -1, which is what the
+/// first version of this measured.
+fn reread(template: &[f64; RU_PERIOD], by: f64) -> [f64; RU_PERIOD] {
+    let mut re = [0.0; RU_PERIOD];
+    let mut im = [0.0; RU_PERIOD];
+    for (k, (re, im)) in re.iter_mut().zip(im.iter_mut()).enumerate() {
+        for (n, &x) in template.iter().enumerate() {
+            let (cos, sin) = basis(2 * k * n);
+            *re += x * cos;
+            *im -= x * sin;
+        }
+    }
+    for (k, (re, im)) in re.iter_mut().zip(im.iter_mut()).enumerate() {
+        // Bins past the middle are the *negative* frequencies: bin 5 of six is
+        // a turn in the other direction, and a delay turns it the other way.
+        // Getting that wrong leaves a whole turn per symbol in the answer, which
+        // is invisible (and harmless) at whole symbols and wrong everywhere
+        // else.
+        let signed = if 2 * k > RU_PERIOD { k as f64 - RU_PERIOD as f64 } else { k as f64 };
+        let theta = -std::f64::consts::TAU * signed * by / RU_PERIOD as f64;
+        let (sin, cos) = theta.sin_cos();
+        let (r, i) = (*re, *im);
+        *re = r * cos - i * sin;
+        *im = r * sin + i * cos;
+    }
+    let mut out = [0.0; RU_PERIOD];
+    for (n, slot) in out.iter_mut().enumerate() {
+        let mut sum = 0.0;
+        for (k, (&re, &im)) in re.iter().zip(im.iter()).enumerate() {
+            let (cos, sin) = basis(2 * k * n);
+            sum += re * cos - im * sin;
+        }
+        *slot = sum / RU_PERIOD as f64;
+    }
+    out
+}
+
+/// `cos` and `sin` of `2*pi*index/RU_PERIOD`, which for six is a multiple of
+/// thirty degrees: twelve values, worked out once.
+fn basis(index: usize) -> (f64, f64) {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[(f64, f64); 12]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [(0.0, 0.0); 12];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let theta = std::f64::consts::TAU * i as f64 / 12.0;
+            *slot = (theta.cos(), theta.sin());
+        }
+        table
+    });
+    table[index % 12]
+}
+
+/// How well a window matches a template at any of `steps` sub-symbol alignments:
+/// what the shape hunt needs, because a far end half a symbol off the network's
+/// instants puts a smoothed version of Ru on the line whose correlation against
+/// the printed shape is 0.89 -- below [`MATCHED`], and the call never starts.
+fn best_share(window: &[f64], template: &[f64; RU_PERIOD], steps: usize) -> f64 {
+    let mut best = correlate(window, template);
+    for step in 1..steps {
+        let by = (RU_PERIOD as f64) * step as f64 / steps as f64;
+        let share = correlate(window, &reread(template, by));
+        if share.abs() > best.abs() {
+            best = share;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod reread_tests {
+    use super::*;
+
+    /// The re-read is a shift in the band-limited sense, and it has to be
+    /// exact: a reversal at the step the far end took is only visible through
+    /// it.
+    #[test]
+    fn reread_is_a_shift() {
+        for shift in [0.0, 0.25, 0.5, 0.75] {
+            let tone: [f64; RU_PERIOD] = std::array::from_fn(|n| {
+                (std::f64::consts::TAU * ((n as f64) - shift) / RU_PERIOD as f64).cos()
+            });
+            let step: [f64; RU_PERIOD] = std::array::from_fn(|n| {
+                (std::f64::consts::TAU * (n as f64) / RU_PERIOD as f64).cos()
+            });
+            let moved = reread(&step, shift);
+            for n in 0..RU_PERIOD {
+                assert!(
+                    (moved[n] - tone[n]).abs() < 1e-9,
+                    "shift {shift}: {moved:?} against {tone:?}"
+                );
+            }
+        }
+    }
+}
+
+/// How well a window has to match the anchor *turned over* before the hunt
+/// calls it that: see [`turned_share`].
+///
+/// Lower than [`MATCHED`], because the comparison is against a *reconstructed*
+/// window rather than against samples the line actually brought: a sub-symbol
+/// step takes the 4000 Hz third of Su out of the sample instants entirely, so
+/// what is left to correlate is one component of three. Measured at the S-bar-u
+/// of a 24.5T step through a 3.4 kHz line, the match is 0.88 against a gate of
+/// 0.90 -- which is why this is not the same number.
+///
+/// **A reversal is not always an exact negation at the sampling instants, and
+/// the difference matters here more than anything else in this file.**
+/// 9.5.2.1.7's S-bar-u is 24.5T: it starts half a symbol after the Su it
+/// answers, so every symbol of it arrives half a symbol late as well as
+/// inverted, and the S-bar-u that answers Jp is (24 + epsilon)T, a step of
+/// epsilon. Su is nearly a single tone, and **a tone moved half a period is its
+/// own negation** -- so "inverted and half a symbol late" arrives as a thirtieth
+/// of a turn and nothing else, and a detector that only negates in place misses
+/// it entirely. Measured on a fractionally delayed rig, that detector reports
+/// the *return* transition instead, a whole S-bar-u late, after which the
+/// digital modem waits out its deadline for a Jp it never sends.
+///
+/// The step is not guessed at: 9.5.2.1.7 fixes the first S-bar-u at 24.5T,
+/// 9.5.2.1.8 fixes the second at (24 + epsilon)T, and the digital modem is the
+/// end that chose epsilon.
+fn turned_share(window: &[f64], template: &[f64; RU_PERIOD], step: f64) -> f64 {
+    // In place first: a reversal with no timing step is an exact negation, and
+    // that is what Ru-to-R-bar-u is and what a far end that ignored Jp gives.
+    let mut best = -correlate(window, template);
+    if step.abs() > 1e-6 {
+        best = best.max(-correlate(window, &reread(template, step)));
+    }
+    best
+}
+
+/// What the hunt is currently hearing./// What the hunt is currently hearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hunt {
     /// No sequence yet, or the last one has been accounted for.
@@ -348,6 +513,11 @@ pub struct Receiver {
     /// hunt goes back to choosing on shape, which is what it wants when the
     /// timetable cannot say.
     expected: Option<Hunt>,
+    /// How far the far end's transmitter will step when the sequence next turns
+    /// over, in symbols: 0.5 for 9.5.2.1.7's 24.5T S-bar-u, epsilon for the one
+    /// that answers Jp (9.5.2.1.8), 0 between Ru and R-bar-u. See
+    /// [`turned_share`].
+    step: f64,
     /// Where the hunt has got to: what it has been hearing, and for how long.
     state: Hunt,
     /// What the first good match looked like: the polarity everything after
@@ -385,6 +555,7 @@ impl Receiver {
             recent: VecDeque::new(),
             products: VecDeque::new(),
             expected: None,
+            step: 0.0,
             state: Hunt::Searching,
             anchor: None,
             taps: Vec::new(),
@@ -441,6 +612,21 @@ impl Receiver {
     /// Look for Su only: what answers Jd, and what Sd is shaped like.
     pub fn expect_su(&mut self) -> &mut Self {
         self.expect(Hunt::Su)
+    }
+
+    /// How far the far end's transmitter will step when the sequence next turns
+    /// over, in symbols: 0.5 for the S-bar-u of 9.5.2.1.7, epsilon for the one
+    /// of 9.5.2.1.8, and 0 between Ru and R-bar-u.
+    ///
+    /// It is what a reversal looks like in the received samples, and the
+    /// timetable knows it before it happens: see [`turned_share`].
+    pub fn expect_step(&mut self, step: f64) -> &mut Self {
+        // Wrapped to the shape's own period and not to one symbol: the sign of
+        // the step is most of what it says (a far end that extends its S-bar-u
+        // and one that shortens it look nothing alike), and `rem_euclid(1.0)`
+        // turns half a symbol early into half a symbol late.
+        self.step = step.rem_euclid(RU_PERIOD as f64);
+        self
     }
 
     /// Go back to choosing between the two on shape alone.
@@ -521,6 +707,88 @@ impl Receiver {
             return Vec::new();
         }
         self.history.iter().skip(from).copied().collect()
+    }
+
+    /// The absolute symbol index of the oldest sample history still holds.
+    ///
+    /// [`Self::history_since`] and the training fits are indexed against the
+    /// history window, which slides; everything the digital modem says about
+    /// *when* something happened is an absolute symbol count. This is the one
+    /// number that goes between them.
+    #[must_use]
+    pub fn history_base(&self) -> u64 {
+        self.count.saturating_sub(self.history.len() as u64)
+    }
+
+    /// The line's own samples between two absolute symbol indices, clipped to
+    /// what history still holds.
+    ///
+    /// This is what Jp's epsilon is measured on: the phase of Su's fundamental
+    /// in the received signal, not in the equaliser's output (see
+    /// [`crate::v92::epsilon`]).
+    #[must_use]
+    pub fn history_range(&self, from: u64, to: u64) -> Vec<f64> {
+        let base = self.history_base();
+        let lo = from.max(base);
+        let hi = to.min(base + self.history.len() as u64);
+        if hi <= lo {
+            return Vec::new();
+        }
+        self.history.iter().skip((lo - base) as usize).take((hi - lo) as usize).copied().collect()
+    }
+
+    /// Where TRN1u begins, within `search` symbols of the history index `from`,
+    /// by correlating the line against the sequence rather than by fitting at
+    /// every alignment.
+    ///
+    /// The first TRN1u's start is known to the hunt's own accuracy: Ru's
+    /// reversal comes out within a period and TRN1u starts 24T after it, which
+    /// is what [`Self::train_near`]'s hundred and thirty least squares over
+    /// ±[`TRAIN_SEARCH`] are for. The **second** one is not known that well --
+    /// it starts 24T plus epsilon after a reversal the hunt may report a period
+    /// late -- and a fit against the wrong alignment is a fit against the wrong
+    /// sequence, which is why the refit never happened on a real line.
+    ///
+    /// TRN1u is a scrambled two-point sequence, so its autocorrelation is a
+    /// spike and everything else on the line (Su, CPt, a codec's silence) is
+    /// not: a correlation over [`ALIGN_WINDOW`] symbols costs a few hundred
+    /// thousand multiplies and can afford to look a long way either side.
+    #[must_use]
+    pub fn align_trn1u(&self, from: u64, search: u64, window: usize) -> Option<(u64, f64)> {
+        let len = self.history.len();
+        let window = window.min(len);
+        if window <= RU_PERIOD {
+            return None;
+        }
+        let reference = reference(0, window, self.reference_mode)?;
+        let lo = (from as usize).saturating_sub(search as usize);
+        let hi = (from as usize + search as usize).min(len.saturating_sub(window));
+        if lo > hi {
+            return None;
+        }
+        let mut best: Option<(f64, f64, usize)> = None;
+        for start in lo..=hi {
+            let (mut together, mut power) = (0.0, 0.0);
+            for (n, &wanted) in reference.iter().enumerate() {
+                let x = self.history[start + n];
+                together += x * wanted;
+                power += x * x;
+            }
+            if !(power > 0.0) {
+                continue;
+            }
+            // How much of the window's own energy is TRN1u at this alignment:
+            // 1 when the line carries exactly the sequence wanted, nothing like
+            // it anywhere else.
+            let quality = together.abs() / power.sqrt() / (window as f64).sqrt();
+            if best.is_none_or(|(found, _, _)| quality > found) {
+                best = Some((quality, together.abs() / power.sqrt(), start));
+            }
+        }
+        if std::env::var_os("V92_TRACE").is_some() {
+            eprintln!("V92TRACE: align_trn1u(from {from} +/-{search}) best {best:?}");
+        }
+        best.map(|(quality, _, start)| (start as u64, quality))
     }
 
     /// How many samples of history the receiver holds.
@@ -605,10 +873,18 @@ impl Receiver {
                 }
                 return false;
             }
-            if share > -MATCHED {
-                // Neither. One of these is the period the sequence turned over
-                // in; two in a row means something else is being sent now.
-                if anchor.stray < 1 {
+            // Neither the same window nor its inverse in place. Ask the other
+            // question a reversal can be: the anchor turned over *at the step
+            // the timetable is about to take* (see [`turned_share`]).
+            let turned = turned_share(&window, &anchor.template, self.step) > TURNED_MATCHED;
+            if !turned {
+                // Neither the sequence nor its inverse: this is one of the
+                // periods the change went through. At a sub-symbol step it takes
+                // more than one -- the far end's transmit filter and the timing
+                // step between them smear the join over a symbol or two -- so
+                // the anchor is held for a few and only dropped when the change
+                // outlasts them.
+                if anchor.stray < STRAY_PERIODS {
                     anchor.stray += 1;
                     return false;
                 }
@@ -661,7 +937,7 @@ impl Receiver {
                 for (i, slot) in template.iter_mut().enumerate() {
                     *slot = shape[(i + phase) % RU_PERIOD];
                 }
-                let size = correlate(&window, &template).abs();
+                let size = best_share(&window, &template, ACQUIRE_STEPS).abs();
                 if size > best.0 {
                     best = (size, kind);
                 }
@@ -672,9 +948,9 @@ impl Receiver {
             return false;
         }
         self.anchor = Some(Anchor {
-            template: window.try_into().unwrap_or([0.0; RU_PERIOD]),
             kind: best.1,
             phase: at % RU_PERIOD as u64,
+            template: window.try_into().unwrap_or([0.0; RU_PERIOD]),
             held: 1,
             stray: 0,
         });
@@ -811,6 +1087,26 @@ impl Receiver {
         true
     }
 
+    /// Fit the equaliser at an alignment that has already been verified, without
+    /// the signal-to-noise gate [`Self::train_near`] applies.
+    ///
+    /// The refit on the second TRN1u (9.5.2.1.9) is taken on a line where a
+    /// two-point stream cannot clear that gate however right the alignment is:
+    /// two thirds of TRN1u's power is at 4000 Hz, a telephone line has nothing
+    /// there, and a fit of the samples against the symbols they stand for
+    /// therefore measures about 15 dB on a real line and 13 on a harness with a
+    /// 3.4 kHz filter. What the refit needs is *when*, and the caller has just
+    /// said when: see [`Self::align_trn1u`].
+    pub fn train_verified(&mut self, from: u64, window: usize) -> bool {
+        if !self.fit_window(from as usize, window) {
+            return false;
+        }
+        self.trained = true;
+        self.trained_at = from as usize;
+        self.events.push_back(Heard::Trained { snr_db: self.snr_db });
+        true
+    }
+
     /// One least-squares fit of the equaliser against the known sequence
     /// starting at `from`.
     fn fit(&mut self, from: usize) -> bool {
@@ -891,7 +1187,7 @@ impl Receiver {
 }
 
 /// TRN1u's symbols from `from` onwards, as many as the history holds.
-fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f64>> {
+pub(crate) fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f64>> {
     if length <= from + TRAIN_TAPS {
         return None;
     }
@@ -936,6 +1232,115 @@ mod tests {
     }
 
     const RU_SYMBOLS_LOCAL: usize = 384;
+
+    /// 9.5.2.1.7: Su for 144T, then S-bar-u for 24.5T -- which starts half a
+    /// symbol late, so the S-bar-u is the Su's own inverse **a half symbol
+    /// further along** rather than in place. The reversal still has to be seen:
+    /// it is what tells the digital modem that the Su it measures epsilon on is
+    /// coming, and that is what Jp waits for.
+    ///
+    /// The half symbol is the hard part, and a line that has band-limited Su to
+    /// its fundamental is the hard version: a tone moved half a period is its
+    /// own negation, so the step and the inversion cancel and a detector that
+    /// only negates in place sees `cos(150) = -0.866` where it needs less than
+    /// -0.9. This end knows the step the timetable is about to make, so it does
+    /// not have to guess at it.
+    #[test]
+    fn a_reversal_is_seen_through_the_half_symbol_the_s_bar_u_steps() {
+        for step in [0.0, 0.3, 0.5, 0.7] {
+            let mut rx = Receiver::new();
+            rx.expect_su();
+            rx.expect_step(step);
+            // What the far end puts on the line, on its own symbol grid: Su,
+            // then S-bar-u. Its transmit filter runs over the whole of it, and
+            // its transmitter steps at the join, so what the network samples is
+            // the filtered sequence read `step` late from there on.
+            // Su 144T, S-bar-u 24.5T, then Su again -- the run that goes on
+            // until Jp.
+            let mut sent: Vec<f64> = (0..144u64).map(|n| su(n, false)).collect();
+            sent.extend((144..168u64).map(|n| su(n, true)));
+            sent.extend((168..440u64).map(|n| su(n, false)));
+            #[allow(unused_assignments)]
+            // A 3.4 kHz linear-phase low-pass at 8 kHz, 31 taps: what a
+            // telephone line leaves of Su, and the filter a numerator like this
+            // one always is -- no phase to confuse the timing with.
+            const HALF: i64 = 15;
+            let taps: Vec<f64> = (-HALF..=HALF)
+                .map(|k| {
+                    let x = k as f64;
+                    let sinc = if x.abs() < 1e-12 {
+                        2.0 * 3400.0 / 8000.0
+                    } else {
+                        (std::f64::consts::PI * x * 2.0 * 3400.0 / 8000.0).sin()
+                            / (std::f64::consts::PI * x)
+                    };
+                    sinc * (0.54 + 0.46 * (std::f64::consts::PI * x / (HALF as f64 + 1.0)).cos())
+                })
+                .collect();
+            let sum: f64 = taps.iter().sum();
+            let mut filtered = Vec::with_capacity(sent.len());
+            for n in 0..sent.len() {
+                let mut value = 0.0;
+                for (k, &tap) in taps.iter().enumerate() {
+                    if let Some(&sample) = n.checked_sub(k).and_then(|i| sent.get(i)) {
+                        value += tap * sample;
+                    }
+                }
+                filtered.push(value / sum);
+            }
+            sent = filtered;
+            let mut line: Vec<f64> = sent[..144].to_vec();
+            for n in 144..440 {
+                line.push(read_at(&sent, n as f64 - step));
+            }
+            let mut found = Vec::new();
+            for (n, &level) in line.iter().enumerate() {
+                rx.feed(level);
+                while let Some(event) = rx.heard() {
+                    if !matches!(event, Heard::Symbol(_)) {
+                        found.push((event, n));
+                    }
+                }
+            }
+            assert!(
+                found.iter().any(|(e, _)| matches!(e, Heard::Su { .. })),
+                "no Su at step {step}: {found:?}"
+            );
+            let reversal = found
+                .iter()
+                .find(|(e, _)| matches!(e, Heard::SuReversal { .. }))
+                .unwrap_or_else(|| panic!("no reversal at step {step}: {found:?}"));
+            let at = match reversal.0 {
+                Heard::SuReversal { at } => at,
+                _ => unreachable!(),
+            };
+            // The line's own filter delays everything by half its length, and
+            // the hunt reports a reversal up to a period after it.
+            assert!((140..190).contains(&at), "reversal at {at}, step {step}");
+        }
+    }
+
+    /// One sample of `sent` read between two symbols, the way a line's own
+    /// band-limited path would: a Hamming-windowed sinc, short enough that the
+    /// ringing it puts around the join is the far end's transmit filter's and
+    /// not the interpolation's.
+    fn read_at(sent: &[f64], at: f64) -> f64 {
+        let base = at.floor();
+        let fraction = at - base;
+        let mut out = 0.0;
+        for k in -8i64..=8 {
+            let index = (base as i64 + k).max(0) as usize;
+            let Some(&x) = sent.get(index) else { continue };
+            let t = fraction - k as f64;
+            let sinc = if t.abs() < 1e-12 {
+                1.0
+            } else {
+                (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t)
+            };
+            out += x * sinc * (0.54 + 0.46 * (std::f64::consts::PI * t / 9.0).cos());
+        }
+        out
+    }
 
     /// Su is found through the zeros Ru does not have, and its reversal too.
     #[test]

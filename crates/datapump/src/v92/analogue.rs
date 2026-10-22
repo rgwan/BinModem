@@ -401,6 +401,14 @@ pub struct Modem {
     /// The sub-symbol delays S-bar-u carries, in the order they are to be
     /// applied: half a symbol, then epsilon (`v92::transmit`).
     delays: Vec<f64>,
+    /// Whether the Su on the line is A6's first one, which is 144T long.
+    ///
+    /// A7's Su -- the one after the 24.5T S-bar-u -- is not: it "runs on until
+    /// Jp", and the digital modem is allowed to take its time working out
+    /// epsilon before it sends one. Cutting that run at 144T as well would put
+    /// a S-bar-u nobody asked for into the middle of the measurement the digital
+    /// modem is still making, and a second half symbol into the transmitter.
+    su_short: bool,
     now: u64,
     lead_in: u64,
     ja_began: Option<u64>,
@@ -443,6 +451,7 @@ impl Modem {
             jp: None,
             circuit107: false,
             delays: Vec::new(),
+            su_short: false,
             now: 0,
             lead_in: (LEAD_IN * FS) as u64,
             ja_began: None,
@@ -614,11 +623,12 @@ impl Modem {
                 }
             }
             Up::Su => {
-                if self.source.count >= SU_SYMBOLS {
+                if self.su_short && self.source.count >= SU_SYMBOLS {
                     // A7: 24.5T of S-bar-u. The half symbol is the
                     // transmitter's, and this is where it is asked for.
                     self.source.start(Up::SuBar);
                     self.delays.push(HALF_SYMBOL);
+                    self.su_short = false;
                 }
             }
             Up::SuBar => {
@@ -831,9 +841,10 @@ impl Modem {
                 self.far_jd = Some(jd);
                 self.su_by = None;
                 self.jd_deadline = None;
-                // A6: Su at once. This end may wait up to 5 s for a better
-                // moment and has no reason to.
+                // A6: Su at once, for 144T. This end may wait up to 5 s for a
+                // better moment and has no reason to.
                 self.source.start(Up::Su);
+                self.su_short = true;
                 self.stage = Stage::Su;
                 self.notes.push(format!("Jd read, lookahead {}", jd.lookahead));
             }
