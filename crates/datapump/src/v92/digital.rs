@@ -451,6 +451,9 @@ pub struct Modem {
     trn_from: Option<u64>,
     /// Consecutive zero bits decoded, which is how E1u is seen (8.5.2).
     zeroes: usize,
+    /// Bits the Ja reader has produced, and ones in the last stretch of them.
+    ja_bits: u64,
+    ja_ones: u64,
     /// Symbols since Phase 2 ended.
     now: u64,
     ja_deadline: Option<u64>,
@@ -484,6 +487,8 @@ impl Modem {
             descriptor: None,
             cpt: None,
             trn_from: None,
+            ja_bits: 0,
+            ja_ones: 0,
             zeroes: 0,
             now: 0,
             ja_deadline,
@@ -737,10 +742,19 @@ impl Modem {
     fn symbol(&mut self, symbol: Symbol) {
         match self.stage {
             Stage::ReadJa => {
-                if let Some(bit) = self.reader.feed(symbol.value)
-                    && let Some(descriptor) = self.ja.feed(bit)
-                {
-                    self.heard_ja(descriptor);
+                if let Some(bit) = self.reader.feed(symbol.value) {
+                    self.ja_bits += 1;
+                    self.ja_ones += u64::from(bit);
+                    if tracing() && self.ja_bits % 400 == 0 {
+                        eprintln!(
+                            "V92TRACE: Ja reader {} bits, {} ones, value {:.3}",
+                            self.ja_bits, self.ja_ones, symbol.value
+                        );
+                        self.ja_ones = 0;
+                    }
+                    if let Some(descriptor) = self.ja.feed(bit) {
+                        self.heard_ja(descriptor);
+                    }
                 }
             }
             Stage::Dil | Stage::Ri | Stage::RiBar => {
