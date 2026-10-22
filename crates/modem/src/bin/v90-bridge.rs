@@ -133,6 +133,7 @@ fn main() -> ExitCode {
     let mut last_state = (modem.state(), String::new(), String::new());
     let mut sent_greeting = false;
     let mut hung_up = false;
+    let trace = std::env::var_os("MODEM_TRACE").is_some();
     let mut seen_dte: Vec<u8> = Vec::new();
     let mut line: Vec<f64> = Vec::with_capacity(4096);
 
@@ -176,6 +177,16 @@ fn main() -> ExitCode {
         seen_dte.extend(data);
         for note in modem.take_line_notes() {
             log.say(&format!("{elapsed:8.3}  note: {note}"));
+        }
+        if trace {
+            for crossed in modem.take_frame_log() {
+                let hex: String = crossed.body.iter().map(|b| format!("{b:02x}")).collect();
+                log.say(&format!(
+                    "{elapsed:8.3}  frame {} {} {hex}",
+                    if crossed.outbound { "out" } else { "in " },
+                    if crossed.intact { "ok  " } else { "bad " },
+                ));
+            }
         }
 
         let state = modem.state();

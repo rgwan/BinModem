@@ -2605,6 +2605,9 @@ impl Modem {
 
     /// End the call and tell the terminal why.
     fn end_call(&mut self, why: Ended) {
+        if std::env::var_os("MODEM_TRACE").is_some() {
+            eprintln!("[modem] end_call: {why:?} in {:?}", self.state);
+        }
         self.drop_call();
         self.at.emit(match why {
             Ended::LocalRequest => ResultCode::Ok,

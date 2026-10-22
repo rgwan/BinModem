@@ -367,6 +367,10 @@ struct Compressor {
     /// uncompressed, because nothing has agreed that the far end would read
     /// anything else.
     speculative: bool,
+    /// Turned on by an XID exchange rather than handed over configured, so
+    /// that a later XID naming no compression can take it away again. What is
+    /// set from above was never negotiated and is not an XID's to withdraw.
+    negotiated: bool,
 }
 
 impl Compressor {
@@ -694,6 +698,9 @@ impl Stack {
     /// decompress data that was never compressed and deliver nonsense.
     pub fn with_compression(mut self, params: v42bis::Params) -> Self {
         self.enable_compression(params);
+        if let Some(c) = self.compression.as_mut() {
+            c.negotiated = false;
+        }
         self
     }
 
@@ -705,6 +712,7 @@ impl Stack {
                 params,
             })),
             speculative: false,
+            negotiated: true,
         });
     }
 
@@ -718,6 +726,7 @@ impl Stack {
                 receive,
             })),
             speculative: false,
+            negotiated: true,
         });
     }
 
@@ -1253,6 +1262,25 @@ impl Stack {
             self.enable_v44(offer.transmit, offer.receive);
         } else if let Some(params) = agreed.v42bis_params() {
             self.enable_compression(params);
+        } else if !self.lapm.is_connected() {
+            // An XID can take compression away again, and this one did: an
+            // Agere SV92PP answered with V.44 in its first XID and then sent
+            // a second, immediately before its SABME, naming no compression
+            // at all. Holding on to the first answer left this end encoding
+            // every frame of the new connection with a dictionary the far
+            // end had just withdrawn, and it answered the first I frame with
+            // "LAPM disconnected (protocol error)" and a DISC -- four hundred
+            // milliseconds into data mode, with the greeting still in the
+            // buffer.
+            //
+            // Only before the connection is up: the agreement is settled then
+            // and nothing has been sent under it. Once frames are crossing,
+            // withdrawing compression is V.42bis 5.6's re-initialisation at
+            // both ends rather than a silent switch here, which is what the
+            // undecodable-stream path further down is for.
+            if self.compression.as_ref().is_some_and(|c| c.negotiated) {
+                self.compression = None;
+            }
         }
         if agreed.fcs32 {
             self.agreed_fcs = Fcs::Bits32;
