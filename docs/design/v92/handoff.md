@@ -164,18 +164,36 @@ Agere 侧：Jd detected / Jp detected / Jd' detected / "CPt sent" / PCM phase 3 
 而**泵在 `Status::Failed` 时不会真的重训**，所以 HSF 这条路现在会干等到窗口结束，
 不会再自动回落到 V.90 数据态（`agr92b` 那种 `CONNECT 31200/52000` 的回落看不到了）。
 
+**卡点是上行符号定时，不是 CPt 解码器**（`c4b4081` 已定量）：
+
+| 分数符号偏移 | 同一套拟合 |
+|---|---|
+| 0 | 166 dB |
+| 1/4 符号 | 156 dB |
+| **1/2 符号** | **19 dB** |
+| 3/4 符号 | 157 dB |
+
+- CPt 解码器**本身是对的**：`a_cpt_reads_back_through_a_band_limited_line`
+  用带限信道 + TRN1u 训练后能读回 Table 23 的 CPt。
+- 长窗重拟合（1200 → 4800 符号）只把 15.4 提到 **15.6 dB**：方程数不是瓶颈。
+- 所以瓶颈是**接收机在网络采样时刻切片，不管对端的符号钟**。半符号偏就是
+  "两个相邻符号之和"，任何均衡器都补不回来；CPt 的 CRC 需要约 30 dB。
+
 **下一步（按收益排序）**
 
-1. **解 CPt**：15.4 dB 的 2 点流按说不该 CRC 全军覆没。先在 `cpt_bit` 里把
-   `CpFinder` 的候选打印出来（`CpFinder::v92(JA_UNIT_BITS)` 的 loose sync 只作用于
-   第一个 CPt），再核对 Agere 的 `CPt sent 80 0 2000 0` 里 drn/type 是不是 Table 23 的
-   位置；必要时用 `agr-tx.raw` 离线跑一个专用解码器比对期望位。
-2. **失败要能重训**：`Status::Failed` 现在只写笔记；泵应该在 Phase 3/4 失败时走
-   `9.7.2.1`（70 ms 静音 + tone A）。这也是 HSF 台架回落到 V.90 的前提。
-3. **重训要保住 V.92 旗标**（`v34/phase2.rs::again()`，code-analogue §11.2 的老 TODO）：
-   现在重训后会退回 Table 10（P2TRACE 里第二次 `table10 true`），V.92 只能试一次。
-4. 上行 SNR 15.4 dB 偏低（Agere 自估 48 dB）：值得查一下 Agere 的 PCM 上行频谱成形
-   （它日志里的 `PCM Spectral Shaping Bits: 0`）与我们的 8 kHz 采样相位。
+1. **上行符号定时恢复**（唯一真正解锁 CPt 的事）：在 `v92::receiver` 的切片前
+   加插值/定时环，或让拟合同时解一个分数延迟（Fractionally-spaced equaliser：
+   2 样点/符号降采样）。验证口径：Agere 的 TRN1u 拟合从 15.6 dB 上到 30 dB 以上，
+   然后 `CPt drn` 出现在 binmodem 日志里、对端不再 clear down。
+2. **失败重训已经接好的部分**：`v90/startup.rs:617` 的 `v92` 分支在
+   `pcm::Status::Failed` 且 `failed_starts < V90_RETRAINS` 时会 `restart_phase2()`——
+   但重训后对端仍回 Table 18，于是又进 V.92 再失败一次。真机要的是
+   **第 N 次失败后拒绝 PCM 上行**（`decline_pcm()`，V.90 分支已有这个动作，V.92 没有）。
+3. **重训保住 V.92 旗标**（`v34/phase2.rs::again()`，code-analogue §11.2 的老 TODO）：
+   现在重训后会退成 Table 10（P2TRACE 第二次 `table10 true`）。
+4. 采集文件不可全信：`agr-tx.raw` 上用接收机链连 TRN1u 都拟合不过 0 dB（在线是 15.4），
+   说明这份 raw 与线路上真正听到的不是同一个信号（或采样率/格式不同）。
+   `tests/v92_capture.rs` 的两个诊断就是为这件事留的。
 
 ## 6. 三个模拟对端的事实
 
