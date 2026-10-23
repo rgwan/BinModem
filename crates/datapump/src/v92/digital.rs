@@ -793,9 +793,20 @@ impl Source {
     }
 
     /// Whether B1d wants more codewords.
+    ///
+    /// B1d counts while it is only *asked* for as well: `begin_data` queues the
+    /// signal at the symbol that ends Ed, but B1d's first symbol is produced a
+    /// tick later, and the queue has to be full *before* it is. Until this said
+    /// so, `fill_downstream` was a no-op there (it asks this), so the first B1d
+    /// symbol found the queue empty and the B1d arm fell back to the U_INFO
+    /// codeword -- one symbol of not-B1d in front of the forty-eight data
+    /// frames. Six symbols are a data frame and the far end counts them from
+    /// Sd, so one extra symbol rotates every interval in the call: it slices the
+    /// right codewords into the wrong six, the sign bits and the modulus bits
+    /// come from the wrong places, and what it descrambles is noise.
     #[must_use]
     pub fn needs_codes(&self) -> bool {
-        self.out == Out::B1d && self.codes.len() < 2 * INTERVALS
+        (self.out == Out::B1d || self.pending == Some(Out::B1d)) && self.codes.len() < 2 * INTERVALS
     }
 
     fn level(&self, ucode: u8, positive: bool) -> f64 {
