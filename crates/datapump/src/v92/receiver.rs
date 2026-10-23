@@ -1262,6 +1262,21 @@ impl Receiver {
         // Recommendation's drawing: see `measure_levels`.
         self.measure_levels(value);
         let shown = value * self.gain;
+        {
+            // The demodulator's own account of itself, so that two runs of the
+            // same call which differ only by the codec's quantising can be told
+            // apart by the gain it settled on and by how often the slicer's
+            // error left the tier's span.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("V92_RX_TRACE").is_some() && n % 4000 == 0 {
+                eprintln!(
+                    "V92RX symbol {n} gain={:.6} right={} wrong={} lost={} value={:.4}",
+                    self.gain, self.right, self.wrong, self.lost, shown
+                );
+            }
+        }
         let index = self.origin.map_or(self.count, |origin| self.count.saturating_sub(origin));
         let chosen = self.slicer.decide(shown);
         let span = self.slicer.half_span();
