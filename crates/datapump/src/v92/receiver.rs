@@ -191,6 +191,16 @@ pub const DFE_FORWARD: usize = 48;
 /// exactly what a DFE takes out.
 pub const DFE_FEEDBACK: usize = 16;
 
+/// How far the feed-forward section may move per symbol in data mode, as a
+/// fraction of the tap norm: a decision-directed step, and nothing more.
+///
+/// The fit is designed once, on TRN2u, and then the line moves under it. What
+/// moves is the far end's own (independent) clock and the small variations of a
+/// real loop; the two are exactly what the receiver's data-mode equaliser is
+/// for. It is not a second design pass -- that is the fit's job, and a loop
+/// that re-designed itself would be following its own decisions.
+pub const DATA_TRACKING: f64 = 2e-4;
+
 /// Symbols of TRN1u the fit is taken over while the arrival point is being
 /// searched for. TRN1u is at least 2040T (8.5.6), and a narrow window keeps the
 /// hundred and thirty fits of that search affordable.
@@ -740,6 +750,22 @@ pub struct Receiver {
     /// measurement has settled on.
     measured: u32,
     gain: f64,
+    /// The gain the training left in place when data mode began: what the
+    /// data-mode level anchor is allowed to move away from. The far end sets
+    /// its own transmit level and a real line's upstream gain is not fixed, so
+    /// the anchor has to track -- but a tracker that can wander anywhere ends
+    /// up following its own decisions instead of the line, and this is the
+    /// bound that stops it.
+    anchor_gain: f64,
+    /// Running sums for the data-mode anchor: the level the slicer chose and
+    /// the line's sample it was chosen from, so that the scale between them is
+    /// a mean and not a decision.
+    level_by_line: f64,
+    line_by_line: f64,
+    level_seen: u32,
+    /// The decision-directed step the feed-forward section is allowed in data
+    /// mode, relative to the tap norm. Zero leaves the fit alone.
+    tracking: f64,
     trained: bool,
     snr_db: f64,
     /// Where the fit was taken, so that a retry can move on.
@@ -782,6 +808,11 @@ impl Receiver {
             outer: 0.0,
             measured: 0,
             gain: 1.0,
+            anchor_gain: 1.0,
+            level_by_line: 0.0,
+            line_by_line: 0.0,
+            level_seen: 0,
+            tracking: 0.0,
             trained: false,
             snr_db: 0.0,
             trained_at: 0,
@@ -928,6 +959,14 @@ impl Receiver {
         self.slicer = Slicer::Levels(levels);
         self.decided.clear();
         self.measured = 0;
+        self.anchor_gain = self.gain;
+        self.level_by_line = 0.0;
+        self.line_by_line = 0.0;
+        self.level_seen = 0;
+        self.tracking = match std::env::var("V92_TRACK").ok().and_then(|t| t.parse::<f64>().ok()) {
+            Some(step) => step,
+            None => DATA_TRACKING,
+        };
     }
 
     /// 9.5.1.1.10: "the first symbol of the second TRN1u shall be symbol 0 of
@@ -1318,9 +1357,13 @@ impl Receiver {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
             if std::env::var_os("V92_RX_TRACE").is_some() && n % 4000 == 0 {
+                let taps: f64 = (self.forward.iter().map(|t| t * t).sum::<f64>()
+                    / self.forward.len().max(1) as f64)
+                    .sqrt();
                 eprintln!(
-                    "V92RX symbol {n} gain={:.6} right={} wrong={} lost={} value={:.4}",
-                    self.gain, self.right, self.wrong, self.lost, shown
+                    "V92RX symbol {n} gain={:.6} right={} wrong={} lost={} value={:.4} \
+                     taps={taps:.5} tracking={:.1e}",
+                    self.gain, self.right, self.wrong, self.lost, shown, self.tracking
                 );
             }
         }
@@ -1355,6 +1398,13 @@ impl Receiver {
         while self.decided.len() > DFE_FEEDBACK {
             self.decided.pop_front();
         }
+        // The receiver's data-mode equaliser: a decision-directed step on the
+        // feed-forward section, which is what follows the far end's clock and
+        // the slow drift of a real loop after the fit has been designed. It is
+        // deliberately small and deliberately only on the feed-forward half:
+        // the feedback section is the channel's, and a loop that adapted it
+        // too would be re-designing the thing it is meant to be tracking.
+        self.track(value, chosen.map(|(level, _)| level));
         self.events.push_back(Heard::Symbol(Symbol {
             index,
             raw: self.count,
@@ -1383,6 +1433,7 @@ impl Receiver {
     /// the boundary a four-point decision is actually taken at.
     fn measure_levels(&mut self, value: f64) {
         if !matches!(self.slicer, Slicer::FourPoint) {
+            self.anchor_data_levels(value);
             return;
         }
         let size = value.abs();
@@ -1406,6 +1457,78 @@ impl Receiver {
             let wanted = inner / self.inner;
             self.gain = self.gain.clamp(0.75, 1.33).mul_add(0.99, wanted * 0.01);
         }
+    }
+
+    /// One decision-directed step on the feed-forward section.
+    ///
+    /// The error is taken in the line's own units, so it is the same number the
+    /// slicer used less its scale: `decided / gain - value`. Normalised by the
+    /// window's own power, because the step has to mean the same thing at any
+    /// received level.
+    fn track(&mut self, value: f64, decided: Option<f64>) {
+        if self.tracking <= 0.0 || self.gain <= 0.0 || !matches!(self.slicer, Slicer::Levels(_)) {
+            return;
+        }
+        let Some(decided) = decided else { return };
+        let error = decided / self.gain - value;
+        let width = self.forward.len();
+        if width == 0 {
+            return;
+        }
+        let power: f64 = self.history.iter().rev().take(width).map(|&x| x * x).sum();
+        if !(power > 1e-9) {
+            return;
+        }
+        let step = self.tracking * error / power;
+        let len = self.history.len();
+        for (k, tap) in self.forward.iter_mut().enumerate() {
+            *tap += step * self.history[len - 1 - k];
+        }
+    }
+
+    /// Keep the data-mode constellation anchored to the line rather than to
+    /// the level the training measured it at.
+    ///
+    /// Tables 28's data-mode points go out at `G` times odd integers, so a
+    /// receiver that knows `G` needs no level tracking at all -- and a receiver
+    /// that needs none is a receiver that assumes the far end transmits at the
+    /// level the Recommendation prints. It need not: an analogue modem sets its
+    /// own transmit level from its own loop, and on a real call the level that
+    /// arrives is neither `G` nor constant. The training's four-point gain is
+    /// therefore a starting point, not an answer.
+    ///
+    /// What is measured here is the least-squares scale between the slicer's
+    /// own decisions and the line samples they were taken from -- a mean, so
+    /// that one badly-decided symbol moves nothing -- and it is applied slowly
+    /// and only inside [`LEVEL_ANCHOR_RANGE`] of the gain training left. The
+    /// range is the point: an anchor free to go anywhere will eventually
+    /// follow the decisions it is supposed to be checking.
+    fn anchor_data_levels(&mut self, value: f64) {
+        let Some((level, error)) = self.slicer.decide(value * self.gain) else { return };
+        if level == 0.0 || value == 0.0 {
+            return;
+        }
+        // Only the decisions worth trusting: half a level step inside the
+        // boundary, which is where a symbol that the line actually carried
+        // lands.
+        if error > 0.5 * self.slicer.half_span() {
+            return;
+        }
+        self.level_by_line = 0.999f64.mul_add(self.level_by_line, level * value);
+        self.line_by_line = 0.999f64.mul_add(self.line_by_line, value * value);
+        self.level_seen = self.level_seen.saturating_add(1);
+        if self.level_seen < 256 || self.line_by_line.abs() < 1e-12 {
+            return;
+        }
+        let wanted = self.level_by_line / self.line_by_line;
+        let floor = self.anchor_gain * (1.0 - LEVEL_ANCHOR_RANGE);
+        let ceiling = self.anchor_gain * (1.0 + LEVEL_ANCHOR_RANGE);
+        let wanted = wanted.clamp(floor, ceiling);
+        // A hundredth per measurement, so that the anchor is a filter and not
+        // a follower: what it is meant to catch is a line whose level has
+        // moved, which is slow.
+        self.gain = 0.99f64.mul_add(self.gain, 0.01 * wanted);
+        self.level_seen = 0;
     }
 
     /// Train on the TRN1u that begins at history index `from`.
@@ -1965,6 +2088,26 @@ impl Receiver {
         if received.len() < from + reference.len() {
             return false;
         }
+        // `V92_WINDOW_TRACE`: the two sequences a fit is made of, exactly as
+        // they stood when it was made. Everything the fit decides is a
+        // function of these two vectors and of the section lengths, so a
+        // candidate design can be tried on them offline -- where a sweep is a
+        // loop rather than a rebuild -- and only the winner written once.
+        if let Ok(path) = std::env::var("V92_WINDOW_TRACE") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let join = |values: &[f64]| {
+                    values.iter().map(|v| format!("{v:.9}")).collect::<Vec<_>>().join(" ")
+                };
+                let _ = writeln!(
+                    file,
+                    "V92WINDOW from {from} skip {at_skip} window {span} forward {forward} feedback {feedback}"
+                );
+                let _ = writeln!(file, "V92RECEIVED {}", join(&received[from..from + reference.len()]));
+                let _ = writeln!(file, "V92REFERENCE {}", join(&reference));
+                file.flush().ok();
+            }
+        }
         let forward = forward.min(reference.len() / 8).max(1);
         let feedback = feedback.min(reference.len() / 16);
         let taps = forward + feedback;
@@ -2096,6 +2239,14 @@ impl Receiver {
         self.snr_db.is_finite() && self.snr_db > 0.0
     }
 }
+
+/// How far the data-mode anchor may move the training's gain, either way.
+///
+/// A quarter is wider than any upstream gain a codec and a loop produce, and
+/// narrower than the range in which a tracker following its own decisions can
+/// walk away. Outside it the level is wrong enough that the fit is what needs
+/// looking at, not the anchor.
+pub const LEVEL_ANCHOR_RANGE: f64 = 0.25;
 
 /// TRN1u's symbols from `from` onwards, as many as the history holds.
 /// The same sequence, but starting at its symbol `skip` rather than at its
