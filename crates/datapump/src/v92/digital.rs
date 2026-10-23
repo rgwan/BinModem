@@ -195,6 +195,14 @@ const E1U_ZEROES: usize = 12;
 /// already reports the empty descriptor correctly.
 pub const ZERO_DIL_USES_SCR: bool = true;
 
+/// How long after Ed this end waits for E2u before conditioning its receiver
+/// for B1u regardless, in seconds of line time.
+pub const B1U_WAIT: f64 = 2.0;
+
+/// "B1d consists of 48 data frames of scrambled ones" (V.90 8.6.1), the signal
+/// that comes between Ed and the data.
+pub const B1D_FRAMES: usize = 48;
+
 /// Whether V92_TRACE in the environment is set, so that a start-up that will
 /// not find its place is legible.
 fn tracing() -> bool {
@@ -240,6 +248,26 @@ fn write_anchor(path: &std::path::Path) {
     if let Ok(mut file) = std::fs::File::create(std::path::Path::new(&side)) {
         let _ = writeln!(file, "{:.6}", epoch_now());
     }
+}
+
+/// Where to write what B1u decodes to, when `V92_B1U_TRACE` names a file: one
+/// `symbol level bits` line for every upstream symbol in data mode.
+///
+/// 8.7.1 makes B1u "48 data frames of scrambled binary ones" before any data,
+/// which is the one stretch of the upstream whose contents are known without
+/// the far end's help: a decoder that is right reads all ones there, and one
+/// that is a symbol out reads a hole and then a run of ones.
+fn b1u_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("V92_B1U_TRACE")?;
+        let path = std::path::PathBuf::from(path);
+        let file = std::fs::File::create(&path).ok()?;
+        write_anchor(&path);
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
 }
 
 /// Where to write the line samples this end receives, when `V92_RX_TRACE` names
@@ -841,8 +869,16 @@ impl Source {
                     self.count += 1;
                     match self.codes.pop_front() {
                         Some(octet) => {
-                            let (u, positive) = ucode::from_octet(self.law, octet);
-                            return self.level(u, positive);
+                            // `from_octet` gives back whether the code is
+                            // *negative* -- it is `octet`'s inverse, and
+                            // `octet` was asked for with `!positive`. Reading
+                            // its answer as "positive" inverted every sign on
+                            // the line, which is a constant the differential
+                            // chain hides from all but its first symbol and
+                            // nothing hides from a receiver that looks at the
+                            // codeword itself.
+                            let (u, negative) = ucode::from_octet(self.law, octet);
+                            return self.level(u, !negative);
                         }
                         // Nothing queued yet: the last codeword again rather
                         // than a silence the far end would read as a cleardown.
@@ -855,17 +891,17 @@ impl Source {
                         self.start(next);
                         continue;
                     }
-                    // Sent once, not repeated (V.90 8.4.1): what follows it is
-                    // the analogue modem's CPt, and 9.5.1.1.12 cuts the DIL
-                    // short at a segment boundary when that comes first.
-                    if self.count >= self.dil.len() && self.at_frame_boundary() {
-                        let next = self.pending.take().unwrap_or(Out::Silence);
-                        self.start(next);
-                        continue;
-                    }
-                    let at = self.count;
+                    // V.90 8.4.1, which 8.6.1/V.92 adopts whole: "The entire
+                    // sequence, not just the last DIL-segment, is repeated
+                    // until either the analogue modem causes it to be
+                    // terminated or a timeout occurs." What ends it here is the
+                    // CPt that `heard_cp` answers with Ri (9.5.1.1.12), so the
+                    // descriptor runs round and round until that comes. Sending
+                    // it once and then falling silent handed a far end that was
+                    // still reading DIL a hole to read instead.
+                    let at = self.count % self.dil.len();
                     // "The sequence shall be terminated on a DIL-segment
-                    // boundary" (V.90 8.4.1).
+                    // boundary": a wrap is one, and so is every `dil_ends`.
                     if (at == 0 || self.dil_ends.contains(&at))
                         && let Some(next) = self.pending.take()
                     {
@@ -1107,9 +1143,20 @@ pub struct Modem {
     e2u_zeroes: u32,
     /// Whether Ed has gone out, which is the only time E2u can be expected.
     awaiting_e2u: bool,
+    /// Whether the receiver is still waiting for the symbol B1u starts on.
+    /// 9.6.1.1.6 conditions it for B1u *after* E2u, and E2u ends one symbol
+    /// before B1u's frame interval 0 -- which is the only symbol that says how
+    /// the twelve-interval data frame and the four-symbol trellis frame fall.
+    b1u_pending: bool,
+    /// The symbol by which B1u has to have been found, so that an E2u this end
+    /// failed to read costs the call nothing rather than everything.
+    b1u_deadline: Option<u64>,
     /// The downstream data encoder, once CPu has said what to encode (V.90
     /// 8.6.1).
     downstream: Option<crate::v90::encoder::Encoder>,
+    /// Data frames of B1d still to go: 8.6.1/V.90 makes B1d "48 data frames of
+    /// scrambled ones" and only what follows it is data.
+    b1d_left: usize,
     /// The data scrambler the downstream data mode runs on (V.90 8.6.1), reset
     /// at B1d's first symbol.
     downstream_scrambler: Scrambler,
@@ -1117,6 +1164,13 @@ pub struct Modem {
     upstream_data: Option<Decoder>,
     /// The design's prefilter scale, folded out of the receiver for B1u.
     upstream_scale: f64,
+    /// The symbol delay the design puts between what the analogue modem sends
+    /// and what reaches the codec: B1u's frame interval 0 is `delay` symbols
+    /// into what is received, because the prefilter and the channel it was
+    /// designed against are not a plain wire.
+    upstream_delay: usize,
+    /// Symbols of B1u still to be skipped for that delay.
+    b1u_skip: usize,
     /// Upstream data bits the decoder has produced since B1u began.
     upstream_bits: u64,
     /// DTE bits fed in from above, sent as B1d's payload (9.6.1.1.5).
@@ -1191,13 +1245,18 @@ impl Modem {
             cpu: None,
             e2u_zeroes: 0,
             awaiting_e2u: false,
+            b1u_pending: false,
+            b1u_deadline: None,
             upstream_bits: 0,
             outbound: VecDeque::new(),
             recovered: Vec::new(),
             downstream: None,
+            b1d_left: 0,
             downstream_scrambler: Scrambler::new(Mode::Call),
             upstream_data: None,
             upstream_scale: 1.0,
+            upstream_delay: 0,
+            b1u_skip: 0,
             peak: 0.0,
             notes: Vec::new(),
         }
@@ -1492,6 +1551,17 @@ impl Modem {
         if self.stage == Stage::Phase4 {
             self.phase4_out();
             self.fill_downstream();
+        }
+        // An E2u this end never read must not leave the receiver on four points
+        // for the rest of the call: B1u follows E2u whatever was heard, so past
+        // the wait the receiver starts on the next symbol anyway, a frame
+        // boundary that may be a symbol or two out rather than none at all.
+        if self.b1u_pending
+            && let Some(at) = self.b1u_deadline
+            && self.now >= at
+        {
+            self.note("V.92: no E2u, conditioning for B1u anyway".into());
+            self.begin_b1u();
         }
         // D2/D3: once enough of TRN1u has gone by, the fit is made.
         if self.stage == Stage::Training
@@ -1858,6 +1928,7 @@ impl Modem {
         // The prefilter was scaled down to fit Q0.15; the receiver must fold
         // that scale back in when it reads B1u's levels.
         self.upstream_scale = designed.scale;
+        self.upstream_delay = designed.delay;
         // The rate this end asks for. The analogue modem's Ja says which rungs
         // it allows; this end takes the slowest of those, because the number
         // that decides how far up the ladder a line carries is the *noise*, and
@@ -1918,32 +1989,44 @@ impl Modem {
     fn begin_data(&mut self) {
         self.note("V.92: Ed out".into());
         let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
-        if let Some(parameters) = self.parameters.take() {
-            // Recondition the receiver for B1u (9.6.1.1.6): the slicer now
-            // decides against CPd's data-mode constellation, not TRN2u's four
-            // points, so the DFE's feedback is right from the first symbol.
-            let mut levels: Vec<f64> = Vec::new();
-            for set in &parameters.sets {
-                for &point in set {
-                    let level = parameters.gain * f64::from(point);
-                    levels.push(level);
-                    levels.push(-level);
-                }
-            }
-            levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-            self.rx.set_slicer(Slicer::Levels(levels));
-            self.rx.set_data_mode(self.upstream_scale);
-            self.upstream_data = Some(Decoder::new(&parameters));
-        }
+        // The receiver is *not* reconditioned here. 9.6.1.1.6 has it done
+        // "after receiving E2u", and that is not pedantry: E2u is a data frame
+        // of TRN2u's four points (8.7.2), so it still needs the equaliser
+        // TRN2u trained and the four-point slicer that feeds its feedback,
+        // and B1u's twelve-interval frame begins on the *next* symbol, which
+        // is the only thing that says where frame interval 0 and the first
+        // trellis frame are. Conditioning here instead read E2u with the data
+        // mode's constellation, and started B1u's frame count at a symbol
+        // some hundreds early -- a whole number of symbols the far end never
+        // agreed to.
+        self.b1u_pending = self.parameters.is_some();
+        self.b1u_deadline = self.b1u_pending.then_some(self.now + (B1U_WAIT * FS) as u64);
         let mut downstream = 0;
         if let Some(cpu) = self.cpu.as_ref()
             && let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu)
         {
+            // What B1d goes out on: CPu's rate, its six intervals' sets and
+            // the sign bits it spends on shaping.
+            if tracing() {
+                eprintln!(
+                    "V92TRACE: B1d mapping k {} s {} ld {} shaping {:?} sets {:?}",
+                    mapping.k,
+                    mapping.redundancy.data_bits(),
+                    mapping.lookahead,
+                    mapping.shaping,
+                    mapping
+                        .sets
+                        .iter()
+                        .map(|set| (set.points().len(), set.points().first().copied(), set.points().last().copied()))
+                        .collect::<Vec<_>>()
+                );
+            }
             downstream = mapping.rate();
             self.downstream = Some(crate::v90::encoder::Encoder::new(mapping, self.settings.law));
-            // 8.6.1: the data-mode scrambler starts afresh at B1d.
+            // 8.6.1: the data-mode scrambler starts afresh at B1d, and B1d is
+            // 48 data frames of scrambled ones before the data starts.
             self.downstream_scrambler = Scrambler::new(Mode::Call);
+            self.b1d_left = B1D_FRAMES;
             self.note(format!("V.92: B1d at {downstream}"));
         } else {
             self.note("V.92: no CPu yet, B1d waits".into());
@@ -1956,6 +2039,45 @@ impl Modem {
         self.fill_downstream();
     }
 
+    /// 9.6.1.1.6: condition the receiver for B1u, on the symbol E2u ended
+    /// before.
+    ///
+    /// Three things happen together and are all about the same symbol: the
+    /// slicer moves to CPd's data mode constellation, the equaliser becomes
+    /// the memoryless scale the far end's own precoder and prefilter left the
+    /// channel at (6.4.2 -- they equalise at the transmitter, so a decision
+    /// feedback section here would equalise a second time), and the decoder
+    /// starts a data frame at what is now symbol 0.
+    fn begin_b1u(&mut self) {
+        let Some(parameters) = self.parameters.clone() else { return };
+        let mut levels: Vec<f64> = Vec::new();
+        for set in &parameters.sets {
+            for &point in set {
+                let level = parameters.gain * f64::from(point);
+                levels.push(level);
+                levels.push(-level);
+            }
+        }
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        self.rx.set_slicer(Slicer::Levels(levels));
+        self.rx.set_data_mode(self.upstream_scale);
+        self.upstream_data = Some(Decoder::new(&parameters));
+        // The design's own delay, if it has one: what arrives at symbol n of
+        // the line is symbol n - delay of the frame count (see
+        // [`Design::delay`](crate::v92::design::Design::delay)).
+        self.b1u_skip = self.upstream_delay;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.note(format!(
+            "V.92: B1u from symbol {}, {} bit/s, scale {:.3}, taps {:?}",
+            self.now,
+            parameters.rate(),
+            self.upstream_scale,
+            self.rx.taps()
+        ));
+    }
+
     /// Keep B1d's codeword queue fed from the downstream encoder (V.90 8.6.1).
     fn fill_downstream(&mut self) {
         if !self.source.needs_codes() {
@@ -1965,12 +2087,29 @@ impl Modem {
         let mut octets = Vec::new();
         if let Some(encoder) = self.downstream.as_mut() {
             for _ in 0..8 {
-                // The DTE's bits, and the idle pattern (ones) when there are
-                // none: V.90's data mode idles on ones, and the far end's
-                // equaliser and scrambling chain need a stream whether or not
-                // the terminal is typing.
+                // 8.6.1/V.90, which 8.8.1/V.92 adopts whole: "B1d consists of
+                // 48 data frames of scrambled ones transmitted at the end of
+                // start-up using the selected data mode constellation
+                // parameters ... The symbols in the first data frame of B1d
+                // shall have the magnitudes resulting from mapping the first
+                // D scrambled ones after initializing the scrambler to zero".
+                // The far end reads exactly that many symbols before any of
+                // them is data: an Agere SV92PP's data mode decoder is
+                // initialised with a 288-symbol (48 x 6) countdown and drops
+                // everything it decodes until it has run out. Sending the
+                // terminal's bits there loses the first 288 symbols of the
+                // call's data and moves every bit after them, which is a
+                // greeting that never arrives and a V.42 that never opens.
+                let b1d = self.b1d_left > 0;
+                if b1d {
+                    self.b1d_left -= 1;
+                }
+                // After B1d the DTE's bits, and the idle pattern (ones) when
+                // there are none: V.90's data mode idles on ones, and the far
+                // end's scrambling chain needs a stream whether or not the
+                // terminal is typing.
                 let frame = encoder.next_frame(|| {
-                    let bit = self.outbound.pop_front().unwrap_or(true);
+                    let bit = if b1d { true } else { self.outbound.pop_front().unwrap_or(true) };
                     self.downstream_scrambler.scramble(bit)
                 });
                 octets.extend(frame.octets(law));
@@ -1984,11 +2123,23 @@ impl Modem {
     /// One upstream symbol: through the reader, then into whichever sequence
     /// finder is listening.
     fn symbol_upstream(&mut self, level: f64) {
-        // 9.6.1.1.6: after Ed the receiver is conditioned for B1u, which is the
-        // data mode modulation rather than four points.
+        // 9.6.1.1.6: once E2u has ended, the receiver is B1u's -- the data mode
+        // modulation rather than four points -- and every symbol from there is
+        // a data frame's worth of the decoder's.
         if let Some(decoder) = self.upstream_data.as_mut() {
+            if self.b1u_skip > 0 {
+                self.b1u_skip -= 1;
+                return;
+            }
             decoder.feed(level);
             let bits = decoder.take_bits();
+            if let Some(file) = b1u_trace_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                let _ = writeln!(file, "{} {level:.6} {} {text}", self.now, bits.len());
+            }
             if !bits.is_empty() {
                 self.upstream_bits += bits.len() as u64;
                 self.recovered.extend(bits);
@@ -1998,6 +2149,9 @@ impl Modem {
         let Some(reader) = self.upstream.as_mut() else { return };
         let bits: Vec<bool> = reader.feed(level).into_iter().collect();
         let dropped = self.now < self.upstream_drop_until;
+        // Set when this symbol was E2u's last: B1u's frame interval 0 is the
+        // one after it.
+        let mut started = false;
         if let Some(file) = up_trace_file() {
             use std::io::Write;
             let mut out = String::with_capacity(bits.len() + 12);
@@ -2026,16 +2180,26 @@ impl Modem {
                     self.e2u_zeroes = 0;
                 } else {
                     self.e2u_zeroes += 1;
-                    if self.e2u_zeroes == UP_INTERVALS as u32 {
+                    // 8.7.2: E2u "shall be extended by a single symbol if bit
+                    // 29 of CPd is set", and either way it is whole symbols.
+                    let e2u = UP_INTERVALS as u32
+                        + u32::from(self.parameters.as_ref().is_some_and(|p| p.extend_e2u));
+                    if self.e2u_zeroes >= e2u {
                         let now = self.now;
                         if let Some(exchange) = self.exchange.as_mut() {
                             exchange.peer_e(now);
                         }
                         self.awaiting_e2u = false;
                         self.note("V.92: E2u".into());
+                        started = true;
                     }
                 }
             }
+        }
+        // The symbol after E2u's last one is B1u's frame interval 0 (8.7.1), so
+        // the decoder is built now and fed from here on.
+        if started {
+            self.begin_b1u();
         }
     }
 
@@ -2819,12 +2983,41 @@ mod tests {
             .collect();
         assert!(source.dil_ends.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(*source.dil_ends.last().unwrap(), source.dil.len());
-        // And the source sends exactly one DIL pass before moving on.
+        let length = source.dil.len();
+        // V.90 8.4.1, adopted whole by 8.6.1: the *entire* sequence is repeated
+        // until the far end terminates it, so two passes are two identical
+        // passes and the DIL is still on the line afterwards.
         source.change(Out::Dil);
-        let mut produced: Vec<f64> = Vec::new();
-        for _ in 0..source.dil.len() + 8 {
-            produced.push(source.next());
-        }
+        let produced: Vec<f64> = (0..2 * length).map(|_| source.next()).collect();
         assert!(produced.iter().any(|v| v.abs() > 0.0), "the DIL was silent");
+        assert_eq!(produced[..length], produced[length..], "the DIL did not repeat");
+        assert_eq!(source.out(), Out::Dil, "the DIL left the line with nothing to replace it");
+
+        // 9.5.1.1.12: a CPt part way through a pass ends the DIL on the next
+        // segment boundary (V.90 8.4.1), not at once and not at the end of the
+        // pass.
+        let into = 7;
+        let into = into.min(length / 2);
+        for _ in 0..into {
+            source.next();
+        }
+        source.change(Out::Ri);
+        let next_end = source
+            .dil_ends
+            .iter()
+            .copied()
+            .find(|&end| end > into)
+            .expect("a segment boundary after the seventh symbol");
+        let mut sent = into;
+        loop {
+            source.next();
+            if source.out() != Out::Dil {
+                break;
+            }
+            sent += 1;
+            assert!(sent <= next_end, "the DIL ran past the segment boundary it had reached");
+        }
+        assert_eq!(sent, next_end, "the DIL stopped mid-segment");
+        assert_eq!(source.out(), Out::Ri, "the DIL was not followed by Ri");
     }
 }
