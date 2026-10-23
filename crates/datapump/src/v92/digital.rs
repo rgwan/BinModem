@@ -1631,7 +1631,7 @@ impl Modem {
             if let Some(exchange) = self.exchange.as_mut() {
                 exchange.sequence_ended(kind, now);
             }
-            if kind == SequenceKind::E {
+            if kind == SequenceKind::E && !matches!(self.status, Status::Connected { .. }) {
                 self.begin_data();
             }
         }
@@ -1909,6 +1909,20 @@ impl Modem {
         self.note("V.92: Ed out".into());
         let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
         if let Some(parameters) = self.parameters.take() {
+            // Recondition the receiver for B1u (9.6.1.1.6): the slicer now
+            // decides against CPd's data-mode constellation, not TRN2u's four
+            // points, so the DFE's feedback is right from the first symbol.
+            let mut levels: Vec<f64> = Vec::new();
+            for set in &parameters.sets {
+                for &point in set {
+                    let level = parameters.gain * f64::from(point);
+                    levels.push(level);
+                    levels.push(-level);
+                }
+            }
+            levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+            self.rx.set_slicer(Slicer::Levels(levels));
             self.upstream_data = Some(Decoder::new(&parameters));
         }
         let mut downstream = 0;

@@ -1962,3 +1962,69 @@ BlockShortClear(0x100, gGlobalPtr+0xe67c);
   `FLAGS`（每次调用、边沿触发）。
 - 数据态解码器 `V90DataModeDecoderInit` 在 **23.952 s**（它）跑（`eb14=18816/eb18=3136` 出现），
   之后 `eb10` 冲到 ~7033 再一路衰减过地板（`3136`）——"没有星座"的特征曲线。
+
+### 二十二、数据态入口的 "Remote request 重训练" 精确触发条件（反编译实锤，2026-10-26）
+
+反编译 `V92ClientControlRcv`（0x080a7d80）、`V92ClientControlEventHandler`（0x080a8a20）、
+`V92ClientDataModeRxState`（0x080ac570）、`V92ClientPhase4RxWaitSUVState` 的子状态分发
+（`FUN_080ab950/080aba30/080abc20/080abfc0`），把"Remote request"这条线彻底钉死。
+
+#### 触发点（唯一）
+
+```c
+// V92ClientControlRcv，每次收帧都跑
+if ([0x116bc]!=0 && [0x116b8]==0) {          // 0x116bc 在 R̄i 检测(0x80aacd7)武装
+    if ([0x1174b]==0 || [0x39a3c]>0) [0x11780]=0;   // 事件4没来 / 呼叫等待→复位
+    else {
+        [0x11780] += 样点数;
+        if (400 <= [0x11780]) {               // 400 样点 = 50ms 连续
+            [0x116bc]=0; V34ReportStatus(0x27);
+            V92ClientControlException(0x9722); // "Retraining! (Remote request)"
+        }
+    }
+}
+```
+
+- `0x1174b` = 事件码 4（"远端请求重训/清线"检测；V90 版对应 `0x11743`，同构）。
+- `0x39a3c` = 呼叫等待计数器（>0 抑制）。
+- 判据是 **50ms 连续的事件4**，不是瞬时。
+
+#### 子状态分发（从等 SUVd 到数据态入口）
+
+| 函数 | 地址 | 动作 |
+|---|---|---|
+| `V92ClientPhase4RxWaitSUVState` | 0x80ab760 | 等 `[0x11753]`(SUVd)；`[0x11adf]&0x40` 无 ack→`FUN_080aba30`，有 ack→`FUN_080abc20` |
+| `FUN_080aba30` | 0x80aba30 | 等 `[0x11752]`(CPd 已收)→`V34RxDataSetEdDetector`、设 RX=`FUN_080abc20`、deadline 8000 |
+| `FUN_080abc20` | 0x80abc20 | 等 `[0x11754]`(SUV ack) && `CheckClearDown==0`→RX=`FUN_080abfc0` |
+| `FUN_080abfc0` | 0x80abfc0 | **数据态入口**：等 `[0x11755]`(事件10)→`V90DataModeDecoderInit(&g[0x119da],…)` + `V34RxDataSetDataMode` |
+
+关键：数据态入口那次 `V90DataModeDecoderInit` 读的是 **`0x119da`（对端自己算的 CPu）**，
+不是我们发的 CPd。R̄i 检测那次（0x80aadd8）读的才是 `0x118ec`（相位3 的 MP/CPt）。
+`0x119da` 由对端 TX 态 `V92ClientPhase4TxSendTRN2uState`（内部 0x80ab048）
+`V92ClientControlCreateCPData(rate,1,0)` 生成——即 **CPu**。V.92 8.8.1 里 B1d 用的就是
+CPu（"B1d ← new data-mode parameters from the CPu just received"），所以对端解码器用自己
+算的 CPu 解 B1d 是**合规**的。
+
+#### 根因（比 §二十 的"竞态"更精确）
+
+我方 `exchange.rs`：`sent_ack && peer_acked → E`，`E` 结束（2 帧=1.5ms）→`begin_data()`→B1d。
+即 **Ed 一结束就立刻 B1d**。而对端数据态解码器的重初始化由**收到 Ed 后的事件10**触发，
+读 `0x119da`（CPu，25.5s 已填）。但重初始化比 B1d 晚约 0.4s：
+
+```
+26.424s 我方 Ed 到（对端时钟）
+26.425s 我方 B1d 到（Ed 后 1.5ms，几乎立刻）
+26.838s 对端 "Tx Data Mode Active" + "Retraining(Remote request)" 同一刻
+```
+
+B1d 用空/旧星座去切 → 恒定码字 → "远端重训请求"检测器判事件4 → 50ms 后 `0x9722`。
+（§二十 里"0x119da 由解析 CP 填"这条作废：`V92DataModeEncoderParseCPData` 写的是 0x99xx/
+0x9xxx 的编码器表，不写 0x119da；0x119da 只由 `V92ClientControlCreateCPData` 填。）
+
+#### 我方侧绕过（待验证）
+
+在 Ed 结束到 B1d 之间插一个 guard：`exchange.rs` 里 `E` 结束时不立刻 `begin_data()`，
+而是设 `b1d_hold_until = now + B1D_GUARD`（起始 400ms）。guard 期间 `Source` 自然重复 Ed
+（扰码零，非静默），对端在此期间完成重初始化，B1d 才上线。spec 依据：D4-5 "After Ed,
+transmit B1d" 未规定"立即"；A4-3 "收到 Ed 后才 condition 接收机为 B1d"；B1d 的扰码器本身
+"复位到零"（§4.15），不依赖与 Ed 的连续扰码态。

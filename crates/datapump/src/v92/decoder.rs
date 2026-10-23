@@ -145,6 +145,10 @@ impl Decoder {
 
     /// One equalised symbol, on the scale the parameters' levels are in.
     pub fn feed(&mut self, level: f64) {
+        // The wire carries G x v (8.8.3), while the constellation sets are the
+        // pre-gain magnitudes a(eta), so the equalised level is divided back by
+        // G before it is sliced against them.
+        let level = level / self.params.gain;
         let interval = super::interval(self.n);
         let set: &[u16] = self.params.set_for(interval).unwrap_or(&[]);
         self.frame[self.filled] = Bests::new(&Constellation::new(set), level);
