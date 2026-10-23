@@ -1068,6 +1068,19 @@ impl Receiver {
         self.snr_db = fitted.snr_db;
         self.trained = fitted.trained;
         self.trained_at = fitted.at;
+        // What the equaliser *is*, not just how well it fitted. Two runs of the
+        // same call that differ only by a codec's quantising can report about
+        // the same SNR and still be different filters, and the taps are the only
+        // way to see that.
+        if std::env::var_os("V92_TAPS_TRACE").is_some() {
+            let taps = |name: &str, taps: &[f64]| {
+                let text: Vec<String> = taps.iter().map(|tap| format!("{tap:.6}")).collect();
+                eprintln!("V92TAPS {name} {} {}", taps.len(), text.join(" "));
+            };
+            eprintln!("V92TAPS fit snr {:.3} at {}", fitted.snr_db, fitted.at);
+            taps("forward", &fitted.forward);
+            taps("feedback", &fitted.feedback);
+        }
     }
 
     /// What the four-point slicer has measured the inner and the outer tier to
@@ -1252,10 +1265,27 @@ impl Receiver {
         // fit expects -- it designed the feedback against symbols that were
         // known, and a line that has just started is the only place the two
         // differ.
+        let forward_only = value;
         let decided = self.decided.len();
         for (j, &tap) in self.feedback.iter().enumerate() {
             if j < decided {
                 value += tap * self.decided[decided - 1 - j];
+            }
+        }
+        // `V92_DFE_TRACE`: the two halves of the equaliser's output kept apart.
+        // A symbol-level error that is in the feed-forward half came from the
+        // line or the taps; one that is only in the sum came from the decisions
+        // the feedback section is fed.
+        if std::env::var_os("V92_DFE_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if matches!(self.slicer, Slicer::Levels(_)) {
+                eprintln!(
+                    "V92DFE {n} {} fwd {forward_only:.6} fb {:.6} sum {value:.6}",
+                    self.count,
+                    value - forward_only
+                );
             }
         }
         // What the four-point tiers measure on this line rather than on the
