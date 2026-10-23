@@ -554,6 +554,9 @@ impl Digital {
     }
 
     pub fn take_bits(&mut self) -> Vec<bool> {
+        if let Some(m) = self.v92.as_mut() {
+            return m.take_bits();
+        }
         match self.v90.as_mut() {
             Some(m) => m.take_bits(),
             None => self.v34.take_bits(),
@@ -561,6 +564,10 @@ impl Digital {
     }
 
     pub fn send_bits(&mut self, bits: &[bool]) {
+        if let Some(m) = self.v92.as_mut() {
+            m.send_bits(bits);
+            return;
+        }
         match self.v90.as_mut() {
             Some(m) => m.send_bits(bits),
             None => self.v34.send_bits(bits),
@@ -568,6 +575,9 @@ impl Digital {
     }
 
     pub fn pending_bits(&self) -> usize {
+        if let Some(m) = self.v92.as_ref() {
+            return m.pending_bits();
+        }
         match self.v90.as_ref() {
             Some(m) => m.pending_bits(),
             None => self.v34.pending_bits(),

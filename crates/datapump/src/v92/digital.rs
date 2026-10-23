@@ -1114,6 +1114,10 @@ pub struct Modem {
     upstream_data: Option<Decoder>,
     /// Upstream data bits the decoder has produced since B1u began.
     upstream_bits: u64,
+    /// DTE bits fed in from above, sent as B1d's payload (9.6.1.1.5).
+    outbound: VecDeque<bool>,
+    /// Upstream data bits recovered since B1u began, handed up on `take_bits`.
+    recovered: Vec<bool>,
     /// Largest sample seen since the last trace line.
     peak: f64,
     notes: Vec<String>,
@@ -1183,6 +1187,8 @@ impl Modem {
             e2u_zeroes: 0,
             awaiting_e2u: false,
             upstream_bits: 0,
+            outbound: VecDeque::new(),
+            recovered: Vec::new(),
             downstream: None,
             upstream_data: None,
             peak: 0.0,
@@ -1196,6 +1202,21 @@ impl Modem {
 
     pub fn status(&self) -> Status {
         self.status
+    }
+
+    /// DTE bits for B1d, fed in by the stack above the datapump (9.6.1.1.5).
+    pub fn send_bits(&mut self, bits: &[bool]) {
+        self.outbound.extend(bits.iter().copied());
+    }
+
+    /// How many B1d bits are still waiting to be encoded.
+    pub fn pending_bits(&self) -> usize {
+        self.outbound.len()
+    }
+
+    /// Upstream data bits recovered since B1u began, for the stack above.
+    pub fn take_bits(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.recovered)
     }
 
     /// What is on the line, for the transcript.
@@ -1886,18 +1907,23 @@ impl Modem {
     /// and the upstream's decoder from this end's own CPd.
     fn begin_data(&mut self) {
         self.note("V.92: Ed out".into());
+        let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
         if let Some(parameters) = self.parameters.take() {
             self.upstream_data = Some(Decoder::new(&parameters));
         }
+        let mut downstream = 0;
         if let Some(cpu) = self.cpu.as_ref()
             && let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu)
         {
-            let rate = mapping.rate();
+            downstream = mapping.rate();
             self.downstream = Some(crate::v90::encoder::Encoder::new(mapping, self.settings.law));
-            self.note(format!("V.92: B1d at {rate}"));
+            self.note(format!("V.92: B1d at {downstream}"));
         } else {
             self.note("V.92: no CPu yet, B1d waits".into());
         }
+        // Data mode is on the line now (9.6.1.1.5-6): the stack above starts
+        // handing DTE bits down and taking recovered bits up from here.
+        self.status = Status::Connected { downstream, upstream };
         self.stage = Stage::Phase4;
         self.source.change(Out::B1d);
         self.fill_downstream();
@@ -1912,10 +1938,11 @@ impl Modem {
         let mut octets = Vec::new();
         if let Some(encoder) = self.downstream.as_mut() {
             for _ in 0..8 {
-                // The DTE's own bits are not wired up here yet: a constant
-                // stream keeps the mapper's own state turning, which is what the
-                // far end's equaliser and the scrambling chain need.
-                let frame = encoder.next_frame(|| false);
+                // The DTE's bits, and the idle pattern (ones) when there are
+                // none: V.90's data mode idles on ones, and the far end's
+                // equaliser and scrambling chain need a stream whether or not
+                // the terminal is typing.
+                let frame = encoder.next_frame(|| self.outbound.pop_front().unwrap_or(true));
                 octets.extend(frame.octets(law));
             }
         }
@@ -1934,6 +1961,7 @@ impl Modem {
             let bits = decoder.take_bits();
             if !bits.is_empty() {
                 self.upstream_bits += bits.len() as u64;
+                self.recovered.extend(bits);
             }
             return;
         }
