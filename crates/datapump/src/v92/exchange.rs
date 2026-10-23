@@ -218,8 +218,16 @@ pub struct Exchange {
     /// The sample the first CP of this exchange finished at, which the repeat
     /// window is measured from.
     my_cp_end: Option<u64>,
-    /// The repeat rule has fired: CPs go out until the exchange ends.
+    /// The repeat rule has fired: CPs go out, one in a group, until the
+    /// exchange ends.
     repeat_cp: bool,
+    /// Symbols since the last CP of a repeat group, which is how the repeats
+    /// stay interleaved with the SUVs between them.
+    since_cp: Option<u64>,
+    /// Symbols between the CPs of a repeat group, with SUVs in the gaps. Zero
+    /// repeats them back to back, which is what 9.6.1.1.3 says and what
+    /// Figure 14 draws for the analogue side's CPu'.
+    repeat_gap: u64,
     /// Whether the window check has already been settled, one way or the
     /// other.
     settled: bool,
@@ -256,6 +264,8 @@ impl Exchange {
             sent_suv: false,
             my_cp_end: None,
             repeat_cp: false,
+            since_cp: None,
+            repeat_gap: 0,
             settled: false,
             need_single_cp: true,
             wait_for_cp: false,
@@ -340,6 +350,24 @@ impl Exchange {
         self.settled = true;
     }
 
+    /// Put SUVs between the CPs of a repeat group, `gap` symbols apart.
+    ///
+    /// 9.6.1.1.3's repeats are CPd sequences, and the analogue modem sends its
+    /// CPu on receiving an *SUVd* (9.6.2.1.2) -- Figure 14 draws exactly that
+    /// shape for the digital side: "sends CPd, then plain SUVd, until a CPu'
+    /// arrives". Repeating CPds with nothing between them is a transmission the
+    /// far end cannot answer at all: measured on an Agere SV92PP with the
+    /// upstream finally readable, this end put out 134 CPd and not one SUVd
+    /// after the first, the far end's own SUVd flag stayed at zero for the
+    /// whole of Phase 4, and it cleared the line down with `0x96212` -- while
+    /// the far end needs about four seconds of SUVd before its detector
+    /// acquires. Zero is the clause's own reading and is what the analogue side
+    /// of Figure 14 does with CPu'; a digital modem that has measured its far
+    /// end needs the gap.
+    pub fn repeat_between_suvs(&mut self, gap: u64) {
+        self.repeat_gap = gap;
+    }
+
     // -- what we send --------------------------------------------------------
 
     /// What should go next, asked at a sequence boundary, `now` being that
@@ -366,7 +394,17 @@ impl Exchange {
     /// time one is held back.
     fn cp_due(&mut self, now: u64) -> bool {
         if self.repeat_cp {
-            return true;
+            // A CPd every `REPEAT_CP_GAP` symbols rather than back to back.
+            // 9.6.1.1.3 says "repeated CPd sequences", and the analogue modem
+            // sends its CPu after receiving an *SUVd* (9.6.2.1.2) -- Figure 14
+            // draws exactly that: "the digital modem sends CPd, then plain
+            // SUVd, until a CPu' arrives". A repetition of CPds with no SUVd
+            // between them is a transmission the far end cannot answer: it
+            // sits in its wait-for-SUV state until its own ten second deadline
+            // and clears the line down. Measured on an Agere SV92PP: two
+            // hundred CPd and not one SUVd on the line, `suv=0` in its own
+            // state for the whole of Phase 4, `0x96212` at the end of it.
+            return self.since_cp.is_none_or(|at| now.saturating_sub(at) >= self.repeat_gap);
         }
         if !self.need_single_cp || !self.peer_suv || !self.sent_suv {
             return false;
@@ -413,8 +451,11 @@ impl Exchange {
         if let Some((_, ack)) = self.sending.take() {
             self.sent_ack |= ack;
         }
-        if is_cp(kind) && self.my_cp_end.is_none() {
-            self.my_cp_end = Some(at);
+        if is_cp(kind) {
+            self.since_cp = Some(at);
+            if self.my_cp_end.is_none() {
+                self.my_cp_end = Some(at);
+            }
         }
         if matches!(kind, SequenceKind::E) {
             self.finished = true;
@@ -539,6 +580,9 @@ mod tests {
     /// can be read in symbols.
     const FS: f64 = 8000.0;
 
+    /// What the digital modem asks for, as `v92::digital` does.
+    const REPEAT_GAP_IN_TESTS: u64 = 1200;
+
     /// Which end a scripted side is, for the labels the figures print.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Side {
@@ -591,9 +635,16 @@ mod tests {
 
     impl Scripted {
         fn new(side: Side, context: Context, round_trip: f64, suv: u64, cp: u64, start: u64) -> Self {
+            let mut exchange = Exchange::new(context, round_trip, FS);
+            // The scripted digital side is this end's own modem, so it repeats
+            // the way that one does; the analogue side repeats the way Figure
+            // 14 draws CPu' -- back to back.
+            if side == Side::Digital {
+                exchange.repeat_between_suvs(REPEAT_GAP_IN_TESTS);
+            }
             Self {
                 side,
-                exchange: Exchange::new(context, round_trip, FS),
+                exchange,
                 suv,
                 cp,
                 e: 12,
@@ -867,6 +918,34 @@ mod tests {
         assert!(!exchange.repeating());
         assert!(exchange.peer_acked());
         assert_eq!(exchange.next_sequence(200 + window), SequenceKind::Suv);
+    }
+
+    /// A repeat group with SUVs between the CPs, which is what a far end that
+    /// only sends its CPu on receiving an SUV needs: without it this end sends
+    /// CPd and nothing else, and the far end waits out its own deadline.
+    #[test]
+    fn a_repeat_group_leaves_suvs_between_its_cps() {
+        let mut exchange = Exchange::new(Context::Training, 0.0, FS);
+        exchange.repeat_between_suvs(1200);
+        let window = exchange.window();
+        exchange.peer_suv(PeerSuv::default(), 0);
+        exchange.sequence_started(SequenceKind::Suv);
+        exchange.sequence_ended(SequenceKind::Suv, 24);
+        exchange.sequence_started(SequenceKind::Cp);
+        exchange.sequence_ended(SequenceKind::Cp, 120);
+        // The repeat starts, and the gap runs from the end of the CP that was
+        // not answered: SUVs until it has gone by, then another CPd.
+        exchange.peer_suv(PeerSuv::default(), 120 + window + 1);
+        assert!(exchange.repeating());
+        assert_eq!(exchange.next_sequence(120 + window + 1), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(120 + 1199), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(120 + 1200), SequenceKind::Cp);
+        exchange.sequence_started(SequenceKind::Cp);
+        exchange.sequence_ended(SequenceKind::Cp, 120 + 1200 + 96);
+        // And the group goes on: another gap, another CPd.
+        assert_eq!(exchange.next_sequence(120 + 1200 + 96), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(120 + 1200 + 96 + 1199), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(120 + 1200 + 96 + 1200), SequenceKind::Cp);
     }
 
     /// The same window with the straddling sequence unacknowledged: 9.6.2.1.3

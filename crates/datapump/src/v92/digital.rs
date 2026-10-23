@@ -52,7 +52,7 @@ use crate::v92::receiver::reference;
 use crate::v92::design::{Channel, design};
 use crate::v92::epsilon;
 use crate::v92::exchange::{Context, Exchange};
-use crate::v92::receiver::{ALIGN_WINDOW, Heard, Receiver, Symbol, TRAIN_WINDOW};
+use crate::v92::receiver::{ALIGN_WINDOW, Heard, Receiver, Slicer, Symbol, TRAIN_WINDOW};
 use crate::v92::sequences::{
     CpFamily, Cpd, J, JP_PRIME_BITS, Jp, Suvd, UpFinder, trn2u_unit,
 };
@@ -83,6 +83,26 @@ const R_BAR_FRAMES: usize = 4;
 /// back through V.34 Phase 2 to its death, three times running, at a TRN2d of
 /// exactly the 2040T the clause asks for.
 const TRN2D_LEAST: usize = 4800;
+
+/// Symbols of TRN2u the Phase 4 fit waits for before it is taken.
+const TRN2U_FIT_AFTER: u64 = 2400;
+
+/// Symbols of TRN2u dropped after the fit is in, before the finder sees any
+/// bits.
+const TRN2U_DROP_AFTER_FIT: u64 = 300;
+
+/// Symbols between the CPds of a repeat group, with SUVd in all the gaps.
+///
+/// 9.6.2.1.2 has the analogue modem send its CPu on receiving an *SUVd*, and an
+/// Agere SV92PP needs a couple of seconds of SUVd before its detector acquires
+/// at all; a CPd is 3732 bits, near half a second of the line. A group repeated
+/// every fifteen hundredths of a second is three quarters CPd and starves it --
+/// measured: with `1200` the far end never acquired in nine seconds, while the
+/// same call with the repeats never firing at all (its acknowledge bit came
+/// back) had the line SUVd for the two seconds it needed and detected at once.
+/// Three seconds is long enough for several acquisitions and still well inside
+/// 9.6.1.1.3's "repeated CPd sequences".
+const REPEAT_CP_GAP: u64 = 1200;
 
 /// Symbols of TRN1u that are allowed to go by before the fit is taken. It is
 /// not a comfort margin: the receiver's history is a window of 4096 samples,
@@ -798,6 +818,10 @@ impl Source {
                     // No CPt was installed: the two-point stream this used to
                     // be everywhere. Phase 4 cannot be signalled without CPt, so
                     // this is a caller that never set one.
+                    if let Some((ucode, positive)) = self.phase4_codeword(false) {
+                        self.count += 1;
+                        return self.level(ucode, positive);
+                    }
                     let bit = self.bits.pop_front().unwrap_or(false);
                     self.count += 1;
                     self.sign ^= self.scrambler.scramble(bit);
@@ -914,14 +938,20 @@ impl Source {
                         continue;
                     }
                     self.count += 1;
-                    // 8.6.5/V.90: scrambled binary ones through the encoder of
-                    // 5.4, on the constellation set CPt passed in. It is not a
-                    // two-point signal: the far end's slicer takes CPt's rate,
-                    // and 24 bits a frame over a stream that carries one is
-                    // noise however good the line is.
-                    if let Some((ucode, positive)) = self.phase4_codeword(true) {
-                        return self.level(ucode, positive);
-                    }
+                    // 8.6.5/V.90: TRN2d is "scrambled binary ones" -- a
+                    // **binary** signal, one bit a symbol, the scrambled bit
+                    // being the symbol's sign. It does not go through the
+                    // encoder of 5.4 and it does not use CPt's constellation;
+                    // SUVd, CPd and Ed after it do (8.8.2, 8.8.3, 8.8.5).
+                    //
+                    // Sending it on CPt's constellation, through the trellis and
+                    // the precoder, is what this end used to do and what an
+                    // Agere SV92PP cannot read: its Phase 4 receiver is a plain
+                    // slicer with no Viterbi, so its descrambled stream over
+                    // TRN2d had no run of ones in it anywhere, its detector
+                    // never acquired and it never ran on to the SUVd. Measured:
+                    // with TRN2d binary it detects the SUVd at once, sends its
+                    // CPu, detects the CPd and goes to data mode. See §0.0j.
                     self.sign = self.scrambler.scramble(true);
                     return self.level(self.uinfo, self.sign);
                 }
@@ -1023,12 +1053,32 @@ pub struct Modem {
     /// Where the second TRN1u's first symbol is, in absolute symbols. 9.6.1.1.1
     /// designs the upstream from it, and 9.5.1.1.10 counts data frames from it.
     trn2_from: Option<u64>,
+    /// When to take the Phase 4 fit on TRN2u, in symbols.
+    four_at: u64,
+    /// Up to which symbol the reader's bits are thrown away rather than given
+    /// to [`Self::up_finder`] and the E2u counter.
+    ///
+    /// TRN2u is a known sequence: it is fitted on, not read. What it decodes to
+    /// before the Phase 4 equaliser is in place is a line read at thirteen
+    /// decibels, and a finder looking for a seventy-two-bit SUVu in that will
+    /// eventually find one that is not there. So the first stretch of it is
+    /// dropped. The receiver behind it is not gated: it keeps decoding, keeps
+    /// its differential chain, and the fit it makes is what ends the drop.
+    upstream_drop_until: u64,
+    /// Bits the reader gave back that were dropped, for the trace.
+    upstream_dropped: u64,
     /// 9.6.1.1.2-9.6.1.1.4: the SUV/CP/E exchange, which decides what goes out
     /// next and when the handshake is done.
     exchange: Option<Exchange>,
     /// 8.7.2-8.7.6: four points to a symbol, differentially decoded and GPA
     /// descrambled -- what TRN2u, SUVu and CPu all arrive as.
     upstream: Option<Trn2uReader>,
+    /// Which of Tables 28 and 29 the far end is transmitting, which is Jp bit
+    /// 48's to say (9.5.1.1.8). It is one field rather than two so that the bit
+    /// this end sends and the reader it builds cannot disagree: an eight-point
+    /// TRN2u read as four points is a quarter of the bits, and the SUVu' that
+    /// CPd needs never comes out.
+    upstream_size: Trn2uSize,
     /// And what picks a CPu or an SUVu out of the bits it gives back.
     up_finder: Option<UpFinder>,
     /// The CPd this end will send, and the parameters behind it, which are also
@@ -1106,6 +1156,10 @@ impl Modem {
             trn2_estimate: None,
             exchange: None,
             upstream: None,
+            upstream_size: Trn2uSize::Four,
+            four_at: 0,
+            upstream_drop_until: 0,
+            upstream_dropped: 0,
             up_finder: None,
             cpd: None,
             parameters: None,
@@ -1233,6 +1287,23 @@ impl Modem {
     }
 
     fn timers(&mut self) {
+        // Phase 4's equaliser is fitted on TRN2u itself (8.7.6 makes it a known
+        // sequence), a couple of thousand symbols into it: by then the history
+        // is all TRN2u, the reader has its differential chain seeded from its
+        // first symbol, and the exchange that has to be read has not started.
+        if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
+            self.four_at = u64::MAX;
+            if self.rx.train_on_trn2u(TRAIN_WINDOW) && self.rx.install_phase_four() {
+                self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
+                self.note(format!(
+                    "V.92: phase 4 receiver fitted on TRN2u, {:.1} dB",
+                    self.rx.snr_db()
+                ));
+            } else {
+                self.upstream_drop_until = self.upstream_drop_until.min(self.now);
+                self.note("V.92: no phase 4 fit on TRN2u".into());
+            }
+        }
         // 9.5.1.1.7-9.5.1.1.8: Jp waits for the phase the receiver has to work
         // out, and the phase is measured on the Su that follows the 24.5T
         // S-bar-u -- the run whose own phase already carries the half symbol,
@@ -1274,11 +1345,15 @@ impl Modem {
             }
             self.jp_sent = true;
             self.su_from = None;
-            let jp = Jp {
-                epsilon,
-                eight_in_training: self.rx.snr_db() >= 20.0,
-                eight_in_renegotiation: false,
-            };
+            // Four points, and the far end is told so (bit 48 = 0). TRN2u is
+            // "scrambled binary ones" (8.7.6): eight points a symbol would put
+            // a third more bits on the line and carry nothing extra, and the
+            // data mode's constellation is CPd's to choose, not this bit's.
+            // What it would cost is the reader: `upstream_size` above is what
+            // decodes the whole exchange, and a bit that asked for a
+            // constellation this end was not reading left Phase 4 waiting for
+            // an SUVu' that could not arrive.
+            let jp = Jp { epsilon, eight_in_training: false, eight_in_renegotiation: false };
             self.source.jp = jp.to_bits();
             // "shall finish the current Jd and then send Jp" (9.5.1.1.8). The
             // S-bar-u that answers Jp is (24 + epsilon)T (9.5.2.1.8), so the
@@ -1596,7 +1671,9 @@ impl Modem {
             self.design_and_store();
         }
         self.begin_upstream();
-        self.exchange = Some(Exchange::new(Context::Training, self.settings.round_trip, FS));
+        let mut exchange = Exchange::new(Context::Training, self.settings.round_trip, FS);
+        exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        self.exchange = Some(exchange);
         self.upstream_data = None;
         self.note("V.92: TRN2d done, SUVd out".into());
         self.apply_exchange();
@@ -1623,11 +1700,38 @@ impl Modem {
         if self.upstream.is_some() {
             return;
         }
+        // 9.6.1.1.1 with 8.7.6: TRN2u is the first four-point signal since CPt,
+        // so the fit designed on TRN1u goes in here, before a single symbol of
+        // it is read. Without it this end reads TRN2u at the thirteen decibels
+        // the two-point fit gives, which is the 5 to 13 per cent of wrong bits
+        // the handover keeps quoting. `train_on_trn2u` refines it afterwards.
+        let was = self.rx.snr_db();
+        if self.rx.begin_phase_four() {
+            self.note(format!("V.92: phase 4 receiver {was:.1} -> {:.1} dB", self.rx.snr_db()));
+        }
+        // 8.7.6's TRN2u begins at this symbol: the Phase 4 fit is designed on it
+        // a little way in, and nothing is given to the finder until that fit is
+        // in (see `upstream_drop_until`).
+        let start = self.rx.symbols();
+        self.four_at = start + TRN2U_FIT_AFTER;
+        self.upstream_drop_until = self.now + TRN2U_FIT_AFTER + TRN2U_DROP_AFTER_FIT;
         // Jp bit 48 chose four points or eight for TRN2u, and every sequence
         // between here and B1u rides the same modulation (8.7.2-8.7.6).
-        let size = Trn2uSize::Four;
+        let size = self.upstream_size;
         self.upstream = Some(Trn2uReader::new(size));
         self.up_finder = Some(UpFinder::new(trn2u_unit(size == Trn2uSize::Eight)));
+        // The equaliser's decisions are what its feedback section subtracts, so
+        // it has to know which constellation it is deciding: a two-point
+        // decision held against a four-point symbol is a wrong symbol fed back
+        // for the next eight, which is the one way a decision-feedback
+        // equaliser makes a line worse rather than better.
+        self.rx.set_slicer(if size == Trn2uSize::Eight { Slicer::EightPoint } else { Slicer::FourPoint });
+        let (inner, outer, gain, seen) = self.rx.measured_levels();
+        if seen > 0 {
+            self.note(format!(
+                "V.92: upstream four points measure {inner:.3}/{outer:.3}, gain {gain:.3} over {seen}"
+            ));
+        }
         self.note("V.92: upstream reader on TRN2u".into());
     }
 
@@ -1803,6 +1907,7 @@ impl Modem {
         }
         let Some(reader) = self.upstream.as_mut() else { return };
         let bits: Vec<bool> = reader.feed(level).into_iter().collect();
+        let dropped = self.now < self.upstream_drop_until;
         if let Some(file) = up_trace_file() {
             use std::io::Write;
             let mut out = String::with_capacity(bits.len() + 12);
@@ -1814,6 +1919,10 @@ impl Modem {
             }
         }
         for bit in bits {
+            if dropped {
+                self.upstream_dropped += 1;
+                continue;
+            }
             if let Some(finder) = self.up_finder.as_mut()
                 && let Some(family) = finder.feed(bit)
             {
@@ -1854,6 +1963,12 @@ impl Modem {
                 }
             }
             CpFamily::Cpu(cp) => {
+                let (inner, outer, gain, seen) = self.rx.measured_levels();
+                if seen > 0 {
+                    self.note(format!(
+                        "V.92: upstream four points measure {inner:.3}/{outer:.3}, gain {gain:.3} over {seen}"
+                    ));
+                }
                 self.note(format!(
                     "V.92: CPu drn {}, ack {}, {:.1} kbit/s",
                     cp.drn,
@@ -2260,22 +2375,54 @@ mod tests {
     /// slicing CPt's constellation out of that reads noise however clean the
     /// line is; that is the shape of the bug this pins.
     #[test]
-    fn phase_4_carries_cpt_rate_and_not_two_points() {
+    /// TRN2d is a binary signal; the sequences after it are on CPt's
+    /// constellation.
+    ///
+    /// 8.6.5/V.90 makes TRN2d "scrambled binary ones": one bit a symbol, the
+    /// scrambled bit being the symbol's sign, and no encoder of 5.4 in the way.
+    /// 8.8.2/8.8.3/8.8.5 put Ed, CPd and SUVd on "the corresponding TRN2d
+    /// modulation", which is where CPt's constellation and the encoder come in.
+    ///
+    /// Sending TRN2d on CPt's constellation, through the trellis and the
+    /// precoder, is what this end used to do and what an Agere SV92PP cannot
+    /// read: its Phase 4 receiver is a plain slicer with no Viterbi, so over a
+    /// sixteen-point TRN2d its descrambled stream had no run of ones in it
+    /// anywhere, its sequence detector never acquired, and it sat in its
+    /// wait-for-an-SUVd state until `V34 exception 60096212` ten seconds later.
+    /// With TRN2d binary the same call had it detect the SUVd, send its CPu,
+    /// detect the CPd and go to data mode. See §0.0j of the handover.
+    #[test]
+    fn trn2d_is_binary_and_the_sequences_are_not() {
         let settings = settings();
         let cpt = cpt(16, 16..=47);
         let mut source = Source::new(&settings);
         assert!(source.set_cpt(&cpt));
-        // (16 + 8) * 8000/6 = 32 000 bit/s over six 24-bit data frames.
-        assert_eq!(source.phase4_frame_bits(), 24);
         source.change(Out::Trn2d);
-        let levels: Vec<f64> = (0..600).map(|_| source.next()).collect();
-        let mut magnitudes: Vec<i64> = levels.iter().map(|l| (l.abs() * 512.0) as i64).collect();
-        magnitudes.sort_unstable();
-        magnitudes.dedup();
+        let magnitudes = |levels: &[f64]| {
+            let mut seen: Vec<i64> = levels.iter().map(|l| (l.abs() * 512.0) as i64).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen
+        };
+        let trn2d: Vec<f64> = (0..600).map(|_| source.next()).collect();
+        assert_eq!(
+            magnitudes(&trn2d).len(),
+            1,
+            "TRN2d carried {:?}, so it is not the two-point signal 8.6.5 asks for",
+            magnitudes(&trn2d)
+        );
+        // And the sequences are on CPt's constellation: more points than a
+        // binary signal has. TRN2d runs its least first, so the change takes
+        // effect at a frame boundary of its own and not before.
+        for _ in 0..TRN2D_LEAST {
+            source.next();
+        }
+        source.send(Out::Suvd, Suvd { silence: false, ack: false }.to_bits(INTERVALS));
+        let suvd: Vec<f64> = (0..200).map(|_| source.next()).collect();
         assert!(
-            magnitudes.len() > 4,
-            "TRN2d carried {} magnitudes, so it is still a two-point signal: {magnitudes:?}",
-            magnitudes.len()
+            magnitudes(&suvd).len() > 4,
+            "the SUVd carried only {:?}, so it is not on CPt's constellation",
+            magnitudes(&suvd)
         );
     }
 

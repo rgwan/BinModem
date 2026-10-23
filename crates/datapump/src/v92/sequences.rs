@@ -1095,6 +1095,74 @@ fn down_length(bits: &[bool]) -> Length {
 }
 
 #[cfg(test)]
+mod upstream_trace {
+    //! Read a `V92_UP_TRACE` file back and say what the upstream carried.
+    //!
+    //! The bench writes one line per upstream symbol -- `now level bits`, the
+    //! bits already differentially decoded and descrambled -- so replaying it
+    //! through the finder answers "did the far end send a CPu, and did this end
+    //! see the sequences it did send" without a second 40 second call. That is
+    //! the difference between a receiver that is wrong and a far end that sent
+    //! nothing.
+    //!
+    //! `V92_UP_TRACE=/tmp/up.txt V92_UP_SPAN=107000..234000 cargo test --release
+    //! -p datapump --lib scan_an_upstream_trace -- --ignored --nocapture`
+
+    use super::*;
+
+    #[test]
+    #[ignore = "needs V92_UP_TRACE to name a captured upstream"]
+    fn scan_an_upstream_trace() {
+        let Ok(path) = std::env::var("V92_UP_TRACE") else { return };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (mut from, mut to) = (0u64, u64::MAX);
+        if let Ok(span) = std::env::var("V92_UP_SPAN") {
+            let mut it = span.split("..");
+            from = it.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+            to = it.next().and_then(|t| t.parse().ok()).unwrap_or(u64::MAX);
+        }
+        let mut finder = UpFinder::new(trn2u_unit(false));
+        let mut found: Vec<(u64, String)> = Vec::new();
+        let (mut bits_seen, mut zeros) = (0u64, 0u64);
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(now) = parts.next().and_then(|t| t.parse::<u64>().ok()) else { continue };
+            let _level = parts.next();
+            let Some(pattern) = parts.next() else { continue };
+            if now < from || now >= to {
+                continue;
+            }
+            for ch in pattern.chars() {
+                bits_seen += 1;
+                let bit = ch == '1';
+                if !bit {
+                    zeros += 1;
+                }
+                if let Some(family) = finder.feed(bit) {
+                    found.push((now, match family {
+                        CpFamily::Suvu(s) => format!("SUVu ack {}", s.ack),
+                        CpFamily::Cpu(_) => "CPu".into(),
+                        CpFamily::Cpt(_) => "CPt".into(),
+                        CpFamily::Cpus(c) => format!("CPus drn {} ack {}", c.drn, c.ack),
+                    }));
+                }
+            }
+        }
+        eprintln!("V92UP: {bits_seen} bits, {zeros} zeros, {} sequences", found.len());
+        let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+        for (_, name) in &found {
+            *counts.entry(name.as_str()).or_default() += 1;
+        }
+        for (name, count) in &counts {
+            eprintln!("V92UP: {count} x {name}");
+        }
+        if let (Some((first, _)), Some((last, _))) = (found.first(), found.last()) {
+            eprintln!("V92UP: first at {first}, last at {last}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::v34::info::crc;

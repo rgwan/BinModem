@@ -1071,3 +1071,454 @@ J::from_bits(&window72) -> Option<J>;   // 72 位滑窗，CRC 校验
 
 **留下的东西**：§3.1 的两条路（ε 的符号/量纲核对、第二 TRN1u 的定位）是唯一还没闭环的；
 再往后是 Phase 4。
+
+## §0.0h Phase 4 上行接收机：DFE（2026-10-23 本轮）
+
+### 结论（不要再重新推导）
+
+V.92 上行 = 8000 符号/秒、1 符号 1 采样。对端发送频谱 **3.5 kHz 前平 / 3.7 kHz −6 dB /
+3.9 kHz 无**。两点 TRN1u 靠符号位还能判，四点 TRN2u/CPu 的**内/外档之分**正好在被削掉的
+带上 ⇒ **CPu 过不了不是协议或 CRC 问题，是接收机眼图不够开**。
+
+同一捕获线的档位误码（TRN2u = 加扰全 1，符号已知，可直接量）：
+
+| 前馈 | 反馈 | 拟合 | 档位错 |
+|---|---|---|---|
+| 48 | 0 | 14.6 dB | 0.68 % |
+| 24 | 8 | 31.1 dB | **0.007 %**（13990 符号错 1 个）|
+| 32 | 16 | 34.8 dB | — |
+
+CPu 1377 bit：1 % 误码必败，0.007 % 稳过。
+
+### 已实装
+
+- `v92/receiver.rs`：DFE（`DFE_FORWARD=32`、`DFE_FEEDBACK=16`）、判决引导运行、静音守卫、
+  实测四点档位（内侧档锚回 1/√5）、`Slicer::FourPoint` 电平修正（原写 ±1/±3，应为 ±1/√5、±3/√5）。
+- `reference_from(skip, len, mode)`（`reference()` 的 `from` 从只缩短长度、不跳过）。
+- `fit_at(at, len, skip, F, B)` + `pending_levels` 通道（用显式参考序列拟合）。
+- `train_on_trn2u(window)`：TRN2u 数据辅助训练，8 种假设（帧内比特相位 × 符号种子 ×
+  幅度位是否差分），lag 扫 0..TRAIN_TAPS。**线上 14.3 dB，装上并全程使用。**
+- `design_phase_four_at(anchor, window)`：TRN1u 到达时设计 Phase 4 拟合，挂在
+  `train_near` 成功路径（Ru 后、Su 后各一次）。**目前仍然返回 false。**
+
+### 踩过的坑（按代价排序）
+
+1. **lag 是独立自由度**：因果滤波器不能产出比它看到的样本更晚的符号。lag 错 → 0.1 dB，
+   lag 对 → 23.8 dB（同一窗口同一线）。
+2. **ridge 只能小**：前馈列与反馈列近共线，ridge 决定拆分。`1e-6·trace/taps` 把解压掉，
+   `1e-9` 才对；正确做法是 1e-9 起、`solve_hermitian` 失败才升到 1e-7/1e-5。
+3. **参考序列坐标系**：`pending_levels` 按序列索引建 → 切片 `offset+(start−p)`；
+   按样本索引建 → 切片 `start−lag`。混用 → 0.07 dB（这一处错了两次）。
+4. **`pending_levels` 曾从未被赋值** → 静默退回 TRN1u 两点参考，拟合"看起来没发生"。
+5. **电平构造要 `2*length` 个比特**（一符号两比特），否则序列半路 break。
+6. **解构时别把相关分数当偏移量**（`share.0` vs `share.1`）。
+7. **静音时 DFE 会自激**：E1u 的静音是"交换结束"信号，必须清判决历史并输出 0。
+8. **拟合必须便宜**：48 未知数 × 97 对齐 × 每 2000 符号重试 ⇒ modem 掉出实时、对端超时。
+
+### 台架现状（run `link7`）
+
+Phase 4 走通；SUVu 77 ack=true / 52 ack=false；**CPu 无**；`phase 4 receiver stays at 13.5 dB`
+（TRN1u 路线未装上，TRN2u 路线此前装上时为 14.3 dB）。
+
+### 下一步
+
+1. **对拍定位唯一缺陷**：同一 `start`/`span`/F/B 并排调 `fit_at` 的 `reference_from` 与
+   `pending_levels` 两条通道。现在前者出 0.1–0.6 dB、后者出 14.5 dB，
+   而上一轮同一调用曾出 22–60 dB。10 行测试、秒级反馈。
+2. **TRN1u 在线训练**：TRN1u 在 Ru 后与 Su 后各一次。`Dil` 阶段历史尾部已是 E1u
+   （实测 probe share 0.000），所以**不能回头找**，要在 TRN1u 到达时逐符号累加正规方程
+   （已知序列 ⇒ 反馈喂真值，不会误锁），累够解一次。
+3. **丢弃门控加在比特流一侧**：TRN2u 前一半的 `Trn2uReader` 输出不送 `UpFinder`，
+   接收机全程运行、全程训练。
+
+调试方法（台架 100 s/轮，不要用它迭代算法）见 skill `v92-pcm-upstream-dfe`。
+
+### §0.0h.1 更正（同日，用回放验证后）
+
+**"24+8 → 31 dB / 0.007 %" 不可复现，勿再引用为判据。** 用 `replay_a_captured_line`
+把捕获线（`/tmp/rx5.txt`）灌进 `Receiver` 实测：
+
+| | 拟合 |
+|---|---|
+| 48 抽头线性（Rust，`train_near`）| 15.73 dB |
+| 32+16 DFE（Rust，start 扫 ±64、skip 扫 0..48）| **14.70 dB** |
+
+原因已定位：离线 Python 的 `design_dfe` 把反馈列写成 `s[F-1-j : …]`，那是**目标索引之前
+23-j 个符号**（相当于"未来"符号）；Rust 按因果写成 `reference[n-1-j]`（真正过去）。
+所以离线的 31 dB 是在一个**非因果**目标下拟合出来的数，真实 DFE 拿不到。
+档位误码 0.007 % 那组数是把非因果抽头放进因果循环里跑出来的，能跑通但拟合目标不成立。
+
+**教训**：判据只能用"同一实现内、变量可控"的对拍。合成线（25 抽头 0.95-奈奎斯特 sinc）
+比实线苛刻得多，也不作数。回放捕获线是唯一可信口径。
+
+**下一步据此修正**：先把 48 抽头线性拟合的**评价口径**与 DFE 对齐（同一窗口、同一 skip），
+再决定 32+16 到底有没有优势；若确实没有，CPu 的解法就不是 DFE，而是
+（a）TRN2u 前一半丢弃 + 更长的线性拟合（96/128 抽头，离线测过 0.24 % 档位错），或
+（b）在半符号相位上做定时恢复（`epsilon::lag` 那套已有）后再判决。
+
+### §0.0h.2 交接要点（新 session 从这一节开始）
+
+**读的顺序**：本节 → §0.0h.1（判定标准更正）→ §0.0h（实装与坑）→ skill `v92-pcm-upstream-dfe`。
+
+#### 已经确定的事（不要再重推）
+
+1. CPu 过不了 = 接收机眼图不够开，不是协议/CRC/位域。
+2. 对端发送频谱：3.5 kHz 前平、3.7 kHz −6 dB、3.9 kHz 无。四点档位之分正被削掉。
+3. **DFE 方向成立，参数是 48 前馈 + 16 反馈**。捕获线上的实测（秒级回放）：
+   ```
+   V92_REPLAY=/tmp/rx5.txt V92_ANCHOR=1021 \
+     cargo test --release -p datapump --lib replay_a_captured -- --ignored --nocapture
+   → linear 15.73 dB / feedback 33.96 dB at start 1082 skip 48 taps 48+16
+   ```
+4. 参数关系（已写进代码）：**`start = 锚点 + CHANNEL_DELAY(13) + lag`，`skip = lag`**。
+   只扫 start 或只扫 skip 都碰不到这个点（各自都 ≤15 dB）。
+5. TRN1u 在 /Su 之后**可能不出现**（部分 modem）。Phase 4 拟合只依赖 **/Ru 后**那个
+   TRN1u（挂在 `train_near` 成功路径）；/Su 后的 `train_verified` 只精化，且只在更好时
+   才替换 stash，`restore()` 不动 `phase_four`。
+6. 丢弃只加在比特流一侧（`Trn2uReader` 输出 → `UpFinder` 之前），接收机全程运行、全程训练。
+
+#### 唯一的未解缺陷
+
+`design_phase_four_at(1021, 1200)` 返回 **false**，而它被要求的那个点
+（start 1082 / skip 48 / 48+16）在紧邻的暴力扫描里是 **33.96 dB**。
+所以只剩该函数内部一道 guard（`span <= 4*TRAIN_TAPS`、`lag` 上界、`floor` 比较之一）。
+定位方法：在 `design_phase_four_at` 的循环里打一行 `(lag, start, span, took, snr)`，
+用上面那条回放命令跑（**1 秒**，不要用台架）。
+
+#### 不要做的事
+
+- 不要用台架迭代算法（一轮 ~100 s，且对端行为有随机性）。
+- 不要用合成线（25 抽头 0.95-奈奎斯特 sinc）判优劣：方向与实线相反。
+- 不要在 `Dil` 阶段回头到历史里找 TRN1u：那时历史尾部已是 E1u（实测 probe share 0.000）。
+- 不要再引用 "24+8 → 31 dB / 0.007 %"：那是非因果目标下的旧数，已作废。
+
+#### 下一步（按顺序）
+
+1. 修 `design_phase_four_at` 的那道 guard，让回放给出 ≥30 dB 且 `taken == true`。
+2. `DFE_FORWARD=48 / DFE_FEEDBACK=16` 的拟合成本需复核：96 未知数的求解比 32 未知数贵，
+   确认它不会让 modem 掉出实时（此前 48 未知数 × 97 对齐周期性重试导致过超时）。
+3. 台架验证：期望 `phase 4 receiver fitted ... dB` 且随后出现 `CPu drn 1, ack ...`。
+4. 之后按 §0.0h.2 第 6 条加丢弃门控（TRN2u 前一半不送 `UpFinder`）。
+
+#### 现有判据
+
+| 名字 | 状态 | 作用 |
+|---|---|---|
+| `replay_a_captured_line` | `#[ignore]`，需 `V92_REPLAY`/`V92_ANCHOR` | **唯一可信口径**，秒级，打印 linear / 单 TRN1u 设计结果 |
+| `the_phase_four_fit_is_trained_on_trn2u_itself` | 通过（14.5 dB）| TRN2u 8 假设 + lag 搜索 |
+| `decision_feedback_beats_the_linear_fit_on_a_band_limited_line` | `#[ignore]`，**不通过** | 合成线判据，方向与实线相反，仅作参考 |
+| `--lib` | 659 绿 | |
+
+## §0.0i 本轮（DFE 接通、上行接收闭环，堵点移到对端的 SUV 检测）
+
+### 结论一：§0.0h.2 那个"唯一未解缺陷"不是 guard，是 `DFE_FEEDBACK`
+
+工作树里 `DFE_FEEDBACK` 被留在 **0**。于是 `fit_at` 只有前馈，拟合恒 ~15 dB，
+`design_phase_four_at` 里 `best.filter(|f| f.snr() > floor)` 那一句永远为假 ——
+看起来像"被一道 guard 挡住"，其实是拟合本身没赢过线性底。
+
+改回 **16** 后同一条回放（`/tmp/rx5.txt`，anchor 1021）立刻给出：
+
+```
+V92BENCH: linear 15.73 dB
+V92BENCH: single TRN1u: designed true at 15.73 dB, taken true -> 33.90 dB
+```
+
+真机同样：`V.92: phase 4 receiver 13.5 -> 33.9 dB`（E1u 时用 TRN1u 设计的装上），
+`V.92: phase 4 receiver fitted on TRN2u, 33.8 dB`（TRN2u 数据辅助那一发）。
+
+**教训**：判据不通过时先看"拟合参数是不是被改过"，再看算法。这一条花了上一轮一整轮。
+
+### 结论二：`design_phase_four_at` 的 49 个 lag 是同一个拟合做 49 次
+
+`start = anchor + lag + CHANNEL_DELAY` 与 `skip = lag` 同步移动 ⇒ `start - skip` 恒定
+⇒ 对齐根本没变。实测（`V92_REFIT_TRACE=1`）49 个 lag 全部 **32.71 dB**，小数点后两位一样。
+
+改成：先用 `align_trn1u` 相关把锚点钉到符号级（回放里质量 0.744、偏移 0），
+再只搜**真正独立的那个自由度** —— 对齐，`CHANNEL_DELAY ± DESIGN_SLIPS(4)`，`skip` 恒 0。
+9 次拟合，回放 33.90 dB（全局最高 33.96 在 offset 59/48+16，差 0.06 dB 不值得多 40 次求解）。
+整个回放测试从 0.69 s 降到 0.36 s。
+
+### 结论三：`four_at` 从未被赋过值 ⇒ TRN2u 拟合在"还没有 TRN2u"时就跑
+
+`four_at` 初始 0，`begin_upstream` 不设它，于是 `upstream.is_some() && symbols() >= 0`
+第一个 tick 就成立 —— 历史尾部那时是 E1u/静音。现在在 `begin_upstream` 里设
+
+```rust
+self.four_at = start + TRN2U_FIT_AFTER;      // 2400 符号（0.3 s）之后
+self.upstream_drop_until = start + TRN2U_FIT_AFTER + TRN2U_DROP_AFTER_FIT;
+```
+
+丢弃门控按用户规则放在**比特流一侧**（`symbol_upstream` 里、`up_finder.feed` 之前），
+`Trn2uReader` 全程照跑、DFE 全程照训练。`train_verified`（第二个 TRN1u）也补上了
+`design_phase_four_at`，所以"只有一个 TRN1u 的对端"也能拿到 Phase 4 抽头。
+
+### 结论四：上行接收已经闭环（本轮最大的收获）
+
+真机、判据是**对端解的 SUVu/CPu**（不是我们的日志）：
+
+| | 修前（dfe48） | 修后（final01） |
+|---|---|---|
+| Phase 4 接收机 | 13.5 dB，拟合从没装上 | **33.9 dB**，两路都装上 |
+| TRN2u 解出的错比特 | 5–13 % | **9 / 27600**（全在头 20 bit 的暂态） |
+| CRC 通过的 SUVu | 137（约 373 时隙） | **1929 条，连续无缝** |
+| CPu | 0 | **0（对端根本没发，见下）** |
+
+判据工具（新增，秒级、不用台架）：
+`V92_UP_TRACE=/tmp/up.txt V92_UP_SPAN=107000..234000 cargo test --release -p datapump --lib
+scan_an_upstream_trace -- --ignored --nocapture` → `1932 x SUVu ack false`，无 CPu。
+
+### 结论五：上行修好之后，暴露的是**我们自己交换机的 bug**
+
+`repeat_cp` 一旦置位，`cp_due()` 就恒返回 true ⇒ 只发 CPd、**再也不发 SUVd**。
+实测：一轮 134 个 CPd、0 个 SUVd，对端 `suv=0` 到死。
+而 9.6.2.1.2 说模拟端**收到 SUVd 才发 CPu**，Figure 14 画的正是 "CPd, then plain SUVd"。
+
+修法：`Exchange::repeat_between_suvs(gap)`，重复组里每 `gap` 符号一个 CPd、中间全是 SUVd。
+默认 0（= 条款字面，也是 Figure 14 里 CPu' 的样子，所以脚本化对端的断言不动），
+`digital.rs` 里设 `REPEAT_CP_GAP = 1200`（0.15 s ≈ 40 个 SUVd）。回归测试
+`a_repeat_group_leaves_suvs_between_its_cps`。
+
+### 结论六：堵点现在是**对端检测不到我们的 SUVd**（唯一剩下的）
+
+对端引擎自己的话（`AGRSM_PHASE4_PROBE` / `AGRSM_ENGINE_TRACE`）：
+
+```
+[  19.698] PCM phase 4 started
+[  25.x  ] SUVu sent 2001                 ← 它在发 SUVu，从没发 CPu
+[  34.260] V34 exception: 60096212        ← RxWaitSUV 超时（= 0x96212）
+探针：suv=0（0x11753 全程为 0）、acq=0、n=2、len=6、det=MP→other@23.17
+```
+
+本轮**排除**掉的两个解释（都做了实验）：
+
+1. **不是 ack 位**。dfe48 那轮我们的 SUVd/CPd 恰好带着 ack=1（上游误码偶然解出的假 ack），
+   于是怀疑"它要 ack 位"。强制 ack=1（`V92_FORCE_ACK`，已删）→ 仍然 `0x96212`。
+2. **不是 SUVd 的持续时间**。把第一个 CPd 推迟（`V92_CP_HOLD=24000`，已删）→
+   21.40 s 起**纯 SUVd 4.46 s**（对端 TRN2u 内一直有 SUVd）→ 仍然 `0x96212`。
+
+所以剩下的问题在**对端怎么收我们的 SUVd**，不在我们发什么、发多久。
+复现：`V92_TRACE=1 AGRSM_PHASE4_PROBE=/tmp/p.txt AGRSM_EVT_TRACE=/tmp/e.txt
+AGRSM_SCR_TRACE=/tmp/s.txt` + 台架一轮（~40 s）。
+
+### 台架工具的两处改动（这一轮加的）
+
+1. `run_agr_v90.py`：`--verbosity` 默认 **2**（= `agrsmodemd -d 2`），对端 DSP 的调试信息
+   每轮都进 `agrsmodemd.log`；结束时 `_digest()` 把 phase 4 / SUV / CP / exception / SNR
+   那几十行摘出来打一遍，不用再翻文件。
+2. 新增 `scan_an_upstream_trace`（`#[ignore]`）：把 `V92_UP_TRACE` 回放进 `UpFinder`，
+   直接回答"对端到底发了什么、我们解出了什么"。**判上行一律用它，不要只看我们的 note。**
+
+### 下一步（按顺序）
+
+0. **已经量到的起点（`AGRSM_EVT_TRACE` 一次运行，按时间归并）**：
+
+   | 时段 | 事件 |
+   |---|---|
+   | 17–20 s（相位 3） | `evt 9 len 6` × 207（CRC 通过，相位 3 的序列，正常）|
+   | 20–23 s（我们的 TRN2d + 第一批 SUVd） | **一个事件都没有** |
+   | 23–30 s（CPd/SUVd 交替） | `evt 10 len 203` × 46（"序列开始"），**`evt 9` 一个都没有** |
+
+   ⇒ 相位 4 里对端的检测器**会**被喂、**会**捕获（`evt 10` 是"找到同步、开始收"），
+   但它从帧头算出的长度是 **203 字节**（我们的 CPd 是 434 字节、SUVd 是 4 字节），
+   于是永远收不完、永远不报 `evt 9`。而 20–23 s（纯 TRN2d/SUVd）它连同步都不报。
+   **先解释 203**：要么我们相位 4 的码字布置（CPt 星座 / D 比特每帧 / ucode→线性值）
+   与它切出来的比特不是一回事，要么它对相位 4 的 `TRN2d` 与 `SUVd` 用的是不同判据。
+
+1. **对端 SUVd 检测**：`suv=0` + `len=6` 是入口。`len` 是检测器从帧头算出的长度
+   （`4 + 12·[19] + (8+2ΣL)·[20] + (10+2ΣLC)·[21]` 字节，`len == 4` 才分类成 SUV）。
+   我们的 SUVd 应是 4 字节；它算出 6 ⇒ 要么它读到的不是我们的 SUVd，要么我们的
+   SUVd 帧头让它算成 6。**先拿 `AGRSM_EVT_TRACE` 在 phase 4 里数 `evt 9` 的 `len` 分布**，
+   再决定是改我们的 SUVd 还是承认它压根没解到。
+   注意本轮的 SCR/EVT trace 已经把旧记忆里"phase 4 里 V34RxData 0 次/秒"推翻了
+   （实测 23–30 s 有 2016 次解扰器调用、903 个事件），旧结论别直接引用。
+2. `CPu` 一旦出现：`SUVd'`（ack=1）→ `Ed/E2u` → `B1d/B1u` → CONNECT 的代码都在，
+   `B1d` 仍是常量比特、`B1u` 没有字节出口（见 §0.0.2）。
+
+### 本轮判据
+
+| 名字 | 状态 |
+|---|---|
+| `replay_a_captured_line` | 通过，33.90 dB（秒级，`V92_REPLAY`/`V92_ANCHOR`）|
+| `an_upstream_trace_can_be_read_back`（`scan_an_upstream_trace`）| `#[ignore]`，需 `V92_UP_TRACE` |
+| `a_repeat_group_leaves_suvs_between_its_cps` | 通过（新）|
+| `--lib` | **660 绿**（+1 新测试）|
+| 台架 `final01` | Phase 4 接收机 33.9 dB、SUVu 1929 条、CPu 0、对端 `0x96212` |
+
+## §0.0j 不发 CPu 的原因（反编译定的）与 TRN2d 的调制
+
+### 一、对端为什么必须收到 SUVd 才发 CPu（反编译 `agrsm_core.o`，非推测）
+
+`V92ClientPhase4RxWaitSUVState`（=== 段在 `/tmp/agere-v92p4.c`）：
+
+```c
+if ([0x11753] != 0 && [0x8800] == 0) {        // 收全一条 SUV（FUN_0006a010，len==4）
+    if (([0x11adf] & 0x40) == 0) {            // SUV 的 **silence 位**（Table 31 bit 32）
+        V92ClientControlSendSequence(0, 0);   // 不静默：先发 SUVu
+        next = FUN_0006d360;                  //   → 等 CP
+    } else {
+        V92ClientControlSendSequence(0, 3);   // 静默：直接发 CPu
+        V34RxDataSetEdDetector(...); next = FUN_0006d550;
+    }
+}
+```
+
+`FUN_0006d360` 里：`if ([0x11752] != 0)`（= 收到 CP，Phase 3 就已经是 1）→
+`V92ClientControlSendSequence(0, uVar2)`，`uVar2 = 3` 即 **CPu**。
+
+⇒ 链条是：**SUVd（CRC 通过）→ `[0x11753]` → 发 SUVu 并进 FUN_0006d360 →
+`[0x11752]` 已是 1 → 立刻发 CPu**。缺的从来只有第一环。
+
+### 二、对端怎么判一条序列是不是 SUV（同一函数反编译）
+
+`V34RxDataMPDetector` 在 CPd 模式（`[0x8664]=1`）下：
+
+```c
+u = shift >> [0x8640];
+[0x864c] = (u & 2) ? 4 : 6;      // 4 字节 ⇒ SUV；6 ⇒ 别的
+```
+
+先要**捕获**：`(shift>>15 & 0x1ff) == 0x1ff` 且 `iVar10 > 0x10`（连续 **>16 个 1**）
+且当前字节 ≠ 0xff。⇒ 它必须先在解扰后的比特流里看到一段 ≥17 个 1 的连续段
+（就是 TRN2d 的 scrambled ones），否则永远 `acq=0`，后面的 SUVd 连看都不看。
+
+这就是为什么 `suv=0` 从头到尾——不是 CRC 不过，是**没有捕获点**。
+
+### 三、实测证据链（台架 `final01`，16 点 TRN2d）
+
+| 观察 | 值 |
+|---|---|
+| 我们发的 16 个电平 | ±396…±6652，8 个幅度 × 2 符号 |
+| 对端实际收到（`agr-rx.raw` 与 `caller.raw` 互相关）| **1.0000 @ 25328 样点** ⇒ 线路无损，它收到的就是我们发的 |
+| 对端解扰器输出（`AGRSM_SCR_TRACE`）相位 4 | **随机噪声**（相位 3 是结构化的 `94 47 39 d4 …`）|
+| 探针 | `acq=0`、`n=2`、`len=6`、`suv=0` |
+| `[0xeb10]`（切片统计，标称 12544）| 2168 → 135，一路塌 |
+| 结局 | `V34 exception 60096212`（RxWaitSUV 超时）|
+
+### 四、修法：**TRN2d 是二值信号，SUVd/CPd/Ed 才用 CPt 的星座**
+
+8.6.5/V.90 说 TRN2d 是 "scrambled binary **ones**"——一个符号一个比特，
+加扰后的比特就是符号的极性，**不过 5.4 的编码器、不用 CPt 的星座**；
+8.8.2/8.8.3/8.8.5 才把 Ed/CPd/SUVd 放到 "corresponding TRN2d modulation" 上。
+
+我们原来把 TRN2d 也塞进 `Encoder`（16 点 + 网格 + 预编码器）。对端的相位 4 接收机
+**没有 Viterbi**，只能切二值，于是它拿到的是一串噪声 ⇒ 捕获不了 ⇒ 不发 CPu。
+
+改 `Out::Trn2d` 为 `self.sign = self.scrambler.scramble(true)`（二值），
+SUVd/CPd/Ed 保持走 `phase4_codeword`（CPt 星座）。**一轮实测直接通了**：
+
+```
+SUVd detected 1 | CPu sent 52 0 2000 ... | CPd detected 1e 6f12 | SUVu' sent a001
+SUVd' detected 8001 | TxRate 24000 bps | Tx Data Mode Active! | Rx Data Mode Active!
+Data rate: 40000 / 24000 bps   V44 Encoder/Decoder: Compressed mode active
+```
+
+我方日志同步：`CPu drn 10, ack false, 40.0 kbit/s` → `CPd drn 1, ack true` →
+`Ed` → `B1d at 40000`。**这是本项目第一次到 V.92 数据态。**
+
+### 五、还没复现 —— 一定要先做这件事
+
+那轮成功之后我为了清理死代码用一个脚本改 `digital.rs`，脚本的正则匹配到了错误的
+位置，**删掉了约 2100 行**。已恢复，但只能从 dangling commit
+`f02efdc4a8259638787adc937e7ec439ec6b83f3` 取 `crates/datapump/src/v92/digital.rs`
+——那是上一轮的**中间态**（`four_at`、`prepare_phase_four` 都还没有），
+本轮的改动是我在这个中间态上重新加的。
+
+⇒ **不能排除**上一轮最终版 `digital.rs` 里还有别的东西（§0.0 的下一阶段清单、
+`prepare_phase_four` 之外的改动）没被恢复，而成功那轮用的正是最终版。
+现状：同一个 TRN2d 二值改动在当前树上 **4 次台架都失败**（`suv=0`、`0x96212`）。
+
+下一步（按顺序）：
+
+1. **把上一轮最终的 `digital.rs` 找回来**（对话历史 / 编辑器备份 / 重新按 §0.0h
+   的清单从 `f02efdc4` 补），与当前版本 diff，把丢掉的部分补上，再跑一次台架确认
+   `suv=1` 回来。这是最优先，别的都会绕开它。
+2. 数据态那一步：`B1u` 还没有字节出口、`B1d` 仍是常量比特（§0.0.2），
+   所以即使 `Tx/Rx Data Mode Active` 也只是空转，随后对端 `Carrier Lost /
+   Disconnect reason: Training Failed`。
+3. `repeat_between_suvs`（REPEAT_CP_GAP=1200）与 TRN2u 丢弃门控（用户规则①②）
+   都已实现并通过单测，保留。
+
+### 本轮单测
+
+`--lib` **661 绿**（+1，替换了旧的 `phase_4_carries_cpt_rate_and_not_two_points`，
+改成 `trn2d_is_binary_and_the_sequences_are_not`）。
+
+### 六、§0.0j 之后新增的三条实测（本轮）
+
+1. **重复 CPd 会饿死 SUVd**。`twopt` 那轮之所以通，是因为对端的 SUVu 带回了
+   ack=1（只有 3 个 CPd，线路 95% 是 SUVd）；而 ack 收不到时 `repeat_cp` 置位，
+   `REPEAT_CP_GAP=1200` 让线路 3/4 是 CPd。已改成 **24000**（3 s），
+   一轮仍有 9 个 CPd（9.6.1.1.3 的"重复"仍在），但线路以 SUVd 为主。
+2. **`begin_phase_four` 在本树里从没被调用**（`f02efdc4` 是中间态，缺这段集成）。
+   不过实测在 `begin_exchange` 处补调用**不会生效**：`train_on_trn2u` 已经更早
+   把 33.8 dB 的拟合装上了（`begin_phase_four` 打印 `stash None current 33.8`）。
+   ⇒ 我方相位 4 接收机本来就是 33.8 dB，**CPu 收不到的原因不在我方接收**。
+3. **新的、未解的疑点（下一步从这里开始）**：`AGRSM_SCR_TRACE` 里相位 4
+   对端的切片字节是**周期 3 字节（24 bit）的重复图案** `c0 b6 6d c0 b6 6d …`，
+   解扰输出同样是周期的垃圾。24 bit = 一个数据帧 ⇒ 它看到的是**逐帧完全相同**
+   的 6 个符号。而我方 `last` 队列从未空过（加了临时探针验证，`dried: 0`），
+   线上不该是逐帧重复。**要么我们真的在发重复帧，要么对端只按帧边界重复采样。**
+   下一步：把 `caller.raw` 与 `agr-rx.raw` 对齐后，直接数相位 4 里 6 符号帧的
+   重复率（`caller.raw` 有 `--capture`），确定是不是我们发的。
+
+### 本轮判据与改动
+
+- `--lib` **661 绿**。
+- `REPEAT_CP_GAP` 1200 → 24000（`Exchange::repeat_between_suvs`）。
+- TRN2d 二值（§0.0j 四），SUVd/CPd/Ed 仍走 CPt 星座。
+- **未提交**；`digital.rs` 是从 dangling commit `f02efdc4` 恢复后重做的，见 §0.0j 五。
+
+### 七、§0.0j 六 第 3 条已排除：我们没在发重复帧
+
+用 `--capture` 数 `caller.raw` 相位 4 的 6 符号帧（21.6–22.6 / 23.4–24.4 / 25.0–26.0 s
+三段）：**每段 1333 帧、1333 个互不相同**。⇒ 线上不是逐帧重复，§0.0j 六 第 3 条
+观察到的周期 3 字节是对端**自己的切片结果**，不是我们的信号。
+
+并且这个周期本身给了答案：**3 字节 = 24 bit**。若对端按 1 bit/符号切，
+24 bit = 24 符号 = **4 个 6 符号数据帧** ⇒ 3 字节周期正好成立。
+⇒ 对端相位 4 的切片器**仍然是二值（1 bit/符号）**，即它读我们 16 点的
+SUVd/CPd 时只取到 1/4 的比特。
+
+这条与 §0.0j 四 的成功轮矛盾（那轮 SUVd/CPd 也是 16 点，却读通了），
+所以下一步二选一，各一轮台架：
+
+1. **把 SUVd/CPd/Ed 也改成二值**（整条相位 4 都二值），看对端是否立刻解出 SUVd。
+   若通了，说明对端的相位 4 接收机就是二值的，CPt 星座只在 B1d 之前**不能**用。
+2. 若仍不通，则 §0.0j 四 那一轮是偶然（对端内部状态），要转去查它什么时候把
+   切片器从二值切到 CPt——反编译 `V34RxDataSetCPdDetector` 的调用者
+   `V92ClientPhase4RxWaitRiBarState` 与 `FUN_0006d8f0` 的
+   `PCMClientDemodulatorSetFullDuplexMode`，找"谁把切片改成 CPt 星座"。
+
+（`real80`–`real83` 三个 2 点 SUVd 的构建都失败过，但那时 `TRN2d` 还是 16 点，
+所以"整条二值"这一组还没真正测过。）
+
+### 八、对端相位 4 的帧长实测（`[0x11730]`，本轮探针新增）
+
+`AGRSM_PHASE4_PROBE` 现在多打三个字段 `d=<0x11730>/<0x1168c>/<0x11744>`，
+其中 **`0x11730` = 它认为一个数据帧有几个比特**（`FUN_0006d360` 用它算读完一条
+序列后要跳过多少比特：`ceil(51/d)*d`）。实测：
+
+| 时刻 | 线上我们发的 | `d` |
+|---|---|---|
+| 20.2–23.2 s | TRN2d（二值）+ 第一批 SUVd（16 点）| **0**（还没设）|
+| 23.24–23.75 s | CPd（16 点）| **6** |
+| 24.25 s 起 | CPd 之后 | **24** |
+
+⇒ **对端在收到 CPd 之前，相位 4 的数据帧是 6 bit = 一符号一比特（二值）；
+只有 CPd 之后才切到 24 bit（CPt 的速率、4 bit/符号）。**
+
+这条把 §0.0j 六/七 的"3 字节周期"完全解释掉了（24 bit = 4×6 bit 帧），
+也说明 **TRN2d 和 SUVd 都必须二值**。注意 CPd 自己是在 `d=6` 期间被读的
+（23.24 s 起就是 6），所以 **CPd 也得二值**，`d=24` 是它读完 CPd 之后才设的。
+
+⚠️ 但"整条相位 4 二值"的两组构建都试过、都没通（`real80/81` 补到 6、
+`real82` 补到 24），所以**还差一环**。下一轮的第一件事：
+
+1. 把三种都跑一遍并比对 `d` 的取值与 `acq`：
+   （a）TRN2d 二值 + 序列 16 点（现状）→ `d` 何时变 6/24？
+   （b）全二值、序列用**差分**编码（`sign ^= scramble(bit)`）、补到 6；
+   （c）全二值、补到 24。
+   现在的 `V92_BINARY_PHASE4=1` 开关（`binary_sequences()`）就是为了这个 A/B，
+   定下来后把它连同 env 一起删掉。
+2. 每一轮都读 `AGRSM_PHASE4_PROBE` 的 `d=` 与 `suv=`：`suv=1` 是唯一硬判据。
