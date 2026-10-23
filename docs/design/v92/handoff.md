@@ -5,7 +5,96 @@
 
 ---
 
-## 0.0 第三轮取证（结论：管道是好的，第二轮的上行误码判定成立）
+## 0.0 交接速览：**只读这一节就能开工**
+
+### 0.0.1 目标与位置
+
+目标：BinModem（数字 server）与 Agere SV92PP 建立 V.92 连接并传数据。
+
+现在的状态：**Phase 2、Phase 3 双向走完；Phase 4 下游已完成**（对端 `acq=1`、
+`SUVd detected`、`CPu sent`、`CPd detected`）；**堵点在上行**：对端发的 `CPu` 我们解不出来
+（CRC 不过）→ 我们的 SUVd 拿不到 ack → 对端 1 s 窗口超时 → `0x962140` 清线。
+
+### 0.0.2 已证实的（可以当地基用）
+
+| 结论 | 怎么证的 |
+|---|---|
+| 下游调制正确：TRN2d/SUVd/CPd/Ed 走 V.90 5.4 编码器 + `Mapping::from_cp(CPt)` | 对端日志 `acq=1`/`SUVd detected`/`CPd detected`；`caller.raw` 相位 4 有 8 个幅度 |
+| Bridge 透明（同采样率直连） | 对端 socket 流与本端 `rx`：幅度比 **0.996**，同位置拟合与残差一致 |
+| 两点（TRN1u）接收正确 | **样本外 0 误码**（前 1200 符号拟合、后 1200 判决，ridge 1e-9…1e-2 全 0%） |
+| 规范没有规定模拟端发送成形滤波器 | V.92 6.4 只有模编码器/预编码器+预滤波器/逆映射/卷积编码器；8.5.5 说 Ru/R̄u 旁路它们 |
+| 对端上行确实带 3.8 kHz 滚降（**正常**，规范允许的实现） | `AGRSM_SOCK_TX_CAPTURE` 频谱：3.5 kHz 前平、3.75–3.95 kHz 0.27、3.95–4 kHz 0 |
+
+### 0.0.3 四点（TRN2u/CPu）为什么错 —— 这就是剩下的活
+
+`V92_UP_TRACE` 分段统计：TRN2u 解扰后本应全 1，实测 **7–10% 的 0**。
+四点星座的内/外之分（1/√5 vs 3/√5）恰好落在 **3.5–4 kHz**，正是对端滚降砍掉的 5–13 dB 那一段
+⇒ 坏的是**幅度判决**；符号位（交变、能量偏低频）反而干净。两点全对、四点 8% 错，与这条完全吻合。
+
+### 0.0.4 下一轮要做的三件（按顺序，验收口径写死）
+
+1. **按规范设计上行接收器**（详见 §0.0f）：
+   `线路 → 匹配滤波 h*(-n)（h 由 TRN1u 互相关估计，8–12 抽头）→ 符号率采样 →
+   短均衡（4–8 抽头）→ 幅度+符号判决 → Trn2uReader → UpFinder`
+   - 要点：**匹配滤波而不是信道求逆**（求逆会在 Nyquist 加 9 dB 噪声）；
+     **判决电平实测**（实测 0.054 / 0.171，比值 3.2，别硬用 0.447/1.342）；
+     每个信号开头估 `L_U` 两档幅度后冻结。
+   - 验收：`V92_UP_TRACE` 里 **TRN2u 段的 0 占比 ≈ 0%**。
+2. **修上行 reader 的启动时刻**：现在从本端 TRN2d（11.8 s）才喂，而对端 TRN2u 从 7.6 s 就开始了
+   （按 9.6 的时序图两者应同时开始）⇒ 本端晚了约 4 s，前段没听。
+   - 验收：`V92_UP_TRACE` 覆盖到对端 TRN2u 的起点（对端 20.0 s = 本端约 7.6 s）。
+3. **CPu 解出后跑完握手**：`SUVd′（ack=1）→ Ed/E2u → B1d/B1u → CONNECT`。
+   - 代码都已在（`Exchange` 的 ack、`Out::Ed`、`e2u_zeroes`、下游 `Encoder`、上游 `Decoder`），
+     缺的是 B1d 的 DTE 位流（现在常量）与 B1u 的字节出口。
+   - 验收：对端日志出现 `LAPM established` / 数据态稳定；`V92_UP_TRACE`/`V92_ENGINE_TRACE` 无重训练。
+
+### 0.0.5 作废的结论（**别再拿它们当依据**）
+
+| 作废的说法 | 实情 |
+|---|---|
+| "相位 4 里 `V34RxData` 0 次 / 检测器从不被喂" | 假象：解扰 trace 只记 `count<=16`，数据模式每块 24 字节。实测检测器 **167 次/s、n=24** |
+| "上行管道从 16 s 起坏掉" | 那是对端 `0x962140` 清线后的**残留块**；包络互相关证明管道 0.998 透明 |
+| "根因是对端的 3.8 kHz 低通（缺陷）" | 那是**正常的成形带限**，规范不禁止；接收机要能容忍 |
+| "15.4 dB ⇒ 接收机差" | 样本外两点判决 **0 误码**；15.4 dB 是拿满带参考量带限信号 |
+| "上行误码 8% ⇒ CPu 过不了" | 那个统计跨了 TRN2u/CPu/SUVu 三种信号；**判据只认按信号分段的 `V92_UP_TRACE`** |
+| "用 `agr-rx.raw` 读出 SUVd ⇒ 对端收到了" | 循环论证（用我们自己的两点读法读自己的波形）；对端视角只认 `AGRSM_DET_TRACE`/`AGRSM_EVT_TRACE` |
+
+### 0.0.6 台架与探针（`BRIDGE_MOD=V92` 不可省）
+
+```bash
+cd /home/hikari/comm/softmodem
+export PKG_CONFIG_PATH=/tmp/alsa-shim/lib/pkgconfig
+export BRIDGE_MOD=V92 BINMODEM_V92_PCM_UP=1 V92_TRACE=1
+export V92_RX_TRACE=/tmp/rx.txt V92_UP_TRACE=/tmp/up.txt V92_EQ_TRACE=/tmp/eq.txt
+export AGRSM_SOCK_TX_CAPTURE=/tmp/sock.raw
+export AGRSM_ENGINE_TRACE=/tmp/eng.txt AGRSM_PHASE4_PROBE=/tmp/p4.txt
+export AGRSM_EVT_TRACE=/tmp/evt.txt AGRSM_DET_TRACE=/tmp/det.txt AGRSM_BOX_TRACE=/tmp/box.txt
+python3 interop/agrsm/run_agr_v90.py --ms-args "V92" --pre "AT+PIG=0"         --connect-timeout 40 --hold 2 --verbosity 5 --capture
+```
+
+- 改完 `datapump` **必须重建** `modem --bin v90-bridge`（否则跑旧码）。
+- 每个 trace 旁边有 `<file>.t0`（epoch 秒）⇒ 两端时间轴可以直接对齐
+  （实测内容偏移 **12.385 s**，与锚点差 0.45 s 是对端引擎启动晚）。
+- 判据速查：`AGRSM_DET_TRACE` 的 `n` = 对端每 48 样本解几字节（6 = 1 bit/样本，24 = 4 bit/样本）；
+  `AGRSM_PHASE4_PROBE` 每 0.5 s 一行 `summary eafc= eb00= rate= det= n= acq= cp= suv=`；
+  **`eafc=0` 不代表没解扰**；异常码每轮可能不同（`0x96211`/`0x96212`/`0x962140`），先读当轮
+  `AGRSM_ENGINE_TRACE` 尾部。
+
+### 0.0.7 仓库与测试状态
+
+- `cargo test --release -p datapump --lib`：**658 绿**；`--test v92_call` 5 绿；`--test v92_upstream` 2 绿。
+- 本轮的工具已提交：`V92_EQ_TRACE`（拟合的抽头/参考/输出/误差）、`V92_RX_TRACE`、`V92_UP_TRACE`、
+  `AGRSM_SOCK_TX_CAPTURE`（+ 各自的 `.t0` 锚点）、`Receiver::dump_fit`。
+- 详细取证按时间顺序在 §0.0a…§0.0f（下同），**结论以本节为准**。
+
+---
+
+## 0.0a-0.0g 取证记录（历史，按时间顺序；**结论以 §0.0 为准**）
+
+> 下面几节是当时写下的原始记录，中间有几条结论后来被推翻（见 §0.0.5 的作废表）。
+> 保留它们是因为每一步的**测量方法**仍然有用：包络互相关、样本外判决、频谱对照、按信号分段。
+
+### 0.0a 第三轮：管道是好的
 
 加了两个一手探针（都已在仓库里）：
 - `V92_RX_TRACE=<file>`：`rx.feed()` 收到的每个样点（`样点序号 电平`）；
@@ -193,7 +282,7 @@ structure used while transmitting 2 point TRN1u"。所以对端那条 3.8 kHz �
 分段验收：TRN2u 应解成全 1（0% 零）、CPu 应 CRC 通过、SUVu 应稳定；
 同时把上行 reader 的启动时刻与 TRN2d 对齐（或提前到 phase 3 末）。
 
-## 0. 下一步（新 session 从这里开始）
+## 0.1 上一版交接（第三轮时写的，已被 §0.0 取代，仅存历史）
 
 **目标没变**：让 BinModem（数字端）与 Agere SV92PP 走完 V.92 建链并传数据。
 
