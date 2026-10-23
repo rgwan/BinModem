@@ -1616,8 +1616,21 @@ impl Modem {
                     return;
                 };
                 cpd.ack = ack;
-                self.source.send(Out::Cpd, cpd.to_bits(INTERVALS));
-                self.note(format!("V.92: CPd drn {}, ack {ack}", cpd.drn));
+                let bits = cpd.to_bits(INTERVALS);
+                // What the far end's detector will make of it: the sequence is
+                // a 17-one sync, a start bit and sixteen bits per word, then a
+                // start bit and sixteen CRC bits -- so the data bytes it counts
+                // are `(bits - 17 - words) / 16 * 2`, and the length it computes
+                // from the header must agree or it reads the wrong number of
+                // them and the CRC cannot pass.
+                let words = (bits.len().saturating_sub(35)) / 17;
+                let data_bytes = words * 2;
+                self.note(format!(
+                    "V.92: CPd drn {}, ack {ack}, {} bits, {words} words, {data_bytes} data bytes",
+                    cpd.drn,
+                    bits.len()
+                ));
+                self.source.send(Out::Cpd, bits);
             }
             // 8.8.2: Ed is two data frames of scrambled zeros, at CPt's rate.
             SequenceKind::E => {
