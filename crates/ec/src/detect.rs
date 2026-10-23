@@ -73,6 +73,43 @@ const UNFILLED_PAIRS: usize = 4;
 /// it fails (Appendix I.3): a second or so at the fastest rates.
 const HEARD_LIMIT: usize = 1 << 16;
 
+
+/// Where to write what the answerer itself made of the line, when
+/// `V92_DET_TRACE` names a file.
+///
+/// The question this answers cannot be answered from outside the process. The
+/// far end's own upstream trace says what it sent and `V92_EC_RX` says what
+/// this end handed to the error-control stack, but neither says when the
+/// answerer *recognised* the ODP, nor what became of the Pattern it then
+/// queued -- and 7.2.1.3's window for recognising it is short enough that when
+/// it fires is the whole question. Every line carries the count of bits
+/// received so far, so that a time is the count over the data signalling rate.
+fn trace_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    use std::sync::{Mutex, OnceLock};
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_DET_TRACE")?);
+        Some(Mutex::new(std::fs::File::create(path).ok()?))
+    })
+    .as_ref()
+}
+
+fn trace(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    use std::fmt::Write as _;
+    if let Some(file) = trace_file()
+        && let Ok(mut f) = file.lock()
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = write!(f, "{ms} ");
+        let _ = f.write_fmt(line);
+        let _ = f.write_all(b"\n");
+    }
+}
+
 /// Repetitions of the ADP before the answerer will consider stopping.
 ///
 /// V.42 7.2.1.3 requires "at least ten times", and it is a floor rather than a
@@ -469,6 +506,14 @@ pub struct Answerer {
     /// receiver is up, which on V.92 is two seconds before the far end's data
     /// mode exists.
     detecting: bool,
+    /// Bits received, for `V92_DET_TRACE`.
+    bits_in: u64,
+    /// Which answerer this is, for `V92_DET_TRACE`: an end runs more than
+    /// one (the detection phase's own and the bypass's watch), and their
+    /// traces are otherwise indistinguishable.
+    id: u32,
+    /// Whether the first bit of the pattern has been handed out.
+    pattern_out: bool,
     /// Characters of plain text in a row, and everything heard while
     /// detecting.
     text: u32,
@@ -483,7 +528,7 @@ impl Default for Answerer {
 
 impl Answerer {
     pub fn new(t400_ms: u32, answer: Answer) -> Self {
-        Self {
+        let mut a = Self {
             out: VecDeque::new(),
             scanner: CharacterScanner::default(),
             dc1_run: 0,
@@ -497,10 +542,19 @@ impl Answerer {
             since_flag: u32::MAX,
             flag_run: 0,
             flags: false,
+            bits_in: 0,
+            id: {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static NEXT: AtomicU32 = AtomicU32::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
+            pattern_out: false,
             text: 0,
             heard: Vec::new(),
             detecting: false,
-        }
+        };
+        trace(format_args!("#{} answerer created", a.id));
+        a
     }
 
     /// Everything the line brought while the detection phase ran: the far
@@ -518,7 +572,20 @@ impl Answerer {
         {
             self.queue_adp();
         }
-        self.out.pop_front().unwrap_or(true)
+        let bit = match self.out.pop_front() {
+            Some(bit) => {
+                if !self.pattern_out {
+                    self.pattern_out = true;
+                    trace(format_args!(
+                        "#{} first pattern bit out at bits_in {} (outcome {:?})",
+                        self.id, self.bits_in, self.outcome
+                    ));
+                }
+                bit
+            }
+            None => true,
+        };
+        bit
     }
 
     /// Whether the pattern has been sent for long enough to stop.
@@ -559,6 +626,7 @@ impl Answerer {
             Answer::None => ADP_NULL,
             Answer::Extended(v) | Answer::Reserved(v) => v,
         };
+        trace(format_args!("{} ADP QUEUED #{}", self.bits_in, self.repeats + 1));
         push_character(&mut self.out, ADP_E);
         push_character(&mut self.out, second);
         self.repeats += 1;
@@ -584,6 +652,7 @@ impl Answerer {
 
     /// Feed one received bit.
     pub fn receive(&mut self, bit: bool) -> Outcome {
+        self.bits_in += 1;
         // Watched past the end of detection, because what stops the answerer's
         // pattern is the originator's flags (7.2.1.3) and those arrive after
         // the ODP has already been recognised.
@@ -636,7 +705,12 @@ impl Answerer {
                 self.dc1_run += 1;
             }
             self.last_parity = Some(c);
+            trace(format_args!(
+                "{} dc1 {:02x} gap {} run {}",
+                self.bits_in, c, 0u32, self.dc1_run
+            ));
             if self.dc1_run >= 4 {
+                trace(format_args!("{} ORDER RECOGNISED", self.bits_in));
                 self.detecting = true;
                 self.outcome = Outcome::OriginatorDetected;
                 // The clock restarts, so that the bound on how long the

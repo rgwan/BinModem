@@ -1329,6 +1329,11 @@ pub struct Modem {
     /// The analogue modem's CPu, once it has arrived: the downstream's data
     /// mode parameters (9.6.1.1.5).
     cpu: Option<Cp>,
+    /// `V92_B1U_ADJ`: what to do to the data-mode level before the decoder
+    /// sees it. Empty means nothing, which is the only behaviour in use.
+    b1u_adjust: String,
+    /// The levels `V92_B1U_ADJ=dc` averages over.
+    b1u_history: std::collections::VecDeque<f64>,
     /// Zero bits since Ed went out, for E2u: twelve (or thirteen) descrambled
     /// zeros are what tells it from anything else (8.5.2, 8.7.2).
     e2u_zeroes: u32,
@@ -1429,6 +1434,8 @@ impl Modem {
             four_at: 0,
             trn2u_from: 0,
             upstream_drop_until: 0,
+            b1u_adjust: std::env::var("V92_B1U_ADJ").unwrap_or_default(),
+            b1u_history: std::collections::VecDeque::with_capacity(1024),
             upstream_dropped: 0,
             up_finder: None,
             cpd: None,
@@ -2369,15 +2376,6 @@ impl Modem {
         // with insertion loss it is never exact.
         self.rx.set_data_mode(levels);
         self.upstream_data = Some(Decoder::new(&parameters));
-        if std::env::var_os("V92_RX_BITS").is_some() {
-            eprintln!(
-                "V92B1U begin at now={} parameters gain={} sets={} b1u_skip={}",
-                self.now,
-                parameters.gain,
-                parameters.sets.len(),
-                self.b1u_skip
-            );
-        }
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
         // run completed in.
         //
@@ -2430,6 +2428,21 @@ impl Modem {
             .unwrap_or(
                 self.upstream_delay + B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS,
             );
+        if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
+            // Printed after the assignment, not before: this line said
+            // `b1u_skip 0` on every call for as long as it existed, because it
+            // was written above the line that sets the field.
+            eprintln!(
+                "V92B1U begin at now={} gain={} sets={} upstream_delay={} origin={} acquire={} b1u_skip={}",
+                self.now,
+                parameters.gain,
+                parameters.sets.len(),
+                self.upstream_delay,
+                B1U_ORIGIN_AFTER_E2U,
+                B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS,
+                self.b1u_skip
+            );
+        }
         self.b1u_pending = false;
         self.b1u_deadline = None;
         self.note(format!(
@@ -2503,6 +2516,31 @@ impl Modem {
                 self.b1u_skip -= 1;
                 return;
             }
+            // Diagnostic (`V92_B1U_ADJ`): what the data-mode level stream needs
+            // before it is a constellation at all. Measured on the Agere calls
+            // that fail, the stream sits on CPd's lattice but its *mean* is +0.45
+            // (two lattice steps) where a passing call's mean is 0, so the
+            // question "is it the offset or the symbol phase" is worth one
+            // experiment rather than one hypothesis. `flip` negates the level,
+            // `dc` subtracts a running mean, `shift:N` subtracts N lattice steps
+            // and `none` (the default) does nothing.
+            let level = match self.b1u_adjust.as_str() {
+                "flip" => -level,
+                "dc" => {
+                    let mean = self.b1u_history.iter().sum::<f64>() / self.b1u_history.len().max(1) as f64;
+                    let out = level - mean;
+                    if self.b1u_history.len() >= 512 {
+                        self.b1u_history.pop_front();
+                    }
+                    self.b1u_history.push_back(level);
+                    out
+                }
+                other if other.starts_with("shift:") => {
+                    let steps: f64 = other["shift:".len()..].parse().unwrap_or(0.0);
+                    level - steps * 2.0 * self.parameters.as_ref().map_or(1.0, |p| p.gain)
+                }
+                _ => level,
+            };
             decoder.feed(level);
             let bits = decoder.take_bits();
             if let Some(file) = b1u_trace_file()
