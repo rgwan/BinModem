@@ -1687,7 +1687,7 @@ impl Receiver {
     /// the frame alignment is unchanged by it.
     ///
     /// Returns whether the fit took and was installed.
-    pub fn train_on_trn2u(&mut self, window: usize) -> bool {
+    pub fn train_on_trn2u(&mut self, window: usize, trn2u_from: u64) -> bool {
         let length = self.history.len();
         if length < 2 * TRAIN_TAPS || length < window.min(2 * PROBE) {
             return false;
@@ -1695,106 +1695,44 @@ impl Receiver {
         // Two bits a symbol: the magnitude and the sign difference.
         let Some(bits) = reference_from(0, 2 * length + 4, self.reference_mode) else { return false };
         let before = self.fitted();
-        let line: Vec<f64> = self.history.iter().copied().collect();
         let p = length.saturating_sub(window).max(PROBE);
-        let probe_end = (p + PROBE).min(length);
-        if probe_end < p + PROBE / 2 {
-            return false;
-        }
-        let energy = line[p..probe_end].iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
-        // First which hypothesis the line is carrying, by probe alone -- four
-        // correlations and no fits -- then the arithmetic on that one.
-        let mut carried: Option<(f64, usize, usize, usize, usize, Vec<f64>)> = None;
-        for phase in 0..2usize {
-            for seed in 0..2usize {
-                for differential_magnitude in [false, true] {
-                let Some(levels) = trn2u_levels(&bits, length, phase, seed, differential_magnitude) else {
-                    continue;
-                };
-                let mut share = (0.0f64, 0usize);
-                for offset in 0..levels.len().saturating_sub(PROBE) {
-                    let mut together = 0.0;
-                    let mut norm = 0.0;
-                    for k in 0..PROBE {
-                        together += line[p + k] * levels[offset + k];
-                        norm += levels[offset + k] * levels[offset + k];
-                    }
-                    let value = (together / (energy * norm.sqrt().max(1e-12))).abs();
-                    if value > share.0 {
-                        share = (value, offset);
-                    }
-                }
-                if share.0 < PROBE_MATCHED {
-                    continue;
-                }
-                if carried.as_ref().is_none_or(|(seen, ..)| share.0 > *seen) {
-                    carried = Some((share.0, share.1, phase, seed, differential_magnitude as usize, levels));
-                }
-                }
-            }
-        }
-        let Some((score, offset, _phase, _seed, _mag, levels)) = carried else {
+        // No probe and no search. 8.7.6 resets TRN2u's scrambler at E1u, so its
+        // first symbol is exactly `trn2u_from` -- the alignment this used to
+        // search for with eight correlations over thousands of offsets is a
+        // number this side already has, and searching for it was a stall in the
+        // middle of TRN2d (the downstream the far end is acquiring on). The
+        // far end's mapping is the spec's own: magnitude bit first and direct,
+        // sign bit second and differential (`phase = 0`,
+        // `differential_magnitude = false`); the seed is a global sign the
+        // least-squares fit absorbs.
+        let Some(levels) = trn2u_levels(&bits, length, 0, 0, false) else {
             return false;
         };
-        // And the window, over the whole span a causal equaliser can reach:
-        // what the fit needs from the probe is only *which symbol* each sample
-        // is, and where the window then starts is a separate question -- one it
-        // answers best when it starts late enough for the feed-forward section
-        // to look ahead of the reference rather than at it.
-        //
-        // And the one thing the probe cannot say: how far behind the samples the
-        // decision sits. The probe says which symbol each *sample* carries, but a
-        // causal filter cannot produce a symbol that arrives twelve samples after
-        // the ones it can already see, so the decision is deliberately lagged --
-        // and how far is the fit's own budget, not a property of the line.
-        // Forty-eight hypotheses at one solve each, once per call.
-        //
-        // `levels` is indexed by the sequence, not by the sample, so what the
-        // fit needs is the probe's own offset -- which already carries the delay
-        // between the samples and the symbols they carry -- refined by the
-        // symbol the window starts on. The few either side are searched because
-        // the probe is a hundred and twenty-eight symbols and the fit is twelve
-        // hundred: it can be a symbol out and still correlate.
-        //
-        // `levels` is indexed by the sample it belongs to -- `levels[m]` is the
-        // symbol that sample `m` carries -- so the window's slice is its start
-        // less the lag the equaliser is given, not the probe's offset. The
-        // probe only said which hypothesis the line is carrying; the sample
-        // side of the mapping is the same one the fit works in.
-        //
-        // The probe found which symbol the sample at `p` carries, so the
-        // sequence sits `p - share` samples to the right of the history's
-        // start: `levels` is indexed by the sequence, the fit wants it indexed
-        // by the sample, and that one number is the difference. On a line where
-        // TRN2u starts at the beginning of the history the two are the same,
-        // which is why this was right in the test and wrong on the harness.
-        let mut best: Option<Fitted> = None;
+        let base = self.history_base();
+        let origin = trn2u_from.saturating_sub(base);
+        let offset = p.saturating_sub(origin as usize);
+        if origin as usize > p || offset + window > levels.len() {
+            return false;
+        }
+        // One least-squares fit, at the channel's own decision lag. The
+        // window starts at `p`; the reference is the sequence `offset` symbols
+        // in, less the lag.
         let start = p;
         let span = window.min(length - start);
-        let origin = p as i64 - offset as i64;
-        for lag in 0..=TRAIN_TAPS {
-            let skip = start as i64 - lag as i64 - origin;
-            if skip < 0 {
-                continue;
-            }
-            let skip = skip as u64;
-            if skip as usize + span > levels.len() {
-                continue;
-            }
-            self.pending_levels = Some(levels.clone());
-            if !self.fit_at(start, span, skip, DFE_FORWARD, DFE_FEEDBACK) {
-                self.pending_levels = None;
-                continue;
-            }
-            if best.as_ref().is_none_or(|seen| self.snr_db > seen.snr()) {
+        let lag = CHANNEL_DELAY.min(offset);
+        let skip = start as i64 - lag as i64 - origin as i64;
+        let mut best: Option<Fitted> = None;
+        if skip >= 0 && skip as usize + span <= levels.len() {
+            self.pending_levels = Some(levels);
+            if self.fit_at(start, span, skip as u64, DFE_FORWARD, DFE_FEEDBACK) {
                 best = Some(self.fitted());
+            } else {
+                self.pending_levels = None;
             }
         }
-        let chosen = score;
         if std::env::var_os("V92_REFIT_TRACE").is_some() {
             eprintln!(
-                "V92TRACE: train_on_trn2u window {window} probe share {:.3} best {:?} before {:.1}",
-                chosen,
+                "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {:?} before {:.1}",
                 best.as_ref().map(Fitted::snr),
                 before.snr()
             );
@@ -2594,7 +2532,7 @@ mod tests {
             let _ = trn.next_symbol();
         }
         rx.set_slicer(Slicer::FourPoint);
-        assert!(rx.train_on_trn2u(1200), "no fit on TRN2u");
+        assert!(rx.train_on_trn2u(1200, 0), "no fit on TRN2u");
         assert!(rx.begin_phase_four(), "the fit was not taken up");
         // Fifteen decibels is what this synthetic channel gives a forty-eight
         // tap decision feedback fit; the number that matters is on the line, and

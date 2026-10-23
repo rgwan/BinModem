@@ -1066,6 +1066,9 @@ pub struct Modem {
     trn2_from: Option<u64>,
     /// When to take the Phase 4 fit on TRN2u, in symbols.
     four_at: u64,
+    /// The absolute symbol where TRN2u's scrambler resets (8.7.6: the E1u that
+    /// ends CPt), which is the alignment the Phase 4 fit is taken against.
+    trn2u_from: u64,
     /// Up to which symbol the reader's bits are thrown away rather than given
     /// to [`Self::up_finder`] and the E2u counter.
     ///
@@ -1170,6 +1173,7 @@ impl Modem {
             upstream: None,
             upstream_size: Trn2uSize::Four,
             four_at: 0,
+            trn2u_from: 0,
             upstream_drop_until: 0,
             upstream_dropped: 0,
             up_finder: None,
@@ -1305,10 +1309,12 @@ impl Modem {
         // first symbol, and the exchange that has to be read has not started.
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
-            if self.rx.train_on_trn2u(TRAIN_WINDOW) && self.rx.install_phase_four() {
+            let fit_started = std::time::Instant::now();
+            if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
+                let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
                 self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
                 self.note(format!(
-                    "V.92: phase 4 receiver fitted on TRN2u, {:.1} dB",
+                    "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB",
                     self.rx.snr_db()
                 ));
             } else {
@@ -1738,6 +1744,7 @@ impl Modem {
         // a little way in, and nothing is given to the finder until that fit is
         // in (see `upstream_drop_until`).
         let start = self.rx.symbols();
+        self.trn2u_from = start;
         self.four_at = start + TRN2U_FIT_AFTER;
         self.upstream_drop_until = self.now + TRN2U_FIT_AFTER + TRN2U_DROP_AFTER_FIT;
         // Jp bit 48 chose four points or eight for TRN2u, and every sequence
