@@ -667,12 +667,50 @@ fn sections_in_use() -> (usize, usize) {
 /// on each tap, which is the size an MMSE front end's regulariser should be.
 pub const FFE_RIDGE: f64 = 1e-4;
 
-/// The ridge multipliers a fit tries, in order: the smallest the arithmetic will
-/// take, and larger only if the solve refuses.
+/// The ridge multipliers a fit tries, in order: the first is the one the split
+/// between the two sections is decided at, the rest are larger and are only
+/// reached when the solve refuses.
+///
+/// This ridge is not the design's -- that is [`FFE_RIDGE`], a hundredth of the
+/// feed-forward block's own diagonal. This one is a millionth of the *mean*
+/// diagonal, and its job is to take the ambiguity out of a system that is nearly
+/// singular by construction: the forward columns are the line and the feedback
+/// columns are the symbols it carries, so the two blocks are almost the same
+/// numbers and a small change in the split between them barely moves the
+/// residual at all. The least-squares problem therefore has a direction it does
+/// not care about, and below this ridge that direction is decided by the
+/// arithmetic rather than by the line.
+///
+/// Measured, on eight Agere calls from one batch plus the two captures the
+/// polarity work was done on (μ-law round trip, `V92_WINDOW_TRACE` and
+/// `V92_B1U_TRACE`), the ridge is the difference between a data-mode equaliser
+/// that reads 8.7.1's forty-eight frames of ones and one that does not:
+///
+/// | ridge | calls reading B1u 568 against 449 of 576 |
+/// |---|---|
+/// | 1e-9 (was the default) | 9 of 10 -- `045055-pol3-2` fails, 432 against 379 |
+/// | 1e-6 | 9 of 10 -- `030350-g42-2` fails instead |
+/// | 1.5e-6 | 10 of 10 |
+/// | 2e-6 | 10 of 10 |
+/// | 3e-6 | 10 of 10 |
+/// | 4e-6 | `045055-pol3-2` fails again (measured on that call only) |
+/// | 1e-5 (the old second rung) | both calls measured fail, 378 against 427 |
+///
+/// So the band that carries all of them is 1.5e-6 to 3e-6, and 1.5e-6 is its
+/// bottom edge -- the smallest ridge at which the split is the line's rather
+/// than the arithmetic's. The call that fails at 1e-9 is `045055-pol3-2`, the
+/// call this batch failed on. Its taps at
+/// 1e-9 differ from a passing call's by up to 0.106 in the middle of the forward
+/// section (rms 0.033 against a section rms of 1.389) although the two windows
+/// are the same signal to within one quantising step, and installing the passing
+/// call's taps in the failing call, or its taps in a passing one, moves the
+/// failure with the taps. A fit whose residual is 33.79 dB either way is not
+/// wrong at the ten-thousandths that separates these two calls: the difference
+/// is entirely in which point of the ambiguous direction the solve landed on.
 fn ridges_in_use() -> Vec<f64> {
     match std::env::var("V92_RIDGE") {
         Ok(text) => text.split(',').filter_map(|item| item.trim().parse().ok()).collect(),
-        Err(_) => vec![1e-9, 1e-7, 1e-5],
+        Err(_) => vec![1.5e-6, 1e-5, 1e-4],
     }
 }
 
@@ -780,6 +818,12 @@ pub struct Receiver {
     /// The Phase 4 fit, designed while the second TRN1u is still on the line
     /// and put in place when TRN2u begins (see [`Self::prepare_phase_four`]).
     phase_four: Option<Fitted>,
+    /// The design's own forward section, kept when the design is accepted: what
+    /// decides which way up the TRN2u fit is. TRN1u is the one training
+    /// sequence with no seed in it (8.5.7 zeroes its scrambler and it is not
+    /// differentially encoded), so of the two fits this is the one whose
+    /// polarity means something -- see [`Self::trn2u_sign`].
+    design_forward: Vec<f64>,
     /// Training: the feed-forward and feedback sections of the decision
     /// feedback equaliser the fit designed.
     forward: Vec<f64>,
@@ -851,6 +895,7 @@ impl Receiver {
             anchor: None,
             pending_levels: None,
             phase_four: None,
+            design_forward: Vec::new(),
             forward: Vec::new(),
             feedback: Vec::new(),
             decided: VecDeque::with_capacity(DFE_FEEDBACK + 1),
@@ -1845,6 +1890,7 @@ impl Receiver {
                 // repeatedly while the second TRN1u is being read, and each
                 // call sees more of it than the last.
                 self.restore(&before);
+                self.design_forward.clone_from(&found.forward);
                 self.phase_four = Some(found);
                 true
             }
@@ -1921,6 +1967,9 @@ impl Receiver {
         match best.filter(|found| found.snr() > floor) {
             Some(found) => {
                 self.restore(&before);
+                // This is the fit whose polarity has no seed in it, kept for
+                // the TRN2u fit to be read against: see [`Self::trn2u_sign`].
+                self.design_forward.clone_from(&found.forward);
                 self.phase_four = Some(found);
                 true
             }
@@ -2002,6 +2051,13 @@ impl Receiver {
         match best.filter(|found| found.snr() > before.snr() - 3.0) {
             Some(mut found) => {
                 self.restore(&before);
+                // Which way up the line's TRN2u arrived, decided against the
+                // design before the fit is installed: see [`Self::trn2u_sign`].
+                if self.trn2u_sign(&found.forward) < 0.0 {
+                    for tap in found.forward.iter_mut() {
+                        *tap = -*tap;
+                    }
+                }
                 self.phase_four = Some(found);
                 true
             }
@@ -2009,6 +2065,99 @@ impl Receiver {
                 self.restore(&before);
                 false
             }
+        }
+    }
+
+    /// Whether the TRN2u the fit was made on arrived the way up the data mode
+    /// needs, as a sign to apply to the fit's forward section.
+    ///
+    /// 8.7.6 zeroes TRN2u's scrambler at E1u and says nothing about the
+    /// differential sign encoder, whose seed is whatever the exchange left in
+    /// it: [`trn2u_levels`] generates the far end's sequence either as it stands
+    /// or negated, and **both fit the window equally well**. Measured on two
+    /// Agere calls from one binary (the μ-law round trip the bench's uplink
+    /// carries, `V92_WINDOW_TRACE` and `V92_FIT_TRACE`), the Phase 4 fit at
+    /// 6992 comes out at 33.73 and 33.79 dB with the same feedback section
+    /// ([0.388, ...] against [0.390, ...]) and forward sections that are one
+    /// vector with ff[15] +8.231 against -8.238. The two hypotheses are
+    /// therefore not a sign *image* of each other -- the feedback half does not
+    /// move, because its columns are built from the reference and not from the
+    /// line -- and negating the equaliser's output never could repair the wrong
+    /// one.
+    ///
+    /// What picks between them is the one fit whose reference has no seed at
+    /// all: the design, fitted on TRN1u, which is not differentially encoded and
+    /// whose scrambler is zeroed at its own first symbol (8.5.7). The design's
+    /// forward section and the TRN2u fit's are the same vector to a cosine of
+    /// 0.994, and the sign between them is the question: over eight calls from
+    /// one batch, dot(design_ff, joint_ff) is -92.2 (cosine -0.994) on every call
+    /// that reads B1u as its forty-eight frames of ones -- 568 against 449 of 576
+    /// bits -- and +92.1 (cosine +0.992) on the one call that reads neither
+    /// polarity, 432 against 379. So the fit is kept when the two disagree and
+    /// its forward section negated when they agree.
+    ///
+    /// Negating the forward section is exactly what fitting against the negated
+    /// reference would have produced: the normal equations are odd in the
+    /// reference through the forward block and even through the feedback one, so
+    /// (-ff, +fb) is the same least-squares optimum, at the same residual, for
+    /// the other hypothesis. It is not a second fit and it does not need one.
+    ///
+    /// Returns +1 to keep the fit, -1 to negate its forward section, and 0 where
+    /// the two sections are not recognisably the same filter -- no design yet, or
+    /// a design that landed on another window -- which leaves the fit as the
+    /// least squares left it rather than choosing on a number that is not
+    /// evidence.
+    fn trn2u_sign(&self, forward: &[f64]) -> f64 {
+        match std::env::var("V92_TRN2u_SIGN").ok().as_deref() {
+            Some("off") => return 1.0,
+            Some("flip") => return -1.0,
+            _ => {}
+        }
+        let design = &self.design_forward;
+        if design.is_empty() || forward.is_empty() {
+            return 0.0;
+        }
+        // The two fits can be at different alignments -- each search keeps the
+        // best signal to noise over the slips it tried, and a decision feedback
+        // fit's own error is flat over the length of its forward section -- so
+        // the sign is read at the shift where the two sections are the same
+        // filter at all. Measured on the calls above: cosine 0.8763 or -0.8788
+        // at the right shift, 0.027 at none.
+        let mut cosine: f64 = 0.0;
+        let slips = DESIGN_SLIPS as i64 + 2;
+        for shift in -slips..=slips {
+            let (a, b) = if shift >= 0 {
+                (&design[shift as usize..], &forward[..])
+            } else {
+                (&design[..], &forward[(-shift) as usize..])
+            };
+            let scope = a.len().min(b.len());
+            if scope == 0 {
+                continue;
+            }
+            let joined: f64 = (0..scope).map(|i| a[i] * b[i]).sum();
+            let left: f64 = a[..scope].iter().map(|tap| tap * tap).sum();
+            let right: f64 = b[..scope].iter().map(|tap| tap * tap).sum();
+            if left <= 0.0 || right <= 0.0 {
+                continue;
+            }
+            let seen = joined / (left * right).sqrt();
+            if seen.abs() > cosine.abs() {
+                cosine = seen;
+            }
+        }
+        if std::env::var_os("V92_FIT_TRACE").is_some() {
+            eprintln!("V92FIT trn2u sign cosine {cosine:.4}");
+        }
+        // The gate is a cosine of a half, which the two fits clear at the right
+        // shift; below that they are not the same filter and their product is
+        // not a sign.
+        if cosine <= -0.5 {
+            1.0
+        } else if cosine >= 0.5 {
+            -1.0
+        } else {
+            0.0
         }
     }
 
