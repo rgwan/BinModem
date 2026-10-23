@@ -2041,13 +2041,36 @@ impl Modem {
             return None;
         };
         let limits = self.settings.limits;
-        let designed = match design(&channel, &limits) {
+        let mut designed = match design(&channel, &limits) {
             Ok(designed) => designed,
             Err(why) => {
                 eprintln!("V92TRACE: no upstream design: {why}");
                 return None;
             }
         };
+        // Diagnostic: what the far end does with the filters in CPd, and what
+        // happens when it is asked for none at all.
+        //   none -> z2 = [1]: pass-through, no filtering
+        //   a    -> z2 - delta ("x plus a correction")
+        //   b    -> delta - z2 ("x minus the inverse")
+        match std::env::var("V92_PRE").ok().as_deref() {
+            Some("none") => {
+                designed.filters =
+                    crate::v92::Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() };
+            }
+            Some("a") => {
+                if let Some(first) = designed.filters.z2.first_mut() {
+                    *first -= 1.0;
+                }
+            }
+            Some("b") => {
+                designed.filters.z2.iter_mut().for_each(|value| *value = -*value);
+                if let Some(first) = designed.filters.z2.first_mut() {
+                    *first += 1.0;
+                }
+            }
+            _ => {}
+        }
         // The prefilter was scaled down to fit Q0.15; the receiver must fold
         // that scale back in when it reads B1u's levels.
         self.upstream_scale = designed.scale;
