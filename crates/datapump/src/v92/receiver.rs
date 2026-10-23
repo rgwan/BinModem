@@ -2000,7 +2000,7 @@ impl Receiver {
             );
         }
         match best.filter(|found| found.snr() > before.snr() - 3.0) {
-            Some(found) => {
+            Some(mut found) => {
                 self.restore(&before);
                 self.phase_four = Some(found);
                 true
@@ -2267,6 +2267,7 @@ impl Receiver {
         let solved: Vec<f64> = solved.iter().map(|value| value.re).collect();
         self.forward = solved[..forward].to_vec();
         self.feedback = solved[forward..].to_vec();
+
         // The section starts where the training left it rather than at zero:
         // the symbols it would be fed next are the ones just fitted against.
         self.decided.clear();
@@ -2296,6 +2297,22 @@ impl Receiver {
         let signal = signal / count;
         let noise = noise / count;
         self.snr_db = if noise > 0.0 { 10.0 * (signal / noise).log10() } else { f64::INFINITY };
+        // `V92_FIT_TRACE`: every fit as it is installed. The taps a receiver
+        // ends up with are the last fit it took, so a trace that only records
+        // the fits that were thrown away cannot say which one a call is using
+        // -- and "the same snr with the opposite taps" is a question about
+        // exactly that.
+        if std::env::var_os("V92_FIT_TRACE").is_some() {
+            let text: Vec<String> = self.forward.iter().map(|tap| format!("{tap:.4}")).collect();
+            let back: Vec<String> = self.feedback.iter().map(|tap| format!("{tap:.4}")).collect();
+            eprintln!(
+                "V92FIT at {from} skip {at_skip} window {span} forward {forward} feedback {feedback} \
+                 snr {:.3}: ff [{}] fb [{}]",
+                self.snr_db,
+                text.join(" "),
+                back.join(" ")
+            );
+        }
         self.snr_db.is_finite() && self.snr_db > 0.0
     }
 }

@@ -203,6 +203,11 @@ pub const B1U_WAIT: f64 = 2.0;
 /// that comes between Ed and the data.
 pub const B1D_FRAMES: usize = 48;
 
+/// "B1u consists of 48 data frames of scrambled binary ones" (8.7.1), the same
+/// count on the upstream side, and the window the data mode's polarity is read
+/// over (see `Modem::score_b1u`).
+pub const B1U_FRAMES: usize = 48;
+
 /// Data frames one downstream fill encodes at a time.
 ///
 /// It is the unit the codeword queue is topped up in, and so the unit in which
@@ -1367,6 +1372,19 @@ pub struct Modem {
     upstream_delay: usize,
     /// Symbols of B1u still to be skipped for that delay.
     b1u_skip: usize,
+    /// The same decoder on the other polarity, kept while B1u is being read
+    /// both ways up: see [`Self::b1u_polarity`] and `decide_b1u_polarity`.
+    b1u_probe: Option<Decoder>,
+    /// Ones each decoder has read out of B1u: `[0]` is the line as it arrived,
+    /// `[1]` is it negated.
+    b1u_ones: [u64; 2],
+    /// Bits each of them has read, for the margin the choice is made on.
+    b1u_scored: [u64; 2],
+    /// Symbols of B1u still to be read both ways up before the choice is made.
+    b1u_scoring: usize,
+    /// Which way up the data mode is, +1 or -1, applied to the equaliser's
+    /// output before the decoder sees it. See [`Self::b1u_scoring`].
+    b1u_polarity: f64,
     /// Upstream data bits the decoder has produced since B1u began.
     upstream_bits: u64,
     /// DTE bits fed in from above, sent as B1d's payload (9.6.1.1.5).
@@ -1455,6 +1473,11 @@ impl Modem {
             upstream_scale: 1.0,
             upstream_delay: 0,
             b1u_skip: 0,
+            b1u_probe: None,
+            b1u_ones: [0; 2],
+            b1u_scored: [0; 2],
+            b1u_scoring: 0,
+            b1u_polarity: 1.0,
             peak: 0.0,
             notes: Vec::new(),
         }
@@ -2445,6 +2468,17 @@ impl Modem {
         }
         self.b1u_pending = false;
         self.b1u_deadline = None;
+        // Both ways up, until B1u says which one it is: 8.7.1 makes those 48
+        // data frames known, so the polarity that reads them as ones is the
+        // line's and the other is an equaliser that TRN2u's own seed left
+        // inverted. The window is the rest of B1u, and its bits are B1u's --
+        // which carry nothing -- so both decoders' output is dropped while it
+        // runs.
+        self.b1u_probe = Some(Decoder::new(&parameters));
+        self.b1u_ones = [0; 2];
+        self.b1u_scored = [0; 2];
+        self.b1u_scoring = (B1U_FRAMES * crate::v92::UP_INTERVALS).saturating_sub(self.b1u_skip);
+        self.b1u_polarity = 1.0;
         self.note(format!(
             "V.92: B1u from symbol {}, {} bit/s, scale {:.3}, taps {:?}",
             self.now,
@@ -2511,11 +2545,23 @@ impl Modem {
         // 9.6.1.1.6: once E2u has ended, the receiver is B1u's -- the data mode
         // modulation rather than four points -- and every symbol from there is
         // a data frame's worth of the decoder's.
-        if let Some(decoder) = self.upstream_data.as_mut() {
+        if self.upstream_data.is_some() {
+            // The acquisition window first, then the polarity measurement, and
+            // only then the decoder that will carry the call: both windows are
+            // B1u's, and both are dropped.
             if self.b1u_skip > 0 {
                 self.b1u_skip -= 1;
                 return;
             }
+            if self.b1u_scoring > 0 {
+                self.score_b1u(level);
+                return;
+            }
+        }
+        if let Some(decoder) = self.upstream_data.as_mut() {
+            // The polarity the measurement above found, then whatever
+            // diagnostic transform `V92_B1U_ADJ` asks for.
+            let level = self.b1u_polarity * level;
             // Diagnostic (`V92_B1U_ADJ`): what the data-mode level stream needs
             // before it is a constellation at all. Measured on the Agere calls
             // that fail, the stream sits on CPd's lattice but its *mean* is +0.45
@@ -2626,6 +2672,79 @@ impl Modem {
         if started {
             self.begin_b1u();
         }
+    }
+
+    /// B1u through both polarities' decoders at once, so that the call can say
+    /// which way up the data mode is instead of inheriting it from TRN2u.
+    ///
+    /// Why this is needed at all: every sequence before B1u is antipodal or
+    /// differentially encoded, so a line read upside down decodes them
+    /// identically -- Ru, Su, TRN1u and the exchange all came through correct
+    /// on the calls this repairs. TRN2u is the first constellation the polarity
+    /// could be read from, and it is the one place it cannot be trusted: its
+    /// differential sign encoder starts from a seed the exchange left behind,
+    /// not from a reset (8.7.6 resets the *scrambler* at E1u, not the sign
+    /// chain), so on an Agere SV92PP it arrives either way up from call to call
+    /// (measured: one call's TRN2u is the other's, sample for sample, negated,
+    /// while the two calls' B1u is identical to 1e-7). The Phase 4 fit pins the
+    /// data-mode equaliser to whichever polarity TRN2u arrived with, at exactly
+    /// the same residual either way -- 33.7 dB measured on both -- and a data
+    /// mode read through the inverted one is on the right lattice and carries
+    /// the wrong bits.
+    ///
+    /// B1u is the first thing on the line whose polarity is the data mode's
+    /// own: 8.7.1 zeroes the scrambler, the differential encoder, the precoder
+    /// and the prefilter at its first symbol and sends 48 data frames of ones.
+    /// So the polarity that reads those frames as ones is the line's, and it is
+    /// measurable by decoding them both ways up -- which is what this does. The
+    /// bits are B1u's, which carry no information, so both are dropped.
+    fn score_b1u(&mut self, level: f64) {
+        for (which, sign) in [1.0, -1.0].into_iter().enumerate() {
+            let decoder = if which == 0 {
+                self.upstream_data.as_mut()
+            } else {
+                self.b1u_probe.as_mut()
+            };
+            let Some(decoder) = decoder else { continue };
+            decoder.feed(sign * level);
+            let bits = decoder.take_bits();
+            self.b1u_ones[which] += bits.iter().filter(|bit| **bit).count() as u64;
+            self.b1u_scored[which] += bits.len() as u64;
+        }
+        self.b1u_scoring -= 1;
+        if self.b1u_scoring == 0 {
+            self.decide_b1u_polarity();
+        }
+    }
+
+    /// Which way up B1u came, from the two readings [`Self::score_b1u`] took.
+    ///
+    /// The margin is not a taste: B1u's data is *all* ones, so the right
+    /// polarity reads every bit as one and the wrong one reads a fixed wrong
+    /// pattern in its place (measured on an Agere: 30 of every 36 bits, and no
+    /// frame of all ones). An eighth of the window is far outside both, and a
+    /// window where the two readings are that close is one where neither was
+    /// reading B1u -- so it keeps what the receiver had rather than inventing a
+    /// polarity out of noise.
+    fn decide_b1u_polarity(&mut self) {
+        let scored = self.b1u_scored[0].min(self.b1u_scored[1]);
+        let (straight, flipped) = (self.b1u_ones[0], self.b1u_ones[1]);
+        let inverted = std::env::var("V92_B1U_POLARITY").ok().as_deref() != Some("off")
+            && scored > 0
+            && flipped > straight + scored / 8;
+        if inverted {
+            // The equaliser that was reading *this* polarity all along, not the
+            // one that read the other and would have a window of the wrong sign
+            // in its Viterbi's pipeline: its first forty trellis frames would be
+            // decided from a mixture.
+            std::mem::swap(&mut self.upstream_data, &mut self.b1u_probe);
+            self.b1u_polarity = -1.0;
+        }
+        self.b1u_probe = None;
+        let verdict = if inverted { "inverted, negating" } else { "as received" };
+        self.note(format!(
+            "V.92: B1u polarity {verdict} ({straight} ones straight, {flipped} negated, {scored} bits scored)"
+        ));
     }
 
     /// One upstream sequence, as 8.7.2-8.7.6 delivered it.
