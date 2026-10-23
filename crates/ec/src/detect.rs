@@ -460,6 +460,12 @@ pub struct Answerer {
     flag_run: u32,
     /// Whether the originator has begun the protocol phase (7.2.1.3).
     flags: bool,
+    /// Whether anything in the line has looked like a detection pattern yet.
+    ///
+    /// Kept apart from `heard`: bits are heard from the moment this end's
+    /// receiver is up, which on V.92 is two seconds before the far end's data
+    /// mode exists.
+    detecting: bool,
     /// Characters of plain text in a row, and everything heard while
     /// detecting.
     text: u32,
@@ -490,6 +496,7 @@ impl Answerer {
             flags: false,
             text: 0,
             heard: Vec::new(),
+            detecting: false,
         }
     }
 
@@ -535,6 +542,12 @@ impl Answerer {
         push_character(&mut self.out, ADP_E);
         push_character(&mut self.out, second);
         self.repeats += 1;
+    }
+
+    /// Whether the far end has started a detection phase at all: either the
+    /// ODP has been seen, or flags have.
+    fn someone_is_detecting(&self) -> bool {
+        self.detecting || self.flags || self.dc1_run > 0
     }
 
     /// Feed one received bit.
@@ -591,6 +604,7 @@ impl Answerer {
                 self.dc1_run += 1;
             }
             self.last_parity = Some(c);
+            self.detecting = true;
             if self.dc1_run >= 4 {
                 self.outcome = Outcome::OriginatorDetected;
                 // The clock restarts, so that the bound on how long the
@@ -607,7 +621,24 @@ impl Answerer {
     }
 
     pub fn tick(&mut self, dt_ms: u32) -> Outcome {
+        // 7.2.1.3 gives the answerer no deadline for the ODP -- it "shall
+        // transmit 1-bits" until it detects one -- so T400 bounds the exchange
+        // that follows the ODP, not the wait for it. Expiring it on a quiet
+        // line sent a V.92 call transparent two seconds before the far end had
+        // even entered data mode (its B1d and this end's B1u are not
+        // simultaneous), and the ODP it was waiting for then repeated
+        // unanswered for the rest of the call.
+        //
+        // A line that stays silent is still given up on, at a bound wide
+        // enough to hold that asymmetry: a far end that is never going to say
+        // anything should not hold the terminal for ever.
         self.elapsed += dt_ms;
+        if !self.someone_is_detecting() {
+            if self.elapsed >= self.t400_ms.saturating_mul(10) {
+                self.outcome = Outcome::TimedOut;
+            }
+            return self.outcome;
+        }
         if self.outcome != Outcome::Pending {
             return self.outcome;
         }
@@ -955,7 +986,10 @@ mod tests {
             a.transmit();
             a.receive(true);
         }
-        assert_eq!(a.tick(DEFAULT_T400_MS), Outcome::TimedOut);
+        // Mark and nothing else: no ODP, so 7.2.1.3's wait is not on a clock.
+        // Ten T400s of steady mark is a line that is not going to speak.
+        assert_eq!(a.tick(DEFAULT_T400_MS), Outcome::Pending);
+        assert_eq!(a.tick(DEFAULT_T400_MS * 9), Outcome::TimedOut);
     }
 
     #[test]

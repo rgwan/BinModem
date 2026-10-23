@@ -2722,8 +2722,10 @@ mod tests {
     #[test]
     fn a_bypassed_answerer_still_falls_back_when_the_far_end_does_no_v42() {
         let mut b = Stack::new(Role::Answerer, Params::default()).bypassing_detection();
-        // A far end that took the line and said nothing on it.
-        for _ in 0..100 {
+        // A far end that took the line and said nothing on it. The wait for
+        // the ODP is not on T400 (7.2.1.3 has the answerer send mark until it
+        // sees one), so this is the bound that ends it.
+        for _ in 0..200 {
             for _ in 0..4_000 {
                 b.next_bit();
                 b.feed_bit(true);

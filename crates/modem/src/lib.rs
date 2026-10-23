@@ -1694,7 +1694,20 @@ impl Modem {
         // also the honest answer to what a character typed into that gap
         // means: 5.6.1's instruction to give up on the call, because from the
         // terminal's side there is not yet a call.
-        if self.announce.is_some() {
+        // Whether this call is supposed to have error control at all. An
+        // answering modem that has been told not to (`AT\N0`) still owes the
+        // caller its Answerer Detection Pattern, so "answering" counts as a
+        // reason on its own.
+        let wants_ec = (self.want_error_control || self.role == Role::Answering)
+            && !matches!(self.pump, Some(Pump::Bell103(_)));
+        // Announced but no stack yet: the CONNECT went out before the pump
+        // reported connected, and returning here would skip the arm below that
+        // builds the error-control stack. A V.92 call does exactly that -- its
+        // CONNECT comes from the connect announcement while phase 4 is still
+        // running -- and the stack then never existed at all: the line carried
+        // nothing but mark, the far end repeated its ODP until the call ended,
+        // and no amount of fixing the demodulator could have helped.
+        if self.announce.is_some() && !(self.ec.is_none() && wants_ec) {
             // The line can change its rates in that gap. A V.34 far end
             // renegotiated a second after data mode began in
             // live-1789546478, while the detection phase was still running,
@@ -2082,6 +2095,23 @@ impl Modem {
 
     fn carry_data(&mut self) {
         let Some(pump) = self.pump.as_ref() else { return };
+        if std::env::var_os("V92_TX_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now = self.call_samples as u64;
+            let prev = LAST.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 8 * 2000 {
+                LAST.store(now, Ordering::Relaxed);
+                eprintln!(
+                    "V92CARRY state={:?} accepts={} pending={} ec={} role={:?}",
+                    self.state,
+                    pump.accepts_bits(),
+                    pump.pending_bits(),
+                    self.ec.is_some(),
+                    self.role
+                );
+            }
+        }
         // A carrier that has gone is only news when one was supposed to be
         // there, and through a retrain there are stretches where one is not.
         // The training segment of 5.2.3 is the plainest: each end sends its
@@ -2118,6 +2148,9 @@ impl Modem {
             // something already, a banner or a prompt, by the time this end
             // stops listening for a pattern.
             if let Some(mut ec) = self.ec.take() {
+                if std::env::var_os("V92_TX_TRACE").is_some() {
+                    eprintln!("V92EC dropped as transparent at {:.2}s, phase {:?}", self.call_samples as f64 / self.fs, ec.phase());
+                }
                 for bit in ec.take_unclaimed() {
                     if let Some(c) = self.async_bits.feed(bit) {
                         self.recovered.push(c);

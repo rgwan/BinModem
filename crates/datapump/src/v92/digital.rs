@@ -257,6 +257,23 @@ fn write_anchor(path: &std::path::Path) {
 /// which is the one stretch of the upstream whose contents are known without
 /// the far end's help: a decoder that is right reads all ones there, and one
 /// that is a symbol out reads a hole and then a run of ones.
+/// Where to write the bits handed to the downstream scrambler, when
+/// `V92_TX_TRACE` names a file: one character per bit, in transmission order.
+///
+/// This is the downstream stream V.42 owns -- before scrambling, before the
+/// constellation -- so it is what a far end that says it hears nothing can be
+/// checked against.
+fn tx_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_TX_TRACE")?);
+        let file = std::fs::File::create(&path).ok()?;
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
+}
+
 fn b1u_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
@@ -1366,6 +1383,14 @@ impl Modem {
 
     /// DTE bits for B1d, fed in by the stack above the datapump (9.6.1.1.5).
     pub fn send_bits(&mut self, bits: &[bool]) {
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(bits.len() as u64, Ordering::Relaxed);
+            if std::env::var_os("V92_TX_TRACE").is_some() && (n == 0 || n % 4096 < bits.len() as u64) {
+                eprintln!("V92TX send_bits: +{} (total {})", bits.len(), n + bits.len() as u64);
+            }
+        }
         self.outbound.extend(bits.iter().copied());
     }
 
@@ -2285,6 +2310,15 @@ impl Modem {
                 // terminal is typing.
                 let frame = encoder.next_frame(|| {
                     let bit = if b1d { true } else { self.outbound.pop_front().unwrap_or(true) };
+                    // What goes into the scrambler, which is the stream V.42 owns:
+                    // 0x7E flags, the ADP, then the terminal's bits.
+                    if let Some(file) = tx_trace_file()
+                        && let Ok(mut file) = file.lock()
+                    {
+                        use std::io::Write as _;
+                        let _ = write!(file, "{}", u8::from(bit));
+                        let _ = file.flush();
+                    }
                     self.downstream_scrambler.scramble(bit)
                 });
                 octets.extend(frame.octets(law));
