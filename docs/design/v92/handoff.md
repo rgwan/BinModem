@@ -1706,3 +1706,45 @@ z1 0 p1 64 z2 128 p2 0 / limits 192,128`，对端检测器算长公式
 
 ⇒ 线上形态：`TRN2d ≥4800 符号` → `SUVd 背靠背`，收到第一条 SUVu 插一条 `CPd`，
 之后回到 `SUVd 背靠背`，直到 ack 或 repeat 组触发。
+
+### 十五、对端的相位 4 接收**从未被武装**：`[0x1174c]`/`[0x1174d]` 从未置位
+
+反编译 `V92ClientPhase4RxWaitRiBarState`（0x5c5b0）得到它的完整开头：
+
+```c
+if ([0x11694] >= [0x11698]) goto deadline;   // 超时
+if ([0x1174d] == 0) return;                  // ← 门：只有 0x1174d 置位才动作
+V34ReportTrainingProgressLong(0x4e, 0);
+PCMClientDemodulatorSetFullDuplexMode();
+[0x116bc]=1; [0xba30]=0; [0xba38]=0; [0x11780]=0;
+PCMClientDemodulatorSetDelay([0x11788]);     // ← 切片时刻，来自事件参数
+V34RxDataReset();
+V90DecoderSetDataMode();                     // ← 把 [0x13a7c] 换成 V90DataModeDecoder
+BlockShortClear(0x100, gGlobalPtr+0xe67c);
+```
+
+`[0x1174c]`（Ri）和 `[0x1174d]`（R̄i）都由 `V92ClientControlEventHandler`（0x5a350，
+跳转表分发）置位，`[0x1174d]` 那一路还把事件参数存进 `[0x11788]` 当切片延迟。
+
+**实测（探针新字段 `rx4 armed` / `flags`）：**
+
+```
+19.716 → 23.244 s   armed=0  delay=0  0x11748=1 0x1174c=0 0x1174d=0 0x11751=1   （每半秒都是这一个值）
+```
+
+⇒ **对端从头到尾没有报过 "Ri 收到" 或 "R̄i 收到"**，所以 `V92ClientPhase4RxWaitRiBarState`
+一行都没跑 —— 它既没有 `PCMClientDemodulatorSetFullDuplexMode`，也没有
+`PCMClientDemodulatorSetDelay`，也没有 `V90DecoderSetDataMode`。
+它相位 4 的接收机**根本没被接上**，这与 §十/§十一 的"恒定码字"是同一件事的起点。
+
+**而我方 Ri/R̄i 是对规范的**：线上实测 Ri = `+++---`、R̄i = `---+++`，
+各 6 符号块、帧对齐、24T（与 §4.8 的 V.90 8.6.4 表格一致），极性也对
+（`(interval < 3) ^ bar`）。所以要查的是**对端那把报告 Ri/R̄i 的匹配器**：
+
+1. 在 `V92ClientControlEventHandler` 的跳转表里找出 `0x5a4b4`（0x1174c）和
+   `0x5a4c4`（0x1174d）两个分支对应的**事件码**；
+2. 再找**谁**把这两个事件码推进事件队列（`V34ReportTrainingProgressLong` 之外的
+   `V92ClientControlReport…` 一族），即"Ri/R̄i 匹配器"——它凭什么判一条 Ri/R̄i，
+   我们在相位 3/4 的 Ri 时长、前后沿是不是它要的形状。
+
+这一条比之前所有猜测都具体：**不是"对端解不出我们的 SUVd"，而是"对端根本没开始接收"**。
