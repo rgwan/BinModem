@@ -2199,7 +2199,12 @@ impl Modem {
         // The design's own delay, if it has one: what arrives at symbol n of
         // the line is symbol n - delay of the frame count (see
         // [`Design::delay`](crate::v92::design::Design::delay)).
-        self.b1u_skip = self.upstream_delay;
+        // Diagnostic: force the number of symbols B1u's frame origin is taken
+        // to be into what arrives, instead of the design's own delay.
+        self.b1u_skip = std::env::var("V92_B1U_SKIP")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(self.upstream_delay);
         self.b1u_pending = false;
         self.b1u_deadline = None;
         self.note(format!(
