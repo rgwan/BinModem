@@ -287,6 +287,26 @@ fn b1u_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     .clone()
 }
 
+/// Where the bits the production decoder hands up are written, one line per
+/// upstream symbol: `<time> <count> <bits>`.
+///
+/// `V92_B1U_TRACE` records the equaliser's decisions, which is what the *bit
+/// layer* is judged on by `tools/v92_lapm_compare.py` -- and that comparison
+/// re-implements the bit layer in Python. This records what the Rust one
+/// actually produced, so the two can be told apart: a stack that never sees a
+/// V.42 detection pattern on a stream that a Python model finds one in says
+/// the decoder, not the line, is where to look.
+fn rx_bits_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("V92_RX_BITS")?;
+        let file = std::fs::File::create(std::path::PathBuf::from(path)).ok()?;
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
+}
+
 /// How many sample instants the far end's symbol timing is searched for
 /// between this end's own, and how far either way.
 const FRACTIONAL_STEPS: usize = 8;
@@ -2244,6 +2264,15 @@ impl Modem {
         // with insertion loss it is never exact.
         self.rx.set_data_mode(levels);
         self.upstream_data = Some(Decoder::new(&parameters));
+        if std::env::var_os("V92_RX_BITS").is_some() {
+            eprintln!(
+                "V92B1U begin at now={} parameters gain={} sets={} b1u_skip={}",
+                self.now,
+                parameters.gain,
+                parameters.sets.len(),
+                self.b1u_skip
+            );
+        }
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
         // run completed in.
         //
@@ -2349,6 +2378,13 @@ impl Modem {
                 let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
                 let _ = writeln!(file, "{} {level:.6} {} {text}", self.now, bits.len());
             }
+            if let Some(file) = rx_bits_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                let _ = writeln!(file, "{} {} {}", self.now, bits.len(), text);
+            }
             if !bits.is_empty() {
                 self.upstream_bits += bits.len() as u64;
                 self.recovered.extend(bits);
@@ -2356,6 +2392,14 @@ impl Modem {
             return;
         }
         let Some(reader) = self.upstream.as_mut() else { return };
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("V92_RX_BITS").is_some() && matches!(n, 0 | 4000 | 40000 | 400000) {
+                eprintln!("V92B1U no data decoder yet: symbol {n} at now={}", self.now);
+            }
+        }
         let bits: Vec<bool> = reader.feed(level).into_iter().collect();
         let dropped = self.now < self.upstream_drop_until;
         // Set when this symbol was E2u's last: B1u's frame interval 0 is the

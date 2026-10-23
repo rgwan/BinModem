@@ -545,9 +545,21 @@ impl Answerer {
     }
 
     /// Whether the far end has started a detection phase at all: either the
-    /// ODP has been seen, or flags have.
+    /// ODP has been recognised, or flags have.
+    ///
+    /// A *partial* DC1 run is deliberately not evidence. The line a V.92 call
+    /// gives the answerer before the far end's own data mode exists decodes to
+    /// something that frames a character every ten bits or so, and 2 of the
+    /// 256 characters are DC1s: at 24000 bit/s that is a DC1 every 70 ms, so
+    /// within T400 the first one always arrives and the run of four never
+    /// does. Arming T400 on that made the answerer declare the far end
+    /// non-V.42 750 ms after entering data mode -- 2 seconds before the Agere
+    /// at the other end starts its own V.42 at all (its log reaches "V44
+    /// Compressed mode active, Framer mode 1" 3.2 s after this end's B1u).
+    /// V.42 7.2.1.3 measures T400 from the establishment of the connection,
+    /// and on V.92 the two ends' establishing are not simultaneous.
     fn someone_is_detecting(&self) -> bool {
-        self.detecting || self.flags || self.dc1_run > 0
+        self.detecting || self.flags
     }
 
     /// Feed one received bit.
@@ -604,8 +616,8 @@ impl Answerer {
                 self.dc1_run += 1;
             }
             self.last_parity = Some(c);
-            self.detecting = true;
             if self.dc1_run >= 4 {
+                self.detecting = true;
                 self.outcome = Outcome::OriginatorDetected;
                 // The clock restarts, so that the bound on how long the
                 // pattern is repeated is a bound on the repeating rather than
@@ -1179,6 +1191,24 @@ mod tests {
             a.receive(b);
         }
         assert_eq!(a.outcome(), Outcome::Text);
+    }
+
+    /// The pattern an Agere SV92PP puts on the line as a V.92 originator:
+    /// Table 3's ten bits per character, where the tenth is the stop bit and
+    /// the ninth is the parity bit that tells the two DC1s apart.
+    #[test]
+    fn the_originators_odp_is_recognised() {
+        let mut a = Answerer::new(DEFAULT_T400_MS, Answer::ErrorControl);
+        let mut bits = VecDeque::new();
+        for _ in 0..6 {
+            push_character(&mut bits, ODP_EVEN);
+            push_character(&mut bits, ODP_ODD);
+        }
+        let mut outcome = Outcome::Pending;
+        for bit in bits {
+            outcome = a.receive(bit);
+        }
+        assert_eq!(outcome, Outcome::OriginatorDetected);
     }
 
     #[test]

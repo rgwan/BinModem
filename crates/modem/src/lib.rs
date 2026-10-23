@@ -1733,6 +1733,15 @@ impl Modem {
             // handshake it means nothing.
             Progress::Negotiating | Progress::Retraining => {}
             Progress::Connected { receive: rate, transmit } => {
+                if std::env::var_os("V92_EC_TRACE").is_some() {
+                    eprintln!(
+                        "V92EC connected arm at {:.2}s, announce={} ec={} wants_ec={}",
+                        self.call_samples as f64 / self.fs,
+                        self.announce.is_some(),
+                        self.ec.is_some(),
+                        wants_ec
+                    );
+                }
                 self.rate = rate;
                 self.transmit_rate = transmit;
                 if let Some(m) = self.pump.as_ref().and_then(Pump::v34) {
@@ -1849,6 +1858,9 @@ impl Modem {
                         // transmitted". 6.4 then takes the lower of the two
                         // ends' proposals, so these are ceilings twice over.
                         stack.offer_dictionary(c.max_dict, c.max_string);
+                    }
+                    if std::env::var_os("V92_EC_TRACE").is_some() {
+                        eprintln!("V92EC created at {:.2}s", self.call_samples as f64 / self.fs);
                     }
                     self.ec = Some(stack);
                 }
@@ -2094,8 +2106,10 @@ impl Modem {
     }
 
     fn carry_data(&mut self) {
+        /// Upstream bits handed to the error-control stack, for the traces.
+        static RX_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(pump) = self.pump.as_ref() else { return };
-        if std::env::var_os("V92_TX_TRACE").is_some() {
+        if std::env::var_os("V92_EC_TRACE").is_some() {
             use std::sync::atomic::{AtomicU64, Ordering};
             static LAST: AtomicU64 = AtomicU64::new(0);
             let now = self.call_samples as u64;
@@ -2103,11 +2117,12 @@ impl Modem {
             if now.saturating_sub(prev) >= 8 * 2000 {
                 LAST.store(now, Ordering::Relaxed);
                 eprintln!(
-                    "V92CARRY state={:?} accepts={} pending={} ec={} role={:?}",
+                    "V92CARRY state={:?} accepts={} pending={} received={} ec={} role={:?}",
                     self.state,
                     pump.accepts_bits(),
                     pump.pending_bits(),
-                    self.ec.is_some(),
+                    RX_BITS.load(std::sync::atomic::Ordering::Relaxed),
+                    self.ec.as_ref().map(|e| format!("{:?}", e.phase())).unwrap_or_else(|| "none".into()),
                     self.role
                 );
             }
@@ -2148,7 +2163,7 @@ impl Modem {
             // something already, a banner or a prompt, by the time this end
             // stops listening for a pattern.
             if let Some(mut ec) = self.ec.take() {
-                if std::env::var_os("V92_TX_TRACE").is_some() {
+                if std::env::var_os("V92_EC_TRACE").is_some() {
                     eprintln!("V92EC dropped as transparent at {:.2}s, phase {:?}", self.call_samples as f64 / self.fs, ec.phase());
                 }
                 for bit in ec.take_unclaimed() {
@@ -2167,8 +2182,23 @@ impl Modem {
                 // frames what goes out and unframes what comes back, and the
                 // line is never idle because a synchronous link always carries
                 // something.
-                for bit in pump.take_bits() {
-                    ec.feed_bit(bit);
+                {
+                    /// What the stack above actually heard, for the traces.
+                    static RX_LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+                        std::sync::OnceLock::new();
+                    let file = RX_LOG.get_or_init(|| {
+                        let path = std::env::var_os("V92_EC_RX")?;
+                        Some(std::sync::Mutex::new(std::fs::File::create(path).ok()?))
+                    });
+                    let mut logged = file.as_ref().and_then(|f| f.lock().ok());
+                    for bit in pump.take_bits() {
+                        RX_BITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(f) = logged.as_mut() {
+                            use std::io::Write;
+                            let _ = f.write_all(if bit { b"1" } else { b"0" });
+                        }
+                        ec.feed_bit(bit);
+                    }
                 }
                 if !self.outbound.is_empty() && ec.is_connected() {
                     let queued = std::mem::take(&mut self.outbound);
@@ -2471,6 +2501,13 @@ impl Modem {
             v8line::Status::Negotiating => {}
             v8line::Status::Agreed(modulation) => {
                 self.declared_lapm = negotiation.lapm();
+                if std::env::var_os("V92_EC_TRACE").is_some() {
+                    eprintln!(
+                        "V8 agreed: declared_lapm={} far_protocol={:?}",
+                        self.declared_lapm,
+                        negotiation.far_menu().map(|m| m.protocol)
+                    );
+                }
                 self.far_menu = negotiation.far_menu();
                 self.pcm_role = negotiation.pcm_role();
                 // The menu is agreed at the start of V.8's handover silence,
