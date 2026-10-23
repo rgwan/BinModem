@@ -1892,6 +1892,24 @@ impl Modem {
                         self.settings.limits.most
                     );
                 }
+                if let Some(path) = std::env::var_os("V92_CPD_TRACE") {
+                    // What this end actually told the analogue modem to run:
+                    // the design, coefficient by coefficient, so that a
+                    // captured line can be filtered with the same numbers.
+                    let f = &parameters.filters;
+                    let text = format!(
+                        "gain {:.9}\nscale {:.9}\nmoduli {:?}\nsets {:?}\nz1 {:?}\np1 {:?}\nz2 {:?}\np2 {:?}\n",
+                        parameters.gain,
+                        self.upstream_scale,
+                        parameters.moduli,
+                        parameters.sets,
+                        f.z1,
+                        f.p1,
+                        f.z2,
+                        f.p2
+                    );
+                    let _ = std::fs::write(std::path::Path::new(&path), text);
+                }
                 self.cpd = Some(Cpd::from(&parameters));
                 self.note(format!(
                     "V.92: upstream drn {}, {:.1} kbit/s",
@@ -1963,7 +1981,8 @@ impl Modem {
             }
             noise /= 4.0;
         }
-        let Some(choice) = choice else {
+        let mut choice = choice;
+        let Some(choice) = choice.as_mut() else {
             eprintln!(
                 "V92TRACE: no upstream rung carries this line (noise {noise:.2e}, fit noise {:.2e}, residual {:.1} dB, ja {ja:#x})",
                 channel.noise,
@@ -1971,6 +1990,13 @@ impl Modem {
             );
             return None;
         };
+        // Diagnostic: force a four-point constellation, so that what the far
+        // end puts on the line can be counted in levels. A CPd it obeys and a
+        // CPd it ignores look nothing alike.
+        if std::env::var_os("V92_TINY").is_some() {
+            choice.parameters.moduli = [4u8; UP_INTERVALS];
+            choice.parameters.sets = vec![vec![1, 3, 5, 7]];
+        }
         if tracing() {
             eprintln!(
                 "V92TRACE: upstream design assumed noise {noise:.2e}, scale {:.2}, residual {:.1} dB",
@@ -1978,7 +2004,7 @@ impl Modem {
                 designed.residual_db()
             );
         }
-        Some(choice.parameters)
+        Some(choice.parameters.clone())
     }
 
     /// 9.6.1.1.5-6: B1d out, and the receiver conditioned for B1u.
