@@ -2095,13 +2095,37 @@ impl Modem {
         };
         // Diagnostic: what the far end does with the filters in CPd, and what
         // happens when it is asked for none at all.
-        //   none -> z2 = [1]: pass-through, no filtering
+        //   none  -> z2 = [1]: pass-through, no filtering
+        //   probe -> z2 = [0.8, 0.6]: two taps and unit energy, so 8.8.3's
+        //            `mean square of (v G) = 1` still holds and the CPd that
+        //            carries it is legal in every field -- but the far end's own
+        //            output is then filtered by a section whose response is
+        //            1.4 at DC and 0.2 at 4 kHz, which no far end can produce
+        //            by accident and no receiver can mistake for the line.
+        //            It answers one question and only one: whether the far end
+        //            runs the prefilter it is sent. See docs/16 section 8f.3.
         //   a    -> z2 - delta ("x plus a correction")
         //   b    -> delta - z2 ("x minus the inverse")
+        let mut sent_scale = designed.scale;
         match std::env::var("V92_PRE").ok().as_deref() {
             Some("none") => {
                 designed.filters =
                     crate::v92::Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() };
+                // The far end is told to run the section we sent, at the
+                // amplitude we sent it at, so nothing was scaled: what the
+                // design's own scale folds back is not in play. The log said
+                // 12.586 here while the CPd said z2 = [1], which is a number
+                // that reads as a receiver correction that is not happening.
+                sent_scale = 1.0;
+            }
+            Some("probe") => {
+                designed.filters = crate::v92::Filters {
+                    z1: Vec::new(),
+                    p1: Vec::new(),
+                    z2: vec![0.8, 0.6],
+                    p2: Vec::new(),
+                };
+                sent_scale = 1.0;
             }
             Some("a") => {
                 if let Some(first) = designed.filters.z2.first_mut() {
@@ -2117,8 +2141,10 @@ impl Modem {
             _ => {}
         }
         // The prefilter was scaled down to fit Q0.15; the receiver must fold
-        // that scale back in when it reads B1u's levels.
-        self.upstream_scale = designed.scale;
+        // that scale back in when it reads B1u's levels. That is only true for
+        // the design as it was made: `none` and `probe` replace it with a
+        // section that is already on its final amplitude.
+        self.upstream_scale = sent_scale;
         self.upstream_delay = designed.delay;
         // The rate this end asks for. The analogue modem's Ja says which rungs
         // it allows; this end takes the slowest of those, because the number
