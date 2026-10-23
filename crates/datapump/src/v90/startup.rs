@@ -353,6 +353,17 @@ pub struct Digital {
     /// Whether data mode has been reached, after which a start-up is a
     /// retrain or a renegotiation rather than the call being placed.
     connected_once: bool,
+    /// Lines for the transcript not yet taken (see [`Self::take_notes`]).
+    ///
+    /// V.92's phases 3 and 4 keep thirty-odd notes -- what CPt and Ja said,
+    /// which rung of the upstream ladder CPd carries, where B1u's frame origin
+    /// is, what each SUVu's ack bit was, why a refit was thrown away -- and
+    /// until this existed none of them reached the transcript: `take_notes`
+    /// was written for the analogue start-up alone, so a digital server's log
+    /// showed the phase names and nothing about what it decided. That is the
+    /// difference between "phase 4: B1d" and knowing the data phase never
+    /// carried a frame.
+    notes: Vec<String>,
 }
 
 impl Digital {
@@ -373,6 +384,7 @@ impl Digital {
             renegotiations: 0,
             habits: digital::Habits::default(),
             connected_once: false,
+            notes: Vec::new(),
         }
     }
 
@@ -627,6 +639,18 @@ impl Digital {
             Some(m) => m.clear_down(),
             None => self.v34.clear_down(),
         }
+    }
+
+    /// What phases 3 and 4 have decided since this was last asked, a line
+    /// each for the transcript (see [`Analogue::take_notes`]).
+    ///
+    /// V.92's notes live on [`pcm::Modem`] and are drained here; V.90's and
+    /// V.34's own start-ups keep none.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        if let Some(m) = self.v92.as_mut() {
+            self.notes.extend(m.take_notes());
+        }
+        std::mem::take(&mut self.notes)
     }
 
     /// One network sample in, one out.

@@ -128,6 +128,12 @@ impl Line {
     pub fn phase(&self) -> &'static str {
         self.modem.phase()
     }
+
+    /// What the start-up has decided since this was last asked, a line each
+    /// for the transcript (see [`Digital::take_notes`]).
+    pub fn take_notes(&mut self) -> Vec<String> {
+        self.modem.take_notes()
+    }
 }
 
 #[cfg(test)]

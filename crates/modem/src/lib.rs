@@ -1651,10 +1651,17 @@ impl Modem {
             return 0.0;
         };
         let out = pump.step(line);
-        if let Pump::V90(m) = pump {
-            // Taken on the sample that made them, and kept here, so that a
-            // pump put away on this same sample still has its last lines told.
-            self.line_notes.extend(m.take_notes());
+        // Taken on the sample that made them, and kept here, so that a pump put
+        // away on this same sample still has its last lines told. Both V.90
+        // pumps keep notes: the analogue start-up's phases 3 and 4, and the
+        // digital server's, whose V.92 half writes thirty-odd of them -- which
+        // rung CPd carried, where B1u's frame origin is, what each SUVu's ack
+        // bit was. Without that arm a V.92 server's transcript said "phase 4:
+        // B1d" and nothing else, all the way to a call that never connected.
+        match pump {
+            Pump::V90(m) => self.line_notes.extend(m.take_notes()),
+            Pump::V90Server(m) => self.line_notes.extend(m.take_notes()),
+            _ => {}
         }
 
         match self.state {
