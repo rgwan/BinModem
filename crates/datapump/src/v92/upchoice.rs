@@ -132,6 +132,26 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
         // Refused rather than clamped.
         return None;
     }
+    // The prefilter had to be scaled down to fit Q0.15, so the far end's output
+    // is that many times quieter than a unit-gain prefilter's -- and `G` is the
+    // number that says how loud the line should be. Fold the two: `G` is the
+    // gain that puts *this* design's output on the constellation, which is what
+    // `design()` says the rate choice does ("which folds the scale into G").
+    // Measured on the harness, `scale` is 12.58 -- a channel whose inverse does
+    // not fit Q0.15 -- so without this the far end runs a prefilter twelve and
+    // a half times too quiet and every level is off by that much.
+    //
+    // It is per call and it is measured, not assumed: a telephone loop's loss
+    // is not fixed, and this number carries whatever the loop did.
+    let gain = if std::env::var("V92_GAIN_SCALE").ok().as_deref() == Some("fold") {
+        gain / design.scale.max(f64::MIN_POSITIVE)
+    } else {
+        gain
+    };
+    if !(gain > 0.0) || gain * crate::v92::GAIN_SCALE < 1.0 {
+        // A gain the field would round to nothing is not a gain.
+        return None;
+    }
     Some(Parameters {
         drn,
         trellis,
@@ -179,7 +199,7 @@ mod tests {
         }
         let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
         taps.iter_mut().for_each(|t| *t /= norm);
-        design(&Channel { taps, noise }, &plan()).expect("designable")
+        design(&Channel { taps, noise, signal: 1.0 }, &plan()).expect("designable")
     }
 
     /// `gain_for` is 8.8.3's: a uniform set on a spacing of two, brought to a

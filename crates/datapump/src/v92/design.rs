@@ -40,12 +40,33 @@ use super::{FilterLimits, Filters};
 /// equations as unknowns.
 pub const CHANNEL_TAPS: usize = 64;
 
-/// A ridge on the inverse, as a fraction of the autocorrelation's trace.
+/// The floor under the inverse's ridge, as a fraction of the autocorrelation's
+/// trace: the smallest the arithmetic will take.
 ///
-/// Without it, a least-squares inverse of a channel with a null in its band --
-/// every real loop has one at DC -- puts an enormous coefficient on that null,
-/// and the quantiser then either saturates it or loses it.
+/// A least-squares inverse of a channel with a null in its band -- every real
+/// loop has one at DC -- puts an enormous coefficient on that null, and the
+/// quantiser then either saturates it or loses it. `RIDGE` alone was the whole
+/// story here once, and it is far too small to stop that: on the harness the
+/// section came out needing twelve and a half times the dynamic range Q0.15 has
+/// (`Design::scale` 12.586), which is a prefilter no far end can run at the
+/// amplitude `G` names.
+///
+/// What the ridge should be is the reciprocal of the signal to noise the design
+/// is being made into. Minimising ISI alone is the wrong problem -- it is
+/// solvable and it is what the constant below did -- and minimising ISI subject
+/// to a transmit power the line can carry is the right one. That trade is
+/// exactly what a ridge is, so it is [`Channel::noise_ratio`], floored here and
+/// capped by [`ALPHA_MOST`].
 const RIDGE: f64 = 1e-6;
+
+/// The largest ridge a design will take.
+///
+/// The ridge trades residual ISI for transmit power, and past about a tenth the
+/// inverse stops being an inverse at all -- it is a matched filter, which puts
+/// the whole of the channel's memory back as ISI for the precoder to cancel.
+/// A design that asks for more than this is a design for a channel that should
+/// not be carrying this rung, not a design with a better ridge.
+const ALPHA_MOST: f64 = 0.1;
 
 /// The upstream channel as the digital modem sees it: T-spaced taps and the
 /// noise the estimate was made in.
@@ -55,6 +76,15 @@ pub struct Channel {
     /// The power of what the taps do not explain, as a mean square on the
     /// same scale as the taps' input.
     pub noise: f64,
+    /// The mean square of the line the estimate was made on, on that same
+    /// scale: what `noise` is a noise *against*.
+    ///
+    /// A telephone loop's loss is not fixed -- it depends on the loop, on the
+    /// far end's transmit level and on the network -- so the one number the
+    /// design must not take from a constant is the signal to noise it is
+    /// designing into. This is the measurement, taken on every call from the
+    /// same window the taps came from.
+    pub signal: f64,
 }
 
 impl Channel {
@@ -111,7 +141,24 @@ impl Channel {
         if count == 0 {
             return None;
         }
-        Some(Self { taps: fitted, noise: power / count as f64 })
+        let mut signal = 0.0;
+        for n in taps - 1..length {
+            signal += received[n] * received[n];
+        }
+        Some(Self { taps: fitted, noise: power / count as f64, signal: signal / count as f64 })
+    }
+
+    /// The reciprocal of this channel's signal to noise, which is the ridge its
+    /// prefilter's inverse wants: see [`RIDGE`].
+    ///
+    /// Bounded at both ends so that a measurement taken in the wrong window --
+    /// silence, or a burst -- cannot take the design with it.
+    #[must_use]
+    pub fn noise_ratio(&self) -> f64 {
+        if !(self.signal > 0.0) || !self.noise.is_finite() {
+            return RIDGE;
+        }
+        (self.noise / self.signal).clamp(RIDGE, ALPHA_MOST)
     }
 
     /// The channel's response to a unit impulse over `length` symbols.
@@ -282,6 +329,11 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
 /// make `c * w` nearest a unit impulse at the channel's first significant tap,
 /// with the ridge that keeps a null in the band from running away with them.
 fn inverse(channel: &Channel, length: usize) -> Vec<f64> {
+    inverse_with(channel, length, channel.noise_ratio())
+}
+
+/// [`inverse`] at a stated ridge, as a fraction of the autocorrelation's trace.
+fn inverse_with(channel: &Channel, length: usize, relative_ridge: f64) -> Vec<f64> {
     let taps = &channel.taps;
     let length = length.max(1);
     let mut a = vec![Complex::ZERO; length * length];
@@ -299,7 +351,7 @@ fn inverse(channel: &Channel, length: usize) -> Vec<f64> {
         }
     }
     let trace: f64 = (0..length).map(|i| a[i * length + i].re).sum();
-    let ridge = RIDGE * trace / length as f64;
+    let ridge = relative_ridge * trace / length as f64;
     for i in 0..length {
         a[i * length + i].re += ridge;
     }
@@ -352,7 +404,7 @@ mod tests {
     /// One tap at unit gain: nothing to equalise.
     #[test]
     fn an_ideal_channel_gets_a_pass_through_and_no_precoder() {
-        let channel = Channel { taps: vec![1.0], noise: 0.0 };
+        let channel = Channel { taps: vec![1.0], noise: 0.0, signal: 1.0 };
         let design = design(&channel, &limits(3, 3, 3)).expect("an ideal channel is designable");
         assert!(design.filters.z2[0] > 0.98, "{:?}", design.filters.z2[0]);
         assert_eq!(design.delay, 0, "an ideal channel adds no delay");
@@ -376,7 +428,7 @@ mod tests {
         }
         let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
         taps.iter_mut().for_each(|t| *t /= norm);
-        let channel = Channel { taps, noise: 1e-6 };
+        let channel = Channel { taps, noise: 1e-6, signal: 1.0 };
         let design = design(&channel, &limits(3, 3, 3)).expect("a loop is designable");
         assert!(design.residual_db() > 25.0, "residual {:.1} dB, filters {:?}", design.residual_db(), design.filters);
     }
@@ -390,7 +442,7 @@ mod tests {
         for k in 1..30 {
             taps[k] = 0.3 / k as f64;
         }
-        let channel = Channel { taps, noise: 1e-6 };
+        let channel = Channel { taps, noise: 1e-6, signal: 1.0 };
         for sections in 0..4u8 {
             for (total, most) in [(0u8, 0u8), (1, 1), (2, 2), (3, 3)] {
                 let limit = limits(sections, total, most);
@@ -430,7 +482,7 @@ mod tests {
         }
         let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
         taps.iter_mut().for_each(|t| *t /= norm);
-        let channel = Channel { taps: taps.clone(), noise: 1e-6 };
+        let channel = Channel { taps: taps.clone(), noise: 1e-6, signal: 1.0 };
         let plan = limits(3, 3, 3);
         let design = design(&channel, &plan).expect("designable");
         assert!(design.residual_db() > 20.0, "residual {:.1} dB", design.residual_db());
@@ -515,7 +567,7 @@ mod tests {
         }
         let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
         taps.iter_mut().for_each(|t| *t /= norm);
-        let channel = Channel { taps: taps.clone(), noise: 1e-6 };
+        let channel = Channel { taps: taps.clone(), noise: 1e-6, signal: 1.0 };
         let design = design(&channel, &limits(3, 3, 3)).expect("designable");
         let drn = 1u8;
         let choice = crate::v92::upchoice::choose(&design, 1e-6, 1 << (drn - 1), Trellis::Sixteen)
