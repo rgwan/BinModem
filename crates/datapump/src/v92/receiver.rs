@@ -889,22 +889,28 @@ impl Receiver {
         self.gain = 1.0;
     }
 
-    /// Recondition the equaliser for B1u (9.6.1.1.6).
+    /// Recondition the slicer for B1u (9.6.1.1.6), and keep the equaliser.
     ///
-    /// The data mode's precoder and prefilter have already inverted the line,
-    /// so the feed-forward taps trained on TRN2u -- the channel's own inverse --
-    /// would invert it twice. For B1u the only correction left is the scale the
-    /// design folded out of the prefilter to keep it inside Q0.15: one tap of
-    /// `scale`, no feedback. The slicer is what decides, the decoder behind it
-    /// does the modulus arithmetic.
-    pub fn set_data_mode(&mut self, scale: f64) {
-        self.forward = vec![scale];
-        self.feedback.clear();
+    /// 6.4.2 puts the equalisation at the transmitter: the analogue modem runs
+    /// this end's own prefilter and precoder, so what arrives is meant to be the
+    /// constellation itself. "Meant to be" is not "is": the prefilter is a FIR
+    /// of at most LZ2 taps fitted to a channel estimate, and a real line has
+    /// insertion loss that no such filter inverts exactly. What it leaves is
+    /// post-cursor ISI, and a decision feedback section is what removes
+    /// post-cursor ISI -- it was fitted on TRN2u for exactly that line.
+    ///
+    /// Replacing the feed-forward section with one tap and clearing the feedback
+    /// (which is what this used to do) throws that away and hands the residual
+    /// straight to the slicer. It survives a straight wire and nothing else,
+    /// which is why it looked right on a bench.
+    ///
+    /// The `gain` the four-point tiers established is kept as well: it is the
+    /// AGC that puts the equaliser's output on the scale the levels are on, and
+    /// TRN2u and B1u are transmitted at the same power (3.8, 8.7.1).
+    pub fn set_data_mode(&mut self, levels: Vec<f64>) {
+        self.slicer = Slicer::Levels(levels);
         self.decided.clear();
         self.measured = 0;
-        self.inner = 0.0;
-        self.outer = 0.0;
-        self.gain = 1.0;
     }
 
     /// 9.5.1.1.10: "the first symbol of the second TRN1u shall be symbol 0 of

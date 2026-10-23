@@ -270,6 +270,100 @@ fn b1u_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     .clone()
 }
 
+/// How many sample instants the far end's symbol timing is searched for
+/// between this end's own, and how far either way.
+const FRACTIONAL_STEPS: usize = 8;
+
+/// The sinc kernel's half-width, in symbols.
+const FRACTIONAL_HALF: i32 = 4;
+
+fn sinc(t: f64) -> f64 {
+    if t.abs() < 1e-9 { 1.0 } else { (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t) }
+}
+
+/// `received` read `delay` symbols later than it was sampled, through a
+/// windowed sinc. A negative delay reads it earlier.
+fn shift_by(received: &[f64], delay: f64) -> Vec<f64> {
+    let last = received.len().saturating_sub(1) as i64;
+    let weights: Vec<(i64, f64)> = (-FRACTIONAL_HALF..=FRACTIONAL_HALF)
+        .map(|k| {
+            let t = delay + f64::from(k);
+            // Blackman over the kernel: the tails of a truncated sinc ring, and
+            // what this is resampled for is precisely the band where ringing
+            // would be mistaken for the line.
+            let w = if t.abs() <= f64::from(FRACTIONAL_HALF) {
+                let x = std::f64::consts::PI * t / f64::from(FRACTIONAL_HALF);
+                0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos()
+            } else {
+                0.0
+            };
+            (i64::from(k), sinc(t) * w)
+        })
+        .collect();
+    (0..received.len())
+        .map(|n| {
+            weights
+                .iter()
+                .map(|&(k, w)| {
+                    let at = (n as i64 - k).clamp(0, last) as usize;
+                    w * received[at]
+                })
+                .sum()
+        })
+        .collect()
+}
+
+/// TRN1u as it should have arrived, rather than as this end's sample instants
+/// happened to catch it.
+///
+/// The delay is the one whose least-squares fit of the sequence leaves the
+/// least behind; a whole symbol of it is already taken out by the alignment
+/// that found TRN1u, so what is searched for here is the part between.
+fn align_fractional(known: &[f64], received: &[f64]) -> Vec<f64> {
+    if received.len() < 2 * FRACTIONAL_HALF as usize + 8 {
+        return received.to_vec();
+    }
+    // What decides the delay is not the fit's residual -- sixteen taps can
+    // absorb a fractional delay almost as well as resampling can, so the
+    // residual barely moves -- but how much of the estimate that absorption
+    // costs. A line's own response is a main tap and a short tail; a fractional
+    // delay is a spread of taps either side of it, and it is that spread, not
+    // the residual, that the far end would be asked to invert.
+    let spread = |taps: &[f64]| {
+        let total: f64 = taps.iter().map(|tap| tap.abs()).sum();
+        if total <= 0.0 {
+            return f64::INFINITY;
+        }
+        let main = taps
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map_or(0, |(at, _)| at);
+        taps.iter()
+            .enumerate()
+            .map(|(at, tap)| tap.abs() * (at as f64 - main as f64).abs())
+            .sum::<f64>()
+            / total
+    };
+    let mut best: Option<(f64, Vec<f64>)> = None;
+    for step in 0..FRACTIONAL_STEPS {
+        let delay = step as f64 / FRACTIONAL_STEPS as f64;
+        let shifted = if step == 0 { received.to_vec() } else { shift_by(received, delay) };
+        let Some(channel) = Channel::estimate(known, &shifted, 16) else { continue };
+        let cost = spread(&channel.taps);
+        if tracing() {
+            eprintln!(
+                "V92TRACE: TRN1u delay {delay:.3}: noise {:.2e}, spread {cost:.2}",
+                channel.noise
+            );
+        }
+        if best.as_ref().is_none_or(|(least, _)| cost < *least) {
+            best = Some((cost, shifted));
+        }
+    }
+    best.map_or_else(|| received.to_vec(), |(_, shifted)| shifted)
+}
+
 /// Where to write the line samples this end receives, when `V92_RX_TRACE` names
 /// a file: one `symbol_index level` line each. Offline that is the whole of the
 /// upstream problem -- a receiver can be fitted against it without a bench run
@@ -1931,6 +2025,17 @@ impl Modem {
         if received.len() < FIT / 2 {
             return None;
         }
+        // The fit above is only worth what the sample instants are worth, and
+        // they are not this end's to choose: the analogue modem's clock is its
+        // own, so its symbols arrive a fraction of a symbol away from the
+        // network's sample instants. A linear equaliser is at its worst at half
+        // a symbol (`receiver`'s own table: 19 dB against 166 dB on the
+        // instants), which is where an Agere SV92PP's TRN1u fits, and the
+        // prefilter this end designs is the inverse of *what the line does* --
+        // not of the line and this end's timing recovery together. Inverting the
+        // second asks the far end to undo an interpolator it never ran, and what
+        // arrives afterwards is ISI at the level spacing.
+        let received = align_fractional(&known, &received);
         let Some(channel) = Channel::estimate(&known, &received, 48) else {
             eprintln!("V92TRACE: no channel estimate ({} symbols)", received.len());
             return None;
@@ -2086,8 +2191,10 @@ impl Modem {
         }
         levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-        self.rx.set_slicer(Slicer::Levels(levels));
-        self.rx.set_data_mode(self.upstream_scale);
+        // The slicer moves to CPd's constellation and the equaliser stays: the
+        // prefilter the far end runs is this end's design of it, and on a line
+        // with insertion loss it is never exact.
+        self.rx.set_data_mode(levels);
         self.upstream_data = Some(Decoder::new(&parameters));
         // The design's own delay, if it has one: what arrives at symbol n of
         // the line is symbol n - delay of the frame count (see

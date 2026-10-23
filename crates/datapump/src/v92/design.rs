@@ -502,6 +502,96 @@ mod tests {
         assert_eq!(errors, 0, "{errors} of {length} bits wrong through the designed channel");
     }
 
+    /// The whole upstream chain as a bench sees it: the analogue modem's
+    /// precoder and prefilter, the gain, a quantiser, and this end's receiver at
+    /// the scale the design tells it to use.
+    ///
+    /// Returns (bits wrong, bits compared) after lining the two streams up.
+    fn through_the_line(quantise: impl Fn(f64) -> f64) -> (usize, usize) {
+        let mut taps = vec![0.0; 20];
+        taps[0] = 1.0;
+        for k in 1..20 {
+            taps[k] = 0.35 / k as f64;
+        }
+        let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
+        taps.iter_mut().for_each(|t| *t /= norm);
+        let channel = Channel { taps: taps.clone(), noise: 1e-6 };
+        let design = design(&channel, &limits(3, 3, 3)).expect("designable");
+        let drn = 1u8;
+        let choice = crate::v92::upchoice::choose(&design, 1e-6, 1 << (drn - 1), Trellis::Sixteen)
+            .expect("the slowest rung carries this line");
+        let parameters = choice.parameters;
+        let mut encoder = UpEncoder::new(&parameters).expect("feasible");
+        let mut decoder = Decoder::new(&parameters);
+        let mut seed = 0x5eed_1234_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed >> 63 == 0
+        };
+        let mut line = vec![0.0f64; taps.len()];
+        let (mut sent, mut received) = (Vec::new(), Vec::new());
+        for _ in 0..(SURVIVOR_DEPTH * 6 * 12 + 2400) {
+            let symbol = encoder.next_symbol(|| {
+                let bit = next();
+                sent.push(bit);
+                bit
+            });
+            line.rotate_right(1);
+            line[0] = symbol.out;
+            let seen: f64 = taps.iter().enumerate().map(|(k, &tap)| tap * line[k]).sum();
+            // The analogue modem transmits at its own power, well below the
+            // codec's full scale: G x v having mean square one is the *design's*
+            // unit, not a level to put on a 16-bit codec at.
+            let level = 0.25;
+            decoder.feed(quantise(seen * level) / level * design.scale);
+            received.extend(decoder.take_bits());
+        }
+        let shortest = sent.len().min(received.len());
+        assert!(shortest > 400, "{} bits decoded of {}", received.len(), sent.len());
+        let at = (0..shortest.min(400))
+            .find(|&offset| {
+                let length = shortest - offset;
+                length > 200
+                    && sent[offset..offset + length].iter().zip(&received[..length]).all(|(a, b)| a == b)
+            })
+            .unwrap_or(0);
+        let length = shortest - at;
+        let errors = sent[at..].iter().zip(&received[..length]).filter(|(a, b)| a != b).count();
+        (errors, length)
+    }
+
+    /// A quantiser fine enough that the design's own residual is all that is
+    /// left: the chain is what it should be.
+    #[test]
+    fn a_designed_chain_survives_a_fine_quantiser() {
+        let (errors, length) = through_the_line(|seen| (seen * 32768.0).round() / 32768.0);
+        assert_eq!(errors, 0, "{errors} of {length} bits wrong through a 16 bit line");
+    }
+
+    /// Through the codec a PCM upstream line actually ends in: the same chain,
+    /// to the bit, once the levels are put on the line at a power a codec has
+    /// room for.
+    ///
+    /// That last clause is the whole of it. `G x v` having mean square one is
+    /// the design's own unit (Table 30's NOTE), not a level to hand a 16-bit
+    /// codec at: sent at full scale the top constellation points sit on
+    /// mu-law's 32124 ceiling, clip, and cost six per cent of the bits. The
+    /// analogue modem transmits at its own power instead, and the receiver's
+    /// `Design::scale` is what folds that back out (which is why it is measured
+    /// from the channel estimate and not assumed).
+    #[test]
+    fn a_mu_law_line_reads_back_through_the_codec() {
+        let law = crate::v90::ucode::Law::Mu;
+        let (errors, length) = through_the_line(|seen| {
+            let (u, negative) =
+                crate::v90::ucode::nearest(law, (seen * 32768.0).round().clamp(-32768.0, 32767.0) as i32);
+            crate::v90::ucode::amplitude(law, u, negative) as f64 / 32768.0
+        });
+        assert_eq!(errors, 0, "{errors} of {length} bits wrong through the codec");
+    }
+
     /// [`Channel::estimate`] against a channel it was given: TRN1u's own
     /// levels in, the same channel's output with a little noise, and the taps
     /// come back.
