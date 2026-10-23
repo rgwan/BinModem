@@ -203,6 +203,14 @@ pub const B1U_WAIT: f64 = 2.0;
 /// that comes between Ed and the data.
 pub const B1D_FRAMES: usize = 48;
 
+/// Data frames one downstream fill encodes at a time.
+///
+/// It is the unit the codeword queue is topped up in, and so the unit in which
+/// DTE bits are taken from the stack above: a caller has to have that many
+/// frames' worth queued or the rest of the fill goes out as the idle pattern
+/// (see [`Modem::fill_bits`]).
+const B1D_FILL_FRAMES: usize = 8;
+
 /// Whether V92_TRACE in the environment is set, so that a start-up that will
 /// not find its place is legible.
 fn tracing() -> bool {
@@ -1419,6 +1427,25 @@ impl Modem {
         self.outbound.len()
     }
 
+    /// How many DTE bits [`Self::fill_downstream`] can take in one go.
+    ///
+    /// Eight data frames, each of which is a frame's worth of bits -- 272 of
+    /// them at 45333 bit/s, because a frame is six symbols of five or six.
+    /// This is a floor and not a target: a caller that keeps less queued runs
+    /// the queue dry in the middle of a fill, and everything after the dry
+    /// point goes out as the idle pattern instead of what the stack above
+    /// handed over. The stack is not told, so a detection pattern handed down
+    /// as one run of characters arrives cut into pieces -- at 45333 bit/s into
+    /// 64 bits of pattern and 208 bits of ones, over and over, which no
+    /// originator can read as two adjacent ADPs (V.42 7.2.1.2).
+    pub fn fill_bits(&self) -> usize {
+        match self.downstream.as_ref() {
+            Some(encoder) => B1D_FILL_FRAMES * encoder.frame_bits(),
+            // No data mode yet, so there is nothing to keep fed.
+            None => 0,
+        }
+    }
+
     /// Upstream data bits recovered since B1u began, for the stack above.
     pub fn take_bits(&mut self) -> Vec<bool> {
         std::mem::take(&mut self.recovered)
@@ -2370,7 +2397,7 @@ impl Modem {
         let law = self.settings.law;
         let mut octets = Vec::new();
         if let Some(encoder) = self.downstream.as_mut() {
-            for _ in 0..8 {
+            for _ in 0..B1D_FILL_FRAMES {
                 // 8.6.1/V.90, which 8.8.1/V.92 adopts whole: "B1d consists of
                 // 48 data frames of scrambled ones transmitted at the end of
                 // start-up using the selected data mode constellation

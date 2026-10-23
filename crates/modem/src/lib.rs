@@ -254,6 +254,28 @@ impl Pump {
         }
     }
 
+    /// How much the pump wants queued before it has enough to be going on
+    /// with.
+    ///
+    /// 64 bits is enough for every pump whose transmitter takes one bit at a
+    /// time, and it is what bounds how far ahead of the line the stack above
+    /// runs. The V.92 downstream does not take one at a time: one fill encodes
+    /// eight data frames of six symbols, so it wants 272 bits at 45333 bit/s
+    /// at once, and a queue that is only 64 deep is refilled with the idle
+    /// pattern for the other 208 (see `v92::digital::Modem::fill_bits`). The
+    /// stack is never told, so the bits it handed down arrive on the line in
+    /// 64-bit pieces with 208 bits of ones between them -- and a V.42 ADP,
+    /// which has to arrive as a run of async characters, arrives as no
+    /// pattern at all. No far end can detect that, and this one did not.
+    fn fill_bits(&self) -> usize {
+        /// The queue depth every pump but V.92's downstream wants.
+        const REFILL_BITS: usize = 64;
+        match self {
+            Self::V90Server(m) => m.modem().fill_bits().max(REFILL_BITS),
+            _ => REFILL_BITS,
+        }
+    }
+
     fn pending_bits(&self) -> usize {
         match self {
             Self::V22bis(m) => m.pending_bits(),
@@ -2214,7 +2236,11 @@ impl Modem {
                 // never fills: this asked for one for ever, and threw away
                 // every frame the error control handed over on the way. The
                 // frames wait instead, and go when data mode is back.
-                while pump.accepts_bits() && pump.pending_bits() < 64 {
+                // What is queued has to cover a whole fill: the pump takes
+                // its bits in blocks, and a block it cannot fill from the
+                // queue it fills with the idle pattern (see `fill_bits`).
+                let refill = pump.fill_bits();
+                while pump.accepts_bits() && pump.pending_bits() < refill {
                     let bit = ec.next_bit();
                     pump.send_bits(&[bit]);
                 }

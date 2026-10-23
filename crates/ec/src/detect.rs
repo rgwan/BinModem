@@ -979,6 +979,40 @@ mod tests {
         assert_eq!(o.outcome(), Outcome::Answered(Answer::Reserved(0x07)));
     }
 
+    /// The ODP as an Agere SV92PP actually sends it, recorded bit for bit off
+    /// a V.92 call: start bit, DC1 with even parity, ten ones, start bit, DC1
+    /// with odd parity, ten ones, and round again -- forty bits a repetition.
+    ///
+    /// It came from `V92_EC_RX` on the answering side of a call whose upstream
+    /// was separately proved bit-exact against the far end's own framer, so it
+    /// is the far end's pattern and not a decoding of it. Two repetitions are
+    /// in it, and a third is fed on the end of the test: 7.2.1.3 wants four
+    /// DC1s of alternating parity before the ODP counts as received.
+    const SV92PP_ODP: &str = "0100010001111111111101000100111111111111";
+
+    #[test]
+    fn the_odp_a_real_agere_sends_is_recognised() {
+        let mut a = Answerer::default();
+        for k in 0..3 {
+            for bit in SV92PP_ODP.bytes() {
+                a.receive(bit == b'1');
+            }
+            assert_ne!(a.outcome(), Outcome::Text, "after {k} repetitions");
+        }
+        assert_eq!(a.outcome(), Outcome::OriginatorDetected, "the ODP was not recognised");
+        // And what goes back is Table 3's answer, as characters: the pattern
+        // is only worth sending if the far end can frame it.
+        let mut scanner = CharacterScanner::default();
+        let mut sent = Vec::new();
+        for _ in 0..200 {
+            if let Some(c) = scanner.feed(a.transmit()) {
+                sent.push(c);
+            }
+        }
+        assert_eq!(sent.first().copied(), Some(ADP_E), "sent {sent:?}");
+        assert_eq!(sent.get(1).copied(), Some(ADP_C), "sent {sent:?}");
+    }
+
     #[test]
     fn a_silent_far_end_times_out() {
         // A modem with no error control sends nothing recognisable.

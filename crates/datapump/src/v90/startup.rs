@@ -584,6 +584,13 @@ impl Digital {
         }
     }
 
+    /// How many bits one downstream fill can take, for a caller keeping the
+    /// queue fed (see [`pcm::Modem::fill_bits`]). Zero when there is no V.92
+    /// data mode, whose fills are the ones that take more than a handful.
+    pub fn fill_bits(&self) -> usize {
+        self.v92.as_ref().map_or(0, pcm::Modem::fill_bits)
+    }
+
     /// Start a full retrain (9.5.1.1).
     pub fn retrain(&mut self) -> bool {
         if self.v92.is_some() {
