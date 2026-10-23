@@ -1929,3 +1929,36 @@ BlockShortClear(0x100, gGlobalPtr+0xe67c);
 `AGRSM_PHASE4_PROBE` 的 `tables` 行看 `0x119da` 何时变非零）。
 如果它解析完 CPd 不重跑 Init，那就是它的死锁；如果它该重跑而没重跑，再回来查我们 CPd
 的哪一个字段让它没接受。
+
+### 二十一、git 里有"已知好"的提交：`f76e9c0`/`017deac`（16 点 TRN2d 曾让对端解出 SUVd/CPd）
+
+`git log --all -- crates/datapump/src/v92/digital.rs` 里有
+`017deac docs(v92): the phase 4 modulation is fixed and the far end now detects SUVd and CPd`，
+紧跟在 `f76e9c0 v92: send Phase 4 on CPt's constellation, through the encoder of 5.4` 之后。
+**`f76e9c0` 的 `Out::Trn2d` 就是 16 点 CPt 星座那版**（注释原文 "It is not a two-point signal…"），
+而提交信息明说那个状态"far end now detects SUVd and CPd"。
+
+`f76e9c0` 之后到 `f4861cc` 之间，只动过**接收机**（`99673f3` trace、`af1cdfe` dump winning fit），
+没动过相位 4 发送。⇒ **16 点 TRN2d 历史上是通的**；本轮两种 TRN2d（16 点/二值）现在都失败，
+说明差异不在"TRN2d 用几值"，而在 `f76e9c0` 之后被改动的**接收机**（DFE 等），或对端/环境。
+
+#### 决定性实验（下一步第一优先，别再加发送形态）
+
+1. `git worktree add /tmp/v92-f76e9c0 f76e9c0`，在那里 `cargo build --release -p modem --bin v90-bridge`，
+   跑一轮**不带任何探针**（只 `AGRSM_ENGINE_TRACE`）的台架：
+   - 若它**通**（`SUVd detected` / `CPu sent`）⇒ 回归在 BinModem，`git bisect f76e9c0..f40d088`
+     二分出是谁（最可能是接收机改动 → `design_and_store` 产出的 **CPd 内容变了**，或 `begin_phase_four`）。
+   - 若它**不通** ⇒ 对端/环境变了（这一整轮的台架在退化），回到 `agrsmodemd` 二进制二分
+     （我这一轮给 glue.c 加的探针，即使 env 不设，`agr_phase4_probe` 也会在每块被调；
+     对照用 `f76e9c0` 时代的 `agrsmodemd` 重跑）。
+2. 注意：工作树已提交到 `8771bf0`，这个实验是**只读**对照，不要 checkout 回历史提交覆盖现有文件。
+
+### 本轮的探针/工具（全部已提交，可复用）
+
+- `AGRSM_CONN_TRACE=<file>`：钩 `*(gGlobalPtr+0x39c88)` 的控制事件，`code`/`value` 全量；
+  已证明 0x16(R̄i)/0x15(Ri) 在 22.860/22.872 s 上报（§二十）。
+- `AGRSM_PHASE4_PROBE=<file>`：`decoder`（`0x13a7c` 是训练态还是数据态）、
+  `tables`（`0x119da`/`0x1172c`/`0x11728`）、`ucodes`（short block 的切片电平 distinct/range/head）、
+  `FLAGS`（每次调用、边沿触发）。
+- 数据态解码器 `V90DataModeDecoderInit` 在 **23.952 s**（它）跑（`eb14=18816/eb18=3136` 出现），
+  之后 `eb10` 冲到 ~7033 再一路衰减过地板（`3136`）——"没有星座"的特征曲线。
