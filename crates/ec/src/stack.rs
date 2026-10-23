@@ -19,6 +19,26 @@ use crate::lapm::{Cause, Event, Lapm, Params, State};
 use crate::{v42bis, v44};
 use crate::xid::{Compression, Xid};
 
+/// Append one line to the file named by `V92_XID_TRACE`, if it is set.
+///
+/// Diagnostic only: the XID exchange against a real far end is the one thing
+/// no unit test can stand in for, and every line this writes is a question
+/// about what actually crossed the line.
+fn xid_trace(text: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("V92_XID_TRACE") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{text}");
+    }
+}
+
+/// An information field as hex, for those traces.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The data link both ends use for user data (V.42 8.1.2).
 const DLCI_DATA: u8 = 0;
 
@@ -688,6 +708,16 @@ impl Stack {
             offer.transmit = offer.transmit.resolve(transmit);
             offer.receive = offer.receive.resolve(receive);
         }
+        if let Some(path) = std::env::var_os("V92_XID_TRACE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    f,
+                    "XID offer: compression={:?} v42bis={:?}/{:?} v44={:?}",
+                    xid.compression, xid.codewords, xid.max_string, xid.v44
+                );
+            }
+        }
         xid
     }
 
@@ -869,6 +899,15 @@ impl Stack {
             self.log.remove(0);
         }
         self.log.push(Crossed { outbound, intact, body: body.to_vec() });
+    }
+
+    /// One line about the XID exchange into the `V92_XID_TRACE` file.
+    ///
+    /// Instrumentation only, for the question the unit tests cannot answer:
+    /// what a real far end actually put in its XID, and what this end made of
+    /// it. Nothing here changes behaviour.
+    fn trace(&self, text: &str) {
+        xid_trace(&format!("[{:?} {:?}] {text}", self.role, self.phase));
     }
 
     /// Ask for the link to be established.
@@ -1100,11 +1139,9 @@ impl Stack {
                 // P/F bit of an XID frame is set to 0" and names no exception.
                 self.xid_due = false;
                 self.xid_ms = 0;
-                let body = Frame::Xid {
-                    pf: false,
-                    info: self.proposal().encode(Kind::Command),
-                }
-                .encode(DLCI_DATA, self.role, Kind::Command);
+                let info = self.proposal().encode(Kind::Command);
+                self.trace(&format!("XID sending Command info={}", hex(&info)));
+                let body = Frame::Xid { pf: false, info }.encode(DLCI_DATA, self.role, Kind::Command);
                 self.encoder.frame_with(&body, Fcs::Bits16);
                 self.note(true, true, &body);
                 queued = true;
@@ -1149,6 +1186,9 @@ impl Stack {
         };
         let Ok(body) = result else {
             let discarded = self.decoder.discarded().to_vec();
+            if self.damaged < 40 {
+                self.trace(&format!("bad HDLC frame discarded body={}", hex(&discarded)));
+            }
             self.note(false, false, &discarded);
             // A frame that did not survive the line is dropped and left to the
             // retransmission machinery, which is what it is for. Counting them
@@ -1159,6 +1199,9 @@ impl Stack {
         };
         self.note(false, true, &body);
         let Ok((address, frame)) = Frame::decode(&body, self.role) else {
+            if self.damaged < 40 {
+                self.trace(&format!("undecodable frame body={}", hex(&body)));
+            }
             self.damaged += 1;
             return;
         };
@@ -1245,22 +1288,28 @@ impl Stack {
     }
 
     fn receive_xid(&mut self, info: Vec<u8>, kind: Kind) {
+        self.trace(&format!("XID recv {kind:?} info={}", hex(&info)));
         let Ok(theirs) = Xid::decode(&info) else {
+            self.trace("XID recv DID NOT DECODE -- no answer will be sent");
             self.damaged += 1;
             return;
         };
+        self.trace(&format!("XID recv {kind:?} decoded={theirs:?}"));
         match kind {
             Kind::Command => self.heard_xid = Some(theirs),
             Kind::Response => self.heard_answer = Some(theirs),
         }
         let agreed = self.proposal().resolve(&theirs);
+        self.trace(&format!("XID agreed={agreed:?}"));
         // V.44 first where both were offered and both ends know it, and
         // V.42bis otherwise. 7.3 has the responder answer about at most one of
         // the two, so a far end that named neither leaves this alone and the
         // call carries on uncompressed.
         if let Some(offer) = agreed.v44 {
+            self.trace("XID enabling V.44");
             self.enable_v44(offer.transmit, offer.receive);
         } else if let Some(params) = agreed.v42bis_params() {
+            self.trace(&format!("XID enabling V.42bis {params:?}"));
             self.enable_compression(params);
         } else if !self.lapm.is_connected() {
             // An XID can take compression away again, and this one did: an
@@ -1279,6 +1328,7 @@ impl Stack {
             // both ends rather than a silent switch here, which is what the
             // undecodable-stream path further down is for.
             if self.compression.as_ref().is_some_and(|c| c.negotiated) {
+                self.trace("XID agreed none -- compression withdrawn before the link came up");
                 self.compression = None;
             }
         }
@@ -1318,11 +1368,9 @@ impl Stack {
             // What goes back is this end's proposal with one compression
             // algorithm in it, the one `agreed` came to -- V.44 7.3's NOTE,
             // and the same choice made a few lines above.
-            let body = Frame::Xid {
-                pf: false,
-                info: self.proposal().answering(&agreed).encode(Kind::Response),
-            }
-            .encode(DLCI_DATA, self.role, Kind::Response);
+            let info = self.proposal().answering(&agreed).encode(Kind::Response);
+            self.trace(&format!("XID sending Response info={}", hex(&info)));
+            let body = Frame::Xid { pf: false, info }.encode(DLCI_DATA, self.role, Kind::Response);
             // 8.10.2 keeps this one at 16 bits whatever the connection has
             // moved to, because the command it answers was sent at 16.
             self.encoder.frame_with(&body, Fcs::Bits16);
@@ -1428,6 +1476,11 @@ impl Stack {
         if self.phase == Phase::Protocol {
             return;
         }
+        self.trace(&format!(
+            "begin_protocol: agreed_fcs={:?} compression={:?}",
+            self.agreed_fcs,
+            self.compression_name()
+        ));
         self.phase = Phase::Protocol;
         if self.agreed_fcs == Fcs::Bits32 {
             // 8.10.2: the width changes over on the SABME and not before, so
