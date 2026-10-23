@@ -132,22 +132,32 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
         // Refused rather than clamped.
         return None;
     }
-    // The prefilter had to be scaled down to fit Q0.15, so the far end's output
-    // is that many times quieter than a unit-gain prefilter's -- and `G` is the
-    // number that says how loud the line should be. Fold the two: `G` is the
-    // gain that puts *this* design's output on the constellation, which is what
-    // `design()` says the rate choice does ("which folds the scale into G").
-    // Measured on the harness, `scale` is 12.58 -- a channel whose inverse does
-    // not fit Q0.15 -- so without this the far end runs a prefilter twelve and
-    // a half times too quiet and every level is off by that much.
+    // 8.8.3: "The digital modem shall design the modulation parameters assuming
+    // that, when the prefilter output multiplied by G has a mean-square value
+    // of 1, the analogue modem will transmit at the desired power." Read that
+    // as an equation and it fixes G: `ms(v G) = 1`, with `v` this design's own
+    // prefilter output. For a unit prefilter that is what `gain_for` already
+    // returns -- an eight-point set's mean square is eighty-five, and G is
+    // 1/sqrt(85) to nine figures.
     //
-    // It is per call and it is measured, not assumed: a telephone loop's loss
-    // is not fixed, and this number carries whatever the loop did.
-    let gain = if std::env::var("V92_GAIN_SCALE").ok().as_deref() == Some("fold") {
-        gain / design.scale.max(f64::MIN_POSITIVE)
-    } else {
-        gain
-    };
+    // A design whose prefilter had to be scaled down to fit Q0.15 breaks it.
+    // The section is `scale` times smaller than the inverse it stands for, so
+    // keeping `ms(v G) = 1` needs G `scale` times *larger*, and on this harness
+    // `scale` is 12.586 (see `design()`'s `RIDGE`) against a field that carries
+    // 4G <= 0xFFFF, i.e. G <= 0.25. Twelve and a half times 0.1085 is 1.36.
+    //
+    // So `V92_GAIN_SCALE=fold` cannot produce a legal CPd here, and the honest
+    // thing is to say so rather than to send a gain the far end will read as a
+    // different power. Folded, it is refused; unfolded, `G` describes a unit
+    // prefilter, which is exactly what `V92_PRE=none` tells the far end to run.
+    // Sending a real `z2` at this rate needs `design()` to produce a `scale` of
+    // about one, which is the transmit-power constraint the design has not got.
+    let design_gain = gain * design.scale.max(f64::MIN_POSITIVE);
+    let fold = std::env::var("V92_GAIN_SCALE").ok().as_deref() == Some("fold");
+    if fold && design_gain * crate::v92::GAIN_SCALE > f64::from(u16::MAX) {
+        return None;
+    }
+    let gain = if fold { design_gain } else { gain };
     if !(gain > 0.0) || gain * crate::v92::GAIN_SCALE < 1.0 {
         // A gain the field would round to nothing is not a gain.
         return None;
@@ -212,6 +222,32 @@ mod tests {
                 (0..levels).map(|index| (2 * index + 1) as f64).map(|v| v * v).sum::<f64>() / levels as f64;
             assert!((gain * gain * power - 1.0).abs() < 1e-9, "{levels}: {} against 1", gain * gain * power);
             assert!(gain > 0.0 && gain <= GAIN_LARGEST, "{levels}: gain {gain}");
+        }
+    }
+
+    /// 8.8.3's other half: folding a scaled prefilter's `scale` into `G` is not
+    /// a choice the field leaves open.
+    ///
+    /// The assumption is `ms(v G) = 1`, so a prefilter whose section had to be
+    /// scaled down to fit Q0.15 needs `G` scaled up by the same number. Past
+    /// `4G <= 0xFFFF` there is no legal CPd that says it, and the rung has to
+    /// be refused rather than sent with a gain the far end would read as a
+    /// different transmit power.
+    #[test]
+    fn a_scaled_prefilter_cannot_be_folded_into_the_gain() {
+        let design = design_for(0.0);
+        // What a legal field carries, and what this design needs to satisfy
+        // `ms(v G) = 1` if its prefilter is sent at the amplitude Q0.15 holds.
+        let plain = build(&design, 5, Trellis::Sixteen).expect("a rung");
+        let needed = plain.gain * design.scale;
+        assert!(plain.gain * crate::v92::GAIN_SCALE <= f64::from(u16::MAX), "an unfolded gain must fit");
+        if needed * crate::v92::GAIN_SCALE > f64::from(u16::MAX) {
+            // The one thing an unfolded CPd must be able to say is the truth:
+            // `G` describes a unit prefilter, which is what `V92_PRE=none`
+            // tells the far end to run.
+            let power: f64 = plain.sets.iter().flatten().map(|&p| f64::from(p) * f64::from(p)).sum::<f64>()
+                / plain.sets.iter().map(Vec::len).sum::<usize>() as f64;
+            assert!((plain.gain * plain.gain * power - 1.0).abs() < 1e-6);
         }
     }
 
