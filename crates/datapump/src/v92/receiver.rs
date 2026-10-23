@@ -617,6 +617,56 @@ fn sections_in_use() -> (usize, usize) {
     }
 }
 
+/// The ridge the feed-forward block of the normal equations gets, as a fraction
+/// of its own diagonal.
+///
+/// This is not the ridge that makes a singular solve possible -- that is
+/// [`ridges_in_use`], and it is a hundred million times smaller. This one is the
+/// regulariser the design needs, and it belongs on the feed-forward block only.
+///
+/// A decision feedback equaliser's feed-forward section is what inverts the
+/// line, and inverting a line whose spectrum stops before the symbol rate
+/// amplifies noise where the inverse is large. Left to a plain least-squares
+/// solve, the section is free to be as long as it likes and the *feedback*
+/// section pays for it: measured on 193859-rC-patient's TRN2u window, the plain
+/// solve puts the largest feedback tap at 0.508 (linear) and 0.414 (mu-law),
+/// against the 0.5 at which one wrong decision induces the next. The same window
+/// with a tenth of a per cent on the forward diagonal gives 0.321 and 0.313 for
+/// 0.58 dB of fit, and with three thousandths, 0.277 and 0.274 for 1.67 dB.
+///
+/// It also decides the split between the two sections instead of leaving it to
+/// the line's own noise: the forward taps of the linear and mu-law fits differ
+/// by 0.176 rms unregularised, 0.027 at a thousandth and 0.012 at three. Under
+/// the old global ridge the two blocks moved together and no value suited both
+/// streams; that is what the diagnostic history in this module calls "ridge is
+/// not a lever". This is a different quantity from that one, and the difference
+/// is measurable.
+///
+/// What it is worth, measured on 193859-rC-patient -- longest run of ones in the
+/// data-mode bit stream, linear capture, its mu-law twin, and the linear capture
+/// with white noise of the twin's own rms added:
+///
+/// | ridge | linear | mu-law | linear + white |
+/// |---|---|---|---|
+/// | 0 | 47745 | 34 | 22 |
+/// | 2e-5 | 34 | 47745 | 16 |
+/// | 5e-5 | 47745 | 47745 | 22 |
+/// | 1e-4 | 47745 | 47745 | 20 |
+/// | 1.5e-4 | 47745 | 47745 | 20 |
+/// | 2e-4 | 22 | 28 | 20 |
+/// | 5e-4 | 23 | 28 | 16 |
+///
+/// So both captures read B1u as its forty-eight frames of ones for a band about
+/// three times wide, and neither edge is where an argument would put it: the
+/// value is not free to be tuned, but it is not a spike either. Above the band
+/// the fit is simply worse and below it the split drifts again.
+///
+/// The noise column does not move, and that is the honest reading: this fixes
+/// the quantization noise's effect on the *design*, not the chain's margin. What
+/// it is worth in absolute terms is a few times the line's own measurement noise
+/// on each tap, which is the size an MMSE front end's regulariser should be.
+pub const FFE_RIDGE: f64 = 1e-4;
+
 /// The ridge multipliers a fit tries, in order: the smallest the arithmetic will
 /// take, and larger only if the solve refuses.
 fn ridges_in_use() -> Vec<f64> {
@@ -2189,7 +2239,17 @@ impl Receiver {
         // equaliser wanted. So try the smallest and grow only if the solve
         // refuses.
         let scale = trace / taps as f64;
-        let base = a.clone();
+        let mut base = a.clone();
+        // The design's own regulariser, on the feed-forward block alone: see
+        // [`FFE_RIDGE`]. Its size is a fraction of each tap's own column energy,
+        // so it means the same thing on any line.
+        let ffe_ridge = std::env::var("V92_FFE_RIDGE")
+            .ok()
+            .and_then(|text| text.parse::<f64>().ok())
+            .unwrap_or(FFE_RIDGE);
+        for i in 0..forward {
+            base[i * taps + i].re *= 1.0 + ffe_ridge;
+        }
         let mut solved = None;
         for ridge in ridges_in_use() {
             let mut a = base.clone();
