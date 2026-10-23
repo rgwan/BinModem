@@ -234,7 +234,12 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
     }
     // z2 is the feed-forward section, and it is the one section every PCM
     // upstream modem must offer (Table 18 bit 12: p1 and z2 at least).
-    let lz2 = most.min(total);
+    // `V92_LZ2` overrides the section length, which is the one lever on how
+    // hard the prefilter inverts: the normalised inverse's peak does not move
+    // with the ridge (raising it scales the inverse and the response's own main
+    // tap by the same factor), so if a channel's prefilter does not fit Q0.15
+    // the length is what has to give, not the ridge.
+    let lz2 = std::env::var("V92_LZ2").ok().and_then(|text| text.parse().ok()).unwrap_or(most.min(total));
     let inverse = inverse(channel, lz2);
     // h is c convolved with z2: what is left for the precoder to cancel.
     let mut response = convolve(&channel.taps, &inverse);
