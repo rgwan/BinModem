@@ -2313,6 +2313,33 @@ impl Modem {
         // after the symbol that carried its last zero; what is implemented is
         // the measurement. See `crates/datapump/examples/v92_b1u_search.rs`.
         const B1U_ORIGIN_AFTER_E2U: usize = 1;
+        // Data frames of B1u the decoder is not given, while the equaliser
+        // settles onto the data-mode constellation.
+        //
+        // B1u's first symbols decode wrong and the stretch is anchored to the
+        // line, not to the frame index: shifting the origin one data frame
+        // later moves the damage with it, one frame for one frame, so the
+        // receiver needs a fixed number of symbols before its decisions are
+        // the constellation's. Measured on a capture of an Agere SV92PP: the
+        // first seventeen of B1u's forty-eight data frames carry ~50% wrong
+        // bits and everything after them is exact, and dropping sixteen to
+        // eighteen of them leaves one frame with a few wrong bits and the rest
+        // clean.
+        //
+        // Dropping them costs nothing, and that is what makes this the right
+        // place to do it rather than a workaround: 8.7.1 defines B1u as "48
+        // data frames of scrambled binary ones", so those symbols carry no
+        // information at all -- they exist to let the far end's receiver
+        // settle, and ours is entitled to the same. The count is in whole data
+        // frames because the twelve-symbol frame phase and the four-symbol
+        // trellis phase must survive the drop: a skip of anything but a
+        // multiple of twelve desynchronises the trellis frame and destroys the
+        // whole stream (measured: ~50% of every bit, at every such skip).
+        //
+        // The equaliser is not gated: `symbol_upstream` withholds symbols from
+        // `upstream_data` and the receiver behind it keeps running, which is
+        // the same rule `upstream_drop_until` follows for TRN2u.
+        const B1U_ACQUIRE_FRAMES: usize = 18;
         // The design's own delay, if it has one: what arrives at symbol n of
         // the line is symbol n - delay of the frame count (see
         // [`Design::delay`](crate::v92::design::Design::delay)).
@@ -2321,7 +2348,9 @@ impl Modem {
         self.b1u_skip = std::env::var("V92_B1U_SKIP")
             .ok()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(self.upstream_delay + B1U_ORIGIN_AFTER_E2U);
+            .unwrap_or(
+                self.upstream_delay + B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS,
+            );
         self.b1u_pending = false;
         self.b1u_deadline = None;
         self.note(format!(
