@@ -1790,3 +1790,33 @@ BlockShortClear(0x100, gGlobalPtr+0xe67c);
 2. 具体对拍：`bridge.log` 里 `CPt drn 16, 1 set(s)` 的时刻，与对端 `CPt sent` 的时刻（22.902）；
    以及我方 `Stage::Ri → RiBar` 的触发点（`heard_cp` 的 `no_dil()` 分支）。
 3. 判据仍是 `AGRSM_PHASE4_PROBE` 的 `flags`：**`0x1174c`/`0x1174d` 出现 1** 就说明对上了。
+
+### 十七、更正 §十六：那 2.1 s 是**日志偏移**，不是错位；`Jd' detected` 也正常
+
+§十六 把对端日志的时刻直接和我方 `bridge.log` 的时刻比了，忘了 **`caller.raw` →
+`agr-rx.raw` 恒差 24192 样点 = 3.024 s**（见 skill `agrsm-userspace-port`：
+对端 `agr_line_time()` 比我们的桥时间晚 3.024 s）。按这个偏移换算后：
+
+| 对端日志 | 换算到我方时间 | 我方阶段 |
+|---|---|---|
+| 17.970 `Jd detected` | 14.946 | Jd 14.640 起 ✓ |
+| 18.720 `Jp detected` | 15.696 | Jp 16.020 起 ✓ |
+| 19.698 `Jd' detected` | 16.674 | DIL 16.520 起（**正常**，见下）|
+| 22.902 `CPt sent / R,R~ detected` | 19.878 | Ri 20.280 起 ✓ |
+
+⇒ **没有错位**，双方时刻是对上的。§十六 那条结论作废。
+
+`Jd' detected` 也**不是**异常：把成功那轮 `twopt` 的引擎日志调出来逐行对拍，
+它在同一位置同样打 `PCM phase 3 finished → PCM phase 4 started → Jd' detected`，
+两轮一模一样（成功那轮 19.248/19.734，本轮 19.230/19.710）。
+
+**⇒ 两轮直到 22.9 s 的引擎日志完全相同**（`PCM phase 4 started`、`Jd' detected`、
+`PCM RBS map: 0x000000` ×4 都在同一时刻）。分歧发生在 **22.9 s 之后**：
+`twopt` 在 25.590（其时钟）出现 `SUVd detected 1`、`CPu sent`，本轮永远不出现。
+
+### 本轮做的一处修改（正确但未改变台架结果）
+
+`cpt_bit` 的 E1u 判定加了"新鲜度"约束：E1u 必须是**最近一个 CPt 重复之内**出现的
+12 个零（`since_cpt <= cp_len + E1U_ZEROES`），否则就是对方在静音（我们发 DIL 期间
+它确实静音近 4 秒，`CPt reader N bits, 0 ones` 已经证明）。实测台架行为**没有变化**
+（E1u 仍在同一时刻），所以这不是当前堵点，但它是真正的误判模式，保留。

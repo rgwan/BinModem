@@ -1021,6 +1021,17 @@ pub struct Modem {
     cp_pos: usize,
     /// Zeroes seen so far at the start of the repetition.
     e1u_zeroes: usize,
+    /// Bits since the CPt reader last found a CPt by its CRC.
+    ///
+    /// E1u is not "twelve zeros anywhere": it is twelve zeros where the next
+    /// CPt's synchronisation would be, one repetition after a CPt that was
+    /// found. Without this the detector fires on silence -- and the analogue
+    /// modem is silent for as long as the digital one is sending a DIL, which
+    /// on this bench is nearly four seconds. Measured: this end called E1u at
+    /// 20.7 s while the far end was still in Phase 3 and did not finish CPt
+    /// until 22.902 s, so it left Phase 3 two seconds early and everything
+    /// after it was out of step with the far end's Ri/R-bar-i window.
+    since_cpt: usize,
     /// Bits the Ja reader has produced, and ones in the last stretch of them.
     ja_bits: u64,
     ja_ones: u64,
@@ -1144,6 +1155,7 @@ impl Modem {
             cp_len: 0,
             cp_pos: 0,
             e1u_zeroes: 0,
+            since_cpt: 0,
             now: 0,
             ja_deadline,
             su_deadline: None,
@@ -2196,16 +2208,26 @@ impl Modem {
             // the next one is the first of the next repetition.
             self.cp_len = cp.to_bits_in(Layout::V92, UP_INTERVALS).len();
             self.cp_pos = 0;
+            self.since_cpt = 0;
             self.e1u_zeroes = 0;
             self.heard_cp(cp);
             return;
         }
+        self.since_cpt = self.since_cpt.saturating_add(1);
         if self.cp_len == 0 {
             return;
         }
         if self.cp_pos < E1U_ZEROES {
             self.e1u_zeroes = if bit { 0 } else { self.e1u_zeroes + 1 };
-            if self.e1u_zeroes == E1U_ZEROES && self.cpt.is_some() && self.stage == Stage::Ri {
+            // Twelve zeros only mean E1u while CPt is actually being received:
+            // one repetition of it, plus the twelve, is as long ago as the last
+            // CRC hit can be. Silence is not E1u.
+            let fresh = self.since_cpt <= self.cp_len + E1U_ZEROES;
+            if self.e1u_zeroes == E1U_ZEROES
+                && fresh
+                && self.cpt.is_some()
+                && self.stage == Stage::Ri
+            {
                 self.note("V.92: E1u".into());
                 self.source.change(Out::RiBar);
                 self.stage = Stage::RiBar;
