@@ -590,6 +590,23 @@ impl Slicer {
     }
 }
 
+/// The two section lengths a fit should be given, which `V92_EQ=linear` changes.
+///
+/// A diagnostic with a purpose worth naming: `V92_EQ=linear` designs a
+/// feed-forward-only equaliser (a hundred and twenty-eight taps, no feedback)
+/// instead of a decision feedback one. A receiver with no feedback section at
+/// all can only be built when the far end's precoder has already removed the
+/// post-cursor -- which is the thing this chain is missing (see
+/// `docs/15-v92-data-path-handoff.md`). So the experiment says how much of the
+/// margin the missing prefilter costs, in a way that removing the feedback
+/// after the fit cannot: a fit made without feedback allocates the taps itself.
+fn sections_in_use() -> (usize, usize) {
+    match std::env::var("V92_EQ").ok().as_deref() {
+        Some("linear") => (DFE_FORWARD + DFE_FEEDBACK, 0),
+        _ => (DFE_FORWARD, DFE_FEEDBACK),
+    }
+}
+
 /// The ridge multipliers a fit tries, in order: the smallest the arithmetic will
 /// take, and larger only if the solve refuses.
 fn ridges_in_use() -> Vec<f64> {
@@ -1557,6 +1574,7 @@ impl Receiver {
     /// was when it did not, because a Phase 4 read with the far end's TRN1u
     /// alignment wrong is worse than one read at 12 dB.
     pub fn prepare_phase_four(&mut self, window: usize) -> bool {
+        let sections = sections_in_use();
         let before = self.fitted();
         let length = self.history.len();
         if length < PROBE + TRAIN_TAPS {
@@ -1625,7 +1643,7 @@ impl Receiver {
                     if skip < 0 {
                         continue;
                     }
-                    if !self.fit_at(start, span, skip as u64, DFE_FORWARD, DFE_FEEDBACK) {
+                    if !self.fit_at(start, span, skip as u64, sections.0, sections.1) {
                         continue;
                     }
                     if best.as_ref().is_none_or(|seen| self.snr_db > seen.snr()) {
@@ -1677,6 +1695,7 @@ impl Receiver {
     /// that arrives after the samples it can see -- so the window starts that
     /// many samples later and the reference stays at the sequence's own start.
     pub fn design_phase_four_at(&mut self, anchor: usize, window: usize) -> bool {
+        let sections = sections_in_use();
         if anchor >= self.history.len() {
             return false;
         }
@@ -1709,7 +1728,7 @@ impl Receiver {
             if span <= 4 * TRAIN_TAPS {
                 continue;
             }
-            let took = self.fit_at(start, span, 0, DFE_FORWARD, DFE_FEEDBACK);
+            let took = self.fit_at(start, span, 0, sections.0, sections.1);
             if std::env::var_os("V92_REFIT_TRACE").is_some() {
                 eprintln!(
                     "V92TRACE: design anchor {anchor} quality {quality:.3} offset {offset} \
@@ -1757,6 +1776,7 @@ impl Receiver {
     ///
     /// Returns whether the fit took and was installed.
     pub fn train_on_trn2u(&mut self, window: usize, trn2u_from: u64) -> bool {
+        let sections = sections_in_use();
         let length = self.history.len();
         if length < 2 * TRAIN_TAPS || length < window.min(2 * PROBE) {
             return false;
@@ -1793,7 +1813,7 @@ impl Receiver {
         let mut best: Option<Fitted> = None;
         if skip >= 0 && skip as usize + span <= levels.len() {
             self.pending_levels = Some(levels);
-            if self.fit_at(start, span, skip as u64, DFE_FORWARD, DFE_FEEDBACK) {
+            if self.fit_at(start, span, skip as u64, sections.0, sections.1) {
                 best = Some(self.fitted());
             } else {
                 self.pending_levels = None;
