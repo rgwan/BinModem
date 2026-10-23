@@ -41,6 +41,41 @@ use super::{Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 /// nothing.
 pub const SURVIVOR_DEPTH: usize = 40;
 
+/// Where to write one decided trellis frame's four indices, when
+/// `V92_ETA_TRACE` names a file: a header line naming K and the twelve moduli,
+/// then `stage eta0 eta1 eta2 eta3` per decided frame.
+///
+/// Everything the bit layer does -- the mixed radix, the differential sign
+/// step and the scrambler -- happens downstream of these indices, so writing
+/// them out once is what lets a suspected convention be settled by enumerating
+/// it offline over the same capture instead of one bench run per guess. The
+/// indices are what the equaliser and the Viterbi decided, and do not depend on
+/// any of the conventions under test.
+fn eta_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_ETA_TRACE")?);
+        let file = std::fs::File::create(&path).ok()?;
+        Some(Arc::new(Mutex::new(file)))
+    })
+    .clone()
+}
+
+/// One decided frame's indices, to `V92_ETA_TRACE` if it is set.
+fn trace_etas(decoder: &Decoder, stage: u64, etas: [i32; TRELLIS_FRAME]) {
+    let Some(file) = eta_trace_file() else { return };
+    let Ok(mut file) = file.lock() else { return };
+    use std::io::Write;
+    // The header is written by whoever gets the empty file first, so that the
+    // reader does not have to be told K and the moduli separately.
+    if file.metadata().map(|meta| meta.len()).unwrap_or(1) == 0 {
+        let moduli: Vec<String> = decoder.moduli.values().iter().map(u8::to_string).collect();
+        let _ = writeln!(file, "k {} moduli {}", decoder.bits_per_frame, moduli.join(" "));
+    }
+    let _ = writeln!(file, "{stage} {} {} {} {}", etas[0], etas[1], etas[2], etas[3]);
+}
+
 /// The cheapest index of one symbol in each residue class modulo 4, which is
 /// all a 4D subset label depends on ([`label_of`] works on 2 x eta + 1).
 #[derive(Debug, Clone, Copy)]
@@ -287,6 +322,7 @@ impl Decoder {
             "the indices decided on do not carry the inputs the path took"
         );
         self.decided += 1;
+        trace_etas(self, stage.index, etas);
         // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
         // first symbol of B1u begins one. A decision that lands in the middle
         // of one -- which is every decision until the window has passed -- has

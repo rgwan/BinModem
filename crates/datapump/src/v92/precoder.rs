@@ -66,6 +66,34 @@ use crate::v34::trellis::{self, Code};
 /// preferring the larger magnitude can be matched with one edit.
 pub const TIE_TO_SMALLER_INDEX: bool = true;
 
+/// The index offset the class of a 4D pair's *first* symbol carries, in
+/// indices.
+///
+/// 6.4.2 prints "eta_k = Ki + z_k Mi" for k = 0, 1, 2, which puts Ki and the
+/// index it came from in the same residue class modulo Mi. A capture of an
+/// Agere SV92PP's B1u does not agree: read back through the classes as printed,
+/// only the low bit of every Ki comes out right, bits 1 and 2 are wrong in
+/// about a quarter of the frames, and B1u reads 83% ones where 8.7.1 says every
+/// one of its 48 data frames must. Reading positions 0 and 2 of each trellis
+/// frame as "eta_k = Ki + 2 + z_k Mi" instead makes B1u exactly all ones -- and
+/// the far end's whole idle stretch after it, some forty thousand bits.
+///
+/// That is a measurement, not a derivation: it is what this far end's
+/// transmitter does, and it is recorded here as a named constant rather than
+/// buried in the two places that use it, because the clause as printed says
+/// otherwise and a second capture may disagree. What it stands in for is most
+/// likely how a pair's first index is numbered when the constellation's levels
+/// arrive from a CPd of eight odd magnitudes; the offline enumeration that
+/// established it is `crates/datapump/examples/v92_b1u_search.rs`.
+pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
+
+/// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
+/// "the two pairs (y(0),y(1)) and (y(2),y(3))", so k = 0 and k = 2 open one
+/// each and k = 3 is the one that gives up half its freedom to the code.
+fn opens_a_pair(k: usize) -> bool {
+    k % 2 == 0 && k != TRELLIS_FRAME - 1
+}
+
 /// The largest |G x v(n)| this module hands on, in the units 8.8.3 fixes,
 /// where "the prefilter output multiplied by G has a mean-square value of 1"
 /// and TRN1u's +/-LU is therefore +/-1 as well (3.8).
@@ -257,6 +285,8 @@ impl Class {
         let modulus = i64::from(modulus.max(1));
         if k == TRELLIS_FRAME - 1 {
             Self { base: 2 * ki + i64::from(parity), step: 2 * modulus }
+        } else if opens_a_pair(k) {
+            Self { base: ki + PAIR_FIRST_INDEX_OFFSET, step: modulus }
         } else {
             Self { base: ki, step: modulus }
         }
@@ -314,6 +344,11 @@ pub fn index_to_ki(eta: i32, modulus: u8, k: usize) -> u8 {
     if k == TRELLIS_FRAME - 1 {
         let parity = eta.rem_euclid(2);
         (((eta - parity) / 2).rem_euclid(modulus)) as u8
+    } else if opens_a_pair(k) {
+        // The pair's first index is measured from Ki + the offset the far end
+        // uses; see `PAIR_FIRST_INDEX_OFFSET`.
+        (i32::try_from(i64::from(eta) - PAIR_FIRST_INDEX_OFFSET).unwrap_or(eta)
+            .rem_euclid(modulus)) as u8
     } else {
         eta.rem_euclid(modulus) as u8
     }
@@ -1002,24 +1037,26 @@ mod tests {
         let run = |chain: &mut Chain| (0..UP_INTERVALS).map(|_| chain.step(1).v).collect::<Vec<_>>();
 
         let first = run(&mut chain);
-        // Worked through by hand for the first two: at n = 0 every memory is
-        // zero, so c(0) = 0, the class {1, -3, -7, ...} puts a(1) = 3 nearest
-        // it, x(0) = 3 and v(0) = z2(0) x(0) = 3. At n = 1, c(1) = 0.2 u(0) +
-        // 0.5 x(0) = 2.1, the class member nearest -2.1 is a(-3) = -5, so
-        // x(1) = -2.9 and v(1) = -2.9 + 0.3 x(0) + 0.1 v(0) = -1.7.
+        // Worked through by hand for the first two. At n = 0 (k = 0, the first
+        // symbol of a 4D pair) every memory is zero, so c(0) = 0 and the class
+        // is {1 + 2 + 4z} = {..., -5, -1, 3, 7, ...}: the member nearest zero
+        // is a(-1) = -1, so x(0) = -1 and v(0) = z2(0) x(0) = -1. At n = 1
+        // (k = 1, whose class is {1 + 4z} = {..., -7, -3, 1, 5, ...}) c(1) =
+        // 0.2 u(0) + 0.5 x(0) = -0.7, the member nearest 0.7 is a(1) = 3, so
+        // x(1) = 2.3 and v(1) = 2.3 + 0.3 x(0) + 0.1 v(0) = 1.9.
         let pinned = [
-            3.0,
-            -1.7,
-            -1.24,
-            -7.959,
-            -5.7659,
-            -5.14284,
-            -0.874909,
-            -6.9262409,
-            -5.34184284,
-            -5.189106159,
-            -1.0040668659,
-            -6.97925434284,
+            -1.0,
+            1.8999999999999997,
+            1.88,
+            7.212999999999999,
+            6.2513,
+            4.5538799999999995,
+            1.477263,
+            6.356476300000001,
+            5.92455388,
+            4.604721013,
+            1.5843783513,
+            6.39732455388,
         ];
         for (got, want) in first.iter().zip(pinned.iter()) {
             assert!((got - want).abs() < 1e-9, "the first twelve prefilter outputs after a reset: {first:?}");
@@ -1072,6 +1109,15 @@ mod tests {
                 assert_eq!(class.index(0), 7, "2 x Ki + parity");
                 assert!(class.holds(7 - 14) && class.holds(7 + 14));
                 assert!(!class.holds(8), "the parity fixes which half the index is in");
+            } else if opens_a_pair(k) {
+                assert_eq!(class.spacing(), 7, "k = {k} steps by Mi");
+                assert_eq!(
+                    class.index(0),
+                    3 + i32::try_from(PAIR_FIRST_INDEX_OFFSET).expect("a small offset"),
+                    "Ki plus the pair's offset, with the parity ignored"
+                );
+                let base = class.index(0);
+                assert!(class.holds(base - 7) && class.holds(base + 7));
             } else {
                 assert_eq!(class.spacing(), 7, "k = {k} steps by Mi");
                 assert_eq!(class.index(0), 3, "Ki itself, with the parity ignored");

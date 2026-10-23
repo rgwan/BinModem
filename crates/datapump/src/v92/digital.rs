@@ -2219,6 +2219,20 @@ impl Modem {
         // with insertion loss it is never exact.
         self.rx.set_data_mode(levels);
         self.upstream_data = Some(Decoder::new(&parameters));
+        // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
+        // run completed in.
+        //
+        // 8.7.1 makes B1u's contents known -- "48 data frames of scrambled
+        // binary ones" -- which is the one place upstream where the receiver
+        // can be told what it should have read, and a capture of an Agere
+        // SV92PP says the answer is not zero. Read from the completion symbol,
+        // all twelve phases of the frame origin give a stream of random bits;
+        // from one symbol later B1u comes out all ones, and so does the far
+        // end's whole idle stretch after it. The likeliest reason is that the
+        // phase-4 reader's differential decode reports a zero run one symbol
+        // after the symbol that carried its last zero; what is implemented is
+        // the measurement. See `crates/datapump/examples/v92_b1u_search.rs`.
+        const B1U_ORIGIN_AFTER_E2U: usize = 1;
         // The design's own delay, if it has one: what arrives at symbol n of
         // the line is symbol n - delay of the frame count (see
         // [`Design::delay`](crate::v92::design::Design::delay)).
@@ -2227,7 +2241,7 @@ impl Modem {
         self.b1u_skip = std::env::var("V92_B1U_SKIP")
             .ok()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(self.upstream_delay);
+            .unwrap_or(self.upstream_delay + B1U_ORIGIN_AFTER_E2U);
         self.b1u_pending = false;
         self.b1u_deadline = None;
         self.note(format!(
