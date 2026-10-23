@@ -282,6 +282,7 @@ fn probe_replay_raw() {
     let mut dte: Vec<u8> = Vec::new();
     let (mut state, mut phase) = (modem.state(), String::new());
     let mut shown = 0usize;
+    let mut ec_said = String::new();
     let mut answered = false;
     for (i, &s) in line.iter().enumerate() {
         if !answered && i as f64 / fs >= answer_at {
@@ -294,6 +295,19 @@ fn probe_replay_raw() {
             println!("  {:>7.3}  {text}", i as f64 / fs);
         }
         let now = (modem.state(), modem.line_phase().to_owned());
+        let ec_now = modem.error_control_phase();
+        if ec_now != ec_said.as_str() {
+            ec_said = ec_now.to_owned();
+            println!(
+                "  {:>7.3}  error control: phase {:?}, negotiated {}, connected {}, compression {:?}, {:?}",
+                i as f64 / fs,
+                ec_now,
+                modem.error_control_negotiated(),
+                modem.error_controlled(),
+                modem.compression_name(),
+                modem.state()
+            );
+        }
         if now != (state, phase.clone()) {
             let rate = modem.rate().map_or_else(|| "-".to_owned(), |r| r.to_string());
             let up = modem.transmit_rate().map_or_else(|| "-".to_owned(), |r| r.to_string());
@@ -314,7 +328,17 @@ fn probe_replay_raw() {
             shown = dte.len();
         }
     }
-    println!("\n  {} bytes to the DTE", dte.len());
+    // The end of the question, in one line: a call whose V.42 detection went
+    // transparent, or whose XID never agreed a compressor, carries the DTE's
+    // characters over a link with nothing protecting them -- and, when the
+    // physical layer is what is wrong, carries somebody else's.
+    println!(
+        "\n  error control at the end: {:?}, V.44 {:?}, V.42 {:?}",
+        modem.error_control_phase(),
+        modem.compression_name(),
+        modem.error_control_detail()
+    );
+    println!("  {} bytes to the DTE", dte.len());
     if let Ok(out) = std::env::var("MODEM_DTE_OUT") {
         let _ = std::fs::write(&out, &dte);
         println!("  written to {out}");
