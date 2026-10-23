@@ -889,6 +889,24 @@ impl Receiver {
         self.gain = 1.0;
     }
 
+    /// Recondition the equaliser for B1u (9.6.1.1.6).
+    ///
+    /// The data mode's precoder and prefilter have already inverted the line,
+    /// so the feed-forward taps trained on TRN2u -- the channel's own inverse --
+    /// would invert it twice. For B1u the only correction left is the scale the
+    /// design folded out of the prefilter to keep it inside Q0.15: one tap of
+    /// `scale`, no feedback. The slicer is what decides, the decoder behind it
+    /// does the modulus arithmetic.
+    pub fn set_data_mode(&mut self, scale: f64) {
+        self.forward = vec![scale];
+        self.feedback.clear();
+        self.decided.clear();
+        self.measured = 0;
+        self.inner = 0.0;
+        self.outer = 0.0;
+        self.gain = 1.0;
+    }
+
     /// 9.5.1.1.10: "the first symbol of the second TRN1u shall be symbol 0 of
     /// the 12-symbol data frame". The count starts here.
     pub fn set_frame_origin(&mut self, at: u64) {

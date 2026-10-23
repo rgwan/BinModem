@@ -1110,8 +1110,13 @@ pub struct Modem {
     /// The downstream data encoder, once CPu has said what to encode (V.90
     /// 8.6.1).
     downstream: Option<crate::v90::encoder::Encoder>,
+    /// The data scrambler the downstream data mode runs on (V.90 8.6.1), reset
+    /// at B1d's first symbol.
+    downstream_scrambler: Scrambler,
     /// The upstream data decoder, in the parameters this end's own CPd named.
     upstream_data: Option<Decoder>,
+    /// The design's prefilter scale, folded out of the receiver for B1u.
+    upstream_scale: f64,
     /// Upstream data bits the decoder has produced since B1u began.
     upstream_bits: u64,
     /// DTE bits fed in from above, sent as B1d's payload (9.6.1.1.5).
@@ -1190,7 +1195,9 @@ impl Modem {
             outbound: VecDeque::new(),
             recovered: Vec::new(),
             downstream: None,
+            downstream_scrambler: Scrambler::new(Mode::Call),
             upstream_data: None,
+            upstream_scale: 1.0,
             peak: 0.0,
             notes: Vec::new(),
         }
@@ -1829,7 +1836,7 @@ impl Modem {
 
     /// 6.4 from the channel the second TRN1u measured: the fastest rung of the
     /// upstream ladder this line carries, or the slowest it will take.
-    fn design_upstream(&self, from: u64) -> Option<Parameters> {
+    fn design_upstream(&mut self, from: u64) -> Option<Parameters> {
         const FIT: usize = DESIGN_AFTER as usize;
         let known = reference(0, FIT, Mode::Answer)?;
         let received = self.rx.history_range(from, from + known.len() as u64);
@@ -1848,6 +1855,9 @@ impl Modem {
                 return None;
             }
         };
+        // The prefilter was scaled down to fit Q0.15; the receiver must fold
+        // that scale back in when it reads B1u's levels.
+        self.upstream_scale = designed.scale;
         // The rate this end asks for. The analogue modem's Ja says which rungs
         // it allows; this end takes the slowest of those, because the number
         // that decides how far up the ladder a line carries is the *noise*, and
@@ -1923,6 +1933,7 @@ impl Modem {
             levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
             self.rx.set_slicer(Slicer::Levels(levels));
+            self.rx.set_data_mode(self.upstream_scale);
             self.upstream_data = Some(Decoder::new(&parameters));
         }
         let mut downstream = 0;
@@ -1931,6 +1942,8 @@ impl Modem {
         {
             downstream = mapping.rate();
             self.downstream = Some(crate::v90::encoder::Encoder::new(mapping, self.settings.law));
+            // 8.6.1: the data-mode scrambler starts afresh at B1d.
+            self.downstream_scrambler = Scrambler::new(Mode::Call);
             self.note(format!("V.92: B1d at {downstream}"));
         } else {
             self.note("V.92: no CPu yet, B1d waits".into());
@@ -1956,7 +1969,10 @@ impl Modem {
                 // none: V.90's data mode idles on ones, and the far end's
                 // equaliser and scrambling chain need a stream whether or not
                 // the terminal is typing.
-                let frame = encoder.next_frame(|| self.outbound.pop_front().unwrap_or(true));
+                let frame = encoder.next_frame(|| {
+                    let bit = self.outbound.pop_front().unwrap_or(true);
+                    self.downstream_scrambler.scramble(bit)
+                });
                 octets.extend(frame.octets(law));
             }
         }
