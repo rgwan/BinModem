@@ -87,6 +87,28 @@ pub const TIE_TO_SMALLER_INDEX: bool = true;
 /// established it is `crates/datapump/examples/v92_b1u_search.rs`.
 pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
 
+/// The offset in force: `PAIR_FIRST_INDEX_OFFSET` unless `V92_PAIR_OFFSET`
+/// overrides it, read once.
+///
+/// It is a knob because the constant above is a measurement of *one* far end,
+/// and the question "is this call's offset the one the constant names" cannot
+/// be answered by a constant: the decided indices of two calls that differ only
+/// by a codec's quantising step differ by exactly this offset on the pair-first
+/// positions (intervals 0 and 2, and only those -- measured with `V92_ETA_TRACE`
+/// on a capture and the same capture with the codec's error mixed in at 75 %:
+/// 77 % of trellis frames differ, by +1 on k = 0 and k = 2 and by nothing on
+/// k = 1 and k = 3). A wrong offset puts half the symbols one lattice step off,
+/// which slices *better* than a correct one and decides about half the bits
+/// wrongly -- so this is the mechanism behind the "two states" the residual
+/// measurements kept landing in.
+pub fn pair_first_index_offset() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var("V92_PAIR_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(PAIR_FIRST_INDEX_OFFSET)
+    })
+}
+
 /// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
 /// "the two pairs (y(0),y(1)) and (y(2),y(3))", so k = 0 and k = 2 open one
 /// each and k = 3 is the one that gives up half its freedom to the code.
@@ -286,7 +308,7 @@ impl Class {
         if k == TRELLIS_FRAME - 1 {
             Self { base: 2 * ki + i64::from(parity), step: 2 * modulus }
         } else if opens_a_pair(k) {
-            Self { base: ki + PAIR_FIRST_INDEX_OFFSET, step: modulus }
+            Self { base: ki + pair_first_index_offset(), step: modulus }
         } else {
             Self { base: ki, step: modulus }
         }
@@ -347,7 +369,7 @@ pub fn index_to_ki(eta: i32, modulus: u8, k: usize) -> u8 {
     } else if opens_a_pair(k) {
         // The pair's first index is measured from Ki + the offset the far end
         // uses; see `PAIR_FIRST_INDEX_OFFSET`.
-        (i32::try_from(i64::from(eta) - PAIR_FIRST_INDEX_OFFSET).unwrap_or(eta)
+        (i32::try_from(i64::from(eta) - pair_first_index_offset()).unwrap_or(eta)
             .rem_euclid(modulus)) as u8
     } else {
         eta.rem_euclid(modulus) as u8
@@ -1113,7 +1135,7 @@ mod tests {
                 assert_eq!(class.spacing(), 7, "k = {k} steps by Mi");
                 assert_eq!(
                     class.index(0),
-                    3 + i32::try_from(PAIR_FIRST_INDEX_OFFSET).expect("a small offset"),
+                    3 + i32::try_from(pair_first_index_offset()).expect("a small offset"),
                     "Ki plus the pair's offset, with the parity ignored"
                 );
                 let base = class.index(0);
