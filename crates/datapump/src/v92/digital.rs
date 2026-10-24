@@ -283,6 +283,25 @@ fn tracing() -> bool {
 /// Phase 4's upstream is the one direction this end has never had a readout
 /// for: a sequence that does not parse leaves nothing behind, so what the far
 /// end actually sent has to be written down to be looked at offline.
+/// `V92_B1U_BITS`: the bits the decoders read out of B1u, as they read them.
+///
+/// The gate counts them (`b1u_ones`/`b1u_scored`) and says nothing about where
+/// they are, and neither does any other trace: `V92_B1U_TRACE` starts after the
+/// scoring window and `V92_ETA_TRACE` gives the decided ideal indices, which is
+/// one layer short of the bits. Without the bits themselves "reads 66.7 % of
+/// B1u as ones" cannot be told from "reads two data frames in three", so the
+/// pattern has to be on disk. One line per symbol: the symbol, the polarity it
+/// was read at, and the bits that came out of it.
+fn b1u_bits_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_B1U_BITS")?);
+        Some(Arc::new(Mutex::new(std::fs::File::create(path).ok()?)))
+    })
+    .clone()
+}
+
 fn up_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
@@ -3101,6 +3120,13 @@ impl Modem {
             let bits = decoder.take_bits();
             self.b1u_ones[which] += bits.iter().filter(|bit| **bit).count() as u64;
             self.b1u_scored[which] += bits.len() as u64;
+            if let Some(file) = b1u_bits_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                let _ = writeln!(file, "{} {} {text}", self.now, if which == 0 { 1 } else { -1 });
+            }
         }
         self.b1u_scoring -= 1;
         if self.b1u_scoring == 0 {
