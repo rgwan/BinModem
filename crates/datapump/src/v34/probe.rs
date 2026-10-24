@@ -99,11 +99,78 @@ pub struct Tone {
 }
 
 /// What the probing found across the band.
+///
+/// V92-63. This is the only *measurement* of the upstream channel a call ever
+/// takes: L1 is transmitted by the analogue modem and received here, so what it
+/// reads is the line itself rather than a fit of a two-point stream through it.
+/// It is per-tone magnitude and per-tone signal to noise -- exactly what a
+/// power-constrained transmit filter wants -- and it used to be reduced to
+/// [`Probed`] and dropped. [`crate::v92::design::from_reading`] now designs the
+/// far end's prefilter from it: `v92::design::from_reading`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub tones: Vec<Tone>,
     /// The 1050 Hz tone as received, less 1050 Hz, when it could be measured.
     pub frequency_offset: Option<f64>,
+}
+
+impl Reading {
+    /// One line saying what the probing came to: the span, the gain and the
+    /// signal to noise at their extremes, and the clock's error if it could be
+    /// measured.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let Some(first) = self.tones.first() else {
+            return "no tones".into();
+        };
+        let last = self.tones.last().copied().unwrap_or(*first);
+        let (mut gain_low, mut gain_high) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut snr_low, mut snr_high) = (f64::INFINITY, f64::NEG_INFINITY);
+        for tone in &self.tones {
+            gain_low = gain_low.min(tone.gain_db);
+            gain_high = gain_high.max(tone.gain_db);
+            snr_low = snr_low.min(tone.snr_db);
+            snr_high = snr_high.max(tone.snr_db);
+        }
+        let offset = self
+            .frequency_offset
+            .map_or_else(String::new, |offset| format!(", clock {offset:+.2} Hz high"));
+        format!(
+            "{} tones {:.0}-{:.0} Hz, gain {gain_low:+.1}..{gain_high:+.1} dB, \
+             snr {snr_low:.1}..{snr_high:.1} dB{offset}",
+            self.tones.len(),
+            first.frequency,
+            last.frequency
+        )
+    }
+
+    /// The whole reading on one line: frequency in hertz, then the gain and the
+    /// signal to noise at it as `gain/snr` decibels, tones separated by commas.
+    ///
+    /// This is the form the V.92 upstream design logs it in -- one line rather
+    /// than twenty-one because the note it goes into is read by a person
+    /// reading a call's transcript, and twenty-one lines bury everything else in
+    /// it. [`Reading::lines`] is the same reading a tone at a time, for a caller
+    /// that can afford the room.
+    #[must_use]
+    pub fn compact(&self) -> String {
+        self.tones
+            .iter()
+            .map(|tone| format!("{:.0}Hz {:+.1}/{:.1}", tone.frequency, tone.gain_db, tone.snr_db))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The same reading, one line a tone: `frequency Hz: gain dB, snr dB`.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.tones
+            .iter()
+            .map(|tone| {
+                format!("{:.0} Hz: gain {:+.2} dB, snr {:.2} dB", tone.frequency, tone.gain_db, tone.snr_db)
+            })
+            .collect()
+    }
 }
 
 /// Samples in the shortest stretch that holds a whole number of repetitions
@@ -538,6 +605,75 @@ mod tests {
         let reading = a.reading().expect("no reading");
         let snr: Vec<f64> = reading.tones.iter().map(|t| t.snr_db).collect();
         assert!(snr.iter().all(|&s| s > 32.0), "the tones read {snr:?}");
+    }
+
+    /// V92-63. The reading the V.92 upstream design is made from, taken at the
+    /// rate that design runs at: a synthetic L1 -- the twenty-one tones of
+    /// Table 17 -- through a line 20 dB down and falling 6 dB across the band,
+    /// with noise under it, comes back as twenty-one well-formed tones whose
+    /// gain and signal to noise are the line's, not merely as "some reading".
+    #[test]
+    fn a_synthetic_l1_reads_as_twenty_one_tones_of_the_line_it_crossed() {
+        // The V.92 digital modem's own rate: 160 ms of L1 is eight windows
+        // here, which is the fewest a reading is ever taken from.
+        const V92: f64 = 8000.0;
+        let expected = |f: f64| -20.0 - 6.0 * (f - 150.0) / 3600.0;
+
+        // Clean, straight out of the generator. L1 leaves 6 dB above the
+        // nominal level ("L1 is transmitted ... at 6 dB above the nominal power
+        // level"), so a flat line reads +6.02 dB and not 0: the gain is against
+        // the nominal level, which is what the reading is ever compared with.
+        let mut g = Generator::new(V92);
+        let mut clean = Analyzer::new(V92);
+        for _ in 0..1312 {
+            clean.feed(g.next_sample(true));
+        }
+        let clean = clean.reading().expect("an L1 off the generator is readable");
+        assert_eq!(clean.tones.len(), TONES.len(), "{} tones", clean.tones.len());
+        for (tone, &(frequency, _)) in clean.tones.iter().zip(&TONES) {
+            assert_eq!(tone.frequency, frequency, "the tones are out of order");
+            assert!((tone.gain_db - 6.02).abs() < 0.25, "{tone:?}");
+            assert!(tone.snr_db > 45.0, "{tone:?}");
+        }
+
+        // The same signal through a line that attenuates it and tilts it, with
+        // noise under it.
+        let mut tilted = Analyzer::new(V92);
+        let mut seed = 3u32;
+        for i in 0..8000 {
+            let t = i as f64 / V92;
+            let signal: f64 = TONES
+                .iter()
+                .map(|&(f, phase)| {
+                    let gain = 10f64.powf(expected(f) / 20.0);
+                    gain * (std::f64::consts::TAU * f * t + phase.to_radians()).cos()
+                })
+                .sum::<f64>()
+                * nominal_amplitude();
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.0045;
+            tilted.feed(signal + noise);
+        }
+        let reading = tilted.reading().expect("a tilted L1 is readable");
+        assert_eq!(reading.tones.len(), TONES.len());
+        for tone in &reading.tones {
+            assert!(tone.gain_db.is_finite() && tone.snr_db.is_finite(), "{tone:?}");
+            assert!(
+                (tone.gain_db - expected(tone.frequency)).abs() < 1.0,
+                "{} Hz read {:.1} dB and the line is {:.1}",
+                tone.frequency,
+                tone.gain_db,
+                expected(tone.frequency)
+            );
+            assert!(tone.snr_db > 15.0 && tone.snr_db < 45.0, "{tone:?}");
+        }
+        // The three forms a caller can log it in: one line, twenty-one, and a
+        // summary that carries the span and the extremes.
+        assert!(reading.summary().contains("-26.0..-20.0"), "{}", reading.summary());
+        assert_eq!(reading.compact().matches("Hz").count(), TONES.len());
+        assert_eq!(reading.lines().len(), TONES.len());
     }
 
     #[test]

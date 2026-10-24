@@ -760,8 +760,15 @@ impl Digital {
             && let Some(asked) = p2.info1a_pcm_up()
         {
             let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
+            // V92-63: phase 2's L1 reading is the upstream channel this end
+            // measured on the analogue modem's own probing signal. It used to
+            // stop here, because only the V.34/V.90 reduction of it (`Probed`)
+            // was carried forward. The V.92 upstream design is built from it,
+            // so it goes where that design is computed.
+            let probing = p2.reading().cloned();
             let mut settings = pcm::Settings::new(self.law, &asked, p2.round_trip().unwrap_or(0.0), wide);
             settings.habits = pcm::Habits::LIVE;
+            settings.probing = probing;
             self.v92 = Some(pcm::Modem::new(settings));
         }
         if p2.status() == phase2::Status::Done

@@ -56,6 +56,7 @@ use crate::v92::receiver::{ALIGN_WINDOW, Heard, Receiver, Slicer, Symbol, TRAIN_
 use crate::v92::sequences::{
     CpFamily, Cpd, J, JP_PRIME_BITS, Jp, Suvd, UpFinder, trn2u_unit,
 };
+use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
 use crate::v92::upchoice::choose;
 use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
@@ -470,7 +471,7 @@ impl Default for Habits {
 }
 
 /// What Phase 2 settled, as this modem needs it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub law: Law,
     /// The codeword the analogue modem trains its A/D on, from INFO1a's UINFO.
@@ -486,6 +487,17 @@ pub struct Settings {
     /// use the parameters and will not acknowledge them (9.6.2.1.3).
     pub limits: FilterLimits,
     pub habits: Habits,
+    /// V92-63. What phase 2's L1/L2 probing measured of the upstream channel,
+    /// handed over by whoever ran phase 2 (`v90::startup`).
+    ///
+    /// L1 is transmitted by the analogue modem and received here (V.90
+    /// 9.2.1.1.5, 9.2.2.1.5), so it is a measurement of the *upstream line* and
+    /// not of a fit through it, and it carries per-tone magnitude and per-tone
+    /// signal to noise -- exactly what a power-constrained transmit filter
+    /// wants. It used to be reduced to the V.34/V.90 summary and dropped. It
+    /// lives on the settings rather than on the modem because it is decided
+    /// before this modem exists: phase 2 is not this object's.
+    pub probing: Option<Reading>,
 }
 
 impl Settings {
@@ -500,7 +512,15 @@ impl Settings {
             wide,
             limits: FilterLimits::from_info1a(asked.sections, asked.ltot_code, asked.lmax_code),
             habits: Habits::default(),
+            probing: None,
         }
+    }
+
+    /// The same settings, with phase 2's probing reading attached.
+    #[must_use]
+    pub fn with_probing(mut self, reading: Option<Reading>) -> Self {
+        self.probing = reading;
+        self
     }
 
     /// This end's Jd (Table 21): every downstream rate, and the look-ahead.
@@ -1413,9 +1433,10 @@ impl Modem {
         rx.expect_ru();
         // Ru becomes R-bar-u with no timing step at all (9.5.2.1.1).
         rx.expect_step(0.0);
-        Self {
+        let source = Source::new(&settings);
+        let mut modem = Self {
             settings,
-            source: Source::new(&settings),
+            source,
             rx,
             stage: Stage::AwaitRu,
             reader: TwoPointReader::differential(),
@@ -1480,7 +1501,15 @@ impl Modem {
             b1u_polarity: 1.0,
             peak: 0.0,
             notes: Vec::new(),
+        };
+        // V92-63: phase 2 measured the upstream channel and this is where the
+        // measurement used to stop. Say what was kept, once, so that a call's
+        // transcript shows the reading arriving even if nothing else does.
+        if let Some(reading) = modem.settings.probing.clone() {
+            modem.note(format!("V.92: L1 probing retained: {}", reading.summary()));
+            modem.note(format!("V.92: L1 probing per tone: {}", reading.compact()));
         }
+        modem
     }
 
     pub fn settings(&self) -> &Settings {
@@ -3070,6 +3099,7 @@ impl Default for Modem {
             wide: true,
             limits: FilterLimits::from_info1a(0, 0, 0),
             habits: Habits::PROMPT,
+            probing: None,
         })
     }
 }
@@ -3173,7 +3203,41 @@ mod tests {
             wide: true,
             limits: FilterLimits::from_info1a(0, 0, 0),
             habits: Habits::PROMPT,
+            probing: None,
         }
+    }
+
+    /// V92-63: phase 2 measures the upstream channel with L1 and this modem is
+    /// handed the measurement. It is kept, and it says so in the transcript a
+    /// bench call is read from.
+    #[test]
+    fn the_probing_reading_is_kept_where_the_upstream_is_designed() {
+        use crate::v34::probe::{Tone, TONES};
+        let reading = Reading {
+            tones: TONES
+                .iter()
+                .enumerate()
+                .map(|(at, &(frequency, _))| Tone {
+                    frequency,
+                    gain_db: -18.0 - 4.0 * at as f64,
+                    snr_db: 41.0,
+                })
+                .collect(),
+            frequency_offset: Some(0.0),
+        };
+        let mut settings = settings();
+        assert!(settings.probing.is_none(), "a modem with no probing has none");
+        settings = settings.with_probing(Some(reading));
+        let mut modem = Modem::new(settings);
+        let notes = modem.take_notes();
+        assert!(
+            notes.iter().any(|line| line.contains("V.92: L1 probing retained: 21 tones 150-3750 Hz")),
+            "the reading was dropped: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|line| line.contains("150Hz") && line.contains("/41.0")),
+            "the reading is not in the transcript tone by tone: {notes:?}"
+        );
     }
 
     /// The Phase 4 sequences this end puts on the line have to be readable by
@@ -3546,6 +3610,7 @@ mod tests {
         let mut settings = settings();
         settings.habits = Habits::LIVE;
         assert!(settings.habits.trn1d * FS >= TRN1D_MINIMUM as f64, "TRN1d is at least 2040T");
+        let habits = settings.habits;
         let mut modem = Modem::new(settings);
         let ja_read = 8000u64;
         modem.now = ja_read;
@@ -3554,7 +3619,7 @@ mod tests {
         // TRN1d starts after Sd and S-bar-d, and Su is due 5.1 s after that.
         let expected = ja_read
             + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
-            + (settings.habits.trn1d * FS) as u64
+            + (habits.trn1d * FS) as u64
             + (SU_WITHIN * FS) as u64;
         assert_eq!(deadline, expected);
         // Which is 5.1 s after TRN1d's start, and not 5.1 s after Ja.

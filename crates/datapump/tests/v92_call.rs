@@ -32,6 +32,7 @@ fn digital_settings(far_md: u8) -> digital::Settings {
         wide: true,
         limits: FilterLimits::from_info1a(0, 0, 0),
         habits: digital::Habits::PROMPT,
+        probing: None,
     }
 }
 
