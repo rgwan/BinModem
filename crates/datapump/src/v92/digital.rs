@@ -320,6 +320,37 @@ fn b1u_levels_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> 
     .clone()
 }
 
+/// `V92_B1U_LINE`: the symbol `V92_B1U_LEVELS` writes, with the two halves
+/// `docs/47` needs to tell the line from this receiver's own doing.
+///
+/// `docs/22`'s lesson is that a per-position table is only as good as its
+/// phase, so this is written at the same call site, with the same `self.now`,
+/// as the level it belongs to -- not from `V92DFE_TRACE`, whose labels are one
+/// symbol out (`docs/39 §2`). One line per symbol: `now raw line forward value
+/// mode`, where `line` is the sample the equaliser was given and `forward` is
+/// the feed-forward section's share of `value`.
+fn b1u_line_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_B1U_LINE")?);
+        Some(Arc::new(Mutex::new(std::fs::File::create(path).ok()?)))
+    })
+    .clone()
+}
+
+/// One line of [`b1u_line_file`], if it was asked for.
+fn write_b1u_line(symbol: &Symbol, now: u64, mode: &str) {
+    let Some(file) = b1u_line_file() else { return };
+    let Ok(mut file) = file.lock() else { return };
+    use std::io::Write;
+    let _ = writeln!(
+        file,
+        "{} {} {:.9} {:.9} {:.9} {mode}",
+        now, symbol.raw, symbol.line, symbol.forward, symbol.value
+    );
+}
+
 fn up_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
@@ -2904,7 +2935,8 @@ impl Modem {
 
     /// One upstream symbol: through the reader, then into whichever sequence
     /// finder is listening.
-    fn symbol_upstream(&mut self, level: f64) {
+    fn symbol_upstream(&mut self, symbol: Symbol) {
+        let level = symbol.value;
         // 9.6.1.1.6: once E2u has ended, the receiver is B1u's -- the data mode
         // modulation rather than four points -- and every symbol from there is
         // a data frame's worth of the decoder's.
@@ -2930,7 +2962,7 @@ impl Modem {
                 return;
             }
             if self.b1u_scoring > 0 {
-                self.score_b1u(level);
+                self.score_b1u(symbol);
                 return;
             }
         }
@@ -2943,6 +2975,7 @@ impl Modem {
             use std::io::Write;
             let _ = writeln!(file, "{} {level:.9} data", self.now);
         }
+        write_b1u_line(&symbol, self.now, "data");
         let level = self.adjust_b1u_level(self.b1u_polarity * level);
         if let Some(decoder) = self.upstream_data.as_mut() {
             decoder.feed(level);
@@ -3127,13 +3160,15 @@ impl Modem {
     /// So the polarity that reads those frames as ones is the line's, and it is
     /// measurable by decoding them both ways up -- which is what this does. The
     /// bits are B1u's, which carry no information, so both are dropped.
-    fn score_b1u(&mut self, level: f64) {
+    fn score_b1u(&mut self, symbol: Symbol) {
+        let level = symbol.value;
         if let Some(file) = b1u_levels_file()
             && let Ok(mut file) = file.lock()
         {
             use std::io::Write;
             let _ = writeln!(file, "{} {level:.9} score", self.now);
         }
+        write_b1u_line(&symbol, self.now, "score");
         // The same transform the data path takes (`V92_B1U_ADJ`), so that a
         // diagnostic asked for here is measured on the reading the criterion
         // uses and not on a reading nothing else sees. Empty is the default and
@@ -3359,7 +3394,7 @@ impl Modem {
         // 8.7.2-8.7.6: Phase 4's upstream arrives four points to a symbol, and
         // what it carries is SUVu, CPu, E2u and then B1u's payload.
         if self.upstream.is_some() || self.upstream_data.is_some() {
-            self.symbol_upstream(symbol.value);
+            self.symbol_upstream(symbol);
         }
         match self.stage {
             Stage::ReadJa => {

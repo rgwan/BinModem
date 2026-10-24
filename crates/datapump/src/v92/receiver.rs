@@ -525,6 +525,19 @@ pub struct Symbol {
     pub value: f64,
     /// What the slicer decided, if it decided.
     pub decided: Option<f64>,
+    /// The line sample this symbol was taken from, in the levels' own units:
+    /// the receiver's input *before* any tap was applied to it.
+    ///
+    /// `docs/47` needs it. A per-position level error already in this number
+    /// came in on the line; one that only appears in [`Self::value`] is this
+    /// receiver's own doing. Nothing in the data path reads it; it is written
+    /// only where a trace asks for it.
+    pub line: f64,
+    /// The feed-forward section's half of [`Self::value`], decisions aside.
+    ///
+    /// The feedback section is fed this receiver's own decisions, so an error
+    /// that survives here did not come from a decision.
+    pub forward: f64,
 }
 
 impl Symbol {
@@ -1429,7 +1442,14 @@ impl Receiver {
         if !(power > AUDIBLE) {
             self.decided.clear();
             let index = self.origin.map_or(self.count, |origin| self.count.saturating_sub(origin));
-            self.events.push_back(Heard::Symbol(Symbol { index, raw: self.count, value: 0.0, decided: None }));
+            self.events.push_back(Heard::Symbol(Symbol {
+                index,
+                raw: self.count,
+                value: 0.0,
+                decided: None,
+                line: level,
+                forward: 0.0,
+            }));
             return;
         }
         let mut value = 0.0;
@@ -1469,6 +1489,10 @@ impl Receiver {
         // Recommendation's drawing: see `measure_levels`.
         self.measure_levels(value);
         let shown = value * self.gain;
+        // The feed-forward half on the same scale, for `docs/47`'s split: the
+        // forward section is a linear function of the line and of nothing this
+        // receiver decided, and the feedback section is fed those decisions.
+        let shown_forward = forward_only * self.gain;
         {
             // The demodulator's own account of itself, so that two runs of the
             // same call which differ only by the codec's quantising can be told
@@ -1531,6 +1555,8 @@ impl Receiver {
             raw: self.count,
             value: shown,
             decided: chosen.map(|(level, _)| level),
+            line: level,
+            forward: shown_forward,
         }));
         let _ = level;
     }
