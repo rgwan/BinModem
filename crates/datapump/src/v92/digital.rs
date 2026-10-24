@@ -1412,10 +1412,24 @@ pub struct Modem {
     b1u_adjust: String,
     /// The levels `V92_B1U_ADJ=dc` averages over.
     b1u_history: std::collections::VecDeque<f64>,
-    /// Zero bits since Ed went out, for E2u: twelve (or thirteen) descrambled
-    /// zeros are what tells it from anything else (8.5.2, 8.7.2).
+    /// Zero bits in the run now on the line, for E2u: a data frame's worth of
+    /// descrambled zeros is what tells it from anything else (8.5.2, 8.7.2),
+    /// counted in bits because bits are what the reader gives back. See
+    /// [`Self::arm_e2u_search`] for what a frame's worth is, and for why the
+    /// run is measured to its end rather than to its twelfth bit.
     e2u_zeroes: u32,
-    /// Whether Ed has gone out, which is the only time E2u can be expected.
+    /// Whether the E2u search is listening. See [`Self::arm_e2u_search`].
+    ///
+    /// 9.6.2.1.4 makes this a *superset* of Ed: the analogue modem transmits
+    /// E2u once it has "received a CPd or SUVd sequence with the acknowledgement
+    /// bit set **or Ed**", so a far end may send E2u before this end's Ed goes
+    /// out, and both far ends measured here do. Arming at Ed alone left the
+    /// search deaf over exactly the window the far end uses: on the HSF capture
+    /// `20261024-063632-a41c-off-d1` the far end's E2u ends at symbol 108 733
+    /// and this end's Ed went out at symbol ~109 800, so the real E2u was
+    /// dropped and the first false zero run *inside the far end's data mode*
+    /// (symbol 110 745) was taken for it -- which is why every symbol ever
+    /// scored as B1u on that call was the far end's data and not B1u at all.
     awaiting_e2u: bool,
     /// Whether the receiver is still waiting for the symbol B1u starts on.
     /// 9.6.1.1.6 conditions it for B1u *after* E2u, and E2u ends one symbol
@@ -2114,6 +2128,12 @@ impl Modem {
             SequenceKind::Suv => {
                 let bits = Suvd { silence: false, ack }.to_bits(INTERVALS);
                 self.source.send(Out::Suvd, bits);
+                // 9.6.2.1.4: an acknowledged SUVd is one of the two things that
+                // lets the far end send E2u, so the search opens here. See
+                // `arm_e2u_search`.
+                if ack {
+                    self.arm_e2u_search();
+                }
             }
             SequenceKind::Cp => {
                 let Some(mut cpd) = self.cpd.clone() else {
@@ -2139,12 +2159,18 @@ impl Modem {
                     bits.len()
                 ));
                 self.source.send(Out::Cpd, bits);
+                // 9.6.2.1.4: a CPd with its acknowledgement bit set is the
+                // other thing that lets the far end send E2u. See
+                // `arm_e2u_search`.
+                if cpd.ack {
+                    self.arm_e2u_search();
+                }
             }
             // 8.8.2: Ed is two data frames of scrambled zeros, at CPt's rate.
             SequenceKind::E => {
                 self.source.send(Out::Ed, self.source.ed_bits());
-                self.e2u_zeroes = 0;
-                self.awaiting_e2u = true;
+                // Ed, and not only Ed: see `arm_e2u_search`.
+                self.arm_e2u_search();
                 self.note("V.92: Ed".into());
             }
             _ => {}
@@ -2210,6 +2236,9 @@ impl Modem {
             SequenceKind::Suv => {
                 let bits = Suvd { silence: false, ack }.to_bits(INTERVALS);
                 self.source.send(Out::Suvd, bits);
+                if ack {
+                    self.arm_e2u_search();
+                }
             }
             _ => {}
         }
@@ -2561,8 +2590,14 @@ impl Modem {
         // mode's constellation, and started B1u's frame count at a symbol
         // some hundreds early -- a whole number of symbols the far end never
         // agreed to.
-        self.b1u_pending = self.parameters.is_some();
-        self.b1u_deadline = self.b1u_pending.then_some(self.now + (B1U_WAIT * FS) as u64);
+        // A boundary this end already has is not one Ed going out can take
+        // away: the wait is for a boundary that has not been found, and
+        // `begin_b1u` has a decoder running on one. Re-arming the wait here
+        // would time out a call that has its B1u and fail it in the open two
+        // seconds later.
+        let waiting = self.parameters.is_some() && self.upstream_data.is_none();
+        self.b1u_pending = waiting;
+        self.b1u_deadline = waiting.then_some(self.now + (B1U_WAIT * FS) as u64);
         let mut downstream = 0;
         if let Some(cpu) = self.cpu.as_ref()
             && let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu)
@@ -2601,6 +2636,40 @@ impl Modem {
         self.fill_downstream();
     }
 
+    /// Start listening for E2u (9.6.2.1.4).
+    ///
+    /// The analogue modem transmits E2u "after [it] has sent a CPu or SUVu
+    /// sequence with the acknowledgement bit set and it has received a CPd or
+    /// SUVd sequence with the acknowledgement bit set or Ed" -- so Ed is one way
+    /// in, not the way in, and a far end that keys on the CPd it received sends
+    /// E2u while this end is still finishing its own SUVd/CPd exchange. Measured
+    /// on `/tmp/hsf-v90-interop/20261024-063632-a41c-off-d1`: the far end's E2u
+    /// ends at symbol 108 733, this end's last CPd goes out at 18.63 s and its
+    /// Ed at 19.21 s, so the whole of the real E2u falls in the stretch an
+    /// Ed-only arm is deaf to. The cost of arming early is a candidate opened on
+    /// a false zero run inside the exchange, and there is a gate for exactly
+    /// that: the candidate has to read as B1u (see [`Self::score_b1u`]) or it is
+    /// handed back by [`Self::abandon_b1u`] and the hunt goes on.
+    ///
+    /// Nothing is armed before `parameters` exists: `begin_b1u` needs CPd's
+    /// constellation and would return without building a decoder, which would
+    /// leave the search disarmed with no boundary at all.
+    fn arm_e2u_search(&mut self) {
+        if self.parameters.is_none() || self.upstream_data.is_some() {
+            return;
+        }
+        // Only a *new* arm restarts the count: this is called on every SUVd
+        // and CPd this end sends, and a zero run being counted across one of
+        // them is E2u, not a reason to start again. (Measured on
+        // `/tmp/p0corr/ident.raw`: without this, this end's own SUVd at
+        // symbol 111 429 reset a thirty-six-bit run two symbols before it
+        // ended, and the E2u at 111 432 was never seen at all.)
+        if !self.awaiting_e2u {
+            self.e2u_zeroes = 0;
+        }
+        self.awaiting_e2u = true;
+    }
+
     /// 9.6.1.1.6: condition the receiver for B1u, on the symbol E2u ended
     /// before.
     ///
@@ -2628,19 +2697,21 @@ impl Modem {
         self.rx.set_data_mode(levels);
         self.upstream_data = Some(Decoder::new(&parameters));
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
-        // run completed in.
+        // run was found to have ended on.
         //
-        // 8.7.1 makes B1u's contents known -- "48 data frames of scrambled
-        // binary ones" -- which is the one place upstream where the receiver
-        // can be told what it should have read, and a capture of an Agere
-        // SV92PP says the answer is not zero. Read from the completion symbol,
-        // all twelve phases of the frame origin give a stream of random bits;
-        // from one symbol later B1u comes out all ones, and so does the far
-        // end's whole idle stretch after it. The likeliest reason is that the
-        // phase-4 reader's differential decode reports a zero run one symbol
-        // after the symbol that carried its last zero; what is implemented is
-        // the measurement. See `crates/datapump/examples/v92_b1u_search.rs`.
-        const B1U_ORIGIN_AFTER_E2U: usize = 1;
+        // Zero, and the zero is a measurement rather than a derivation: the
+        // detector fires on the symbol carrying the first non-zero bit after
+        // the run (see `symbol_upstream`), and 8.7.1 puts B1u's frame interval
+        // 0 on the symbol after E2u's last zero -- the same symbol. Measured
+        // both ways up on the two captures that matter here: on HSF
+        // `20261024-063632-a41c-off-d1` the run ends on symbol 108 733, symbol
+        // 108 734 carries the first non-zero bit *and* is the first symbol of
+        // the data mode's constellation (its level is 0.33 from the nearest of
+        // TRN2u's four points, where the run's symbols are 0.01 from them); on
+        // `/tmp/p0corr/ident.raw` the same two numbers are 111 431 and 111 432.
+        // It was 1 while the detector fired six symbols inside the run, which
+        // is where the "one symbol after the completion" reading came from.
+        const B1U_ORIGIN_AFTER_E2U: usize = 0;
         // Data frames of B1u the decoder is not given, while the equaliser
         // settles onto the data-mode constellation.
         //
@@ -2690,10 +2761,21 @@ impl Modem {
         // `V92_B1U_SKIP` still forces the whole number, so a wrong origin is
         // measured rather than argued about.
         let _ = self.upstream_delay;
+        // The symbols between the boundary symbol and the first one the
+        // decoder is fed: `[Self::symbol_upstream]` drops `b1u_skip` symbols
+        // after the one `begin_b1u` ran on and feeds the decoder from the next,
+        // so the first symbol fed is `b1u_skip + 1` after the boundary. The `-1`
+        // is that one: without it the acquisition skip is 217 symbols, which is
+        // one more than eighteen data frames, and the frame phase would be a
+        // symbol out. (It went unnoticed because the arm every B1u number was
+        // ever taken on -- an Agere SV92PP -- idles on ones, and a stream of the
+        // same thirty-six bits every frame reads the same at any phase.)
         self.b1u_skip = std::env::var("V92_B1U_SKIP")
             .ok()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS);
+            .unwrap_or(
+                B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1,
+            );
         if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
             // Printed after the assignment, not before: this line said
             // `b1u_skip 0` on every call for as long as it existed, because it
@@ -2876,27 +2958,47 @@ impl Modem {
             {
                 self.up_sequence(family);
             }
-            // 8.7.2: E2u is a data frame of scrambled *zeros*, so twelve
-            // descrambled zeros after Ed is what it is. 9.6.1.1.4 terminates
-            // the exchange on it, and 9.6.1.1.6 conditions for B1u.
+            // 8.7.2: E2u is a data frame of scrambled *zeros*, and a data
+            // frame in the upstream direction is twelve *symbols* (6.4, 8.7.1)
+            // -- so a frame's worth is twelve times the bits a symbol carries,
+            // twenty-four on TRN2u's four points and thirty-six on its eight,
+            // and not the twelve *bits* this used to count. Twelve bits is six
+            // symbols, which put the boundary six symbols inside the far end's
+            // own E2u before the arming was fixed.
+            //
+            // The boundary is where the run *ends*, not where a count in the
+            // middle of it is reached: 8.7.1 puts B1u's frame interval 0 on the
+            // symbol after the one carrying E2u's last zero, and a far end's
+            // E2u need not be exactly one frame long. Measured on the HSF
+            // capture `20261024-063632-a41c-off-d1` the run is symbols
+            // 108 711-108 733 -- twenty-three symbols, against the clause's
+            // twelve, and the far end's data mode starts on 108 734 -- so the
+            // run's end is exact and anything counted from its start is not.
+            // The length is therefore only a floor, which is what keeps the
+            // short zero stretches an SUVu or a CPu carries from opening a
+            // candidate: on that capture the runs long enough to open one are
+            // 106 410, 106 483, 106 550 and 108 734, and only the last is E2u.
+            //
+            // 8.7.2's "extended by a single symbol if bit 29 of CPd is set"
+            // needs no term of its own here, for the same reason: the extension
+            // lengthens the run and the run's end is what is read.
             if self.awaiting_e2u {
                 if bit {
-                    self.e2u_zeroes = 0;
-                } else {
-                    self.e2u_zeroes += 1;
-                    // 8.7.2: E2u "shall be extended by a single symbol if bit
-                    // 29 of CPd is set", and either way it is whole symbols.
-                    let e2u = UP_INTERVALS as u32
-                        + u32::from(self.parameters.as_ref().is_some_and(|p| p.extend_e2u));
+                    let e2u = (UP_INTERVALS * self.upstream_size.bits()) as u32;
                     if self.e2u_zeroes >= e2u {
+                        // This symbol carries the first non-zero bit after a
+                        // frame's worth of zeros, so it is the symbol after the
+                        // one E2u's last zero was on: B1u's frame interval 0
+                        // (8.7.1), and what the twelve-symbol frame and the
+                        // four-symbol trellis frame are counted from.
                         let now = self.now;
                         // Diagnostic (`V92_E2U_FROM`): the symbol a zero run
-                        // has to complete at or after to count as E2u. The
-                        // question "would this arm work if the boundary were
-                        // the right one" cannot be answered by a run that
-                        // starts the receiver a hundred millimetres of line
-                        // early, so the knob makes the boundary a given and
-                        // leaves the equaliser as the only variable.
+                        // has to end at or after to count as E2u. The question
+                        // "would this arm work if the boundary were the right
+                        // one" cannot be answered by a run that starts the
+                        // receiver a hundred millimetres of line early, so the
+                        // knob makes the boundary a given and leaves the
+                        // equaliser as the only variable.
                         if now < e2u_from() {
                             self.e2u_zeroes = 0;
                             continue;
@@ -2907,7 +3009,13 @@ impl Modem {
                         self.awaiting_e2u = false;
                         self.note("V.92: E2u".into());
                         started = true;
+                    } else {
+                        // Too short to be E2u: not a boundary, and the next run
+                        // counts from zero.
+                        self.e2u_zeroes = 0;
                     }
+                } else {
+                    self.e2u_zeroes = self.e2u_zeroes.saturating_add(1);
                 }
             }
         }
@@ -3064,6 +3172,11 @@ impl Modem {
     /// decoders are dropped, and the zero-run detector is armed again. The
     /// deadline set when Ed went out is untouched, so a run of candidates that
     /// all fail costs the wait and then fails the exchange in the open.
+    ///
+    /// The one deadline that is set here is for the candidate opened before Ed
+    /// went out -- which the wider arming in [`Self::arm_e2u_search`] makes
+    /// possible: without it, a first candidate that fails while Ed is still
+    /// unsent would leave a hunt with nothing to end it.
     fn abandon_b1u(&mut self, best: u64, other: u64, scored: u64) {
         let now = self.now;
         self.note(format!(
@@ -3079,6 +3192,10 @@ impl Modem {
         self.rx.set_slicer(Slicer::FourPoint);
         self.awaiting_e2u = true;
         self.e2u_zeroes = 0;
+        if self.b1u_deadline.is_none() {
+            self.b1u_pending = true;
+            self.b1u_deadline = Some(self.now + (B1U_WAIT * FS) as u64);
+        }
     }
 
     /// One upstream sequence, as 8.7.2-8.7.6 delivered it.
@@ -3087,6 +3204,21 @@ impl Modem {
         match family {
             CpFamily::Suvu(suvu) => {
                 self.note(format!("V.92: SUVu, ack {}", suvu.ack));
+                // 9.6.2.1.4's other half, and the half that decides *when*:
+                // the analogue modem transmits E2u "after [it] has sent a CPu
+                // or SUVu sequence with the acknowledgement bit set". An
+                // acknowledged SUVu from the far end is therefore the last
+                // thing that happens before E2u can, and it is the only
+                // observable event on the far end's own side of the clause.
+                // Both far ends measured here ack as they converge, and
+                // neither waits for *this* end's ack bit, which is clear on
+                // every CPd until a CPu has arrived: on the HSF capture the
+                // last acknowledged SUVu is at symbol 108 704 and E2u ends at
+                // 108 733; on `/tmp/p0corr/ident.raw` they are 111 304 and
+                // 111 431.
+                if suvu.ack {
+                    self.arm_e2u_search();
+                }
                 if let Some(exchange) = self.exchange.as_mut() {
                     exchange.peer_suv(
                         PeerSuv { ack: suvu.ack, silence: suvu.silence, wait_for_cp: suvu.wait_for_cpu },
