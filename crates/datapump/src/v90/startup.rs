@@ -670,6 +670,17 @@ impl Digital {
             }
             if failed && self.failed_starts < V90_RETRAINS {
                 // 9.7.1.1: back through Phase 2 for another go.
+                //
+                // What it said before it went. `pcm::Modem::fail` puts the
+                // reason in its own notes, and those notes are drained from
+                // that modem one step later -- by which time this line has
+                // dropped it, so the reason went with it. A call that
+                // restarted Phase 2 two seconds after B1d therefore said
+                // nothing at all about why: the transcript reads
+                // `B1d at 56000` and then a Phase 2 with no line in between.
+                // The reason is the one thing that has to reach the log, and
+                // keeping it costs one drain.
+                self.notes.extend(m.take_notes());
                 self.failed_starts += 1;
                 self.v92 = None;
                 self.v34.restart_phase2();
