@@ -302,6 +302,24 @@ fn b1u_bits_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     .clone()
 }
 
+/// `V92_B1U_LEVELS`: the level stream the *decoder* is fed through B1u.
+///
+/// `V92DFE_TRACE` prints every symbol the receiver processes, from the symbol
+/// `begin_b1u` ran on, whether or not the decoder sees it. That is not the same
+/// stream: `symbol_upstream` drops `b1u_skip` symbols and feeds the decoder from
+/// the next. Which of the two is one symbol out relative to a given dump cannot
+/// be settled by either alone, so this records the decoder's own stream and its
+/// own first symbol -- one line per fed symbol: the symbol, and the level.
+fn b1u_levels_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_B1U_LEVELS")?);
+        Some(Arc::new(Mutex::new(std::fs::File::create(path).ok()?)))
+    })
+    .clone()
+}
+
 fn up_trace_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
@@ -2919,6 +2937,12 @@ impl Modem {
         // The polarity the measurement above found, then whatever diagnostic
         // transform `V92_B1U_ADJ` asks for (see `adjust_b1u_level`). Done
         // before the decoder is borrowed, because the transform keeps state.
+        if let Some(file) = b1u_levels_file()
+            && let Ok(mut file) = file.lock()
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{} {level:.9} data", self.now);
+        }
         let level = self.adjust_b1u_level(self.b1u_polarity * level);
         if let Some(decoder) = self.upstream_data.as_mut() {
             decoder.feed(level);
@@ -3104,6 +3128,12 @@ impl Modem {
     /// measurable by decoding them both ways up -- which is what this does. The
     /// bits are B1u's, which carry no information, so both are dropped.
     fn score_b1u(&mut self, level: f64) {
+        if let Some(file) = b1u_levels_file()
+            && let Ok(mut file) = file.lock()
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{} {level:.9} score", self.now);
+        }
         // The same transform the data path takes (`V92_B1U_ADJ`), so that a
         // diagnostic asked for here is measured on the reading the criterion
         // uses and not on a reading nothing else sees. Empty is the default and
