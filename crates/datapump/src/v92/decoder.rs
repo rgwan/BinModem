@@ -32,7 +32,7 @@ use crate::v32::Scrambler;
 use crate::v34::trellis::{self, Code};
 
 use super::modulus::{self, Moduli12};
-use super::precoder::{Constellation, code_for, index_to_ki, label_of};
+use super::precoder::{Constellation, PairMap, code_for, index_to_ki, label_of};
 use super::{Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 
 /// Trellis frames held before the oldest is decided on. Forty frames is a
@@ -149,6 +149,27 @@ pub struct Decoder {
     labels: Vec<u8>,
     bits: Vec<bool>,
     decided: u64,
+    /// The far end's class map: which half of each 4D pair its encoder rotates
+    /// the class of by two, and the size of the rotation.
+    ///
+    /// This is a **measured** property of the far end and it is per decoder,
+    /// not per process: one call's B1u reads `First` (an Agere SV92PP,
+    /// `/tmp/p0corr/ident.raw`) and another's reads `Second`
+    /// (`/tmp/hsf-v90-interop/20261024-063632-a41c-off-d1`) inside the same
+    /// process. See `PairHalf` and `Modem::decide_b1u_arm`.
+    pair: PairMap,
+    /// Per-position level correction, in the wire's units, subtracted from the
+    /// level this decoder is fed on trellis position `k = n mod 4`.
+    ///
+    /// A far end's transmitter can put a per-position bias on the data mode's
+    /// levels -- measured at +0.31 half-steps at k = 0 and -0.33 at k = 3 on
+    /// HSF, all four positions inside +-0.055 on Agere
+    /// (`docs/39-b1u-symbol-level-comparison.md` §5) -- and B1u is the known
+    /// sequence that measures it: `Modem::install_b1u_dc` fills this in once
+    /// the boundary is confirmed, and only where the estimate is outside a
+    /// dead-band no conformant far end reaches. Zero is every call that has not
+    /// been measured yet, and is what `Decoder::new` starts with.
+    dc: [f64; TRELLIS_FRAME],
 }
 
 impl Decoder {
@@ -188,11 +209,47 @@ impl Decoder {
             labels: Vec::with_capacity(UP_INTERVALS),
             bits: Vec::new(),
             decided: 0,
+            pair: PairMap::model(),
+            dc: [0.0; TRELLIS_FRAME],
         }
+    }
+
+    /// The same decoder, for a far end whose class map has been measured
+    /// rather than assumed.
+    ///
+    /// `Decoder::new` is `PairMap::model()`, which is this end's own encoder's
+    /// rotation on the pair's first half: the value every number taken before
+    /// `docs/39` was measured with, and the one an Agere SV92PP confirms. A
+    /// second far end puts the same rotation on the pair's *second* half, so
+    /// the receiver runs both and keeps the one whose B1u reads as ones.
+    pub fn with_pair(parameters: &Parameters, pair: PairMap) -> Self {
+        Self { pair, ..Self::new(parameters) }
+    }
+
+    /// The class map this decoder is running under.
+    pub fn pair(&self) -> PairMap {
+        self.pair
+    }
+
+    /// Set the per-position level correction, in the wire's units and in the
+    /// sign of the levels this decoder is *fed* -- which is why whoever
+    /// installs it folds the polarity in first (see
+    /// [`Self::dc`] and `Modem::install_b1u_dc`).
+    pub fn set_dc(&mut self, dc: [f64; TRELLIS_FRAME]) {
+        self.dc = dc;
+    }
+
+    /// The per-position level correction in force.
+    pub fn dc(&self) -> [f64; TRELLIS_FRAME] {
+        self.dc
     }
 
     /// One equalised symbol, on the scale the parameters' levels are in.
     pub fn feed(&mut self, level: f64) {
+        // The far end's per-position bias, before anything else: it is a
+        // property of the levels on the wire (see [`Self::dc`]), so it is
+        // removed in the wire's own units and before G is divided out.
+        let level = level - self.dc[self.filled];
         // The wire carries G x v (8.8.3), while the constellation sets are the
         // pre-gain magnitudes a(eta), so the equalised level is divided back by
         // G before it is sliced against them.
@@ -350,7 +407,7 @@ impl Decoder {
         for (k, &eta) in etas.iter().enumerate() {
             let interval = self.labels.len();
             let modulus = self.moduli.modulus(interval);
-            self.labels.push(index_to_ki(eta, modulus, k));
+            self.labels.push(index_to_ki(eta, modulus, k, self.pair));
             if self.labels.len() == UP_INTERVALS {
                 let labels: [u8; UP_INTERVALS] =
                     std::mem::take(&mut self.labels).try_into().expect("twelve intervals");

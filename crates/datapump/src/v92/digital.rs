@@ -59,7 +59,8 @@ use crate::v92::sequences::{
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
 use crate::v92::upchoice::choose;
-use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
+use crate::v92::precoder::{PairHalf, PairMap};
+use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, TRELLIS_FRAME, Trellis};
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
 pub const FS: f64 = 8000.0;
@@ -234,6 +235,95 @@ pub const B1U_CONFIRM_EIGHTHS: u64 = 6;
 /// the window: an eighth, the margin the polarity choice has always been made
 /// on. Above a zero run it is what a real B1u has and a wrong window cannot.
 pub const B1U_POLARITY_LEAD: u64 = 8;
+
+/// How many arms B1u is read through: the four combinations of the two things
+/// about a far end's data mode that a *conformant* far end is still free to
+/// choose, and that this end cannot read off the clause.
+///
+/// 1. **Polarity.** Every sequence before B1u is antipodal or differentially
+///    encoded, so a line read upside down decodes them identically. B1u is the
+///    first thing whose polarity is the data mode's own -- which is why this end
+///    has run both ways up since `docs/36`.
+/// 2. **Which half of each 4D pair the far end's class rotation lands on.**
+///    `docs/39` measured two far ends whose B1u symbol streams differ by
+///    `c = -c' + delta_k (mod 8)` with `delta = 0` at k = 0, 2 and `delta = -2`
+///    at k = 1, 3: the same two-class rotation `PAIR_FIRST_INDEX_OFFSET` puts on
+///    the pair-first half, but on the pair-**second** half. One global delta
+///    fits 51.2 %, so no constant serves both; the arm is measured per call.
+///
+/// The rotation's size (two classes) is not an arm: both far ends measured so
+/// far use two, and sixteen arms would cost four times as much to measure a
+/// number the clause's own structure already pins. See [`PairHalf`].
+pub const B1U_ARMS: usize = 4;
+
+/// The arm's polarity, `+1` or `-1`, by arm index: 0 and 1 as received, 2 and 3
+/// negated.
+fn arm_polarity(arm: usize) -> f64 {
+    if arm < 2 { 1.0 } else { -1.0 }
+}
+
+/// The arm's class map: even arms on the pair's first half, odd on the second.
+fn arm_pair(arm: usize) -> PairHalf {
+    if arm % 2 == 0 { PairHalf::First } else { PairHalf::Second }
+}
+
+/// The polarity and the half, written out, so that a log says which arm won in
+/// terms a reader can check against `docs/39`.
+fn arm_name(arm: usize) -> &'static str {
+    match arm {
+        0 => "pair-first, as received",
+        1 => "pair-second, as received",
+        2 => "pair-first, negated",
+        _ => "pair-second, negated",
+    }
+}
+
+/// Data frames of B1u the four arms are scored over before three of them are
+/// dropped: `V92_B1U_DECIDE_FRAMES`, twelve by default.
+///
+/// Why a lead block at all: four decoders for the whole window is four times
+/// the per-symbol work of one, and B1u's bits are dropped whichever arm wins, so
+/// what the other three are for is the *decision* and nothing else. What has to
+/// survive is the winner's state, and that is what the swap keeps.
+///
+/// Why twelve: the window the arms are compared over has to be long enough to
+/// separate 98 % from 67 %, and twelve data frames is 432 bits against a gate
+/// that is already made on 576. Measured, the arm that wins this block wins the
+/// window on both captures -- see the four-arm table in
+/// `docs/40-b1u-derived-parameters.md`.
+///
+/// It costs more symbols than it reads, because the Viterbi's window is
+/// `SURVIVOR_DEPTH` = 40 trellis frames ahead of its decisions: the first bit
+/// comes out 160 symbols in. So the block is 12 x 36 = 432 bits = 144 decided
+/// symbols, and the arm decision lands at 304 of the window's 361 scored
+/// symbols -- 4 arms over 304 symbols plus 1 over the remaining 57, against 1
+/// arm over 361 before.
+fn b1u_decide_frames() -> u64 {
+    use std::sync::OnceLock;
+    static FRAMES: OnceLock<u64> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("V92_B1U_DECIDE_FRAMES").ok().and_then(|text| text.parse().ok()).unwrap_or(12)
+    })
+}
+
+/// The dead-band a per-position DC estimate has to clear before it is applied,
+/// in half-steps of G: `V92_B1U_DC_DEADBAND`, a tenth by default.
+///
+/// It is measured, not aesthetic. The same estimator -- mean residual to the
+/// nearest data-mode level over B1u's score window -- reads **0.039 / 0.031 /
+/// 0.055 / 0.014** half-steps on `/tmp/p0corr/ident.raw` and **0.314 / 0.084 /
+/// 0.092 / 0.326** on HSF (`docs/39` §5, reproduced here by
+/// `install_b1u_dc`'s own note). So a conformant far end is left untouched by
+/// any dead-band above 0.06, and the far end that needs it is four times
+/// outside. A tenth sits between them with room on both sides; the knob is
+/// there so that the margin can be measured rather than argued.
+fn b1u_dc_deadband() -> f64 {
+    use std::sync::OnceLock;
+    static BAND: OnceLock<f64> = OnceLock::new();
+    *BAND.get_or_init(|| {
+        std::env::var("V92_B1U_DC_DEADBAND").ok().and_then(|text| text.parse().ok()).unwrap_or(0.1)
+    })
+}
 
 /// "B1d consists of 48 data frames of scrambled ones" (V.90 8.6.1), the signal
 /// that comes between Ed and the data.
@@ -1501,19 +1591,40 @@ pub struct Modem {
     upstream_delay: usize,
     /// Symbols of B1u still to be skipped for that delay.
     b1u_skip: usize,
-    /// The same decoder on the other polarity, kept while B1u is being read
-    /// both ways up: see [`Self::b1u_polarity`] and `decide_b1u_polarity`.
-    b1u_probe: Option<Decoder>,
-    /// Ones each decoder has read out of B1u: `[0]` is the line as it arrived,
-    /// `[1]` is it negated.
-    b1u_ones: [u64; 2],
-    /// Bits each of them has read, for the margin the choice is made on.
-    b1u_scored: [u64; 2],
-    /// Symbols of B1u still to be read both ways up before the choice is made.
+    /// The three arms that are not [`Self::upstream_data`]: while B1u is being
+    /// read four ways, arm 0 lives where the data decoder always has and the
+    /// other three live here (see [`B1U_ARMS`] and `decide_b1u_arm`).
+    b1u_arms: [Option<Decoder>; B1U_ARMS],
+    /// Ones each arm has read out of B1u, by arm index.
+    b1u_ones: [u64; B1U_ARMS],
+    /// Bits each arm has read, for the margin the choice is made on.
+    b1u_scored: [u64; B1U_ARMS],
+    /// The same two counts at the moment the arm was chosen, which is the last
+    /// moment all four were scored over the same bits: the family-wide lead
+    /// [`B1U_POLARITY_LEAD`] is applied here and not to counts of different
+    /// lengths.
+    b1u_lead_ones: [u64; B1U_ARMS],
+    b1u_lead_scored: u64,
+    /// The arm that won, once the lead block has been read.
+    b1u_arm: Option<usize>,
+    /// Bits each arm has to have read before the arms are compared. Zero when
+    /// no arm is being scored.
+    b1u_decide: u64,
+    /// Symbols of B1u still to be read through the arms.
     b1u_scoring: usize,
     /// Which way up the data mode is, +1 or -1, applied to the equaliser's
-    /// output before the decoder sees it. See [`Self::b1u_scoring`].
+    /// output before the decoder sees it. It is the winning arm's polarity, set
+    /// when the arm is chosen. See [`Self::b1u_scoring`].
     b1u_polarity: f64,
+    /// The data mode's level table, as `begin_b1u` gave the slicer: the points a
+    /// per-position DC estimate measures its residual against.
+    b1u_lattice: Vec<f64>,
+    /// Per-position DC estimate over B1u, in half-steps of G and in the sign of
+    /// the line as it arrived: `sum / count` is the mean residual at that
+    /// trellis position. `install_b1u_dc` turns it into the correction a
+    /// decoder applies (see [`crate::v92::decoder::Decoder::dc`]).
+    b1u_dc_sum: [f64; TRELLIS_FRAME],
+    b1u_dc_count: [u64; TRELLIS_FRAME],
     /// Upstream data bits the decoder has produced since B1u began.
     upstream_bits: u64,
     /// DTE bits fed in from above, sent as B1d's payload (9.6.1.1.5).
@@ -1654,11 +1765,18 @@ impl Modem {
             upstream_scale: 1.0,
             upstream_delay: 0,
             b1u_skip: 0,
-            b1u_probe: None,
-            b1u_ones: [0; 2],
-            b1u_scored: [0; 2],
+            b1u_arms: [None, None, None, None],
+            b1u_ones: [0; B1U_ARMS],
+            b1u_scored: [0; B1U_ARMS],
+            b1u_lead_ones: [0; B1U_ARMS],
+            b1u_lead_scored: 0,
+            b1u_arm: None,
+            b1u_decide: 0,
             b1u_scoring: 0,
             b1u_polarity: 1.0,
+            b1u_lattice: Vec::new(),
+            b1u_dc_sum: [0.0; TRELLIS_FRAME],
+            b1u_dc_count: [0; TRELLIS_FRAME],
             peak: 0.0,
             notes: Vec::new(),
         };
@@ -2731,8 +2849,16 @@ impl Modem {
         // The slicer moves to CPd's constellation and the equaliser stays: the
         // prefilter the far end runs is this end's design of it, and on a line
         // with insertion loss it is never exact.
+        //
+        // The table is kept: it is what the per-position DC estimator measures
+        // its residual against (see [`Self::b1u_dc_sum`]), and it is the data
+        // mode's own lattice rather than an odd-integer ideal, so an estimate on
+        // a CPd whose levels are not 1, 3, ..., 15 is still a residual to the
+        // levels the far end was told to send.
+        self.b1u_lattice = levels.clone();
         self.rx.set_data_mode(levels);
-        self.upstream_data = Some(Decoder::new(&parameters));
+        // Arm 0, where the straight decoder has always lived.
+        self.upstream_data = Some(Decoder::with_pair(&parameters, PairMap::measured(PairHalf::First)));
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
         // run was found to have ended on.
         //
@@ -2829,19 +2955,34 @@ impl Modem {
             );
         }
         // `b1u_pending` and the deadline stay armed: a candidate that does not
-        // read as B1u (see `decide_b1u_polarity`) hands the hunt back, and the
-        // deadline is what ends the exchange if none of them does.
-        // Both ways up, until B1u says which one it is: 8.7.1 makes those 48
-        // data frames known, so the polarity that reads them as ones is the
-        // line's and the other is an equaliser that TRN2u's own seed left
-        // inverted. The window is the rest of B1u, and its bits are B1u's --
-        // which carry nothing -- so both decoders' output is dropped while it
-        // runs.
-        self.b1u_probe = Some(Decoder::new(&parameters));
-        self.b1u_ones = [0; 2];
-        self.b1u_scored = [0; 2];
+        // read as B1u (see `decide_b1u`) hands the hunt back, and the deadline
+        // is what ends the exchange if none of them does.
+        // Four ways, until B1u says which arm it is: 8.7.1 makes those 48 data
+        // frames known (post-descrambling, 576 ones), so the arm that reads them
+        // as ones is the line's -- polarity *and* the half of the 4D pair the
+        // far end's class rotation lands on ([`B1U_ARMS`]). The window is the
+        // rest of B1u, and its bits are B1u's -- which carry nothing -- so every
+        // arm's output is dropped while it runs.
+        //
+        // Arm 0 takes `upstream_data`, where the straight decoder has always
+        // lived, so the arm that wins with no swap costs no move; the other
+        // three are built here and dropped the moment the arm is chosen.
+        self.b1u_arms = [None, None, None, None];
+        for arm in 1..B1U_ARMS {
+            self.b1u_arms[arm] =
+                Some(Decoder::with_pair(&parameters, PairMap::measured(arm_pair(arm))));
+        }
+        self.b1u_ones = [0; B1U_ARMS];
+        self.b1u_scored = [0; B1U_ARMS];
+        self.b1u_lead_ones = [0; B1U_ARMS];
+        self.b1u_lead_scored = 0;
+        self.b1u_arm = None;
+        let bits_per_frame = u64::from(crate::v92::up_bits(parameters.drn));
+        self.b1u_decide = b1u_decide_frames().saturating_mul(bits_per_frame);
         self.b1u_scoring = (B1U_FRAMES * crate::v92::UP_INTERVALS).saturating_sub(self.b1u_skip);
         self.b1u_polarity = 1.0;
+        self.b1u_dc_sum = [0.0; TRELLIS_FRAME];
+        self.b1u_dc_count = [0; TRELLIS_FRAME];
         self.note(format!(
             "V.92: B1u from symbol {}, {} bit/s, scale {:.3}, taps {:?}",
             self.now,
@@ -3103,8 +3244,9 @@ impl Modem {
         }
     }
 
-    /// B1u through both polarities' decoders at once, so that the call can say
-    /// which way up the data mode is instead of inheriting it from TRN2u.
+    /// B1u through all four arms at once, so that the call can say which way up
+    /// the data mode is -- and which half of the 4D pair its class rotation
+    /// lands on -- instead of inheriting either from TRN2u or from a constant.
     ///
     /// Why this is needed at all: every sequence before B1u is antipodal or
     /// differentially encoded, so a line read upside down decodes them
@@ -3126,7 +3268,13 @@ impl Modem {
     /// and the prefilter at its first symbol and sends 48 data frames of ones.
     /// So the polarity that reads those frames as ones is the line's, and it is
     /// measurable by decoding them both ways up -- which is what this does. The
-    /// bits are B1u's, which carry no information, so both are dropped.
+    /// bits are B1u's, which carry no information, so all four are dropped.
+    ///
+    /// The second axis is [`B1U_ARMS`]'s other one: the half of the 4D pair the
+    /// far end's class rotation lands on, which `docs/39` measured to differ
+    /// between two conformant far ends. Its bits are B1u's too, so the arms cost
+    /// nothing but the lead block they are decided over (see
+    /// [`b1u_decide_frames`]).
     fn score_b1u(&mut self, level: f64) {
         if let Some(file) = b1u_levels_file()
             && let Ok(mut file) = file.lock()
@@ -3134,56 +3282,175 @@ impl Modem {
             use std::io::Write;
             let _ = writeln!(file, "{} {level:.9} score", self.now);
         }
+        // The trellis position this symbol will be fed at, taken from the
+        // decoder that is counting them rather than from a counter of this
+        // module's: it is the position 6.4.2's k is indexed by, and it survives
+        // any `V92_B1U_SKIP` a diagnostic asks for.
+        let k = self.upstream_data.as_ref().map_or(0, |d| d.symbols() % TRELLIS_FRAME as u64) as usize;
         // The same transform the data path takes (`V92_B1U_ADJ`), so that a
         // diagnostic asked for here is measured on the reading the criterion
         // uses and not on a reading nothing else sees. Empty is the default and
         // does nothing.
         let level = self.adjust_b1u_level(level);
-        for (which, sign) in [1.0, -1.0].into_iter().enumerate() {
-            let decoder = if which == 0 {
-                self.upstream_data.as_mut()
-            } else {
-                self.b1u_probe.as_mut()
-            };
+        // The per-position DC estimate, on the line as it arrived: polarity is
+        // the winning arm's and is folded in by `install_b1u_dc`, and the
+        // residual is taken against the data mode's own level table, so this
+        // accumulates nothing a far end's mapping could bias.
+        self.accumulate_b1u_dc(k, level);
+        for arm in 0..B1U_ARMS {
+            if self.b1u_arm.is_some_and(|winner| winner != arm) {
+                // Dropped once the arm is chosen: their state is not the
+                // call's, and only the winner's is kept.
+                continue;
+            }
+            let decoder =
+                if arm == 0 { self.upstream_data.as_mut() } else { self.b1u_arms[arm].as_mut() };
             let Some(decoder) = decoder else { continue };
-            decoder.feed(sign * level);
+            decoder.feed(arm_polarity(arm) * level);
             let bits = decoder.take_bits();
-            self.b1u_ones[which] += bits.iter().filter(|bit| **bit).count() as u64;
-            self.b1u_scored[which] += bits.len() as u64;
+            self.b1u_ones[arm] += bits.iter().filter(|bit| **bit).count() as u64;
+            self.b1u_scored[arm] += bits.len() as u64;
             if let Some(file) = b1u_bits_file()
                 && let Ok(mut file) = file.lock()
             {
                 use std::io::Write;
                 let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
-                let _ = writeln!(file, "{} {} {text}", self.now, if which == 0 { 1 } else { -1 });
+                // The arm is appended rather than replacing the polarity, so
+                // that a reader that only wants the sign keeps working: the
+                // field order is `symbol sign bits arm`.
+                let _ = writeln!(
+                    file,
+                    "{} {} {text} {arm}",
+                    self.now,
+                    if arm_polarity(arm) > 0.0 { 1 } else { -1 }
+                );
             }
         }
         self.b1u_scoring -= 1;
+        if self.b1u_arm.is_none()
+            && (self.b1u_scored[0] >= self.b1u_decide || self.b1u_scoring == 0)
+        {
+            self.decide_b1u_arm();
+        }
         if self.b1u_scoring == 0 {
-            self.decide_b1u_polarity();
+            self.decide_b1u();
         }
     }
 
-    /// Which way up B1u came, from the two readings [`Self::score_b1u`] took.
+    /// One symbol's residual against the nearest data-mode level, accumulated
+    /// per trellis position. See [`Self::b1u_dc_sum`].
+    fn accumulate_b1u_dc(&mut self, k: usize, level: f64) {
+        let Some(nearest) = self
+            .b1u_lattice
+            .iter()
+            .copied()
+            .min_by(|a, b| (level - a).abs().total_cmp(&(level - b).abs()))
+        else {
+            return;
+        };
+        let gain = self.parameters.as_ref().map_or(1.0, |p| p.gain);
+        if gain <= 0.0 {
+            return;
+        }
+        self.b1u_dc_sum[k] += (level - nearest) / gain;
+        self.b1u_dc_count[k] += 1;
+    }
+
+    /// Which arm B1u came through, from the four readings [`Self::score_b1u`]
+    /// has taken -- and then the three that did not win are dropped, keeping
+    /// only the winner's decoder and equaliser state.
     ///
-    /// The margin is not a taste: B1u's data is *all* ones, so the right
-    /// polarity reads every bit as one and the wrong one reads a fixed wrong
-    /// pattern in its place (measured on an Agere: 30 of every 36 bits, and no
-    /// frame of all ones). An eighth of the window is far outside both, and a
-    /// window where the two readings are that close is one where neither was
-    /// reading B1u -- so it keeps what the receiver had rather than inventing a
-    /// polarity out of noise.
-    fn decide_b1u_polarity(&mut self) {
-        let scored = self.b1u_scored[0].min(self.b1u_scored[1]);
-        let (straight, flipped) = (self.b1u_ones[0], self.b1u_ones[1]);
-        // The polarity verdict is unchanged; what is new is that it is also the
-        // boundary's verdict. See [`B1U_CONFIRM_EIGHTHS`] for why the ratio and
-        // the lead are both needed, and for the arm that shows one is not
-        // enough.
-        let inverted = std::env::var("V92_B1U_POLARITY").ok().as_deref() != Some("off")
-            && scored > 0
-            && flipped > straight + scored / B1U_POLARITY_LEAD;
-        let (best, other) = (straight.max(flipped), straight.min(flipped));
+    /// The rule is the one this end has always used for polarity:
+    /// B1u's data is *all* ones (8.7.1), so the arm that reads the most ones is
+    /// the line's. Ties go to the lowest arm index, i.e. to the arm that is
+    /// neither inverted nor rotated, which is the receiver's prior.
+    ///
+    /// `V92_B1U_POLARITY=off` still means what it did -- decide the polarity
+    /// from the exchange and not from B1u -- so the winner is drawn from the two
+    /// as-received arms only. (The gate below still reads the whole family: it
+    /// has always taken the better polarity's count, whichever way up the call
+    /// ends up reading.)
+    fn decide_b1u_arm(&mut self) {
+        let scored = self.b1u_scored[0];
+        if scored == 0 {
+            // Nothing was decoded -- an empty constellation, or a window shorter
+            // than the Viterbi's own delay. Nothing to choose on; keep arm 0 and
+            // let the gate say what that reads as.
+            self.b1u_lead_ones = self.b1u_ones;
+            self.b1u_lead_scored = scored;
+            self.b1u_arm = Some(0);
+            self.b1u_decide = 0;
+            return;
+        }
+        let inverted_allowed = std::env::var("V92_B1U_POLARITY").ok().as_deref() != Some("off");
+        let arms: Vec<usize> =
+            (0..B1U_ARMS).filter(|arm| inverted_allowed || arm_polarity(*arm) > 0.0).collect();
+        let winner = arms
+            .into_iter()
+            .max_by_key(|arm| (self.b1u_ones[*arm], std::cmp::Reverse(*arm)))
+            .unwrap_or(0);
+        self.b1u_lead_ones = self.b1u_ones;
+        self.b1u_lead_scored = scored;
+        self.b1u_arm = Some(winner);
+        self.b1u_decide = 0;
+        self.b1u_polarity = arm_polarity(winner);
+        self.note(format!(
+            "V.92: B1u arm {winner} of {B1U_ARMS} ({}) at {scored} bits: {}",
+            arm_name(winner),
+            (0..B1U_ARMS)
+                .map(|arm| format!("{} {}/{}", arm_name(arm), self.b1u_ones[arm], self.b1u_scored[arm]))
+                .collect::<Vec<String>>()
+                .join("; ")
+        ));
+        if winner != 0 {
+            // The winner's own decoder, with the eighteen data frames of
+            // equaliser and Viterbi state it has already been given, becomes the
+            // call's decoder. That is the whole reason the arms carry decoders
+            // and not just counters: swapping in a fresh one would throw away the
+            // acquisition the arms have already paid for.
+            self.upstream_data = self.b1u_arms[winner].take();
+        }
+        self.b1u_arms = [None, None, None, None];
+    }
+
+    /// Whether this candidate boundary reads as B1u, and if it does, what the
+    /// winning arm's per-position level correction is.
+    ///
+    /// The margin is not a taste: B1u's data is *all* ones, so the right arm
+    /// reads every bit as one and a wrong one reads a fixed wrong pattern in its
+    /// place (measured on an Agere: 30 of every 36 bits, and no frame of all
+    /// ones). An eighth of the window is far outside both, and a window where
+    /// the two readings are that close is one where neither was reading B1u --
+    /// so it keeps what the receiver had rather than inventing a polarity out of
+    /// noise. See [`B1U_CONFIRM_EIGHTHS`] for why the ratio and the lead are
+    /// both needed, and for the arm that shows one is not enough.
+    ///
+    /// Two things changed when the arms became four, and neither weakens the
+    /// gate:
+    ///
+    /// * `best` is the **family-wide maximum** -- the most ones any of the four
+    ///   arms read over the whole window. It was the better of two polarities
+    ///   before, so it can only be higher, and the ratio it has to meet is the
+    ///   same 6/8 of the window.
+    /// * the lead is taken **where all four arms were scored over the same
+    ///   bits**: the end of the lead block ([`b1u_decide_frames`]), against the
+    ///   best of the two arms of the *other* polarity. That is the same
+    ///   arithmetic as before -- an eighth of the window, whole bits -- on the
+    ///   only window that is still a like-for-like comparison once three arms
+    ///   have been dropped.
+    fn decide_b1u(&mut self) {
+        let arm = self.b1u_arm.unwrap_or(0);
+        let scored = self.b1u_scored[arm];
+        let best = self.b1u_ones[arm];
+        let lead = self.b1u_lead_ones[arm];
+        let lead_scored = self.b1u_lead_scored;
+        // The other polarity's best arm, over the same bits: the family-wide
+        // maximum the lead rule is stated against.
+        let other = (0..B1U_ARMS)
+            .filter(|other| arm_polarity(*other) != arm_polarity(arm))
+            .map(|other| self.b1u_lead_ones[other])
+            .max()
+            .unwrap_or(0);
         // `V92_B1U_GATE=off` accepts every candidate, which is what measuring
         // the data mode below a boundary takes: the criterion lives above the
         // thing being measured, so a run that cannot pass it still has to be
@@ -3191,7 +3458,7 @@ impl Modem {
         let reads_as_b1u = std::env::var("V92_B1U_GATE").ok().as_deref() == Some("off")
             || (scored > 0
                 && best * 8 >= scored * B1U_CONFIRM_EIGHTHS
-                && best >= other + scored / B1U_POLARITY_LEAD);
+                && lead >= other + lead_scored / B1U_POLARITY_LEAD);
         if !reads_as_b1u {
             // Not a boundary. This is the whole point of the criterion: a
             // receiver that goes on to read data from a place it has just
@@ -3200,23 +3467,76 @@ impl Modem {
             self.abandon_b1u(best, other, scored);
             return;
         }
-        if inverted {
-            // The equaliser that was reading *this* polarity all along, not the
-            // one that read the other and would have a window of the wrong sign
-            // in its Viterbi's pipeline: its first forty trellis frames would be
-            // decided from a mixture.
-            std::mem::swap(&mut self.upstream_data, &mut self.b1u_probe);
-            self.b1u_polarity = -1.0;
-        }
-        self.b1u_probe = None;
         self.b1u_pending = false;
         self.b1u_deadline = None;
         self.awaiting_e2u = false;
-        let verdict = if inverted { "inverted, negating" } else { "as received" };
+        // The far end's per-position DC, from this window, applied from here on
+        // -- which is still inside B1u, whose remaining symbols are training and
+        // whose bits are dropped either way.
+        self.install_b1u_dc();
+        // Both numbers say what they are measured over. The winner read the
+        // whole window; the three that lost were dropped when the arm was
+        // chosen, so the family's split is quoted over the lead block, which is
+        // the last stretch all four were scored over.
+        let lead_of = |arms: [usize; 2]| -> String {
+            format!("{} {}", self.b1u_lead_ones[arms[0]], self.b1u_lead_ones[arms[1]])
+        };
+        let verdict = if arm_polarity(arm) < 0.0 { "inverted, negating" } else { "as received" };
         self.note(format!(
-            "V.92: B1u confirmed at {scored} bits: polarity {verdict} ({straight} ones straight, \
-             {flipped} negated), {:.1} % ones",
-            100.0 * best as f64 / scored as f64
+            "V.92: B1u confirmed at {scored} bits: {best} ones ({:.1} %), polarity {verdict}, \
+             arm {arm} ({}); over the {lead_scored}-bit lead block: straight {}, negated {}",
+            100.0 * best as f64 / scored as f64,
+            arm_name(arm),
+            lead_of([0, 1]),
+            lead_of([2, 3])
+        ));
+    }
+
+    /// The far end's per-position DC from the B1u that was just confirmed, as
+    /// the correction the winning decoder applies: mean residual per trellis
+    /// position, in half-steps of G, **only where it clears the dead-band**.
+    ///
+    /// Why a dead-band at all: the estimator is a mean, so it has a sampling
+    /// error, and a correction applied to a far end that does not need one is a
+    /// bias this end would be inventing. Measured with the same estimator on
+    /// the same window (`docs/39` §5, and this note prints it), an Agere
+    /// SV92PP reads 0.039 / 0.031 / 0.055 / 0.014 half-steps at k = 0..3 and
+    /// HSF reads 0.314 / 0.084 / 0.092 / 0.326. A tenth of a half-step is
+    /// between them with room on both sides -- twice the largest conformant
+    /// reading and a third of the smallest one that matters.
+    ///
+    /// The sign: the estimate is on the line as it arrived, and a decoder that
+    /// is fed `polarity * level` must be given `polarity * residual` to subtract,
+    /// because `polarity * (level - r)` is the level it is being corrected
+    /// towards.
+    fn install_b1u_dc(&mut self) {
+        let gain = self.parameters.as_ref().map_or(1.0, |p| p.gain);
+        let band = b1u_dc_deadband();
+        let mut dc = [0.0; TRELLIS_FRAME];
+        let mut shown = Vec::with_capacity(TRELLIS_FRAME);
+        for k in 0..TRELLIS_FRAME {
+            let count = self.b1u_dc_count[k];
+            if count == 0 {
+                shown.push(format!("k{k} -"));
+                continue;
+            }
+            let mean = self.b1u_dc_sum[k] / count as f64;
+            shown.push(format!("k{k} {mean:+.3}"));
+            if mean.abs() > band {
+                dc[k] = self.b1u_polarity * mean * gain;
+            }
+        }
+        if let Some(decoder) = self.upstream_data.as_mut() {
+            decoder.set_dc(dc);
+        }
+        let applied: Vec<String> = (0..TRELLIS_FRAME)
+            .filter(|k| dc[*k] != 0.0)
+            .map(|k| format!("k{k}={:+.3}", dc[k] / gain * self.b1u_polarity))
+            .collect();
+        self.note(format!(
+            "V.92: B1u per-position DC {} half-steps (dead-band {band}),              applied {} half-steps on the line as received",
+            shown.join(" "),
+            if applied.is_empty() { "none".to_string() } else { applied.join(" ") }
         ));
     }
 
@@ -3240,11 +3560,17 @@ impl Modem {
              {other} the other), still hunting E2u"
         ));
         self.upstream_data = None;
-        self.b1u_probe = None;
-        self.b1u_ones = [0; 2];
-        self.b1u_scored = [0; 2];
+        self.b1u_arms = [None, None, None, None];
+        self.b1u_ones = [0; B1U_ARMS];
+        self.b1u_scored = [0; B1U_ARMS];
+        self.b1u_lead_ones = [0; B1U_ARMS];
+        self.b1u_lead_scored = 0;
+        self.b1u_arm = None;
+        self.b1u_decide = 0;
         self.b1u_scoring = 0;
         self.b1u_polarity = 1.0;
+        self.b1u_dc_sum = [0.0; TRELLIS_FRAME];
+        self.b1u_dc_count = [0; TRELLIS_FRAME];
         self.rx.set_slicer(Slicer::FourPoint);
         self.awaiting_e2u = true;
         self.e2u_zeroes = 0;

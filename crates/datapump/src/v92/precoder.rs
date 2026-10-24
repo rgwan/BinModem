@@ -109,6 +109,15 @@ pub const TIE_TO_SMALLER_INDEX: bool = true;
 /// four positions were interchangeable. A flattened set is the sort of thing
 /// that turns into a two-index rotation on exactly the pair-first positions.
 /// That is a question for the design path, not for this constant.
+///
+/// **What this constant is now.** It is the *transmitter model's* parameter and
+/// nothing else: what this end's own encoder does, and what a receiver built to
+/// hear this end would have to undo. The *decoder* no longer reads it as a
+/// property of the far end -- `docs/39` measured a second far end that puts the
+/// same rotation on the pair's **other** half, and one constant cannot serve
+/// both -- so a call's decoder takes a [`PairMap`] measured on its own B1u (see
+/// [`PairHalf`] and `Modem::decide_b1u_arm`). `PairMap::model()` is this
+/// constant; `PairMap::measured()` is what a decoder uses.
 pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
 
 /// The offset in force: `PAIR_FIRST_INDEX_OFFSET` unless `V92_PAIR_OFFSET`
@@ -133,11 +142,106 @@ pub fn pair_first_index_offset() -> i64 {
     })
 }
 
-/// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
-/// "the two pairs (y(0),y(1)) and (y(2),y(3))", so k = 0 and k = 2 open one
-/// each and k = 3 is the one that gives up half its freedom to the code.
-fn opens_a_pair(k: usize) -> bool {
-    k % 2 == 0 && k != TRELLIS_FRAME - 1
+/// The rotation `PAIR_FIRST_INDEX_OFFSET` is, said in 6.4.2's *class*
+/// coordinates: how many classes a level's class moves along when the pair's
+/// half carries it.
+///
+/// The two numbers are equal because a class here holds one member per unit of
+/// class index, so an index offset of two is a class shift of two. They are
+/// named apart because they are applied in different places and are not the
+/// same measurement: the index offset is the *transmitter model's* (our own
+/// `Class::for_interval`), while the class shift is what a far end's encoder
+/// does and what this end's decoder has to undo -- on whichever half of the
+/// pair that far end chose. See [`PairHalf`].
+pub const PAIR_CLASS_SHIFT: i64 = PAIR_FIRST_INDEX_OFFSET;
+
+/// Which half of each 4D pair the far end's class shift lands on.
+///
+/// This is a **measured property of the far end's encoder**, not a clause. On
+/// the B1u symbol stream, with a level's class defined as
+/// `c = ((i - 1) / 2) mod 8` over the odd-lattice index `i = level / G`, two
+/// conformant-looking far ends differ by `c_hsf = -c_agere + delta_k (mod 8)`
+/// with `delta = 0` at k = 0, 2 and `delta = -2 (mod 8)` at k = 1, 3 -- a
+/// reflection plus a class shift of two on the pair-**second** half
+/// (`docs/39-b1u-symbol-level-comparison.md`: 172/192 = 89.6 % with k = 0, 1, 2
+/// at 144/144). One global delta fits only 51.2 %, so no single constant serves
+/// both far ends. `PAIR_FIRST_INDEX_OFFSET` is the same constant applied on the
+/// pair-first half, which is what `/tmp/p0corr/ident.raw` and an Agere SV92PP
+/// measure; `Second` is what
+/// `/tmp/hsf-v90-interop/20261024-063632-a41c-off-d1` measures.
+///
+/// The shift is two classes either way, which is why the hypothesis set the
+/// receiver enumerates is four arms -- two halves x two polarities -- and not
+/// sixteen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairHalf {
+    /// k = 0 and k = 2: the pair's first symbol, and where
+    /// `PAIR_FIRST_INDEX_OFFSET` has always been applied.
+    First,
+    /// k = 1 and k = 3: the pair's second symbol. At k = 3 the shift is applied
+    /// in class coordinates *before* 6.4.2's parity-then-halve branch, so there
+    /// it moves Ki by half the shift with the parity untouched -- a Ki-domain
+    /// shift of one, not two. That is why it is applied at the top of
+    /// [`index_to_ki`] and never to a Ki.
+    Second,
+}
+
+impl PairHalf {
+    /// Both halves, in the order the receiver's four arms are numbered.
+    pub const ALL: [PairHalf; 2] = [PairHalf::First, PairHalf::Second];
+
+    /// Whether this half carries the shift at trellis position `k`.
+    pub fn shifts(self, k: usize) -> bool {
+        match self {
+            PairHalf::First => k % 2 == 0 && k != TRELLIS_FRAME - 1,
+            PairHalf::Second => k % 2 == 1,
+        }
+    }
+}
+
+/// A far end's class map: how many classes the shift is, and which half of the
+/// pair it lands on.
+///
+/// Two constructions, and the difference between them is the point of the type.
+/// [`PairMap::model`] is *our transmitter's* -- the constant, on the pair-first
+/// half -- and is what the encoder side of this module, and so every property
+/// test that round-trips an index through a Ki, uses. [`PairMap::measured`] is a
+/// *decoder's*: the measured two classes, on the half this call's B1u named.
+/// Keeping them apart is what stops the receiver's accommodation of one far end
+/// from silently becoming a change to what this end transmits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairMap {
+    half: PairHalf,
+    shift: i64,
+}
+
+impl PairMap {
+    /// The far-end model's: the constant, on the pair's first half.
+    pub fn model() -> Self {
+        Self { half: PairHalf::First, shift: pair_first_index_offset() }
+    }
+
+    /// A decoder's: the measured shift, on the half this call's B1u named.
+    ///
+    /// The shift is [`PAIR_CLASS_SHIFT`], read through the same knob the model
+    /// reads ([`pair_first_index_offset`]), so that `V92_PAIR_OFFSET` keeps
+    /// meaning what it always did for a diagnostic run: the size of the
+    /// rotation. What the receiver derives per call is the *half*, and that is
+    /// the only thing an arm decides.
+    pub fn measured(half: PairHalf) -> Self {
+        Self { half, shift: pair_first_index_offset() }
+    }
+
+    /// Which half this map shifts.
+    pub fn half(self) -> PairHalf {
+        self.half
+    }
+
+    /// How many classes it moves at trellis position `k`: zero on the half it
+    /// leaves alone.
+    pub fn shift_at(self, k: usize) -> i64 {
+        if self.half.shifts(k) { self.shift } else { 0 }
+    }
 }
 
 /// The largest |G x v(n)| this module hands on, in the units 8.8.3 fixes,
@@ -326,15 +430,19 @@ impl Class {
     ///
     /// `parity` is the (eta_0 + eta_1 + eta_2 + Y0) mod 2 term and is read only
     /// at k = 3, where 6.4.2 puts it.
+    ///
+    /// The pair's class only *encoder* side of the chain is here, and it is
+    /// [`PairMap::model`]: what this end transmits. What a far end transmits is
+    /// measured on the call's B1u and used by the decoder alone
+    /// ([`PairMap::measured`]) -- the two are deliberately not the same object,
+    /// so that accommodating one far end cannot change what this end sends.
     pub fn for_interval(ki: u8, modulus: u8, k: usize, parity: bool) -> Self {
         let ki = i64::from(ki);
         let modulus = i64::from(modulus.max(1));
         if k == TRELLIS_FRAME - 1 {
             Self { base: 2 * ki + i64::from(parity), step: 2 * modulus }
-        } else if opens_a_pair(k) {
-            Self { base: ki + pair_first_index_offset(), step: modulus }
         } else {
-            Self { base: ki, step: modulus }
+            Self { base: ki + PairMap::model().shift_at(k), step: modulus }
         }
     }
 
@@ -385,16 +493,27 @@ fn ceiling(a: i64, b: i64) -> i64 {
 /// For k = 0, 1, 2 the class is eta = Ki + z Mi, so Ki is eta modulo Mi taken
 /// non-negative. For k = 3 the class is eta = 2Ki + 2z Mi + p, so the parity
 /// bit p comes off the bottom of eta first and Ki is ((eta - p) / 2) modulo Mi.
-pub fn index_to_ki(eta: i32, modulus: u8, k: usize) -> u8 {
+///
+/// `pair` is the far end's class map and it is applied here, in class
+/// coordinates, and *before* the k = 3 branch. Two reasons, and the second is
+/// why this is not a Ki-domain offset:
+///
+/// * 6.4.2's class at k = 3 is `2Ki + 2z Mi + p`, so a class shift of two
+///   leaves the parity alone (eta - 2 has eta's parity) and moves Ki by one.
+///   A Ki-domain shift of two would move the parity with it and decide a
+///   different subset on a quarter of the symbols.
+/// * the shift is uniform over the selected half, including k = 3, which is
+///   what `docs/39` measured: `delta = -2` at *both* k = 1 and k = 3.
+///
+/// Which half the shift lands on is a property of the far end's encoder
+/// ([`PairHalf`]), so a decoder passes [`PairMap::measured`] and the encoder
+/// side of this module passes [`PairMap::model`] -- see [`Class::for_interval`].
+pub fn index_to_ki(eta: i32, modulus: u8, k: usize, pair: PairMap) -> u8 {
+    let eta = eta - i32::try_from(pair.shift_at(k)).unwrap_or(0);
     let modulus = i32::from(modulus.max(1));
     if k == TRELLIS_FRAME - 1 {
         let parity = eta.rem_euclid(2);
         (((eta - parity) / 2).rem_euclid(modulus)) as u8
-    } else if opens_a_pair(k) {
-        // The pair's first index is measured from Ki + the offset the far end
-        // uses; see `PAIR_FIRST_INDEX_OFFSET`.
-        (i32::try_from(i64::from(eta) - pair_first_index_offset()).unwrap_or(eta)
-            .rem_euclid(modulus)) as u8
     } else {
         eta.rem_euclid(modulus) as u8
     }
@@ -859,7 +978,11 @@ mod tests {
             assert_eq!(symbol.out, symbol.u, "G = 1, so the output is the level itself");
             let set = chain.constellation(interval);
             assert_eq!(set.level(symbol.eta), Some(symbol.u), "the level is a(eta)");
-            assert_eq!(index_to_ki(symbol.eta, 4, k), ki, "the index is in E(Ki)");
+            assert_eq!(
+                index_to_ki(symbol.eta, 4, k, PairMap::model()),
+                ki,
+                "the index is in E(Ki), read back through the same map it was encoded with"
+            );
         }
     }
 
@@ -1104,7 +1227,7 @@ mod tests {
                 .expect("the set is not empty");
             assert_eq!(eta, symbol.eta, "the inverse channel lost the index at interval {interval}, k = {k}");
             assert_eq!(
-                index_to_ki(eta, moduli[interval], k),
+                index_to_ki(eta, moduli[interval], k, PairMap::model()),
                 ki,
                 "interval {interval} at k = {k}: index {eta} does not come back as Ki = {ki}"
             );
@@ -1203,7 +1326,7 @@ mod tests {
                 assert_eq!(class.index(0), 7, "2 x Ki + parity");
                 assert!(class.holds(7 - 14) && class.holds(7 + 14));
                 assert!(!class.holds(8), "the parity fixes which half the index is in");
-            } else if opens_a_pair(k) {
+            } else if PairHalf::First.shifts(k) {
                 assert_eq!(class.spacing(), 7, "k = {k} steps by Mi");
                 assert_eq!(
                     class.index(0),
