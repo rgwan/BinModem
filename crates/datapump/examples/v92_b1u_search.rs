@@ -164,6 +164,14 @@ fn levels_frames(path: &str, trace: &Trace, gain: f64) -> Result<Vec<[u8; UP_INT
 /// B1u as 8.7.1 says the analogue modem sends it: 48 data frames of ones
 /// through GPA and 6.4, from memories that were all zero at the first symbol.
 ///
+/// **It does not reproduce the control arm yet** -- see [`b1u_etas`] for the
+/// measurement. The parameters below are placeholders, not the call's CPd:
+/// `sets` is the µ-law *codes* 1,3,...,15 rather than the codes this end
+/// designed, and `filters` is the default rather than the z1/p1/z2 CPd carried.
+/// The next pass is to build it from the call's own CPd (`V92_CPD_TRACE`
+/// already logs one at V.92 level) and to make it agree with the Agere capture
+/// before it is pointed at HSF.
+///
 /// This is the *forward* reading of the same question the enumeration above
 /// asks backwards, and it is the stronger of the two: 8.7.1 zeroes every
 /// memory before B1u, so the expected level of every symbol of B1u is known
@@ -192,6 +200,43 @@ fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis) -> Vec<
         levels.push(index_to_ki(symbol.eta, trace.moduli[interval], interval % TRELLIS_FRAME));
     }
     levels
+}
+
+/// B1u's ideal point index, one per symbol, for the same forward model.
+///
+/// **This model does not yet reproduce the control arm, so its numbers are not
+/// evidence yet.** Measured: on `/tmp/p0corr/ident.raw` -- the call that reads
+/// 563/576 ones with 553 consecutive ones after the descrambler's 23-symbol
+/// span -- the class sequence this produces agrees with the capture's at 16.1 %
+/// at its best offset, against a chance of 12.5 %, and the dump written by
+/// `--dump-eta` agrees at 10-14 % at every shift from -2 to +24 symbols. The
+/// capture itself is not in doubt: the *same* capture through `--levels` and
+/// the production convention reads 576/576 ones, so the levels are B1u's and
+/// the model is what is wrong. Until that is fixed, any comparison against
+/// this model -- including `--forward`'s agreement column below, which has
+/// always used it -- is measuring the model, not the far end.
+///
+/// [`b1u_levels`] keeps only the class, which is what the digital modem has to
+/// recover; this keeps the point, which is what the *level* has to be near. The
+/// difference matters where a class has two members (6.4.2 lets the far end
+/// pick either), so a level comparison is only informative modulo the modulus
+/// -- but a *systematic* offset, which is what a wrong pair-first convention
+/// would be, shows up here as a mean in lattice steps and nowhere in the
+/// agreement count.
+fn b1u_etas(trace: &Trace, gain: f64, frames: usize, trellis: Trellis) -> Vec<i32> {
+    let parameters = Parameters {
+        drn: (0..=19u8).find(|&drn| datapump::v92::up_bits(drn) == trace.k).unwrap_or(1),
+        trellis,
+        extend_e2u: false,
+        gain,
+        moduli: trace.moduli,
+        filters: Filters { z2: vec![1.0], ..Filters::default() },
+        sets: vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
+        indices: [0; CONSTELLATION_FRAME],
+    };
+    let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
+    encoder.reset_all();
+    (0..(frames * UP_INTERVALS)).map(|_| encoder.next_symbol(|| true).eta).collect()
 }
 
 /// How well a forward B1u matches the capture at one symbol offset.
@@ -478,6 +523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // otherwise win every window.
     let mut within: Option<usize> = None;
     let mut forward = false;
+    let mut dump_eta: Option<String> = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -487,12 +533,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--levels" => levels = Some(args.next().ok_or("--levels wants a path")?),
             "--gain" => gain = args.next().ok_or("--gain wants a number")?.parse()?,
             "--forward" => forward = true,
+            "--dump-eta" => dump_eta = Some(args.next().ok_or("--dump-eta wants a path")?),
             "--within" => within = Some(args.next().ok_or("--within wants a frame count")?.parse()?),
             other => path = Some(other.to_owned()),
         }
     }
     let path = path.ok_or("usage: v92_b1u_search ETA_TRACE [--frames N]")?;
     let trace = read_trace(&path)?;
+    if let Some(out) = dump_eta.as_deref() {
+        let mut text = String::new();
+        for &trellis in &[Trellis::Sixteen, Trellis::ThirtyTwo, Trellis::SixtyFour] {
+            let etas = b1u_etas(&trace, gain, 64, trellis);
+            text.push_str(&format!("{trellis:?}"));
+            for eta in etas {
+                text.push_str(&format!(" {eta}"));
+            }
+            text.push('\n');
+        }
+        fs::write(out, text)?;
+        println!("etas written to {out}");
+        return Ok(());
+    }
     let frames = match levels.as_deref() {
         Some(path) => levels_frames(path, &trace, gain)?,
         None => trace.frames(),
@@ -520,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         let codes = [Trellis::Sixteen, Trellis::ThirtyTwo, Trellis::SixtyFour];
         for &trellis in &codes {
-        let b1u = b1u_levels(&trace, gain, 64, trellis);
+        let b1u = b1u_levels(&trace, gain, count, trellis);
         println!("\n  {trellis:?}: B1u from memories at zero, {} symbols, compared by Ki", b1u.len());
         println!("\n  {:>5}  {:>13}  agreement with the capture", "at", "agree");
         let mut rows = Vec::new();
