@@ -2195,11 +2195,22 @@ impl Modem {
             return None;
         };
         let limits = self.settings.limits;
+        // 8.8.3 makes the precoder, the prefilter and the rate this end's job,
+        // and CPd is how the far end is told what to run: an end that sends no
+        // CPd has told it nothing, and the far end's SUVu acknowledgement stays
+        // clear for ever (docs/27 section 0.5.5, docs/28 P2), so phase 4 never
+        // starts and no B1u is ever transmitted. A design that cannot be made
+        // legal is therefore answered with the identity -- which is legal in
+        // every field of Table 30 and honest about what will happen to the far
+        // end's symbols -- and the log says which and why. Silence is not one
+        // of the answers.
+        let mut degraded: Option<&'static str> = None;
         let mut designed = match design(&channel, &limits) {
             Ok(designed) => designed,
             Err(why) => {
                 eprintln!("V92TRACE: no upstream design: {why}");
-                return None;
+                degraded = Some(why);
+                crate::v92::design::identity(&channel)
             }
         };
         // Diagnostic: what the far end does with the filters in CPd, and what
@@ -2280,19 +2291,47 @@ impl Modem {
         // rung than the line carries costs bandwidth, a faster one costs the
         // call, and there is no measurement here that would justify the risk of
         // the second.
-        let mut noise = 10f64.powf(-self.rx.snr_db() / 10.0);
-        let mut choice = None;
-        for _ in 0..9 {
-            choice = choose(&designed, noise, ja, trellis);
-            if choice.is_some() {
-                break;
+        // The rung search at one assumed noise, with 6 dB taken off the noise
+        // each time the ladder refuses: the fit's own noise is an estimate of
+        // the line at 4000 Hz, where a loop has a null, so it is a floor and
+        // not a reading (see above).
+        let snr = self.rx.snr_db();
+        let rung = |designed: &crate::v92::design::Design| {
+            let mut noise = 10f64.powf(-snr / 10.0);
+            for _ in 0..9 {
+                if let Some(found) = choose(designed, noise, ja, trellis) {
+                    return Some((found, noise));
+                }
+                noise /= 4.0;
             }
-            noise /= 4.0;
-        }
-        let mut choice = choice;
-        let Some(choice) = choice.as_mut() else {
+            None
+        };
+        let mut found = rung(&designed);
+        if found.is_none() && degraded.is_none() {
+            // Nothing the rate ladder will carry comes out of this design, so
+            // the far end would be told nothing at all. Ask it to run no
+            // filters instead: the line's ISI is then this receiver's to undo,
+            // and phase 4 at least begins. The rung does not move -- `ja` below
+            // is the slowest the analogue modem allows either way.
+            let residual = designed.residual_db();
+            degraded = Some("no rung of the 6.1 ladder carries what the design leaves");
+            designed = crate::v92::design::identity(&channel);
+            // No filter is being sent, so nothing was scaled: the far end's
+            // output is on the levels' own scale.
+            self.upstream_scale = 1.0;
+            self.upstream_delay = designed.delay;
             eprintln!(
-                "V92TRACE: no upstream rung carries this line (noise {noise:.2e}, fit noise {:.2e}, residual {:.1} dB, ja {ja:#x})",
+                "V92TRACE: identity fallback: residual {residual:.1} dB, fit noise {:.2e}, ja {ja:#x}",
+                channel.noise
+            );
+            found = rung(&designed);
+        }
+        if let Some(reason) = degraded {
+            self.note(format!("V.92: upstream design degraded to identity ({reason})"));
+        }
+        let Some((mut choice, noise)) = found else {
+            eprintln!(
+                "V92TRACE: no upstream rung carries this line (fit noise {:.2e}, residual {:.1} dB, ja {ja:#x})",
                 channel.noise,
                 designed.residual_db()
             );

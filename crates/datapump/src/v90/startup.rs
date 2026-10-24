@@ -364,6 +364,9 @@ pub struct Digital {
     /// difference between "phase 4: B1d" and knowing the data phase never
     /// carried a frame.
     notes: Vec<String>,
+    /// Whether this phase 2's outcome has been told yet (see [`Self::step`]):
+    /// once each, because a retrain runs another phase 2.
+    info_told: bool,
 }
 
 impl Digital {
@@ -385,6 +388,7 @@ impl Digital {
             habits: digital::Habits::default(),
             connected_once: false,
             notes: Vec::new(),
+            info_told: false,
         }
     }
 
@@ -412,6 +416,7 @@ impl Digital {
             phase2::Modem::v90(Pcm::DigitalV92(self.info0d, wish), digital::FS, self.lead_in),
             digital::FS,
         );
+        self.info_told = false;
         self
     }
 
@@ -610,6 +615,7 @@ impl Digital {
             // V.34's phase 2 with V.90's INFO sequences in it.
             self.v92 = None;
             self.v34.restart_phase2();
+            self.info_told = false;
             return true;
         }
         match self.v90.as_mut() {
@@ -667,6 +673,7 @@ impl Digital {
                 self.failed_starts += 1;
                 self.v92 = None;
                 self.v34.restart_phase2();
+                self.info_told = false;
             }
             return out;
         }
@@ -683,12 +690,58 @@ impl Digital {
                 self.renegotiations += m.renegotiations();
                 self.v90 = None;
                 self.v34.restart_phase2();
+                self.info_told = false;
             }
             return out;
         }
         let out = self.v34.step(input);
         if matches!(self.v34.status(), v34::Status::Connected { .. }) {
             self.connected_once = true;
+        }
+        // Whether this call is V.92 or V.90 hangs on three bits and on nothing
+        // else on the line: this end's INFO0d bit 27, this end's INFO1d bit
+        // 70, and the far end's INFO0a bit 26 (9.3, 8.4.1). An analogue modem
+        // "shall not use" Table 18 when bit 70 is clear, so a run whose bit 70
+        // was clear is V.90 by construction and says nothing about V.92
+        // whatever else it measured -- which is exactly how a batch gets read
+        // as the wrong protocol. Told once per phase 2, and not behind
+        // PHASE2_TRACE.
+        if !self.info_told {
+            let p2 = self.v34.phase2();
+            if p2.status() == phase2::Status::Done {
+                self.info_told = true;
+                let bit70 = p2.info1c().is_some_and(|i| i.pcm_upstream());
+                let permission = if p2.both_v92() {
+                    ""
+                } else {
+                    " (a carrier flag, not a permission: both ends did not show V.92)"
+                };
+                let layout = if p2.info1a_pcm_up().is_some() {
+                    "table 18/V.92 (PCM upstream)"
+                } else if p2.info1a_pcm().is_some() {
+                    "table 10/V.90 (V.90 mode)"
+                } else if p2.info1a().is_some() {
+                    "table 11/V.34 (V.34 mode)"
+                } else {
+                    "none this end could act on"
+                };
+                let then = if p2.info1a_pcm_up().is_some() {
+                    "V.92 phase 3 (PCM upstream)"
+                } else if p2.info1a_pcm().is_some() {
+                    "V.90 phase 3"
+                } else {
+                    "V.34 phase 3"
+                };
+                let refused = match p2.refused_info1a() {
+                    Some(why) => format!(", another refused: {why}"),
+                    None => String::new(),
+                };
+                self.notes.push(format!(
+                    "V.92: phase 2 settled -- INFO0d bit 27 {}, INFO1d bit 70 {}{permission}; \
+                     far INFO0a bit 26 {}; far INFO1a {layout}{refused}; going to {then}",
+                    self.wish.capable, bit70, p2.far_pcm_flags().v92,
+                ));
+            }
         }
         let p2 = self.v34.phase2();
         if std::env::var_os("PHASE2_TRACE").is_some() && p2.status() == phase2::Status::Done {

@@ -328,6 +328,38 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
     Ok(Design { filters, residual: unreached.sqrt(), scale, limited, delay: main })
 }
 
+/// 8.8.3's answer when nothing the design can send is admissible: the far end
+/// runs no filters at all and the line's own ISI is this receiver's to undo.
+///
+/// `z2 = [1]`, no `z1`, no `p1`, no `p2` is legal in every field of Table 30
+/// (LZ1 = LP1 = LP2 = 0, LZ2 = 1, and `G` from `upchoice::gain_for`) and it is
+/// not a lie: it says exactly what will happen to the far end's symbols on the
+/// line. The alternative -- sending no CPd at all -- is what an end does when
+/// it has not designed anything, and it leaves the far end's SUVu
+/// acknowledgement clear for ever (docs/27 section 0.5.5), so phase 4 never
+/// starts and no B1u is ever transmitted (docs/28 P2).
+#[must_use]
+pub fn identity(channel: &Channel) -> Design {
+    let delay = channel
+        .taps
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .map_or(0, |(at, _)| at);
+    Design {
+        filters: Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() },
+        // Nothing is asked of the far end's precoder, so there is nothing for
+        // it to fail to cancel. Whatever ISI the design would have shortened is
+        // still on the line, and it is the *receiver's* equaliser that has to
+        // take it; the rate choice cannot see it through this design, which is
+        // why the caller keeps this fallback on the slowest rung.
+        residual: 0.0,
+        scale: 1.0,
+        limited: true,
+        delay,
+    }
+}
+
 /// The least-squares inverse of the channel inside `length` taps.
 ///
 /// Wiener-Hopf on the channel's own autocorrelation: the coefficients that
