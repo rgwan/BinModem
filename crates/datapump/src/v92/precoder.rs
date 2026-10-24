@@ -839,6 +839,54 @@ mod tests {
         }
     }
 
+    /// 6.4.2's class is "eta_k = Ki + z_k Mi", and z = 0 is an integer, so
+    /// **Ki is a member of its own equivalence class**. That is the clause read
+    /// as an assertion, with no capture and no far end in it.
+    ///
+    /// It is the test `PAIR_FIRST_INDEX_OFFSET` should never have survived.
+    /// The constant adds two indices on k = 0 and k = 2, which is exactly the
+    /// rotation that takes Ki = 0 to eta = 2 and Ki = 2 to eta = -4, i.e. it
+    /// moves the level table two places against Ki on half the intervals while
+    /// the clause requires "the indices are in the same order as the levels"
+    /// and puts no case for k = 0 or 2 at all -- only for k = 3.
+    ///
+    /// It fails at the committed offset, and it is `#[ignore]`d rather than
+    /// deleted so that the deviation cannot be forgotten again: see
+    /// `V92_PAIR_OFFSET` and `pair_first_index_offset`. Run it with
+    /// `cargo test -p datapump --lib ki_is_a_member -- --ignored` and it names
+    /// the triples: (k, Ki, lowest member of E(Ki)) = (0, 0, 2), (0, 1, 3),
+    /// (0, 2, 4), (2, 0, 2), ... -- i.e. Ki = 0 sits on the *second* positive
+    /// level instead of the first, and Ki = 2 wraps to the most negative one.
+    #[test]
+    #[ignore = "6.4.2's eta_k = Ki + z_k Mi is violated on k = 0, 2 by PAIR_FIRST_INDEX_OFFSET"]
+    fn ki_is_a_member_of_its_own_equivalence_class() {
+        let mut wrong: Vec<(usize, u8, i64)> = Vec::new();
+        for modulus in 1..=8u8 {
+            // Only the clause's own first line: k = 0, 1, 2 are "eta_k = Ki +
+            // z_k Mi"; k = 3 is the exception and its members are 2Ki + ...,
+            // so Ki is not one and never was meant to be.
+            for k in 0..TRELLIS_FRAME - 1 {
+                for ki in 0..modulus {
+                    let class = Class::for_interval(ki, modulus, k, false);
+                    // The members are `base + z * step`; Ki is a member iff
+                    // (Ki - base) is a whole number of steps.
+                    let base = i64::from(class.index(0));
+                    let step = class.spacing();
+                    let off = i64::from(ki) - base;
+                    if step == 0 || off % step != 0 {
+                        wrong.push((k, ki, base));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "Ki is not in E(Ki) for {} (k, Ki, lowest member) triples: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(6)]
+        );
+    }
+
     /// Pitfall P-5: "v(n) = sum over kappa = 0..LZ2-1 of x(n-kappa) z2(kappa)"
     /// begins at kappa = 0, while "x(n) = u(n) + sum over kappa = 1..LZ1 of
     /// u(n-kappa) z1(kappa)" begins at kappa = 1 because u(n) is already there
