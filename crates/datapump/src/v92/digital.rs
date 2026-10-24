@@ -49,7 +49,7 @@ use crate::v90::ucode::{self, Law};
 use crate::v92::UP_INTERVALS;
 use crate::v92::decoder::Decoder;
 use crate::v92::receiver::reference;
-use crate::v92::design::{Channel, design};
+use crate::v92::design::{Channel, Design, design};
 use crate::v92::epsilon;
 use crate::v92::exchange::{Context, Exchange};
 use crate::v92::receiver::{ALIGN_WINDOW, Heard, Receiver, Slicer, Symbol, TRAIN_WINDOW};
@@ -492,11 +492,11 @@ pub struct Settings {
     ///
     /// L1 is transmitted by the analogue modem and received here (V.90
     /// 9.2.1.1.5, 9.2.2.1.5), so it is a measurement of the *upstream line* and
-    /// not of a fit through it, and it carries per-tone magnitude and per-tone
-    /// signal to noise -- exactly what a power-constrained transmit filter
-    /// wants. It used to be reduced to the V.34/V.90 summary and dropped. It
-    /// lives on the settings rather than on the modem because it is decided
-    /// before this modem exists: phase 2 is not this object's.
+    /// not of a fit through it. It carries per-tone magnitude and per-tone
+    /// signal to noise, which is what [`design::from_reading`] turns into the
+    /// far end's prefilter. It lives on the settings rather than on the modem
+    /// because it is decided before this modem exists: phase 2 and phase 3 are
+    /// not this object's.
     pub probing: Option<Reading>,
 }
 
@@ -1416,6 +1416,24 @@ pub struct Modem {
     notes: Vec<String>,
 }
 
+/// Where the upstream prefilter is designed from (V92-63).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefilter {
+    /// Phase 2's L1/L2 reading: per-tone magnitude and per-tone signal to
+    /// noise, the two things a power-constrained shaper wants.
+    Reading,
+    /// The least-squares fit of TRN1u: what there was before V92-63.
+    Fit,
+}
+
+/// [`Prefilter::Reading`] unless `V92_Z2=fit` says otherwise.
+fn prefilter_source() -> Prefilter {
+    match std::env::var("V92_Z2").ok().as_deref() {
+        Some("fit") => Prefilter::Fit,
+        _ => Prefilter::Reading,
+    }
+}
+
 impl Modem {
     /// From the end of Phase 2, silent until the analogue modem says Ru.
     #[must_use]
@@ -1502,9 +1520,10 @@ impl Modem {
             peak: 0.0,
             notes: Vec::new(),
         };
-        // V92-63: phase 2 measured the upstream channel and this is where the
-        // measurement used to stop. Say what was kept, once, so that a call's
-        // transcript shows the reading arriving even if nothing else does.
+        // V92-63: phase 2 measured the upstream channel and used to drop the
+        // measurement on the floor here. Say what was kept, once, so that a
+        // call's transcript says the reading arrived even before the design
+        // that uses it is computed.
         if let Some(reading) = modem.settings.probing.clone() {
             modem.note(format!("V.92: L1 probing retained: {}", reading.summary()));
             modem.note(format!("V.92: L1 probing per tone: {}", reading.compact()));
@@ -2199,6 +2218,59 @@ impl Modem {
         }
     }
 
+    /// 8.8.3's prefilter, from whichever measurement of the upstream this call
+    /// has: phase 2's L1 reading where it survived, the TRN1u fit otherwise,
+    /// and the identity where neither makes a legal design.
+    ///
+    /// V92-63. The reading comes first because it is the only measurement here
+    /// of the *line*. TRN1u is a two-point stream with two thirds of its power
+    /// at 4000 Hz, where a loop has a null, so a fit through it says more about
+    /// the null than about the channel; L1 is the analogue modem's own probing
+    /// signal, flat across the band, and what this receiver makes of it is the
+    /// channel. `V92_Z2=fit` puts the old design back in front for a bench
+    /// comparison.
+    ///
+    /// What is logged here is deliberately loud: a bench call has to be able to
+    /// audit the reading and the design that came out of it without gdb, so the
+    /// reading goes in as one line of twenty-one tones and the design as its
+    /// predicted level, its window, the tilt it took out and the flatness it
+    /// reached, plus the same twenty-one tones with what the section does to
+    /// each.
+    fn upstream_design(
+        &mut self,
+        channel: &Channel,
+        limits: &FilterLimits,
+    ) -> (Design, Option<&'static str>) {
+        if let Some(reading) = self.settings.probing.clone() {
+            self.note(format!(
+                "V.92: upstream design from the retained L1 reading: {}",
+                reading.summary()
+            ));
+            if prefilter_source() == Prefilter::Reading {
+                match crate::v92::design::from_reading(&reading, limits) {
+                    Ok((designed, predicted)) => {
+                        self.note(format!("V.92: z2 from the L1 reading: {}", predicted.summary()));
+                        self.note(format!(
+                            "V.92: z2 per tone (H/snr/Z2/Z2H, dB): {}",
+                            predicted.table()
+                        ));
+                        return (designed, None);
+                    }
+                    Err(why) => self.note(format!(
+                        "V.92: no z2 from the L1 reading ({why}); designing from the TRN1u fit"
+                    )),
+                }
+            }
+        }
+        match design(channel, limits) {
+            Ok(designed) => (designed, None),
+            Err(why) => {
+                eprintln!("V92TRACE: no upstream design: {why}");
+                (crate::v92::design::identity(channel), Some(why))
+            }
+        }
+    }
+
     /// 6.4 from the channel the second TRN1u measured: the fastest rung of the
     /// upstream ladder this line carries, or the slowest it will take.
     fn design_upstream(&mut self, from: u64) -> Option<Parameters> {
@@ -2233,15 +2305,7 @@ impl Modem {
         // every field of Table 30 and honest about what will happen to the far
         // end's symbols -- and the log says which and why. Silence is not one
         // of the answers.
-        let mut degraded: Option<&'static str> = None;
-        let mut designed = match design(&channel, &limits) {
-            Ok(designed) => designed,
-            Err(why) => {
-                eprintln!("V92TRACE: no upstream design: {why}");
-                degraded = Some(why);
-                crate::v92::design::identity(&channel)
-            }
-        };
+        let (mut designed, mut degraded) = self.upstream_design(&channel, &limits);
         // Diagnostic: what the far end does with the filters in CPd, and what
         // happens when it is asked for none at all.
         //   none  -> z2 = [1]: pass-through, no filtering
@@ -3207,37 +3271,64 @@ mod tests {
         }
     }
 
-    /// V92-63: phase 2 measures the upstream channel with L1 and this modem is
-    /// handed the measurement. It is kept, and it says so in the transcript a
-    /// bench call is read from.
+    /// V92-63, end to end: an L1 through the analyzer becomes a `Reading`, the
+    /// reading is put on the settings the way phase 2's handover puts it there
+    /// (`v90::startup`), and it is still there -- and logged -- at the point
+    /// where the upstream design is computed.
+    ///
+    /// This is the log a bench call is audited from, so the test prints it.
     #[test]
-    fn the_probing_reading_is_kept_where_the_upstream_is_designed() {
-        use crate::v34::probe::{Tone, TONES};
-        let reading = Reading {
-            tones: TONES
+    fn the_l1_reading_survives_to_the_upstream_design() {
+        // A synthetic L1 through a line 15 dB down and falling 6 dB, with
+        // noise under it, at the V.92 digital modem's own rate.
+        const FS: f64 = 8000.0;
+        let mut analyzer = crate::v34::probe::Analyzer::new(FS);
+        let mut seed = 17u32;
+        for i in 0..8000 {
+            let t = i as f64 / FS;
+            let signal: f64 = crate::v34::probe::TONES
                 .iter()
-                .enumerate()
-                .map(|(at, &(frequency, _))| Tone {
-                    frequency,
-                    gain_db: -18.0 - 4.0 * at as f64,
-                    snr_db: 41.0,
+                .map(|&(f, phase)| {
+                    let gain = 10f64.powf((-15.0 - 6.0 * (f - 150.0) / 3600.0) / 20.0);
+                    gain * (std::f64::consts::TAU * f * t + phase.to_radians()).cos()
                 })
-                .collect(),
-            frequency_offset: Some(0.0),
-        };
+                .sum::<f64>()
+                * 0.2;
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (f64::from(seed) / f64::from(u32::MAX) - 0.5) * 0.002;
+            analyzer.feed(signal + noise);
+        }
+        let reading = analyzer.reading().expect("an L1 of one second is a reading");
+        assert_eq!(reading.tones.len(), 21);
+
+        // The handover, as `v90::startup` does it: the reading goes on the
+        // settings the phase 3 modem is built from.
         let mut settings = settings();
-        assert!(settings.probing.is_none(), "a modem with no probing has none");
-        settings = settings.with_probing(Some(reading));
+        settings.probing = Some(reading);
         let mut modem = Modem::new(settings);
         let notes = modem.take_notes();
         assert!(
-            notes.iter().any(|line| line.contains("V.92: L1 probing retained: 21 tones 150-3750 Hz")),
-            "the reading was dropped: {notes:?}"
+            notes.iter().any(|line| line.contains("L1 probing retained")),
+            "the modem cannot see the reading: {notes:?}"
         );
-        assert!(
-            notes.iter().any(|line| line.contains("150Hz") && line.contains("/41.0")),
-            "the reading is not in the transcript tone by tone: {notes:?}"
-        );
+
+        // ...and at the point the upstream design is computed, where it used to
+        // be dropped.
+        let channel = Channel { taps: vec![1.0, -0.2, 0.05], noise: 1e-6, signal: 1.0 };
+        let limits = FilterLimits::from_info1a(3, 3, 3);
+        let (designed, degraded) = modem.upstream_design(&channel, &limits);
+        for line in modem.take_notes() {
+            eprintln!("{line}");
+        }
+        assert!(degraded.is_none(), "{degraded:?}");
+        assert_eq!(designed.filters.z2.len(), crate::v92::design::READING_TAPS);
+        designed.filters.fits(&limits).unwrap_or_else(|error| panic!("{error}"));
+        // Level first: the design does not spend what the receiver's cliff is
+        // one decibel of.
+        let power: f64 = designed.filters.z2.iter().map(|tap| tap * tap).sum();
+        assert!(power >= 0.9995, "the design attenuates: sum z^2 {power:.4}");
     }
 
     /// The Phase 4 sequences this end puts on the line have to be readable by
