@@ -133,11 +133,21 @@ pub fn rotation_wanted() -> bool {
     })
 }
 
-/// How many symbols B1u is measured over: forty-eight per trellis position,
-/// half of the ninety `docs/46`'s tables were read with, which is enough for
-/// the bar in [`Measuring::rotation`] to separate a plateau from a tie and
-/// short enough to finish inside the Viterbi's own window.
-pub const ROTATION_SYMBOLS: u64 = 48 * TRELLIS_FRAME as u64;
+/// How many symbols B1u is measured over: forty per trellis position, i.e.
+/// a hundred and sixty symbols of B1u's five hundred and seventy-six.
+///
+/// Forty and not more because a decision cannot be re-taken: the Viterbi
+/// decides its first frame a hundred and sixty-four symbols in (`SURVIVOR_DEPTH`
+/// frames plus one, from the first symbol this decoder is fed), so a
+/// measurement that ran past that would either decide the first frames on the
+/// constant and the rest on the measurement -- two rotations in one B1u -- or
+/// have to hold the window open, which changes the decisions of exactly the
+/// frames it held. Forty samples a position is what fits before the first
+/// decision with the window untouched, and it is far more than the bar in
+/// [`Measuring::rotation`] needs: `docs/46`'s plateaus are per-position
+/// properties of the far end, not something that only shows up after ninety
+/// symbols.
+pub const ROTATION_SYMBOLS: u64 = 40 * TRELLIS_FRAME as u64;
 
 /// The classes a rotation can name: the period of 6.4.2's class map at the
 /// modulus every CPd this receiver has been handed carries (`docs/46 §2`).
@@ -629,12 +639,14 @@ impl Decoder {
         self.metrics = next;
         self.stages.push_back(stage);
         self.back.push_back(from);
-        // B1u is still being measured, so the rotation this window would be
-        // decided on is not known yet: the window is held open -- eight frames
-        // past its depth, the 192 symbols the measurement takes -- and drained
-        // as soon as it is. Holding it is what lets the measurement apply from
-        // B1u's first symbol rather than from wherever the window happened to
-        // get to.
+        // Belt and braces, and it does not fire with the acquisition skip this
+        // receiver uses: a measurement that has not finished by the time the
+        // window is full would leave the first frames decided on the constant
+        // and the rest on the measurement, so the window is held open until it
+        // has. With `ROTATION_SYMBOLS` of a hundred and sixty the measurement
+        // is in a hundred and sixty symbols in and the first decision is at a
+        // hundred and sixty-four, so nothing here is ever held and the
+        // decisions of a measured call are the decisions of an unmeasured one.
         if self.measuring.is_some() {
             return;
         }
