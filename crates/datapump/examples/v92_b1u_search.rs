@@ -164,13 +164,25 @@ fn levels_frames(path: &str, trace: &Trace, gain: f64) -> Result<Vec<[u8; UP_INT
 /// B1u as 8.7.1 says the analogue modem sends it: 48 data frames of ones
 /// through GPA and 6.4, from memories that were all zero at the first symbol.
 ///
-/// **It does not reproduce the control arm yet** -- see [`b1u_etas`] for the
-/// measurement. The parameters below are placeholders, not the call's CPd:
-/// `sets` is the µ-law *codes* 1,3,...,15 rather than the codes this end
-/// designed, and `filters` is the default rather than the z1/p1/z2 CPd carried.
-/// The next pass is to build it from the call's own CPd (`V92_CPD_TRACE`
-/// already logs one at V.92 level) and to make it agree with the Agere capture
-/// before it is pointed at HSF.
+/// **It does not reproduce the control arm, and carrying the call's own CPd
+/// did not change that** -- so the parameters were never the cause. Measured:
+/// `/tmp/fin/ident.cpd` (V92_CPD_TRACE) says gain 0.108465229, moduli all 8,
+/// `sets [[1, 3, 5, 7, 9, 11, 13, 15]]`, `z1 [] p1 [] z2 [1.0] p2 []` -- i.e.
+/// **exactly** what this function's defaults already built, so `--from-cpd`
+/// reproduces the default model bit for bit and the control still fails at
+/// 16.1 %. The model is not a model of a different call; it is a model of the
+/// same call that does not agree with it.
+///
+/// What that leaves: run through the same bit layer, the model's own class
+/// sequence descrambles to all ones from bit 0, and so does the capture, and
+/// the two sequences are nevertheless different (`[7, 3, 0, 6, 7, 0, 4, ...]`
+/// against `[3, 0, 2, 1, 5, 5, 7, ...]` at the file's own frame zero). Two
+/// readings that both descramble to ones must be the same sequence, so the
+/// disagreement is in the frame grid the two paths take: `--levels` reaches
+/// 576/576 only with the frame origin at file index 11, while the production
+/// decoder reaches 563/576 only at phase 0. That one-symbol inconsistency
+/// between the level path and the decoder is the thing to settle before this
+/// model is used on HSF, and it outranks HSF.
 ///
 /// This is the *forward* reading of the same question the enumeration above
 /// asks backwards, and it is the stronger of the two: 8.7.1 zeroes every
@@ -178,15 +190,26 @@ fn levels_frames(path: &str, trace: &Trace, gain: f64) -> Result<Vec<[u8; UP_INT
 /// with nothing left to guess, and the capture can be compared against it
 /// symbol by symbol. A convention error in the bit layer, the trellis or the
 /// scrambler shows up as a level that is not where this says it should be.
-fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis) -> Vec<u8> {
+fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Option<&Cpd>) -> Vec<u8> {
     let parameters = Parameters {
         drn: (0..=19u8).find(|&drn| datapump::v92::up_bits(drn) == trace.k).unwrap_or(1),
         trellis,
         extend_e2u: false,
-        gain,
-        moduli: trace.moduli,
-        filters: Filters { z2: vec![1.0], ..Filters::default() },
-        sets: vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
+        gain: cpd.map_or(gain, |cpd| cpd.gain),
+        moduli: match cpd { Some(cpd) => cpd.moduli, None => trace.moduli },
+        filters: match cpd {
+            Some(cpd) => Filters {
+                z1: cpd.z1.clone(),
+                p1: cpd.p1.clone(),
+                z2: cpd.z2.clone(),
+                p2: cpd.p2.clone(),
+            },
+            None => Filters { z2: vec![1.0], ..Filters::default() },
+        },
+        sets: match cpd {
+            Some(cpd) => cpd.sets.clone(),
+            None => vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
+        },
         indices: [0; CONSTELLATION_FRAME],
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
@@ -223,20 +246,99 @@ fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis) -> Vec<
 /// -- but a *systematic* offset, which is what a wrong pair-first convention
 /// would be, shows up here as a mean in lattice steps and nowhere in the
 /// agreement count.
-fn b1u_etas(trace: &Trace, gain: f64, frames: usize, trellis: Trellis) -> Vec<i32> {
+fn b1u_etas(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Option<&Cpd>) -> Vec<i32> {
     let parameters = Parameters {
         drn: (0..=19u8).find(|&drn| datapump::v92::up_bits(drn) == trace.k).unwrap_or(1),
         trellis,
         extend_e2u: false,
-        gain,
-        moduli: trace.moduli,
-        filters: Filters { z2: vec![1.0], ..Filters::default() },
-        sets: vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
+        gain: cpd.map_or(gain, |cpd| cpd.gain),
+        moduli: match cpd { Some(cpd) => cpd.moduli, None => trace.moduli },
+        filters: match cpd {
+            Some(cpd) => Filters {
+                z1: cpd.z1.clone(),
+                p1: cpd.p1.clone(),
+                z2: cpd.z2.clone(),
+                p2: cpd.p2.clone(),
+            },
+            None => Filters { z2: vec![1.0], ..Filters::default() },
+        },
+        sets: match cpd {
+            Some(cpd) => cpd.sets.clone(),
+            None => vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
+        },
         indices: [0; CONSTELLATION_FRAME],
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
     encoder.reset_all();
     (0..(frames * UP_INTERVALS)).map(|_| encoder.next_symbol(|| true).eta).collect()
+}
+
+/// The CPd this end actually sent, as `V92_CPD_TRACE` writes it.
+///
+/// The model below is only a model of *a* call until it carries these: `sets`
+/// is which Ucodes the design chose, and `z1`/`p1`/`z2` are the precoder and
+/// prefilter the far end was told to run. A model with the defaults is modelling
+/// another call, and it duly agreed with the Agere capture at chance -- see
+/// `b1u_etas`.
+#[derive(Debug, Clone)]
+struct Cpd {
+    gain: f64,
+    moduli: [u8; UP_INTERVALS],
+    sets: Vec<Vec<u16>>,
+    z1: Vec<f64>,
+    p1: Vec<f64>,
+    z2: Vec<f64>,
+    p2: Vec<f64>,
+}
+
+fn numbers(text: &str) -> Vec<f64> {
+    text.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|word| word.trim().parse().ok())
+        .collect()
+}
+
+fn read_cpd(path: &str) -> Result<Cpd, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut cpd = Cpd {
+        gain: 0.0,
+        moduli: [0; UP_INTERVALS],
+        sets: Vec::new(),
+        z1: Vec::new(),
+        p1: Vec::new(),
+        z2: Vec::new(),
+        p2: Vec::new(),
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(' ') else { continue };
+        match key {
+            "gain" => cpd.gain = value.trim().parse()?,
+            "moduli" => {
+                for (into, word) in cpd.moduli.iter_mut().zip(numbers(value)) {
+                    *into = word as u8;
+                }
+            }
+            "sets" => {
+                for set in value.trim().trim_start_matches('[').trim_end_matches(']').split("],") {
+                    let codes: Vec<u16> = numbers(set).into_iter().map(|x| x as u16).collect();
+                    if !codes.is_empty() {
+                        cpd.sets.push(codes);
+                    }
+                }
+            }
+            "z1" => cpd.z1 = numbers(value),
+            "p1" => cpd.p1 = numbers(value),
+            "z2" => cpd.z2 = numbers(value),
+            "p2" => cpd.p2 = numbers(value),
+            _ => {}
+        }
+    }
+    if cpd.sets.is_empty() {
+        return Err("the CPd trace has no sets".into());
+    }
+    Ok(cpd)
 }
 
 /// How well a forward B1u matches the capture at one symbol offset.
@@ -524,6 +626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut within: Option<usize> = None;
     let mut forward = false;
     let mut dump_eta: Option<String> = None;
+    let mut cpd_path: Option<String> = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -534,16 +637,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--gain" => gain = args.next().ok_or("--gain wants a number")?.parse()?,
             "--forward" => forward = true,
             "--dump-eta" => dump_eta = Some(args.next().ok_or("--dump-eta wants a path")?),
+            "--from-cpd" => cpd_path = Some(args.next().ok_or("--from-cpd wants a path")?),
             "--within" => within = Some(args.next().ok_or("--within wants a frame count")?.parse()?),
             other => path = Some(other.to_owned()),
         }
     }
     let path = path.ok_or("usage: v92_b1u_search ETA_TRACE [--frames N]")?;
     let trace = read_trace(&path)?;
+    // The call's own CPd when one is given: without it the forward model is a
+    // model of a different call (see `Cpd`).
+    let cpd = match cpd_path.as_deref() {
+        Some(path) => Some(read_cpd(path)?),
+        None => None,
+    };
+    if let Some(cpd) = cpd.as_ref() {
+        println!(
+            "\nCPd from the call: gain {:.9}, moduli {:?}, sets {:?}, z1 {} p1 {} z2 {:?} p2 {}",
+            cpd.gain,
+            cpd.moduli,
+            cpd.sets.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            cpd.z1.len(),
+            cpd.p1.len(),
+            cpd.z2,
+            cpd.p2.len()
+        );
+    }
     if let Some(out) = dump_eta.as_deref() {
         let mut text = String::new();
         for &trellis in &[Trellis::Sixteen, Trellis::ThirtyTwo, Trellis::SixtyFour] {
-            let etas = b1u_etas(&trace, gain, 64, trellis);
+            let etas = b1u_etas(&trace, gain, 64, trellis, cpd.as_ref());
             text.push_str(&format!("{trellis:?}"));
             for eta in etas {
                 text.push_str(&format!(" {eta}"));
@@ -581,7 +703,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         let codes = [Trellis::Sixteen, Trellis::ThirtyTwo, Trellis::SixtyFour];
         for &trellis in &codes {
-        let b1u = b1u_levels(&trace, gain, count, trellis);
+        let b1u = b1u_levels(&trace, gain, count, trellis, cpd.as_ref());
         println!("\n  {trellis:?}: B1u from memories at zero, {} symbols, compared by Ki", b1u.len());
         println!("\n  {:>5}  {:>13}  agreement with the capture", "at", "agree");
         let mut rows = Vec::new();
