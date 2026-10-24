@@ -32,7 +32,7 @@ use crate::v32::Scrambler;
 use crate::v34::trellis::{self, Code};
 
 use super::modulus::{self, Moduli12};
-use super::precoder::{Constellation, code_for, index_to_ki, label_of};
+use super::precoder::{Constellation, code_for, index_to_ki, label_of, opens_a_pair, pair_first_index_offset};
 use super::{Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 
 /// Trellis frames held before the oldest is decided on. Forty frames is a
@@ -40,6 +40,60 @@ use super::{Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 /// here to have settled, short enough that the tail a cleardown cuts off is
 /// nothing.
 pub const SURVIVOR_DEPTH: usize = 40;
+
+/// `V92_K3`: the receive-side correction `docs/47` measures, and nothing else.
+///
+/// Two tables, because the measurement separates two things that look alike:
+///
+/// * `levels=d0,d1,d2,d3` is a sub-step displacement of the level at a trellis
+///   position, in half-steps -- the units `a(eta) = 2|eta| + 1` is written in,
+///   so one level step is 2. It is taken off the level before it is sliced, at
+///   the decoder's own symbol count, from the first symbol of B1u on.
+/// * `rot=r0,r1,r2,r3` is the far end's class rotation, in the same convention
+///   as `v92_b1u_class --offset`: the model's class is the observed one minus
+///   the table's entry, and the one this decoder already applies is `2,0,2,0`
+///   (`PAIR_FIRST_INDEX_OFFSET`). Only the difference from that one is applied,
+///   so the default path is untouched.
+///
+/// `V92_K3=levels=0,0,0,0.2;rot=6,6,6,7` is the shape the measurement found.
+/// Unset, off, or unparsable is no correction at all -- the level and the class
+/// are the ones this decoder has always fed and taken, bit for bit.
+fn correction() -> Option<&'static Correction> {
+    use std::sync::OnceLock;
+    static FIX: OnceLock<Option<Correction>> = OnceLock::new();
+    FIX.get_or_init(|| {
+        let text = std::env::var("V92_K3").ok()?;
+        let mut fix = Correction { levels: [0.0; TRELLIS_FRAME], rotation: None };
+        let mut any = false;
+        // Fields are separated by `;` or a space, not by a comma -- the
+        // comma is what the tables themselves are made of.
+        for field in text.split([';', ' ']).filter(|f| !f.is_empty()) {
+            if let Some(value) = field.strip_prefix("levels=") {
+                fix.levels = table_of(value)?;
+                any = true;
+            } else if let Some(value) = field.strip_prefix("rot=") {
+                fix.rotation = Some(table_of(value)?);
+                any = true;
+            }
+        }
+        any.then_some(fix)
+    })
+    .as_ref()
+}
+
+/// Four values, or nothing.
+fn table_of<T: std::str::FromStr>(text: &str) -> Option<[T; TRELLIS_FRAME]> {
+    let values: Vec<T> = text.split(',').map(|word| word.trim().parse().ok()).collect::<Option<Vec<T>>>()?;
+    values.try_into().ok()
+}
+
+/// What `docs/47`'s two tables are, when `V92_K3` names them.
+struct Correction {
+    /// Half-steps taken off the level at each trellis position.
+    levels: [f64; TRELLIS_FRAME],
+    /// The far end's class rotation, in `v92_b1u_class --offset`'s convention.
+    rotation: Option<[i64; TRELLIS_FRAME]>,
+}
 
 /// Where to write one decided trellis frame's four indices, when
 /// `V92_ETA_TRACE` names a file: a header line naming K and the twelve moduli,
@@ -196,7 +250,12 @@ impl Decoder {
         // The wire carries G x v (8.8.3), while the constellation sets are the
         // pre-gain magnitudes a(eta), so the equalised level is divided back by
         // G before it is sliced against them.
-        let level = level / self.params.gain;
+        let mut level = level / self.params.gain;
+        // `docs/47`'s per-position displacement, if it was asked for: one
+        // subtract, keyed on the position this symbol is in.
+        if let Some(fix) = correction() {
+            level -= fix.levels[self.n as usize % TRELLIS_FRAME];
+        }
         let interval = super::interval(self.n);
         let set: &[u16] = self.params.set_for(interval).unwrap_or(&[]);
         self.frame[self.filled] = Bests::new(&Constellation::new(set), level);
@@ -350,7 +409,15 @@ impl Decoder {
         for (k, &eta) in etas.iter().enumerate() {
             let interval = self.labels.len();
             let modulus = self.moduli.modulus(interval);
-            self.labels.push(index_to_ki(eta, modulus, k));
+            let mut ki = index_to_ki(eta, modulus, k);
+            // `docs/47`'s rotation, as the difference from the one
+            // `index_to_ki` already applies -- zero when the switch is off.
+            if let Some(table) = correction().and_then(|fix| fix.rotation) {
+                let applied = if opens_a_pair(k) { pair_first_index_offset() } else { 0 };
+                let want = table[k];
+                ki = (i64::from(ki) + applied - want).rem_euclid(i64::from(modulus.max(1))) as u8;
+            }
+            self.labels.push(ki);
             if self.labels.len() == UP_INTERVALS {
                 let labels: [u8; UP_INTERVALS] =
                     std::mem::take(&mut self.labels).try_into().expect("twelve intervals");

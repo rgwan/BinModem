@@ -136,7 +136,7 @@ pub fn pair_first_index_offset() -> i64 {
 /// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
 /// "the two pairs (y(0),y(1)) and (y(2),y(3))", so k = 0 and k = 2 open one
 /// each and k = 3 is the one that gives up half its freedom to the code.
-fn opens_a_pair(k: usize) -> bool {
+pub(crate) fn opens_a_pair(k: usize) -> bool {
     k % 2 == 0 && k != TRELLIS_FRAME - 1
 }
 
