@@ -957,5 +957,64 @@ mod tests {
         assert!(decoder.back.len() <= SURVIVOR_DEPTH);
         let _ = decoder.take_bits();
     }
+
+    /// The rotation is *read off* B1u and not named.
+    ///
+    /// A synthetic far end sends B1u's model classes rotated by a table of its
+    /// own -- including tables that are not `PAIR_FIRST_INDEX_OFFSET` -- and the
+    /// measurement has to come back with that table, at every sample count the
+    /// window has. Both readings of the model are sent, because the sequence is
+    /// defined up to one global sign (`docs/46 §2`) and the measurement is what
+    /// decides which of the two this line is on.
+    ///
+    /// This is the test that says the estimator is not a lookup for the one case
+    /// that produced it: a table nothing has ever used has to come out of B1u's
+    /// known content alone.
+    #[test]
+    fn a_rotation_that_is_not_the_constant_is_measured_off_b1u() {
+        // drn 1 is K = 36, the rate an Agere SV92PP's B1u is read at, and the
+        // one whose moduli are eight: the rotation is named in the class space.
+        let parameters = parameters(1, Trellis::Sixteen);
+        assert!(parameters.moduli.iter().all(|&modulus| modulus == CLASSES as u8), "eight classes");
+        let bits = up_bits(parameters.drn);
+        let classes = b1u_classes(bits, &parameters.moduli);
+        assert_eq!(classes.len(), B1U_FRAMES * UP_INTERVALS, "B1u is 576 known classes");
+        let set = Constellation::new(&parameters.sets[0]);
+        for rotation in [[2, 0, 2, 0], [6, 6, 6, 7], [5, 3, 7, 1]] {
+            for complemented in [false, true] {
+                let mut measuring = Measuring::new(bits, parameters.moduli, 0).expect("eight classes");
+                for n in 0..ROTATION_SYMBOLS as usize {
+                    let k = n % TRELLIS_FRAME;
+                    let model = usize::from(classes[n]);
+                    let model = if complemented { CLASSES - 1 - model } else { model };
+                    let class = (model + rotation[k] as usize) % CLASSES;
+                    // Any member of the class will do: the class is what is
+                    // measured and which member carries it is the free bit.
+                    let eta = if k == TRELLIS_FRAME - 1 { 2 * class as i32 } else { class as i32 };
+                    let level = set.level(eta).expect("every class has a member in the set");
+                    let nearest = Bests::new(&set, level).nearest().expect("the set is not empty");
+                    measuring.observe(parameters.moduli[n % UP_INTERVALS], nearest);
+                }
+                assert_eq!(
+                    measuring.rotation(),
+                    rotation.map(Some),
+                    "rotation {rotation:?} with the model complemented = {complemented}"
+                );
+            }
+        }
+        // A line that is not carrying B1u: no position has a mode, so nothing
+        // is taken and the decoder keeps the constant.
+        let mut measuring = Measuring::new(bits, parameters.moduli, 0).expect("eight classes");
+        let mut random = Random::new(11);
+        for n in 0..ROTATION_SYMBOLS as usize {
+            let class = 4 * usize::from(random.next()) + 2 * usize::from(random.next())
+                + usize::from(random.next());
+            let eta = if n % TRELLIS_FRAME == TRELLIS_FRAME - 1 { 2 * class as i32 } else { class as i32 };
+            let level = set.level(eta).expect("every class has a member in the set");
+            let nearest = Bests::new(&set, level).nearest().expect("the set is not empty");
+            measuring.observe(parameters.moduli[n % UP_INTERVALS], nearest);
+        }
+        assert_eq!(measuring.rotation(), [None; TRELLIS_FRAME], "noise was taken for a rotation");
+    }
 }
 
