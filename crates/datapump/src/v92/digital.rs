@@ -58,7 +58,7 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::upchoice::choose;
+use crate::v92::upchoice::{choose, pin};
 use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
@@ -2561,8 +2561,24 @@ impl Modem {
         // the call in Phase 4, which is exactly where V.92's last attempt this
         // far stopped.
         const SLOWEST: u32 = 1;
-        let ja = self.ja.upstream_rates().unwrap_or(0) & SLOWEST;
-        let ja = if ja == 0 { SLOWEST } else { ja };
+        // The bench's stress arm, and nothing else. `V92_UP_RATE=48000` pins
+        // the rung naming that rate so that the *receive* path can be measured
+        // at a spacing the design would otherwise refuse. Unset -- which is
+        // every call a user makes -- the two lines below are the only ones that
+        // run, and `ja` is the same `1` it has always been. An unparsable or
+        // off-ladder rate is a bench mistake and leaves the default alone
+        // rather than silently choosing something else.
+        let pinned = std::env::var("V92_UP_RATE").ok().and_then(|rate| {
+            let rate = rate.trim().parse::<u32>().ok()?;
+            (1..=crate::v92::UP_RATES as u8).rev().find(|&drn| crate::v92::up_rate(drn) == rate)
+        });
+        let ja = match pinned {
+            Some(drn) => 1u32 << (drn - 1),
+            None => {
+                let ja = self.ja.upstream_rates().unwrap_or(0) & SLOWEST;
+                if ja == 0 { SLOWEST } else { ja }
+            }
+        };
         let trellis = Trellis::Sixteen;
         // The noise the design is told about, and the one number in this file
         // that is a reading of the line rather than of a fit. TRN1u is a
@@ -2590,7 +2606,22 @@ impl Modem {
                 }
                 noise /= 4.0;
             }
-            None
+            // A pinned rung that 6.4.2's spacing judgement refused. Table 30 and
+            // the class rules are still asked; the spacing question is answered
+            // in the log instead of by refusing, because the arm exists to
+            // measure what that judgement was protecting.
+            let drn = pinned?;
+            let noise = 10f64.powf(-snr / 10.0);
+            let found = pin(designed, drn, trellis, noise)?;
+            let room = if found.sigma > 0.0 { 3f64.sqrt() / (4.5 * found.sigma) } else { f64::INFINITY };
+            eprintln!(
+                "V92TRACE: upstream rate pinned to drn {drn} ({} bit/s): design sigma {:.2e}, the spacing rule allows LC <= {room:.0}, this set has LC {} (N {})",
+                found.parameters.rate(),
+                found.sigma,
+                found.parameters.sets[0].len(),
+                2 * found.parameters.sets[0].len()
+            );
+            Some((found, noise))
         };
         let mut found = rung(&designed);
         if found.is_none() && degraded.is_none() {

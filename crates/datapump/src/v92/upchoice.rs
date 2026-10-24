@@ -96,6 +96,28 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
     None
 }
 
+/// A rung the caller has pinned instead of searched for.
+///
+/// This is the bench's stress arm and nothing else. [`choose`] refuses a rung
+/// on 6.4.2's spacing judgement and on the noise estimate behind it; pinning
+/// one exists to *measure* what that judgement was standing in front of. Table
+/// 30 and the class rules are still asked -- a parameter set that cannot be
+/// encoded, or whose set cannot carry its classes, returns `None` -- and the
+/// spacing judgement is reported through `sigma` and `predicted` rather than
+/// applied.
+///
+/// It cannot become a default by accident: the only caller reads
+/// `V92_UP_RATE`, and the 24 000 path never reaches it.
+pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Choice> {
+    let parameters = build(design, drn, trellis)?;
+    parameters.fits().ok()?;
+    let carried = design.scale * design.scale * noise.max(0.0);
+    let sigma = (design.residual * design.residual + carried).sqrt();
+    let spacing = 2.0 * parameters.gain;
+    let predicted = 2.0 * normal_tail(spacing / (2.0 * sigma.max(f64::MIN_POSITIVE)));
+    Some(Choice { parameters, sigma, predicted })
+}
+
 /// The parameters for one rung, with the moduli spread evenly over the twelve
 /// intervals and one constellation set shared by all six constellation frames.
 fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
@@ -291,6 +313,54 @@ mod tests {
                 assert!(n >= step, "drn {drn}, interval {i}: N {n} is smaller than its class step {step}");
             }
         }
+    }
+
+    /// Pinning the slowest rung hands back exactly what the search would have.
+    ///
+    /// This is the offline half of "the 24 000 CPd does not move": `pin` is the
+    /// only new entry point, and at drn 1 it agrees with the path a default
+    /// call takes, field for field.
+    #[test]
+    fn pinning_the_slowest_rung_changes_nothing() {
+        let design = design_for(1e-9);
+        let chosen = choose(&design, 1e-9, 1, Trellis::Sixteen).expect("drn 1 is always offered");
+        let pinned = pin(&design, 1, Trellis::Sixteen, 1e-9).expect("drn 1 is pinnable");
+        assert_eq!(chosen.parameters, pinned.parameters);
+        assert_eq!(chosen.sigma, pinned.sigma);
+    }
+
+    /// The rungs this bench can offer and the set each one needs, derived
+    /// rather than typed: 4, 5 and 6 bits a symbol ask for 16, 32 and 64
+    /// positive magnitudes, and N = 2 x LC saturates 6.4.2's k = 3 rule at
+    /// every one of them. 48 000 is the top of the ladder *and* the top of what
+    /// Table 30 can carry: 64 positive points is `SET_POINTS_SENT`.
+    #[test]
+    fn the_rates_this_bench_offers_and_the_sets_they_need() {
+        let design = design_for(0.0);
+        let mut table = Vec::new();
+        for (rate, drn, modulus, lc) in
+            [(24_000u32, 1u8, 8usize, 8usize), (32_000, 7, 16, 16), (40_000, 13, 32, 32), (48_000, 19, 64, 64)]
+        {
+            let choice = pin(&design, drn, Trellis::Sixteen, 1e-9).expect("a buildable rung");
+            let parameters = &choice.parameters;
+            assert_eq!(parameters.rate(), rate);
+            assert_eq!(up_bits(drn), 12 * modulus.ilog2(), "{rate}: K against the modulus");
+            assert_eq!(parameters.moduli, [modulus as u8; UP_INTERVALS]);
+            assert_eq!(parameters.sets[0].len(), lc, "{rate}: LC");
+            assert_eq!(2 * lc, 2 * modulus, "{rate}: N against k = 3's 2 x Mi");
+            parameters.fits().unwrap_or_else(|error| panic!("{rate}: {error}"));
+            // Table 30's gain field: "4 x G > 0" in unsigned Q0.16.
+            let four_g = crate::v92::four_g_from_gain(parameters.gain);
+            assert!(four_g > 0);
+            assert!((crate::v92::gain_from_4g(four_g) - parameters.gain).abs() / parameters.gain < 1e-3);
+            table.push((rate, lc, 2 * lc, four_g));
+        }
+        println!("rate, LC, N, 4G: {table:?}");
+        assert_eq!(table.iter().map(|row| row.1).collect::<Vec<_>>(), vec![8, 16, 32, 64]);
+        // The last rung's N is the most this end will put in a set, so the
+        // ladder's 48 000 is the ceiling CPd itself sets.
+        assert_eq!(2 * 64, CONSTELLATION_POINTS);
+        assert_eq!(64, crate::v92::sequences::SET_POINTS_SENT);
     }
 
     /// A rate the analogue modem's Ja did not offer is never chosen.
