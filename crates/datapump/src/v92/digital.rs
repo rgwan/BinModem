@@ -196,9 +196,44 @@ const E1U_ZEROES: usize = 12;
 /// already reports the empty descriptor correctly.
 pub const ZERO_DIL_USES_SCR: bool = true;
 
-/// How long after Ed this end waits for E2u before conditioning its receiver
-/// for B1u regardless, in seconds of line time.
+/// How long after Ed this end waits for an E2u it can *confirm* before the
+/// phase 4 exchange is declared failed, in seconds of line time.
+///
+/// It used to be the moment the receiver was conditioned for B1u "regardless",
+/// which is the one thing a timer cannot know: B1u's frame interval 0 is a
+/// symbol of the far end's, not of this end's clock, and a receiver that
+/// conditions on its own timer reads a data frame from a boundary that never
+/// existed. Measured on `/tmp/p0corr/g712.raw`, that path delivered 14 kB of
+/// wrong bytes and dropped a V.42 that never opened; a call that cannot find
+/// B1u now fails in the open instead, where the retrain and the fallback the
+/// start-up already has can act on it.
 pub const B1U_WAIT: f64 = 2.0;
+
+/// What a candidate boundary's B1u has to read like to be one (8.7.1: "B1u
+/// consists of 48 data frames of scrambled binary ones").
+///
+/// The window is the data frames B1u spends letting a receiver settle, which
+/// this end drops anyway -- the acquisition skip in `begin_b1u` -- so the
+/// criterion is free: no symbol is read twice and nothing is added to the
+/// per-symbol path. Two conditions, because one alone is not enough:
+///
+/// * three quarters of the window has to read as ones in the better of the two
+///   polarities, and
+/// * that polarity has to lead the other by an eighth of the window.
+///
+/// The first alone does not separate a real B1u from a zero run: the decoder
+/// run over an E2u this end caught 720 symbols early reads 456 of 576 ones one
+/// way up and 469 the other, and a zero run's scrambling reads high in both
+/// directions for the same reason white data does not. The lead is what a real
+/// B1u has and a wrong window cannot: 8.7.1's content is *all* ones, so the
+/// right polarity reads them and the wrong one reads a wrong pattern in their
+/// place.
+pub const B1U_CONFIRM_EIGHTHS: u64 = 6;
+
+/// The lead the better polarity has to have over the other, as a fraction of
+/// the window: an eighth, the margin the polarity choice has always been made
+/// on. Above a zero run it is what a real B1u has and a wrong window cannot.
+pub const B1U_POLARITY_LEAD: u64 = 8;
 
 /// "B1d consists of 48 data frames of scrambled ones" (V.90 8.6.1), the signal
 /// that comes between Ed and the data.
@@ -216,6 +251,24 @@ pub const B1U_FRAMES: usize = 48;
 /// frames' worth queued or the rest of the fill goes out as the idle pattern
 /// (see [`Modem::fill_bits`]).
 const B1D_FILL_FRAMES: usize = 8;
+
+/// `V92_E2U_FROM`, the symbol a zero run has to complete at or after before it
+/// is taken for E2u. Zero when the knob is unset, which is every call this end
+/// makes for a subscriber: a diagnostic, not a behaviour.
+///
+/// It exists because the two questions in phase 4 -- "is the boundary where it
+/// should be" and "do the data mode's decisions come out right once it is" --
+/// cannot be separated by a run that gets the first one wrong, and the first
+/// one is measurable: on the arms narrowed by a channel the zero-run detector
+/// fires 720 symbols before the symbol B1u really begins, and everything after
+/// it is then read from the wrong place.
+fn e2u_from() -> u64 {
+    use std::sync::OnceLock;
+    static FROM: OnceLock<u64> = OnceLock::new();
+    *FROM.get_or_init(|| {
+        std::env::var("V92_E2U_FROM").ok().and_then(|t| t.parse().ok()).unwrap_or(0)
+    })
+}
 
 /// Whether V92_TRACE in the environment is set, so that a start-up that will
 /// not find its place is legible.
@@ -1383,6 +1436,11 @@ pub struct Modem {
     downstream_scrambler: Scrambler,
     /// The upstream data decoder, in the parameters this end's own CPd named.
     upstream_data: Option<Decoder>,
+    /// Which prefilter the CPd is designed from: `V92_Z2=fit` takes the
+    /// two-point fit, anything else the L1/L2 reading. Read once, at
+    /// construction, so that the choice is a property of the modem and a test
+    /// can make it without the process environment.
+    prefilter: Prefilter,
     /// The design's prefilter scale, folded out of the receiver for B1u.
     upstream_scale: f64,
     /// The symbol delay the design puts between what the analogue modem sends
@@ -1426,12 +1484,44 @@ enum Prefilter {
     Fit,
 }
 
-/// [`Prefilter::Reading`] unless `V92_Z2=fit` says otherwise.
-fn prefilter_source() -> Prefilter {
-    match std::env::var("V92_Z2").ok().as_deref() {
+/// Which prefilter the CPd is designed from, from the value of `V92_Z2`.
+///
+/// [`Prefilter::Reading`] is the default and `V92_Z2=fit` is the opt-out: the
+/// reading is a power-constrained shaper designed from twenty-one measurements
+/// of the line, the fit is a least-squares inverse of one two-point burst, and
+/// the reading is the better of the two when it is a reading.
+///
+/// This default has been both ways, and the record of why is worth keeping
+/// because the second flip was for a reason that turned out to be a different
+/// bug:
+///
+/// * it was `Reading` when the reading was built (V92-63, `ecb3c2`);
+/// * a paired Agere bench batch then showed the identity arm at **232/540** with
+///   the reading and **568/576** with the fit, i.e. a call that was working
+///   made broken by a design change, and the default moved to `Fit`;
+/// * the cause was not the shaping. `Design::delay` became 8 with a symmetric
+///   seventeen-tap section, and `begin_b1u` added that delay to B1u's frame
+///   origin on top of the completion symbol it had measured the origin from.
+///   Eight is not a multiple of twelve, so the data frame rotated. With the
+///   delay term removed the reading arm reads B1u as B1u again -- 7128 and 2063
+///   bytes on `/tmp/p0corr/ident.raw` and on both proven-V.92 Agere captures,
+///   568 ones against 449 -- so the shaping is innocent and the default belongs
+///   back on it.
+///
+/// What the reading still cannot be trusted for is *level*: measured on a flat
+/// line it reports -9.8..-12.9 dB, structure the line does not have, because it
+/// includes this end's own receive response. That is a separate defect in the
+/// estimate, not in the idea, and the test beside this pins whichever default
+/// the argument ends on so that it cannot move again without saying so.
+fn prefilter_for(requested: Option<&str>) -> Prefilter {
+    match requested {
         Some("fit") => Prefilter::Fit,
         _ => Prefilter::Reading,
     }
+}
+
+fn prefilter_source() -> Prefilter {
+    prefilter_for(std::env::var("V92_Z2").ok().as_deref())
 }
 
 impl Modem {
@@ -1509,6 +1599,7 @@ impl Modem {
             b1d_left: 0,
             downstream_scrambler: Scrambler::new(Mode::Call),
             upstream_data: None,
+            prefilter: prefilter_source(),
             upstream_scale: 1.0,
             upstream_delay: 0,
             b1u_skip: 0,
@@ -1848,16 +1939,21 @@ impl Modem {
             self.phase4_out();
             self.fill_downstream();
         }
-        // An E2u this end never read must not leave the receiver on four points
-        // for the rest of the call: B1u follows E2u whatever was heard, so past
-        // the wait the receiver starts on the next symbol anyway, a frame
-        // boundary that may be a symbol or two out rather than none at all.
+        // No E2u, or no candidate that reads as B1u, by the time the wait is
+        // out. This end says so and fails the exchange; it does not condition
+        // its receiver on its own clock, because B1u's frame interval 0 is the
+        // far end's symbol and a boundary taken from a timer is a boundary this
+        // end does not have. The start-up turns a failure into the retrain and
+        // the V.90 fallback it already has (`v90::startup`), which is a visible
+        // outcome; a data mode read from an invented boundary is a silent one
+        // and delivered 14 kB of somebody else's bits on the arms measured.
         if self.b1u_pending
             && let Some(at) = self.b1u_deadline
             && self.now >= at
         {
-            self.note("V.92: no E2u, conditioning for B1u anyway".into());
-            self.begin_b1u();
+            self.b1u_pending = false;
+            self.b1u_deadline = None;
+            self.fail("no E2u that reads as B1u within 2 s of Ed");
         }
         // D2/D3: once enough of TRN1u has gone by, the fit is made.
         if self.stage == Stage::Training
@@ -2246,7 +2342,7 @@ impl Modem {
                 "V.92: upstream design from the retained L1 reading: {}",
                 reading.summary()
             ));
-            if prefilter_source() == Prefilter::Reading {
+            if self.prefilter == Prefilter::Reading {
                 match crate::v92::design::from_reading(&reading, limits) {
                     Ok((designed, predicted)) => {
                         self.note(format!("V.92: z2 from the L1 reading: {}", predicted.summary()));
@@ -2613,8 +2709,9 @@ impl Modem {
                 self.b1u_skip
             );
         }
-        self.b1u_pending = false;
-        self.b1u_deadline = None;
+        // `b1u_pending` and the deadline stay armed: a candidate that does not
+        // read as B1u (see `decide_b1u_polarity`) hands the hunt back, and the
+        // deadline is what ends the exchange if none of them does.
         // Both ways up, until B1u says which one it is: 8.7.1 makes those 48
         // data frames known, so the polarity that reads them as ones is the
         // line's and the other is an equaliser that TRN2u's own seed left
@@ -2696,6 +2793,19 @@ impl Modem {
             // The acquisition window first, then the polarity measurement, and
             // only then the decoder that will carry the call: both windows are
             // B1u's, and both are dropped.
+            //
+            // A candidate costs 576 symbols to confirm, so the symbol B1u
+            // really begins on can fall inside a candidate's window: measured
+            // on `/tmp/p0corr/g712.raw`, the detector fires at 115366 and B1u
+            // begins at 115510, a hundred and forty-four symbols later. Keeping
+            // the hunt alive through the window to catch it was tried and is
+            // *not* the answer: on both proven-V.92 Agere captures
+            // (`012503-mask3`, `012713-mask3c`) the data-mode bit stream throws
+            // spurious zero runs at 116102 and 120594, each of which restarted
+            // the probe and cost the call its connection -- 7128 and 2063 bytes
+            // became nothing. A candidate therefore owns the window it opened,
+            // and a boundary it swallowed is one this end fails on rather than
+            // guesses at.
             if self.b1u_skip > 0 {
                 self.b1u_skip -= 1;
                 return;
@@ -2705,35 +2815,11 @@ impl Modem {
                 return;
             }
         }
+        // The polarity the measurement above found, then whatever diagnostic
+        // transform `V92_B1U_ADJ` asks for (see `adjust_b1u_level`). Done
+        // before the decoder is borrowed, because the transform keeps state.
+        let level = self.adjust_b1u_level(self.b1u_polarity * level);
         if let Some(decoder) = self.upstream_data.as_mut() {
-            // The polarity the measurement above found, then whatever
-            // diagnostic transform `V92_B1U_ADJ` asks for.
-            let level = self.b1u_polarity * level;
-            // Diagnostic (`V92_B1U_ADJ`): what the data-mode level stream needs
-            // before it is a constellation at all. Measured on the Agere calls
-            // that fail, the stream sits on CPd's lattice but its *mean* is +0.45
-            // (two lattice steps) where a passing call's mean is 0, so the
-            // question "is it the offset or the symbol phase" is worth one
-            // experiment rather than one hypothesis. `flip` negates the level,
-            // `dc` subtracts a running mean, `shift:N` subtracts N lattice steps
-            // and `none` (the default) does nothing.
-            let level = match self.b1u_adjust.as_str() {
-                "flip" => -level,
-                "dc" => {
-                    let mean = self.b1u_history.iter().sum::<f64>() / self.b1u_history.len().max(1) as f64;
-                    let out = level - mean;
-                    if self.b1u_history.len() >= 512 {
-                        self.b1u_history.pop_front();
-                    }
-                    self.b1u_history.push_back(level);
-                    out
-                }
-                other if other.starts_with("shift:") => {
-                    let steps: f64 = other["shift:".len()..].parse().unwrap_or(0.0);
-                    level - steps * 2.0 * self.parameters.as_ref().map_or(1.0, |p| p.gain)
-                }
-                _ => level,
-            };
             decoder.feed(level);
             let bits = decoder.take_bits();
             if let Some(file) = b1u_trace_file()
@@ -2804,6 +2890,17 @@ impl Modem {
                         + u32::from(self.parameters.as_ref().is_some_and(|p| p.extend_e2u));
                     if self.e2u_zeroes >= e2u {
                         let now = self.now;
+                        // Diagnostic (`V92_E2U_FROM`): the symbol a zero run
+                        // has to complete at or after to count as E2u. The
+                        // question "would this arm work if the boundary were
+                        // the right one" cannot be answered by a run that
+                        // starts the receiver a hundred millimetres of line
+                        // early, so the knob makes the boundary a given and
+                        // leaves the equaliser as the only variable.
+                        if now < e2u_from() {
+                            self.e2u_zeroes = 0;
+                            continue;
+                        }
                         if let Some(exchange) = self.exchange.as_mut() {
                             exchange.peer_e(now);
                         }
@@ -2818,6 +2915,40 @@ impl Modem {
         // the decoder is built now and fed from here on.
         if started {
             self.begin_b1u();
+        }
+    }
+
+    /// `V92_B1U_ADJ`: what the data-mode level stream needs before it is a
+    /// constellation at all. Empty is the only behaviour a call uses; `flip`
+    /// negates, `dc` subtracts a running mean, and `shift:N` subtracts N lattice
+    /// steps (2G, of the CPd gain).
+    ///
+    /// It exists because the residual a broken data mode sees is not always the
+    /// residual a metric sees: a level stream offset by half a lattice step
+    /// slices *better* than a correct one and decides wrong about half the
+    /// time, so "how much of the failure is a constant offset" has to be a
+    /// switch and not an argument. Measured on `/tmp/p0corr/g712.raw` at the
+    /// true B1u origin, neither `dc` nor `shift:0.5` changes B1u's reading
+    /// (420 ones of 576 either way), which says the residual there is not a
+    /// constant offset.
+    fn adjust_b1u_level(&mut self, level: f64) -> f64 {
+        let steps = 2.0 * self.parameters.as_ref().map_or(1.0, |p| p.gain);
+        match self.b1u_adjust.as_str() {
+            "flip" => -level,
+            "dc" => {
+                let mean = self.b1u_history.iter().sum::<f64>() / self.b1u_history.len().max(1) as f64;
+                let out = level - mean;
+                if self.b1u_history.len() >= 512 {
+                    self.b1u_history.pop_front();
+                }
+                self.b1u_history.push_back(level);
+                out
+            }
+            other if other.starts_with("shift:") => {
+                let count: f64 = other["shift:".len()..].parse().unwrap_or(0.0);
+                level - count * steps
+            }
+            _ => level,
         }
     }
 
@@ -2846,6 +2977,11 @@ impl Modem {
     /// measurable by decoding them both ways up -- which is what this does. The
     /// bits are B1u's, which carry no information, so both are dropped.
     fn score_b1u(&mut self, level: f64) {
+        // The same transform the data path takes (`V92_B1U_ADJ`), so that a
+        // diagnostic asked for here is measured on the reading the criterion
+        // uses and not on a reading nothing else sees. Empty is the default and
+        // does nothing.
+        let level = self.adjust_b1u_level(level);
         for (which, sign) in [1.0, -1.0].into_iter().enumerate() {
             let decoder = if which == 0 {
                 self.upstream_data.as_mut()
@@ -2876,9 +3012,30 @@ impl Modem {
     fn decide_b1u_polarity(&mut self) {
         let scored = self.b1u_scored[0].min(self.b1u_scored[1]);
         let (straight, flipped) = (self.b1u_ones[0], self.b1u_ones[1]);
+        // The polarity verdict is unchanged; what is new is that it is also the
+        // boundary's verdict. See [`B1U_CONFIRM_EIGHTHS`] for why the ratio and
+        // the lead are both needed, and for the arm that shows one is not
+        // enough.
         let inverted = std::env::var("V92_B1U_POLARITY").ok().as_deref() != Some("off")
             && scored > 0
-            && flipped > straight + scored / 8;
+            && flipped > straight + scored / B1U_POLARITY_LEAD;
+        let (best, other) = (straight.max(flipped), straight.min(flipped));
+        // `V92_B1U_GATE=off` accepts every candidate, which is what measuring
+        // the data mode below a boundary takes: the criterion lives above the
+        // thing being measured, so a run that cannot pass it still has to be
+        // able to say what it reads.
+        let reads_as_b1u = std::env::var("V92_B1U_GATE").ok().as_deref() == Some("off")
+            || (scored > 0
+                && best * 8 >= scored * B1U_CONFIRM_EIGHTHS
+                && best >= other + scored / B1U_POLARITY_LEAD);
+        if !reads_as_b1u {
+            // Not a boundary. This is the whole point of the criterion: a
+            // receiver that goes on to read data from a place it has just
+            // failed to read B1u from does not need the far end's agreement, it
+            // needs a boundary it actually has.
+            self.abandon_b1u(best, other, scored);
+            return;
+        }
         if inverted {
             // The equaliser that was reading *this* polarity all along, not the
             // one that read the other and would have a window of the wrong sign
@@ -2888,10 +3045,40 @@ impl Modem {
             self.b1u_polarity = -1.0;
         }
         self.b1u_probe = None;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.awaiting_e2u = false;
         let verdict = if inverted { "inverted, negating" } else { "as received" };
         self.note(format!(
-            "V.92: B1u polarity {verdict} ({straight} ones straight, {flipped} negated, {scored} bits scored)"
+            "V.92: B1u confirmed at {scored} bits: polarity {verdict} ({straight} ones straight, \
+             {flipped} negated), {:.1} % ones",
+            100.0 * best as f64 / scored as f64
         ));
+    }
+
+    /// Give a candidate boundary back and resume the hunt for E2u.
+    ///
+    /// Everything [`Self::begin_b1u`] did to the receiver is undone except the
+    /// equaliser, which is the fit's and was not a guess: the slicer goes back
+    /// to TRN2u's four points (8.7.2 makes E2u one of them), the data-mode
+    /// decoders are dropped, and the zero-run detector is armed again. The
+    /// deadline set when Ed went out is untouched, so a run of candidates that
+    /// all fail costs the wait and then fails the exchange in the open.
+    fn abandon_b1u(&mut self, best: u64, other: u64, scored: u64) {
+        let now = self.now;
+        self.note(format!(
+            "V.92: candidate B1u at {now} does not read as B1u ({best}/{scored} ones one way up, \
+             {other} the other), still hunting E2u"
+        ));
+        self.upstream_data = None;
+        self.b1u_probe = None;
+        self.b1u_ones = [0; 2];
+        self.b1u_scored = [0; 2];
+        self.b1u_scoring = 0;
+        self.b1u_polarity = 1.0;
+        self.rx.set_slicer(Slicer::FourPoint);
+        self.awaiting_e2u = true;
+        self.e2u_zeroes = 0;
     }
 
     /// One upstream sequence, as 8.7.2-8.7.6 delivered it.
@@ -3323,6 +3510,10 @@ mod tests {
         let mut settings = settings();
         settings.probing = Some(reading);
         let mut modem = Modem::new(settings);
+        // The reading's path is what this test is about, and which path is the
+        // default is a separate question with its own test: say it here so the
+        // survival of the reading is measured rather than inherited.
+        modem.prefilter = Prefilter::Reading;
         let notes = modem.take_notes();
         assert!(
             notes.iter().any(|line| line.contains("L1 probing retained")),
@@ -3344,6 +3535,23 @@ mod tests {
         // one decibel of.
         let power: f64 = designed.filters.z2.iter().map(|tap| tap * tap).sum();
         assert!(power >= 0.9995, "the design attenuates: sum z^2 {power:.4}");
+    }
+
+    /// Which prefilter the design is built from must not change quietly.
+    ///
+    /// It has changed twice: to `Fit` when a paired bench batch blamed the
+    /// reading for a regression that was really `Design::delay` being counted
+    /// twice in B1u's frame origin, and back to `Reading` when that was found
+    /// (see `prefilter_for`). A default that moves with the last alarming
+    /// number is a default nobody can reason about, so this pins it.
+    #[test]
+    fn the_prefilter_default_is_the_reading_and_the_fit_is_opt_in() {
+        assert_eq!(prefilter_for(None), Prefilter::Reading, "the default moved");
+        assert_eq!(prefilter_for(Some("fit")), Prefilter::Fit, "the opt-out does not work");
+        // Anything unrecognised is the default rather than a third state: a
+        // typo in an environment variable must not quietly change the design.
+        assert_eq!(prefilter_for(Some("Fit")), Prefilter::Reading);
+        assert_eq!(prefilter_for(Some("")), Prefilter::Reading);
     }
 
     /// The Phase 4 sequences this end puts on the line have to be readable by

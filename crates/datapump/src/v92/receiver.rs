@@ -610,9 +610,20 @@ impl Slicer {
 /// `docs/15-v92-data-path-handoff.md`). So the experiment says how much of the
 /// margin the missing prefilter costs, in a way that removing the feedback
 /// after the fit cannot: a fit made without feedback allocates the taps itself.
+/// `V92_EQ=<forward>x<feedback>` is the same diagnostic one size at a time: the
+/// residual a converged fit leaves is either structure it does not have the
+/// taps to describe or a line it is describing wrongly, and only a sweep of the
+/// lengths can say which. The counts are those of a fit, so nothing on the
+/// per-symbol path changes with them.
 fn sections_in_use() -> (usize, usize) {
     match std::env::var("V92_EQ").ok().as_deref() {
         Some("linear") => (DFE_FORWARD + DFE_FEEDBACK, 0),
+        Some(other) => match other.split_once('x').and_then(|(f, b)| {
+            Some((f.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        }) {
+            Some(pair) if pair.0 > 0 => pair,
+            _ => (DFE_FORWARD, DFE_FEEDBACK),
+        },
         _ => (DFE_FORWARD, DFE_FEEDBACK),
     }
 }
@@ -1052,6 +1063,21 @@ impl Receiver {
     /// TRN2u and B1u are transmitted at the same power (3.8, 8.7.1).
     pub fn set_data_mode(&mut self, levels: Vec<f64>) {
         self.slicer = Slicer::Levels(levels);
+        // Diagnostic (`V92_DATA_FB`): what to do with the fitted feedback
+        // section once the data mode starts. `off` zeroes it and `scale:K`
+        // multiplies it, so that "is the decision feedback equalising a second
+        // time what the far end's own precoder already equalised" -- the one
+        // structural question the fit cannot answer, because it is a good fit
+        // either way -- becomes one run per K instead of one hypothesis.
+        if let Some(want) = std::env::var("V92_DATA_FB").ok() {
+            let scale = match want.as_str() {
+                "off" => 0.0,
+                other => other.strip_prefix("scale:").and_then(|k| k.parse().ok()).unwrap_or(1.0),
+            };
+            for tap in &mut self.feedback {
+                *tap *= scale;
+            }
+        }
         self.decided.clear();
         self.measured = 0;
         self.anchor_gain = self.gain;
@@ -1599,6 +1625,16 @@ impl Receiver {
     /// range is the point: an anchor free to go anywhere will eventually
     /// follow the decisions it is supposed to be checking.
     fn anchor_data_levels(&mut self, value: f64) {
+        // Diagnostic (`V92_ANCHOR=off`): no scale estimate at all in data mode,
+        // the gain the four-point tiers left frozen. The reference receiver
+        // never measures the data mode's scale -- it freezes the equaliser's
+        // largest-energy feed-forward tap -- so "what is the anchor costing" is
+        // the question that decides whether this one should exist.
+        use std::sync::OnceLock;
+        static OFF: OnceLock<bool> = OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("V92_ANCHOR").ok().as_deref() == Some("off")) {
+            return;
+        }
         let Some((level, error)) = self.slicer.decide(value * self.gain) else { return };
         if level == 0.0 || value == 0.0 {
             return;
