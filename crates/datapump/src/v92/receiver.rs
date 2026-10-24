@@ -1204,6 +1204,11 @@ impl Receiver {
             return None;
         }
         let mut best: Option<(f64, f64, usize)> = None;
+        // `docs/80` needs the whole profile and not the winner: the fit that
+        // follows this search reads 6 dB when the alignment is taken two
+        // symbols early, and the question is whether the peak is the peak.
+        let diag = std::env::var_os("V92_PHASE3_DIAG").is_some();
+        let mut peaks: Vec<(f64, usize)> = Vec::new();
         for start in lo..=hi {
             let (mut together, mut power) = (0.0, 0.0);
             for (n, &wanted) in reference.iter().enumerate() {
@@ -1218,9 +1223,17 @@ impl Receiver {
             // 1 when the line carries exactly the sequence wanted, nothing like
             // it anywhere else.
             let quality = together.abs() / power.sqrt() / (window as f64).sqrt();
+            if diag {
+                peaks.push((quality, start));
+            }
             if best.is_none_or(|(found, _, _)| quality > found) {
                 best = Some((quality, together.abs() / power.sqrt(), start));
             }
+        }
+        if diag {
+            peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+            peaks.truncate(5);
+            eprintln!("V92DIAG: align_trn1u(from {from} +/-{search}, window {window}) peaks {peaks:?}");
         }
         if std::env::var_os("V92_TRACE").is_some() {
             eprintln!("V92TRACE: align_trn1u(from {from} +/-{search}) best {best:?}");

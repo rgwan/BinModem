@@ -181,6 +181,35 @@ const REFIT_QUALITY: f64 = 0.5;
 /// refit that lands right can still read a little lower.
 const REFIT_SLACK_DB: f64 = 3.0;
 
+/// [`REFIT_SLACK_DB`] for this run, when `V92_REFIT_SLACK` names another.
+///
+/// Diagnosis only, and off unless the variable is set: `docs/80` needs to know
+/// whether Phase 3's exit is decided by this threshold or by the far end, and
+/// the only way to ask is to move the threshold and watch the CPt read. A
+/// large negative value takes every refit; a large positive one takes none.
+/// `V92_REFIT_OFFSET`: whole symbols added to the second TRN1u's alignment, for
+/// diagnosis only.
+///
+/// `docs/80` finds the refit's own fit reading 6 dB below where it reads inside
+/// the window, at phases where the correlation's alignment is the same index it
+/// is inside. This moves that alignment and nothing else, which is the only way
+/// to ask from outside whether the fit is being taken in the wrong place.
+fn refit_offset() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var("V92_REFIT_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0)
+    })
+}
+
+fn refit_slack() -> f64 {
+    use std::sync::OnceLock;
+    static SLACK: OnceLock<f64> = OnceLock::new();
+    *SLACK.get_or_init(|| {
+        std::env::var("V92_REFIT_SLACK").ok().and_then(|t| t.parse().ok()).unwrap_or(REFIT_SLACK_DB)
+    })
+}
+
 /// How far either side of where 9.5.2.1.9 puts the second TRN1u its alignment
 /// is searched. The hunt's reversal is up to a period late and epsilon moves
 /// the far end's whole transmit grid, so the estimate is good to tens of
@@ -268,6 +297,224 @@ fn e2u_from() -> u64 {
     *FROM.get_or_init(|| {
         std::env::var("V92_E2U_FROM").ok().and_then(|t| t.parse().ok()).unwrap_or(0)
     })
+}
+
+/// `V92_PHASE3_DIAG`: why Phase 3's exit did or did not happen.
+///
+/// Phase 3 ends on E1u, and E1u is only looked for once a CPt repetition has
+/// been found **by its CRC** -- so a CPt whose CRC never checks leaves the
+/// chain silent: `cp_len` stays zero, the E1u test is never reached, and no
+/// line of the transcript says so. `docs/77`-`docs/79` measured a window of
+/// sampling phases in which B1u is reached at all, and could not say whether
+/// that window is this receiver's property or the far end's.
+///
+/// With this set, [`Phase3Diag`] mirrors the CPt bit stream and every
+/// `DIAG_EVERY` bits prints one line: whether any CRC hit at all, the state
+/// tuple E1u is decided on, and -- when nothing hit -- the closest thing in the
+/// stream to a CPt frame, which is the fewest bit errors that make some window
+/// check ([`cpt_diag::closest`]). A near miss and a stream that is simply not a
+/// CPt read very differently in that number, and that is the whole question.
+///
+/// `V92_CPT_BITS` names a file to write the same stream to, one `<symbol> <bit>`
+/// line each, for a reading that has to be lined up against another arm's.
+/// Both are off unless asked for, and nothing on the working path depends on
+/// either: the mirror is `None`, not empty, when they are not.
+fn phase3_diag() -> bool {
+    use std::sync::OnceLock;
+    static DIAG: OnceLock<bool> = OnceLock::new();
+    *DIAG.get_or_init(|| std::env::var_os("V92_PHASE3_DIAG").is_some())
+}
+
+/// Where to write the CPt bit stream, when `V92_CPT_BITS` names a file.
+fn cpt_bits_file() -> Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_CPT_BITS")?);
+        Some(Arc::new(Mutex::new(std::fs::File::create(path).ok()?)))
+    })
+    .clone()
+}
+
+/// How many CPt bits go by between two Phase 3 diagnostic lines, and how many
+/// bits of the stream the closest-frame scan keeps and looks at.
+const DIAG_EVERY: u64 = 2000;
+const DIAG_SCAN: usize = 16384;
+
+/// The nearest a bit stream comes to a CPt frame, for [`phase3_diag`].
+///
+/// A CPt is a frame sync, then a start bit and sixteen information bits per
+/// block, then one more start bit and the CRC ([`crate::v90::sequences::frame`],
+/// which is private to that module: the shapes are spelled out here). Three
+/// things can be wrong with a window that is one: its sync is not seventeen
+/// ones, a start bit is set, or its CRC field is not the CRC of the information
+/// it carries. Each of those is a bit that would have to be flipped for the
+/// window to check, so the sum is a distance -- "this many bits off" -- and the
+/// three terms say which bits. The information field is held, so the CRC term
+/// is the distance to the nearest frame carrying *that* information, which is
+/// the question a stream of repeated CPts asks.
+///
+/// Only V.92's CPt shape is tried (Table 23: seven header blocks, eight blocks
+/// per constellation, up to six constellations, with or without a codec set),
+/// because it is the only one a V.92 upstream's Phase 3 can carry.
+mod cpt_diag {
+    use crate::v34::info::crc;
+    use crate::v90::sequences::{BLOCK, SYNC_ONES};
+
+    /// Blocks before the constellations (bits 18:135), and blocks for each
+    /// constellation: `v90::sequences`' own `CP_HEADER_BLOCKS` and
+    /// `MASK_BLOCKS`, which are private there.
+    const HEADER_BLOCKS: usize = 7;
+    const MASK_BLOCKS: usize = 8;
+
+    /// How many sync errors a window may have and still be looked at. A CPt's
+    /// sync is seventeen ones and a stream that is not a CPt averages 8.5 of
+    /// them wrong, so this keeps the windows that could be a near miss and
+    /// drops the rest -- which is also what keeps the scan to one pass.
+    pub const NEAR: usize = 4;
+
+    /// The closest CPt frame in a bit stream: see the module comment.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Closest {
+        /// Sync bits that are not ones, start bits that are not zeroes, and CRC
+        /// bits that differ from the CRC of the information carried.
+        pub errors: usize,
+        pub sync: usize,
+        pub starts: usize,
+        pub crc: usize,
+        /// Where the window starts, in CPt bits from the first one Phase 3 read.
+        pub at: u64,
+        /// How many blocks the frame it matched has, so that its length is
+        /// `SYNC_ONES + (blocks + 1) * (BLOCK + 1)` bits.
+        pub blocks: usize,
+    }
+
+    impl Closest {
+        /// How long the frame it matched is, through its CRC: the length
+        /// `v90::sequences::cp_length` reports before the fill pads it.
+        pub fn length(&self) -> usize {
+            SYNC_ONES + (self.blocks + 1) * (BLOCK + 1)
+        }
+    }
+
+    /// What one scan of one bit stream found.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct Scan {
+        /// The window with the fewest errors, if any window was close enough to
+        /// be looked at.
+        pub closest: Option<Closest>,
+        /// The fewest sync errors any window had, whether or not it was close
+        /// enough to look at. A stream that is not a CPt at all averages 8.5 of
+        /// these; a stream that is one has 0 at every repetition, so this says
+        /// "the shape is not even there" on its own.
+        pub min_sync: usize,
+        /// How many windows were within `NEAR` sync errors, and how many bits
+        /// were scanned.
+        pub near: usize,
+        pub bits: usize,
+    }
+
+    /// Scan every window of `bits` for the one nearest to a CPt frame.
+    ///
+    /// `base` is how many bits were dropped from the front of the stream before
+    /// `bits` began, so that the position reported is absolute.
+    pub fn closest(bits: &[bool], base: u64) -> Scan {
+        let mut scan = Scan { min_sync: SYNC_ONES, bits: bits.len(), ..Scan::default() };
+        let mut information: Vec<bool> = Vec::with_capacity(HEADER_BLOCKS * BLOCK);
+        for at in 0..bits.len().saturating_sub(SYNC_ONES) {
+            let ones = bits[at..at + SYNC_ONES].iter().filter(|b| **b).count();
+            let sync = SYNC_ONES - ones;
+            scan.min_sync = scan.min_sync.min(sync);
+            if sync > NEAR {
+                continue;
+            }
+            scan.near += 1;
+            // One to six constellations, each with or without a codec set: the
+            // shapes `Cp::from_bits_in` can read (Table 23).
+            for hypothesis in 0..12 {
+                let masks = (hypothesis % 6 + 1) * if hypothesis < 6 { 1 } else { 2 };
+                let blocks = HEADER_BLOCKS + MASK_BLOCKS * masks;
+                // The frame through its CRC -- `through_crc` in
+                // `v90::sequences::cp_length` -- without the fill that pads it
+                // out to a whole number of symbols.
+                let length = SYNC_ONES + (blocks + 1) * (BLOCK + 1);
+                if at + length > bits.len() {
+                    continue;
+                }
+                let mut starts = 0;
+                information.clear();
+                for block in 0..blocks {
+                    let start = at + SYNC_ONES + block * (BLOCK + 1);
+                    if bits[start] {
+                        starts += 1;
+                    }
+                    information.extend_from_slice(&bits[start + 1..start + 1 + BLOCK]);
+                }
+                let crc_at = at + SYNC_ONES + blocks * (BLOCK + 1) + 1;
+                let mut received = 0u32;
+                for i in 0..16 {
+                    received |= u32::from(bits[crc_at + i]) << i;
+                }
+                let crc = (u32::from(crc(&information)) ^ received).count_ones() as usize;
+                let errors = sync + starts + crc;
+                let better = match scan.closest {
+                    None => true,
+                    Some(best) => (errors, blocks) < (best.errors, best.blocks),
+                };
+                if better {
+                    scan.closest =
+                        Some(Closest { errors, sync, starts, crc, at: base + at as u64, blocks });
+                }
+            }
+        }
+        scan
+    }
+}
+
+/// What `V92_PHASE3_DIAG` keeps of Phase 3's CPt read.
+///
+/// `None` unless the variable is set, so that the working path carries a `None`
+/// test and not a stream: `docs/77`-`docs/79`'s lesson is that this had to be
+/// measurable, and the 24000 replay had to stay byte-identical.
+#[derive(Debug, Clone, Default)]
+struct Phase3Diag {
+    /// The last [`DIAG_SCAN`] CPt bits, oldest first.
+    bits: Vec<bool>,
+    /// How many bits were dropped from the front of `bits`, so that a position
+    /// in it can be named from the start of Phase 3's CPt.
+    dropped: u64,
+    /// The symbol the CPt reader's first bit arrived on.
+    first_symbol: Option<u64>,
+    /// CRC hits: how many CPt repetitions were found at all. This is the number
+    /// that is zero exactly when E1u was never looked for.
+    hits: u64,
+    /// Which bit of the stream the first and the last hit came on.
+    first_hit: Option<u64>,
+    last_hit: Option<u64>,
+    /// The CPt one hit read, which is the far end's own frame and is what a
+    /// failing arm's stream can be compared against.
+    frame: Option<Vec<bool>>,
+    /// What Jp asked the far end for: the lag it was measured from, and the
+    /// epsilon that went out.
+    jp: Option<(Option<f64>, u16)>,
+    /// Whether Phase 3's exit has already been reported.
+    exited: bool,
+}
+
+impl Phase3Diag {
+    /// One more bit of the CPt stream, bounded to the scan's own window.
+    fn push(&mut self, bit: bool) {
+        self.bits.push(bit);
+        if self.bits.len() > 2 * DIAG_SCAN {
+            self.bits.drain(..DIAG_SCAN);
+            self.dropped += DIAG_SCAN as u64;
+        }
+    }
+
+    /// Where the next bit goes in the whole stream.
+    fn count(&self) -> u64 {
+        self.dropped + self.bits.len() as u64
+    }
 }
 
 /// Whether V92_TRACE in the environment is set, so that a start-up that will
@@ -1405,6 +1652,9 @@ pub struct Modem {
     /// until 22.902 s, so it left Phase 3 two seconds early and everything
     /// after it was out of step with the far end's Ri/R-bar-i window.
     since_cpt: usize,
+    /// What `V92_PHASE3_DIAG` keeps of the CPt read, and nothing at all
+    /// otherwise: see [`Phase3Diag`].
+    diag: Option<Phase3Diag>,
     /// Bits the Ja reader has produced, and ones in the last stretch of them.
     ja_bits: u64,
     ja_ones: u64,
@@ -1647,6 +1897,7 @@ impl Modem {
             cp_pos: 0,
             e1u_zeroes: 0,
             since_cpt: 0,
+            diag: phase3_diag().then(Phase3Diag::default),
             now: 0,
             ja_deadline,
             su_deadline: None,
@@ -1847,6 +2098,11 @@ impl Modem {
         if self.stage == Stage::Dil && matches!(self.source.out(), Out::Ri | Out::RiBar) {
             self.stage = Stage::Ri;
         }
+        if self.diag.is_some() && !matches!(self.stage, Stage::Dil | Stage::Ri | Stage::RiBar) {
+            // The CPt reader has stopped: this is Phase 3's exit, printed once,
+            // whether it ended on E1u or never got looked for.
+            self.phase3_exit();
+        }
         if self.source.in_phase4() {
             // 9.6.1.1: TRN2d is Phase 4's first signal, so the moment it
             // starts is the moment Phase 3 is over.
@@ -1934,6 +2190,9 @@ impl Modem {
             // step the next reversal takes is exactly what was just asked for.
             self.rx.expect_step(epsilon::step_direction() * f64::from(epsilon) / 65536.0);
             self.source.change(Out::Jp);
+            if let Some(diag) = self.diag.as_mut() {
+                diag.jp = Some((lag, epsilon));
+            }
             self.note(format!("V.92: Jp with epsilon {epsilon}"));
         }
         // The second TRN1u carries the equaliser's refit at the new phase:
@@ -1956,6 +2215,9 @@ impl Modem {
             // good to tens of symbols. A least-squares fit at the wrong
             // alignment is a fit against the wrong sequence, and that is what
             // kept this refit from ever happening on a real line.
+            // What the correlation said, for `V92_PHASE3_DIAG` only: the fit
+            // that follows keeps the signal to noise and not the pair.
+            let mut search: Option<(u64, f64)> = None;
             let found = match self.rx.align_trn1u(at, REFIT_SEARCH, ALIGN_WINDOW) {
                 // The alignment is verified by the correlation, not by the fit:
                 // a two-point stream is two thirds of its power at 4000 Hz, and
@@ -1965,6 +2227,7 @@ impl Modem {
                 // 13. What the refit has to get right is *when*, and the
                 // correlation says that to a fraction of a symbol.
                 Some((aligned, quality)) if quality > REFIT_QUALITY => {
+                    search = Some((aligned, quality));
                     // 9.5.1.1.10: "the digital modem shall keep a modulo 12 data
                     // frame interval count from the first symbol of TRN1u" --
                     // the *second* one, and this is the first the alignment of
@@ -1973,7 +2236,8 @@ impl Modem {
                     self.trn2_from = Some(base + aligned);
                     // 9.6.1.1.1's design is scheduled here: see `design_at`.
                     self.design_at = self.trn2_from.map(|at| at + DESIGN_AFTER);
-                    let taken = self.rx.train_verified(aligned, TRAIN_WINDOW);
+                    let anchor = (aligned as i64 + refit_offset()).max(0) as u64;
+                    let taken = self.rx.train_verified(anchor, TRAIN_WINDOW);
                     if tracing() {
                         eprintln!(
                             "V92TRACE: refit at {aligned}, quality {quality:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
@@ -1984,11 +2248,29 @@ impl Modem {
                 }
                 _ => None,
             };
+            if self.diag.is_some() {
+                let line = match search {
+                    Some((aligned, quality)) => format!(
+                        "refit search around {at}: aligned {aligned} (expected {from}), \
+                         quality {quality:.3} over {REFIT_QUALITY}, fit {found:?}, \
+                         snr now {:.1} dB, was {baseline:.1}, slack {}",
+                        self.rx.snr_db(),
+                        refit_slack()
+                    ),
+                    None => format!(
+                        "refit search around {at}: no alignment over {REFIT_QUALITY}, \
+                         snr {:.1} dB, was {baseline:.1}, slack {}",
+                        self.rx.snr_db(),
+                        refit_slack()
+                    ),
+                };
+                self.diag_line(&line);
+            }
             match found {
                 // And a fit that reads the line much worse than the one in place
                 // is not a refit: the taps would be worse for the CPt than what
                 // they replaced.
-                Some(snr) if snr > baseline - REFIT_SLACK_DB => {
+                Some(snr) if snr > baseline - refit_slack() => {
                     self.refit_from = None;
                     self.note(format!("V.92: refit at the new phase, {snr:.1} dB"));
                     // The reader and the CPt finder are left alone: a CPt is a
@@ -3438,6 +3720,18 @@ impl Modem {
                 self.cp_len = 0;
                 self.cp_pos = 0;
                 self.e1u_zeroes = 0;
+                if let Some(diag) = self.diag.as_mut() {
+                    // Phase 3's CPt read starts again here, so the stream, the
+                    // hits and the verdict are this read's and not a last one's.
+                    diag.bits.clear();
+                    diag.dropped = 0;
+                    diag.first_symbol = None;
+                    diag.hits = 0;
+                    diag.first_hit = None;
+                    diag.last_hit = None;
+                    diag.frame = None;
+                    diag.exited = false;
+                }
                 self.note("V.92: second S-bar-u, 107 on".into());
             }
             _ => {}
@@ -3583,6 +3877,17 @@ impl Modem {
     fn cpt_bit(&mut self, bit: bool) {
         self.cp_bits += 1;
         self.cp_ones += u64::from(bit);
+        let now = self.now;
+        if let Some(diag) = self.diag.as_mut() {
+            diag.first_symbol.get_or_insert(now);
+            diag.push(bit);
+            if let Some(file) = cpt_bits_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{now} {}", u8::from(bit));
+            }
+        }
         if tracing() && self.cp_bits % 400 == 0 {
             eprintln!("V92TRACE: CPt reader {} bits, {} ones", self.cp_bits, self.cp_ones);
             self.cp_ones = 0;
@@ -3594,11 +3899,26 @@ impl Modem {
             self.cp_pos = 0;
             self.since_cpt = 0;
             self.e1u_zeroes = 0;
+            if let Some(diag) = self.diag.as_mut() {
+                let at = diag.count().saturating_sub(1);
+                diag.hits += 1;
+                diag.first_hit.get_or_insert(at);
+                diag.last_hit = Some(at);
+                // The frame the far end is actually sending, which is what
+                // another arm's stream can be read against.
+                diag.frame = Some(cp.to_bits_in(Layout::V92, UP_INTERVALS));
+            }
             self.heard_cp(cp);
             return;
         }
         self.since_cpt = self.since_cpt.saturating_add(1);
         if self.cp_len == 0 {
+            // E1u is not looked for at all until one CPt has been found by its
+            // CRC, so on an arm that never finds one this is the whole of
+            // Phase 3's exit -- and it used to say nothing whatever.
+            if self.diag.is_some() && self.cp_bits % DIAG_EVERY == 0 {
+                self.phase3_line("still no CPt CRC hit");
+            }
             return;
         }
         if self.cp_pos < E1U_ZEROES {
@@ -3607,6 +3927,22 @@ impl Modem {
             // one repetition of it, plus the twelve, is as long ago as the last
             // CRC hit can be. Silence is not E1u.
             let fresh = self.since_cpt <= self.cp_len + E1U_ZEROES;
+            if self.diag.is_some()
+                && self.e1u_zeroes == E1U_ZEROES
+                && !(fresh && self.cpt.is_some() && self.stage == Stage::Ri)
+            {
+                // Twelve zeroes arrived where E1u belongs and it was not taken:
+                // the four conditions are `cp_len != 0` (implied here), fresh,
+                // `cpt.is_some()` and `stage == Ri`, and this says which of the
+                // three that can fail did.
+                let why = format!(
+                    "twelve zeroes where E1u belongs, refused: fresh {fresh}, cpt {}, \
+                     stage {:?}",
+                    self.cpt.is_some(),
+                    self.stage
+                );
+                self.phase3_line(&why);
+            }
             if self.e1u_zeroes == E1U_ZEROES
                 && fresh
                 && self.cpt.is_some()
@@ -3628,6 +3964,91 @@ impl Modem {
         if self.cp_pos >= self.cp_len {
             self.cp_pos = 0;
             self.e1u_zeroes = 0;
+        }
+    }
+
+    /// One diagnostic line, when `V92_PHASE3_DIAG` asked for them.
+    fn diag_line(&self, text: &str) {
+        if self.diag.is_some() {
+            eprintln!("V92DIAG: {text}");
+        }
+    }
+
+    /// Phase 3's exit, once: the E1u test's verdict, or the reason it was never
+    /// reached.
+    fn phase3_exit(&mut self) {
+        let why = {
+            let Some(diag) = self.diag.as_ref() else { return };
+            if diag.exited || diag.first_symbol.is_none() {
+                return;
+            }
+            if diag.hits == 0 {
+                "left with no CPt CRC hit at all, so E1u was never looked for".to_owned()
+            } else if self.stage == Stage::Phase4 {
+                "left on E1u".to_owned()
+            } else {
+                format!("left without E1u after {} hits", diag.hits)
+            }
+        };
+        if let Some(diag) = self.diag.as_mut() {
+            diag.exited = true;
+        }
+        self.phase3_line(&why);
+    }
+
+    /// Where Phase 3's exit stands, and -- when no CPt has checked -- how far
+    /// the stream is from being one: see [`phase3_diag`].
+    fn phase3_line(&mut self, why: &str) {
+        let (cp_bits, cp_pos, cp_len, e1u_zeroes, since_cpt, stage) =
+            (self.cp_bits, self.cp_pos, self.cp_len, self.e1u_zeroes, self.since_cpt, self.stage);
+        let cpt = self.cpt.is_some();
+        let (hits, first_hit, last_hit, first_symbol, jp, scan, frame, count) = {
+            let Some(diag) = self.diag.as_ref() else { return };
+            (
+                diag.hits,
+                diag.first_hit,
+                diag.last_hit,
+                diag.first_symbol,
+                diag.jp,
+                cpt_diag::closest(&diag.bits, diag.dropped),
+                diag.frame.as_ref().map(Vec::len),
+                diag.count(),
+            )
+        };
+        eprintln!(
+            "V92DIAG: phase 3 {why}, symbol {}: cp_bits {cp_bits}, cp_pos {cp_pos}, cp_len \
+             {cp_len}, e1u_zeroes {e1u_zeroes}, since_cpt {since_cpt}, cpt {cpt}, stage {stage:?}; \
+             CPt read from symbol {first_symbol:?}, hits {hits} at bits {first_hit:?}..{last_hit:?} \
+             of {count}, frame {frame:?} bits; Jp (lag, epsilon) {jp:?}; rx {:.1} dB",
+            self.now,
+            self.rx.snr_db()
+        );
+        match scan.closest {
+            Some(best) => eprintln!(
+                "V92DIAG: closest CPt frame: {} bit errors (sync {}, starts {}, crc {}) at bit \
+                 {} of {count}, {} blocks ({} bits); best sync error anywhere {}, {} windows \
+                 within {} of {} scanned",
+                best.errors,
+                best.sync,
+                best.starts,
+                best.crc,
+                best.at,
+                best.blocks,
+                best.length(),
+                scan.min_sync,
+                scan.near,
+                cpt_diag::NEAR,
+                scan.bits
+            ),
+            None => eprintln!(
+                "V92DIAG: no CPt frame within {} sync errors anywhere in {} bits; best sync \
+                 error anywhere {} (a CPt has 0, a stream that is not one averages 8.5); \
+                 {} windows examined",
+                cpt_diag::NEAR,
+                scan.bits,
+                scan.min_sync,
+                scan.near
+            ),
         }
     }
 }
