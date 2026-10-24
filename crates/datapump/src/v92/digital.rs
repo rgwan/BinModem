@@ -2572,17 +2572,32 @@ impl Modem {
         // `upstream_data` and the receiver behind it keeps running, which is
         // the same rule `upstream_drop_until` follows for TRN2u.
         const B1U_ACQUIRE_FRAMES: usize = 18;
-        // The design's own delay, if it has one: what arrives at symbol n of
-        // the line is symbol n - delay of the frame count (see
-        // [`Design::delay`](crate::v92::design::Design::delay)).
-        // Diagnostic: force the number of symbols B1u's frame origin is taken
-        // to be into what arrives, instead of the design's own delay.
+        // The design's own delay is *not* taken off here, and that is a
+        // measurement rather than a preference.
+        //
+        // [`Design::delay`](crate::v92::design::Design::delay) is the position
+        // of the response's main tap: a symmetric seventeen-tap z2 puts it at
+        // eight, so the delay is real, and it was added here on the reasoning
+        // that E2u goes out before the prefilter and B1u after it. That is not
+        // so: the prefilter takes effect at CPd (8.8.3) and delays the E
+        // exchange by exactly what it delays B1u, so the completion symbol this
+        // origin is measured from already carries the delay -- and adding it
+        // again rotates the twelve-symbol data frame and the four-symbol
+        // trellis phase by `delay` mod 12.
+        //
+        // Measured on `/tmp/p0corr/ident.raw` with eceb3c2's z2 design, whose
+        // delay is 8: with the term, `longest_ones` 109, 0 bytes, B1u 393 ones
+        // of 540; without it, 7128, 2063 bytes, B1u 568 of 576. Eight is not a
+        // multiple of twelve, so this is not a rounding question -- one of the
+        // two placements is simply wrong, and the line says which.
+        //
+        // `V92_B1U_SKIP` still forces the whole number, so a wrong origin is
+        // measured rather than argued about.
+        let _ = self.upstream_delay;
         self.b1u_skip = std::env::var("V92_B1U_SKIP")
             .ok()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(
-                self.upstream_delay + B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS,
-            );
+            .unwrap_or(B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS);
         if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
             // Printed after the assignment, not before: this line said
             // `b1u_skip 0` on every call for as long as it existed, because it
