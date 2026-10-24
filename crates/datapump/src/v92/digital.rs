@@ -2914,6 +2914,11 @@ impl Modem {
         // keeps the constant -- which is the behaviour it had.
         if let Some(decoder) = self.upstream_data.as_mut() {
             decoder.measure_rotation_from(self.b1u_skip + 1);
+            // Above 24 000 B1u's frames are read against 8.7.1's known content
+            // instead of against 6.4.1's chain, which is not the far end's
+            // there (`docs/74`). It stops with B1u: nothing after it is known,
+            // and the clause's chain is the only thing that can read it.
+            decoder.read_by_content(true);
         }
         self.b1u_ones = [0; 2];
         self.b1u_scored = [0; 2];
@@ -3288,6 +3293,9 @@ impl Modem {
             // decided from a mixture.
             std::mem::swap(&mut self.upstream_data, &mut self.b1u_probe);
             self.b1u_polarity = -1.0;
+        }
+        if let Some(decoder) = self.upstream_data.as_mut() {
+            decoder.read_by_content(false);
         }
         self.b1u_probe = None;
         self.b1u_pending = false;

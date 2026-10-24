@@ -354,6 +354,48 @@ impl Decoder {
         self.d_prev = d;
     }
 
+    /// Both frames a label set can carry, the memory left alone.
+    ///
+    /// Step 4's reflection is decided by a bit that the far end's *payload*
+    /// need not determine: a far end whose half detector saturates reports the
+    /// upper half on every frame, so its d chain is the frame counter and
+    /// nothing the receiver reads back says so (`docs/74`). A receiver that
+    /// knows what B1u carries -- 8.7.1's 48 data frames of ones -- can tell the
+    /// two candidates apart from the data and commit one with [`Self::adopt`].
+    /// The unreflected reading is first, so a caller that cannot tell them
+    /// apart keeps the reading the clause prints.
+    pub fn candidates(
+        &self,
+        labels: &[u8; UP_INTERVALS],
+        moduli: &Moduli12,
+        k: u32,
+    ) -> [Result<FrameBits, &'static str>; 2] {
+        let m = moduli.product();
+        let mut r0: u128 = 0;
+        for (&label, &modulus) in labels.iter().zip(moduli.values()).rev() {
+            if label >= modulus {
+                return [Err("a label is outside its interval's modulus"); 2];
+            }
+            r0 = r0 * u128::from(modulus) + u128::from(label);
+        }
+        let mut out = [Ok(FrameBits::new(0, k)); 2];
+        for (index, r) in [r0, m - 1 - r0].into_iter().enumerate() {
+            out[index] = if r >> k != 0 {
+                Err("the frame holds a larger value than the rate carries")
+            } else {
+                Ok(FrameBits::new(r, k))
+            };
+        }
+        out
+    }
+
+    /// Adopt the sign chain the frame just read implies, as [`Self::decode`]
+    /// would have: d(f) = s(f) xor d(f - 1) on the frame that was taken.
+    pub fn adopt(&mut self, frame: FrameBits, moduli: &Moduli12) {
+        let s = 2 * frame.value() > moduli.product() - 1;
+        self.d_prev = s ^ self.d_prev;
+    }
+
     /// K0 to K11 and the moduli back to the frame's K bits.
     ///
     /// The memory is left alone on every refusal, so a frame the Viterbi got

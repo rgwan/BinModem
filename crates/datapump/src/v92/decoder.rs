@@ -149,9 +149,16 @@ pub fn rotation_wanted() -> bool {
 /// symbols.
 pub const ROTATION_SYMBOLS: u64 = 40 * TRELLIS_FRAME as u64;
 
-/// The classes a rotation can name: the period of 6.4.2's class map at the
-/// modulus every CPd this receiver has been handed carries (`docs/46 §2`).
-const CLASSES: usize = 8;
+/// The classes a rotation can name: the period of 6.4.2's class map, which is
+/// the CPU's Mi and therefore the rung (`docs/46 §2`). Eight until `docs/74`:
+/// a rate above 24 000 has Mi = 16, and the measurement used to refuse to run
+/// there at all rather than name a class outside its histogram.
+const CLASSES: usize = 16;
+
+/// The most bits one data frame carries at the rung the constant rotation was
+/// measured on (drn 1, K = 36). Above it the class map is wider than the
+/// constant was measured at, so the rotation has to be taken off the line.
+const BITS_AT_THE_CONSTANT: u32 = 36;
 
 /// B1u's expected class sequence, and what a capture's classes have left
 /// against it.
@@ -170,6 +177,10 @@ struct Measuring {
     /// `c` classes away from the model's, mod 8, when the model is read with
     /// global sign `sign` (`0` as 6.4.1 prints it, `1` complemented).
     counts: [[[u16; CLASSES]; TRELLIS_FRAME]; 2],
+    /// The class width this rung's moduli name, which is Mi: eight at 24 000
+    /// and sixteen at 32 000. The histogram bins are mod this, not mod the
+    /// array's width -- `CLASSES` is only how wide the array is.
+    classes: usize,
     /// Symbols measured.
     seen: u64,
     /// What the model cost to build, and what the counting cost, for
@@ -190,8 +201,10 @@ impl Measuring {
         let started = std::time::Instant::now();
         let predicted = b1u_classes(bits, &moduli);
         let model_cost = started.elapsed();
+        let classes = usize::from(*moduli.iter().max().expect("twelve moduli"));
         (first < predicted.len()).then(|| Self {
             predicted,
+            classes,
             first,
             counts: [[[0; CLASSES]; TRELLIS_FRAME]; 2],
             seen: 0,
@@ -211,9 +224,9 @@ impl Measuring {
         self.seen += 1;
         let started = std::time::Instant::now();
         let class = i64::from(index_to_ki_class(eta, modulus, k));
-        let complement = CLASSES as i64 - 1 - i64::from(predicted);
+        let complement = self.classes as i64 - 1 - i64::from(predicted);
         for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
-            let away = (class - predicted).rem_euclid(CLASSES as i64);
+            let away = (class - predicted).rem_euclid(self.classes as i64);
             self.counts[sign][k][away as usize] += 1;
         }
         self.count_cost += started.elapsed();
@@ -263,12 +276,22 @@ impl Measuring {
                 .map(|counts| u32::from(counts.iter().copied().max().unwrap_or(0)))
                 .sum()
         };
-        let sign = usize::from(agreement(1) > agreement(0));
+        let _sign = usize::from(agreement(1) > agreement(0));
         let mut table = [None; TRELLIS_FRAME];
-        for (k, counts) in self.counts[sign].iter().enumerate() {
+        // Both readings of the model are allowed to explain a symbol, and at
+        // 32 000 both are needed: the far end there reflects whole frames on a
+        // chain of its own, so a frame reads against one reading or against the
+        // other and neither reading alone is a mode (`docs/74`). The rotation
+        // is a property of the far end's index map, which does not alternate,
+        // so it is the *union* that has to be sharp -- and it is: 90 of 90
+        // classes a position at 32 000, against 36 and 54 taken separately.
+        for (k, counts) in self.counts[0].iter().enumerate() {
+            let union: Vec<u32> = (0..self.classes)
+                .map(|class| u32::from(counts[class]) + u32::from(self.counts[1][k][class]))
+                .collect();
             let samples: u32 = counts.iter().map(|&count| u32::from(count)).sum();
             let mut ranked: Vec<(u32, usize)> =
-                counts.iter().enumerate().map(|(class, &count)| (u32::from(count), class)).collect();
+                union.iter().enumerate().map(|(class, &count)| (count, class)).collect();
             ranked.sort_unstable_by(|a, b| b.cmp(a));
             let best = ranked[0];
             let next = ranked.get(1).copied().unwrap_or((0, 0));
@@ -462,6 +485,16 @@ pub struct Decoder {
     /// `V92_K3`'s `rot=` table, read once here so that the per-symbol path is
     /// an array index and not an environment lookup.
     named_rotation: [Option<i64>; TRELLIS_FRAME],
+    /// Whether a data frame's polarity is to be settled from B1u's known
+    /// content instead of from 6.4.1's chain. Only ever on above 24 000, and
+    /// only while B1u is being read: the far end's chain is not a function of
+    /// what it sends at those rungs (`docs/74`), and B1u's content is the one
+    /// thing a receiver knows symbol for symbol (8.7.1). The caller says when:
+    /// [`Self::read_by_content`].
+    by_content: bool,
+    /// Data frames read so far, so that `by_content` stops at the end of B1u:
+    /// 8.7.1's 48 frames are the only ones whose content is known.
+    pushed: usize,
 }
 
 impl Decoder {
@@ -503,6 +536,8 @@ impl Decoder {
             decided: 0,
             measuring: None,
             rotation: [None; TRELLIS_FRAME],
+            by_content: false,
+            pushed: 0,
             named_rotation: correction()
                 .and_then(|fix| fix.rotation)
                 .map_or([None; TRELLIS_FRAME], |table| table.map(Some)),
@@ -554,6 +589,14 @@ impl Decoder {
         std::mem::take(&mut self.bits)
     }
 
+    /// Settle each B1u data frame's polarity from 8.7.1's known content, or
+    /// stop doing that. On only where the far end's 6.4.1 chain cannot be read
+    /// out of what it sends -- above 24 000 (`docs/74`) -- and only for as long
+    /// as the content is known, which is B1u and nothing after it.
+    pub fn read_by_content(&mut self, on: bool) {
+        self.by_content = on && self.bits_per_frame > BITS_AT_THE_CONSTANT;
+    }
+
     /// Symbols fed since the first symbol of B1u.
     pub fn symbols(&self) -> u64 {
         self.n
@@ -583,7 +626,13 @@ impl Decoder {
     /// keeps the constant, which is what every B1u number before `docs/48` was
     /// taken with.
     pub fn measure_rotation_from(&mut self, first: usize) {
-        if !rotation_wanted() || self.measuring.is_some() {
+        // `V92_ROT` asks for it anywhere; above 24 000 it is not optional,
+        // because `PAIR_FIRST_INDEX_OFFSET` is what an Agere's Mi = 8 line was
+        // measured at and at Mi = 16 that constant is not the far end's
+        // (`docs/74`). Nothing below 24 000 changes: there the measurement
+        // returns the constant it would have been taken as.
+        let wider = self.bits_per_frame > BITS_AT_THE_CONSTANT;
+        if (!rotation_wanted() && !wider) || self.measuring.is_some() {
             return;
         }
         self.measuring = Measuring::new(self.bits_per_frame, self.params.moduli, first);
@@ -739,13 +788,56 @@ impl Decoder {
             if self.labels.len() == UP_INTERVALS {
                 let labels: [u8; UP_INTERVALS] =
                     std::mem::take(&mut self.labels).try_into().expect("twelve intervals");
-                if let Ok(frame) = self.modulus.decode(&labels, &self.moduli, self.bits_per_frame) {
-                    for bit in frame.bits() {
-                        let out = self.descrambler.descramble(bit);
-                        self.bits.push(out);
+                let known = self.by_content && self.pushed < B1U_FRAMES;
+                self.pushed += 1;
+                if !known {
+                    if let Ok(frame) = self.modulus.decode(&labels, &self.moduli, self.bits_per_frame) {
+                        for bit in frame.bits() {
+                            let out = self.descrambler.descramble(bit);
+                            self.bits.push(out);
+                        }
                     }
+                } else {
+                    self.push_frame_by_content(&labels);
                 }
             }
+        }
+    }
+}
+
+impl Decoder {
+    /// One data frame's bits, its polarity settled from 8.7.1's known content.
+    ///
+    /// 6.4.1's differential step is what tells a receiver which way up a frame
+    /// is: d(f) = s(f) xor d(f - 1) at the far end, the reflection undone here.
+    /// That works only while the far end's d is a function of what the far end
+    /// sends. At 32 000 it is not -- the far end there reports the upper half
+    /// on every frame, so its d is the frame counter and its reflection
+    /// alternates -- and no chain read out of the payload can follow it. Which
+    /// is a property of one far end and not of the clause: the clause's own
+    /// answer is that both readings of a frame are legal and the data says
+    /// which (`docs/74`).
+    ///
+    /// So both candidates are read, each descrambled on a copy of the state,
+    /// and the one that comes out closer to B1u's 48 ones is the frame. No
+    /// constant is fitted: the criterion is 8.7.1's content, it is applied to
+    /// every frame at every rung above 24 000, and at 24 000 -- where the chain
+    /// is the far end's -- it is not applied at all.
+    fn push_frame_by_content(&mut self, labels: &[u8; UP_INTERVALS]) {
+        let mut best: Option<(usize, Vec<bool>, Scrambler, FrameBits)> = None;
+        for candidate in self.modulus.candidates(labels, &self.moduli, self.bits_per_frame) {
+            let Ok(frame) = candidate else { continue };
+            let mut probe = self.descrambler.clone();
+            let bits: Vec<bool> = frame.bits().map(|bit| probe.descramble(bit)).collect();
+            let ones = bits.iter().filter(|bit| **bit).count();
+            if best.as_ref().is_none_or(|(most, ..)| ones > *most) {
+                best = Some((ones, bits, probe, frame));
+            }
+        }
+        if let Some((_, bits, state, frame)) = best {
+            self.modulus.adopt(frame, &self.moduli);
+            self.descrambler = state;
+            self.bits.extend(bits);
         }
     }
 }
@@ -975,7 +1067,7 @@ mod tests {
         // drn 1 is K = 36, the rate an Agere SV92PP's B1u is read at, and the
         // one whose moduli are eight: the rotation is named in the class space.
         let parameters = parameters(1, Trellis::Sixteen);
-        assert!(parameters.moduli.iter().all(|&modulus| modulus == CLASSES as u8), "eight classes");
+        assert!(parameters.moduli.iter().all(|&modulus| modulus == 8), "eight classes");
         let bits = up_bits(parameters.drn);
         let classes = b1u_classes(bits, &parameters.moduli);
         assert_eq!(classes.len(), B1U_FRAMES * UP_INTERVALS, "B1u is 576 known classes");

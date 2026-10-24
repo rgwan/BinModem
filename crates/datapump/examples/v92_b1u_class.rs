@@ -379,6 +379,67 @@ fn main() {
         }
     }
 
+    if std::env::var_os("V92_MODEL_FRAMES").is_some() {
+        // The payload each model frame carries, and the two bits 6.4.1 derives
+        // from it: s(f) = [R > (M-1)/2] and d(f) = s(f) xor d(f-1). Printed so
+        // that a far end's reflection chain can be compared with ours rather
+        // than only its effect on the classes.
+        let moduli = Moduli12::new(moduli);
+        let mut scrambler = Scrambler::new(Mode::Answer);
+        let mut d_prev = false;
+        let m = moduli.product();
+        for frame in 0..B1U_FRAMES {
+            let bits: Vec<bool> = (0..bits).map(|_| scrambler.scramble(true)).collect();
+            let r: u128 = FrameBits::from_bits(&bits).value();
+            let s = 2 * r > m - 1;
+            let d = s ^ d_prev;
+            println!("  frame {frame:2}  R {r:012x}  s {}  d_prev {}  d {}", s as u8, d_prev as u8, d as u8);
+            d_prev = d;
+        }
+    }
+
+    if std::env::var_os("V92_ZERO_PAYLOAD").is_some() {
+        // The two sources of a whole-frame complement, side by side.
+        //
+        // A far end whose B1u data are zero sends `scramble(0)` where an
+        // all-ones B1u sends `scramble(1)`. With an additive scrambler that is
+        // the bitwise complement of the ones stream; the production scrambler
+        // is multiplicative, so the two streams are built here by flipping the
+        // bits rather than by feeding `false`, which a zeroed multiplicative
+        // scrambler turns into an all-zero stream.
+        //
+        // The interesting part is that the *chain* comes along: a complemented
+        // payload has s(f) complemented, so d(f) = s(f) xor d(f-1) is
+        // complemented too, and 6.4.1's step 4 reflects with d(f-1). Reflect a
+        // complemented payload with a complemented chain and the two cancel,
+        // which is why this model has a different prediction from "the ones
+        // model complemented": it should agree with the capture on *every*
+        // frame, not on the ones the capture reads as ours.
+        let moduli12 = Moduli12::new(moduli);
+        let mut scrambler = Scrambler::new(Mode::Answer);
+        let mut encoder = modulus::Encoder::new();
+        let mut zero = Vec::with_capacity(B1U_FRAMES * UP_INTERVALS);
+        for _ in 0..B1U_FRAMES {
+            let bits_of: Vec<bool> = (0..bits).map(|_| !scrambler.scramble(true)).collect();
+            let frame = encoder
+                .encode(FrameBits::from_bits(&bits_of), &moduli12)
+                .expect("the moduli carry K bits");
+            zero.extend_from_slice(&frame);
+        }
+        for (name, model) in [("all-ones payload", &predicted), ("zero payload", &zero)] {
+            let mut same = 0usize;
+            let mut mirrored = 0usize;
+            for symbol in &observed {
+                let Some(&wanted) = model.get(start + symbol.n) else { break };
+                let class = (symbol.class() as i64 - offset.as_ref().map_or(0, |o| o[symbol.k()]))
+                    .rem_euclid(classes as i64) as usize;
+                same += usize::from(class == usize::from(wanted));
+                mirrored += usize::from(class == classes - 1 - usize::from(wanted));
+            }
+            println!("  {name}: {same} as-is, {mirrored} complemented, of {}", observed.len());
+        }
+    }
+
     if per_frame {
         let table = offset.unwrap_or([0; TRELLIS_FRAME]);
         println!("\nper frame: rotation {table:?}, 1 = a one, . = a zero");
