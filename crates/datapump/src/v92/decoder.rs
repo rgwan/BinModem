@@ -158,7 +158,20 @@ impl Decoder {
     pub fn new(parameters: &Parameters) -> Self {
         let code = code_for(parameters.trellis);
         let mut metrics = vec![f64::MAX; code.states()];
-        metrics[0] = 0.0;
+        // Which convolutional state the encoder is assumed to be in at the
+        // first symbol this decoder is handed. Zero is right only if that
+        // symbol is the first symbol of B1u -- 8.7.1 zeroes the memories and
+        // then starts encoding -- and it is not: `b1u_skip` drops eighteen
+        // data frames first, so the far end's encoder has been running for
+        // 216 symbols by the time this sees anything. `V92_B1U_STATE` sweeps
+        // the assumption (diagnostic only; the default is the behaviour every
+        // number here was taken with).
+        let start = std::env::var("V92_B1U_STATE")
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .filter(|state| *state < code.states())
+            .unwrap_or(0);
+        metrics[start] = 0.0;
         Self {
             moduli: Moduli12::new(parameters.moduli),
             code,
