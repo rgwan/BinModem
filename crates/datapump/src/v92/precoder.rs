@@ -85,6 +85,30 @@ pub const TIE_TO_SMALLER_INDEX: bool = true;
 /// likely how a pair's first index is numbered when the constellation's levels
 /// arrive from a CPd of eight odd magnitudes; the offline enumeration that
 /// established it is `crates/datapump/examples/v92_b1u_search.rs`.
+///
+/// **It contradicts the clause, and removing it breaks interop.** 6.4.2 puts no
+/// case for k = 0 or k = 2: "eta_k = Ki + z_k Mi, z_k an integer" for k = 0, 1,
+/// 2, and z = 0 is an integer, so Ki is a member of its own class at those
+/// positions. This constant moves Ki two places along on half of them, which
+/// `ki_is_a_member_of_its_own_equivalence_class` fails on by design. Both were
+/// measured rather than argued:
+///
+/// * with the offset removed -- `Class::for_interval` and `index_to_ki` both
+///   reading the clause literally -- `/tmp/p0corr/ident.raw` and an Agere
+///   SV92PP capture (`agr-v90-interop/012503-mask3`) reach B1u in neither: no
+///   trace, no data mode. With it, both read 7128 and 2063 bytes, B1u 568 ones
+///   against 449.
+/// * `the_memories_are_zero_before_b1u` passes at 2 and fails at 0.
+///
+/// So the rotation is required by *our own far-end model and by a real Agere at
+/// once*, which is why encoder, decoder and tests all agreed while all three
+/// are at odds with the printed clause. What that points at next is not this
+/// mapping but the constellation we download: CPd carries six sets (LC1..LC6,
+/// Table 30) and a 4D symbol takes four positions from them, while this end
+/// sends one set for all twelve intervals and reads indices off it as if the
+/// four positions were interchangeable. A flattened set is the sort of thing
+/// that turns into a two-index rotation on exactly the pair-first positions.
+/// That is a question for the design path, not for this constant.
 pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
 
 /// The offset in force: `PAIR_FIRST_INDEX_OFFSET` unless `V92_PAIR_OFFSET`
