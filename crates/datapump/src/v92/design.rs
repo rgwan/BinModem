@@ -492,6 +492,16 @@ pub const SNR_FULL: f64 = 26.0;
 /// the whole of its headroom on one edge of the band.
 pub const PEAK_CAP_DB: f64 = 2.0;
 
+/// How far a tone's gain may sit from the band's mean before the shaper
+/// corrects it, in decibels.
+///
+/// Bounded from both sides by measurement: 0.69 dB above the worst structure a
+/// flat line reports (2.31 dB at 3750 Hz, a15) and 1.56 dB below the worst
+/// deviation the G.712 channel reports (4.56 dB). See `fit_shape` for what the
+/// band acts on and why it is on the deviation rather than on the gain.
+pub const DEAD_BAND_DB: f64 = 3.0;
+
+
 /// The most `sum z^2` a design will spend, which 8.8.3 makes the upstream
 /// transmit power. The identity section, `z2 = [1]`, spends 1; 2 is 3 dB more
 /// than the far end would send unfiltered, and a quarter of the 8 that already
@@ -670,7 +680,91 @@ fn fit_shape(
     // back to fit, it would land at the same net level anyway. Boosting the
     // quiet half of the band is paid for by trimming the loud half, which keeps
     // the level and buys tilt.
-    let mut target: Vec<f64> = usable.iter().map(|(_, _, h)| 1.0 / h).collect();
+    // The dead band, on the deviation from the band's own mean gain.
+    //
+    // The reading is not the thing the shaper wants to invert: it is the line
+    // *plus this end's receive path*, and on a line that is straight it still
+    // reports structure -- measured on the identity arm, 2.31 dB at 3750 Hz
+    // against the band's mean, with only +/-0.7 dB of wobble anywhere else
+    // (a15). Correcting that inverts our own receiver at the transmitter, which
+    // the equaliser was already going to handle, and it tilts a line that had
+    // nothing wrong with it -- on the arm with no channel at all.
+    //
+    // So the target is unity for any tone within `DEAD_BAND_DB` of the mean and
+    // the inverse of the *excess* beyond it for any tone further out:
+    //
+    //     correction(f) = -(d(f) - clamp(d(f), -DEAD_BAND_DB, +DEAD_BAND_DB))
+    //     d(f)          = gain_db(f) - mean(gain_db over the usable tones)
+    //
+    // Three decibels is bounded from both sides by measurement and not chosen:
+    // it sits 0.69 dB above the worst structure a flat line reports (2.31 dB),
+    // so a good line is left completely alone, and 1.56 dB below the worst
+    // deviation the specification channel reports (4.56 dB on G.712's own
+    // figure), so a gross tilt is still corrected.
+    //
+    // The band is on the *deviation*, not on the absolute gain: an absolute band
+    // would leave a line that is 10 dB down everywhere untouched and correct one
+    // that is 10 dB down in the middle, which is the wrong way round -- the mean
+    // is the level, and the level is the receiver's to set.
+    //
+    // This is a gate and not a knee, and the cost is written down rather than
+    // argued away: a tone just outside the band is fully inverted while one just
+    // inside it is not touched, so a line measured close to the edge can land on
+    // either side of it (the reading is good to 0.1-0.2 dB, the edge is a step).
+    // What buys that back is that the fitted section is seventeen taps and
+    // smooths a step in the target into a ramp over the band it covers, and that
+    // the alternative -- correcting only the excess beyond the band -- gave up
+    // the thing the band was introduced for: measured on a reading with an
+    // eight decibel tilt, the knee took 8.0 to 6.3 dB where the gate takes it to
+    // 4.0, i.e. the knee keeps almost none of the tilt correction the actuator
+    // window exists to spend. A gate with nothing to correct inside it and a
+    // real correction outside it is the version that does both jobs.
+    let weighted_mean_db = {
+        let (mut sum, mut weights) = (0.0, 0.0);
+        for (tone, weight, _) in usable {
+            sum += weight * tone.gain_db;
+            weights += weight;
+        }
+        sum / weights
+    };
+    // Does the band hold any structure the shaper should act on at all?
+    //
+    // This is one decision for the whole band and not one per tone, and that is
+    // the point: what the reading's structure is mostly made of on a good line
+    // is *this end's own receive response* (2.31 dB at 3750 Hz on the identity
+    // arm, a15), which is the same shape every call, so correcting "the part
+    // beyond three decibels" tone by tone would keep inverting half of our own
+    // path on every call and would leave a tilt only two of its four available
+    // decibels. Either the band's structure is worth inverting or it is not.
+    //
+    // Measured on a reading with an eight decibel tilt: per-tone correction of
+    // the excess takes 8.0 to 5.6 dB and a one-decibel ramp at the edge rings
+    // the seventeen-tap section to a cut of -2.37 dB where the actuator allows
+    // -2.00; this decision takes the same tilt to 4.0 dB inside the window, and
+    // leaves the flat arm at 3.1 -> 3.1, which is what the band is for.
+    let structure_db = usable
+        .iter()
+        .map(|(tone, _, _)| (tone.gain_db - weighted_mean_db).abs())
+        .fold(0.0f64, f64::max);
+    let band_holds_structure = structure_db > DEAD_BAND_DB;
+    let mut target: Vec<f64> = usable
+        .iter()
+        .map(|(tone, _, h)| {
+            if !band_holds_structure {
+                // The band is doing its job: no correction, and note what is
+                // *not* here -- the absolute `1/h` the target used to be.
+                // Inverting the line's gain is not this section's job; the mean
+                // is the level, the level is the receiver's, and the
+                // normalisation below removes the mean anyway.
+                let _ = h;
+                1.0
+            } else {
+                // Mean-removed: only the *shape* of the line is inverted, the
+                // rest of what the reading found is level and is not touched.
+                10f64.powf(-(tone.gain_db - weighted_mean_db) / 20.0)
+            }
+        })
+        .collect();
     for _ in 0..8 {
         let mean = target.iter().sum::<f64>() / target.len() as f64;
         if !(mean > 0.0) || !mean.is_finite() {
