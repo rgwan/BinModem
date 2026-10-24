@@ -28,12 +28,14 @@
 
 use std::collections::VecDeque;
 
-use crate::v32::Scrambler;
+use crate::v32::{Mode, Scrambler};
 use crate::v34::trellis::{self, Code};
 
-use super::modulus::{self, Moduli12};
-use super::precoder::{Constellation, code_for, index_to_ki, label_of, opens_a_pair, pair_first_index_offset};
-use super::{Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
+use super::modulus::{self, FrameBits, Moduli12};
+use super::precoder::{
+    Constellation, code_for, index_to_ki, index_to_ki_class, label_of, opens_a_pair, pair_first_index_offset,
+};
+use super::{B1U_FRAMES, Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 
 /// Trellis frames held before the oldest is decided on. Forty frames is a
 /// hundred and sixty symbols, twenty milliseconds: long enough for every code
@@ -93,6 +95,227 @@ struct Correction {
     levels: [f64; TRELLIS_FRAME],
     /// The far end's class rotation, in `v92_b1u_class --offset`'s convention.
     rotation: Option<[i64; TRELLIS_FRAME]>,
+}
+
+/// `V92_ROT`: measure this call's class rotation off B1u, once, and use it in
+/// place of `PAIR_FIRST_INDEX_OFFSET`.
+///
+/// The constant is a measurement of *one* far end, and so is `V92_K3`'s `rot=`
+/// table: both name what one particular peer does, and a peer that does
+/// anything else has its indices rotated by the difference -- which is how a
+/// fixed table takes an Agere from 563 of 576 to 323 (`docs/47 §5`). 8.7.1
+/// makes B1u's 576 symbols known and `docs/46` shows the model that predicts
+/// their classes is exact (360/360 on an Agere), so the rotation can be *read
+/// off the call* instead of assumed:
+///
+/// ```text
+/// per position k: rotation[k] = mode over frames of (observed - predicted) mod 8
+/// ```
+///
+/// "Predicted" is B1u's class sequence, which is known up to **one global
+/// sign**: 6.4.1's differential step exists so that an inverted line decodes
+/// the same, so the sequence is defined either as the model reads it or as
+/// `Mi - 1 - Ki`, and which of the two a given capture is aligned with is one
+/// bit, not five hundred and seventy-six (`docs/46 §2`; `docs/46 §3` lists both
+/// readings for Agere, and only the second is 90/90). So the histogram is kept
+/// for both signs and the sign that the line actually reads is taken, by
+/// agreement -- no far end is named, and a wrong choice cannot hurt: the bar
+/// below throws away a position that does not have a mode anyway.
+///
+/// Unset, empty or `0` is off, and off is the constant and nothing else: the
+/// same classes, the same bits, the same files as before this existed.
+pub fn rotation_wanted() -> bool {
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| match std::env::var("V92_ROT") {
+        Ok(text) => !text.trim().is_empty() && text.trim() != "0",
+        Err(_) => false,
+    })
+}
+
+/// How many symbols B1u is measured over: forty-eight per trellis position,
+/// half of the ninety `docs/46`'s tables were read with, which is enough for
+/// the bar in [`Measuring::rotation`] to separate a plateau from a tie and
+/// short enough to finish inside the Viterbi's own window.
+pub const ROTATION_SYMBOLS: u64 = 48 * TRELLIS_FRAME as u64;
+
+/// The classes a rotation can name: the period of 6.4.2's class map at the
+/// modulus every CPd this receiver has been handed carries (`docs/46 §2`).
+const CLASSES: usize = 8;
+
+/// B1u's expected class sequence, and what a capture's classes have left
+/// against it.
+///
+/// At class level this is 8.7.1's known content against 6.4.2 read backwards
+/// with no Viterbi, no equaliser and no descrambler in the way: one nearest
+/// point per symbol, off the table the slicing has just built, and one
+/// histogram bin.
+#[derive(Debug, Clone)]
+struct Measuring {
+    /// The model's 576 classes, B1u's first symbol first.
+    predicted: Vec<u8>,
+    /// Which of those 576 the first symbol fed to this decoder is.
+    first: usize,
+    /// `counts[sign][k][c]`: how many symbols at trellis position `k` came out
+    /// `c` classes away from the model's, mod 8, when the model is read with
+    /// global sign `sign` (`0` as 6.4.1 prints it, `1` complemented).
+    counts: [[[u16; CLASSES]; TRELLIS_FRAME]; 2],
+    /// Symbols measured.
+    seen: u64,
+    /// What the model cost to build, and what the counting cost, for
+    /// `V92_ROT_TRACE`. Neither is on the per-symbol path: this runs once.
+    model_cost: std::time::Duration,
+    count_cost: std::time::Duration,
+}
+
+impl Measuring {
+    /// A measurement of B1u from its `first` symbol on, or nothing when a
+    /// modulus is wider than the histogram: the rotation lives in the class
+    /// space, and a rate whose moduli are not eight does not have eight classes
+    /// to name.
+    fn new(bits: u32, moduli: [u8; UP_INTERVALS], first: usize) -> Option<Self> {
+        if moduli.iter().any(|&modulus| usize::from(modulus) > CLASSES) {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let predicted = b1u_classes(bits, &moduli);
+        let model_cost = started.elapsed();
+        (first < predicted.len()).then(|| Self {
+            predicted,
+            first,
+            counts: [[[0; CLASSES]; TRELLIS_FRAME]; 2],
+            seen: 0,
+            model_cost,
+            count_cost: std::time::Duration::ZERO,
+        })
+    }
+
+    /// One symbol's class against the model's, under both readings of it.
+    fn observe(&mut self, modulus: u8, eta: i32) {
+        let index = self.first + self.seen as usize;
+        let Some(&predicted) = self.predicted.get(index) else { return };
+        // The trellis position in B1u's own numbering, not in this decoder's:
+        // they differ by the acquisition skip, and only coincidentally by a
+        // multiple of four.
+        let k = index % TRELLIS_FRAME;
+        self.seen += 1;
+        let started = std::time::Instant::now();
+        let class = i64::from(index_to_ki_class(eta, modulus, k));
+        let complement = CLASSES as i64 - 1 - i64::from(predicted);
+        for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
+            let away = (class - predicted).rem_euclid(CLASSES as i64);
+            self.counts[sign][k][away as usize] += 1;
+        }
+        self.count_cost += started.elapsed();
+    }
+
+    /// Whether B1u has been measured for long enough.
+    fn done(&self) -> bool {
+        self.seen >= ROTATION_SYMBOLS || self.first + self.seen as usize >= self.predicted.len()
+    }
+
+    /// The rotation at each position where the mode is clear enough to be one,
+    /// and nothing where it is not.
+    ///
+    /// The bar, per position: the mode holds at least half the samples *and*
+    /// at least twice the next class. Both halves are chosen against
+    /// `docs/46`'s tables rather than for a round number.
+    ///
+    /// * Half the samples is what rejects a distribution with no mode at all --
+    ///   eight classes evenly is 12.5 % -- and, just as importantly, a
+    ///   measurement taken against the wrong 576 symbols, which is what a
+    ///   misaligned model looks like: noise.
+    /// * Twice the next class is what rejects the case the class agreement
+    ///   alone cannot settle, a split between two candidates. A wrong rotation
+    ///   is not a smaller error than no rotation, it is about half the bits,
+    ///   so a near-tie has to fall back rather than guess.
+    ///
+    /// Where the two verified far ends sit against it, in the counts this
+    /// measurement actually sees (48 samples a position):
+    ///
+    /// * every position of an Agere and positions 0-2 of an HSF are 90/90 in
+    ///   `docs/46`, i.e. 48/48 here: both halves clear by everything;
+    /// * HSF's k = 3 is the one plateau -- 54/90 there, runner-up 14/90, so
+    ///   60 % and 3.9:1 -- which here is about 29 of 48 against 8. It clears
+    ///   both halves (29 >= 24, 29 >= 16), and that matters: `docs/47 §5` reads
+    ///   438 of 576 with k = 3 at 7 and 356 without it, so a bar that threw the
+    ///   plateau away would leave HSF short of the only configuration that
+    ///   connects. A bar at 90 % would do exactly that, and is why the bar is
+    ///   at half.
+    fn rotation(&self) -> [Option<i64>; TRELLIS_FRAME] {
+        // Which reading of the model this line is on: the one whose four
+        // positions agree best. Ties go to the first, and a tie is not a
+        // measurement anyway -- the per-position bar below is what decides
+        // whether anything is taken from it.
+        let agreement = |sign: usize| -> u32 {
+            self.counts[sign]
+                .iter()
+                .map(|counts| u32::from(counts.iter().copied().max().unwrap_or(0)))
+                .sum()
+        };
+        let sign = usize::from(agreement(1) > agreement(0));
+        let mut table = [None; TRELLIS_FRAME];
+        for (k, counts) in self.counts[sign].iter().enumerate() {
+            let samples: u32 = counts.iter().map(|&count| u32::from(count)).sum();
+            let mut ranked: Vec<(u32, usize)> =
+                counts.iter().enumerate().map(|(class, &count)| (u32::from(count), class)).collect();
+            ranked.sort_unstable_by(|a, b| b.cmp(a));
+            let best = ranked[0];
+            let next = ranked.get(1).copied().unwrap_or((0, 0));
+            if best.0 > 0 && best.0 * 2 >= samples && best.0 >= next.0 * 2 {
+                table[k] = Some(best.1 as i64);
+            }
+        }
+        table
+    }
+}
+
+/// `V92_ROT_TRACE`: what one measurement saw and what it accepted. Diagnostic,
+/// written once per decoder that finished one; nothing in the data path reads
+/// it.
+fn trace_rotation(measuring: &Measuring, table: &[Option<i64>; TRELLIS_FRAME]) {
+    let Some(path) = std::env::var_os("V92_ROT_TRACE") else { return };
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    use std::io::Write;
+    let _ = writeln!(
+        file,
+        "rot first {} seen {} model_ns {} count_ns {}",
+        measuring.first,
+        measuring.seen,
+        measuring.model_cost.as_nanos(),
+        measuring.count_cost.as_nanos()
+    );
+    for (sign, positions) in measuring.counts.iter().enumerate() {
+        for (k, counts) in positions.iter().enumerate() {
+            let row: Vec<String> = counts.iter().map(u16::to_string).collect();
+            let _ =
+                writeln!(file, "sign {sign} k {k} [{}] accepted {}", row.join(" "), u8::from(table[k].is_some()));
+        }
+    }
+    let table: Vec<String> = table.iter().map(|entry| entry.map_or("-".to_string(), |v| v.to_string())).collect();
+    let _ = writeln!(file, "table {}", table.join(","));
+}
+
+/// B1u's class sequence: 8.7.1's forty-eight data frames of ones through 6.3's
+/// scrambler and 6.4.1's modulus encoder, from memories that start zero.
+///
+/// Nothing the precoder does is an input. The precoder, the prefilter, the
+/// trellis and G choose *which member* of a class goes out and not which class
+/// (`docs/46 §1`), so these 576 classes are the same for every far end and all
+/// a capture can differ by is a rotation of them. The scrambler and the mixed
+/// radix are the production objects the encoder uses, not a second reading of
+/// them.
+fn b1u_classes(bits: u32, moduli: &[u8; UP_INTERVALS]) -> Vec<u8> {
+    let moduli = Moduli12::new(*moduli);
+    let mut scrambler = Scrambler::new(Mode::Answer);
+    let mut encoder = modulus::Encoder::new();
+    let mut classes = Vec::with_capacity(B1U_FRAMES * UP_INTERVALS);
+    for _ in 0..B1U_FRAMES {
+        let scrambled: Vec<bool> = (0..bits).map(|_| scrambler.scramble(true)).collect();
+        let Ok(frame) = encoder.encode(FrameBits::from_bits(&scrambled), &moduli) else { break };
+        classes.extend_from_slice(&frame);
+    }
+    classes
 }
 
 /// Where to write one decided trellis frame's four indices, when
@@ -158,6 +381,23 @@ impl Bests {
         }
         bests
     }
+
+    /// The nearest point overall, which is what a hard slice would give and
+    /// what the class measurement needs: each residue class kept its own
+    /// cheapest, so the nearest is the cheapest of the four. Two comparisons
+    /// more than a four-way scan, and only while B1u is being measured.
+    fn nearest(&self) -> Option<i32> {
+        let mut best: Option<usize> = None;
+        for residue in 0..4usize {
+            if self.cost[residue] == f64::MAX {
+                continue;
+            }
+            if best.is_none_or(|best| self.cost[residue] < self.cost[best]) {
+                best = Some(residue);
+            }
+        }
+        best.map(|residue| self.eta[residue])
+    }
 }
 
 /// One trellis frame in the Viterbi's window: its branch metrics and the four
@@ -203,6 +443,15 @@ pub struct Decoder {
     labels: Vec<u8>,
     bits: Vec<bool>,
     decided: u64,
+    /// B1u's known classes, while they are being measured against
+    /// (`V92_ROT`); nothing once the measurement is done, or if it was off.
+    measuring: Option<Measuring>,
+    /// The rotation in force at each position: the measurement where it was
+    /// clear enough, and nothing where the constant is to be kept.
+    rotation: [Option<i64>; TRELLIS_FRAME],
+    /// `V92_K3`'s `rot=` table, read once here so that the per-symbol path is
+    /// an array index and not an environment lookup.
+    named_rotation: [Option<i64>; TRELLIS_FRAME],
 }
 
 impl Decoder {
@@ -242,6 +491,11 @@ impl Decoder {
             labels: Vec::with_capacity(UP_INTERVALS),
             bits: Vec::new(),
             decided: 0,
+            measuring: None,
+            rotation: [None; TRELLIS_FRAME],
+            named_rotation: correction()
+                .and_then(|fix| fix.rotation)
+                .map_or([None; TRELLIS_FRAME], |table| table.map(Some)),
         }
     }
 
@@ -259,6 +513,24 @@ impl Decoder {
         let interval = super::interval(self.n);
         let set: &[u16] = self.params.set_for(interval).unwrap_or(&[]);
         self.frame[self.filled] = Bests::new(&Constellation::new(set), level);
+        // Which class this symbol fell into, against B1u's known one, while the
+        // rotation is being measured: one nearest-point read off the table the
+        // slicing has just built, for the first 192 symbols of B1u and never
+        // again.
+        if self.measuring.is_some() {
+            let bests = self.frame[self.filled];
+            let modulus = self.moduli.modulus(interval);
+            let measuring = self.measuring.as_mut().expect("just checked");
+            if let Some(eta) = bests.nearest() {
+                measuring.observe(modulus, eta);
+            }
+            if measuring.done() {
+                let table = measuring.rotation();
+                trace_rotation(measuring, &table);
+                self.rotation = table;
+                self.measuring = None;
+            }
+        }
         self.filled += 1;
         self.n += 1;
         if self.filled == TRELLIS_FRAME {
@@ -290,6 +562,21 @@ impl Decoder {
     /// The rung of 6.1's ladder this decoder was built for.
     pub fn drn(&self) -> u8 {
         (1..=UP_RATES as u8).find(|&drn| up_bits(drn) == self.bits_per_frame).unwrap_or(0)
+    }
+
+    /// Measure this call's class rotation off B1u, from the `first` symbol of
+    /// B1u that this decoder is about to be fed.
+    ///
+    /// `first` is the caller's to know: the decoder is built at B1u's boundary
+    /// and is fed from `b1u_skip + 1` symbols after it (`digital.rs`), while the
+    /// model counts from B1u's own first symbol. A decoder nobody calls this on
+    /// keeps the constant, which is what every B1u number before `docs/48` was
+    /// taken with.
+    pub fn measure_rotation_from(&mut self, first: usize) {
+        if !rotation_wanted() || self.measuring.is_some() {
+            return;
+        }
+        self.measuring = Measuring::new(self.bits_per_frame, self.params.moduli, first);
     }
 
     /// This frame's branch metrics, and one trellis step.
@@ -342,6 +629,15 @@ impl Decoder {
         self.metrics = next;
         self.stages.push_back(stage);
         self.back.push_back(from);
+        // B1u is still being measured, so the rotation this window would be
+        // decided on is not known yet: the window is held open -- eight frames
+        // past its depth, the 192 symbols the measurement takes -- and drained
+        // as soon as it is. Holding it is what lets the measurement apply from
+        // B1u's first symbol rather than from wherever the window happened to
+        // get to.
+        if self.measuring.is_some() {
+            return;
+        }
         while self.stages.len() > SURVIVOR_DEPTH {
             self.decide();
         }
@@ -410,12 +706,22 @@ impl Decoder {
             let interval = self.labels.len();
             let modulus = self.moduli.modulus(interval);
             let mut ki = index_to_ki(eta, modulus, k);
-            // `docs/47`'s rotation, as the difference from the one
-            // `index_to_ki` already applies -- zero when the switch is off.
-            if let Some(table) = correction().and_then(|fix| fix.rotation) {
+            // The rotation in force at this position, as the difference from
+            // the one `index_to_ki` has just applied: the measured one when
+            // `V92_ROT` accepted it, `V92_K3`'s `rot=` table otherwise, and
+            // nothing at all by default.
+            //
+            // Written as a difference so that the constant *cancels*: the class
+            // that comes out is the observed one minus the rotation in force,
+            // whatever `PAIR_FIRST_INDEX_OFFSET` is. That is why a measurement
+            // that agrees with the constant changes no bit (Agere), why one
+            // that disagrees is not fighting it (HSF), and why the constant can
+            // be moved to a value of its own without moving a measured call.
+            if let Some(want) = self.rotation[k].or(self.named_rotation[k]) {
                 let applied = if opens_a_pair(k) { pair_first_index_offset() } else { 0 };
-                let want = table[k];
-                ki = (i64::from(ki) + applied - want).rem_euclid(i64::from(modulus.max(1))) as u8;
+                if applied != want {
+                    ki = (i64::from(ki) + applied - want).rem_euclid(i64::from(modulus.max(1))) as u8;
+                }
             }
             self.labels.push(ki);
             if self.labels.len() == UP_INTERVALS {

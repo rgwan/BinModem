@@ -2869,6 +2869,21 @@ impl Modem {
         // which carry nothing -- so both decoders' output is dropped while it
         // runs.
         self.b1u_probe = Some(Decoder::new(&parameters));
+        // `V92_ROT`: the class rotation is read off B1u rather than taken from
+        // `PAIR_FIRST_INDEX_OFFSET`, and it is read off the part of B1u this
+        // decoder is actually fed -- the symbol after the acquisition skip,
+        // counted from B1u's own first symbol. Off by default.
+        //
+        // Only the decoder reading the line as received is given it. The
+        // polarity measurement above compares the two decoders' ones counts,
+        // and it can only do that if they differ by polarity and nothing else:
+        // given a measured rotation, the negated copy of an Agere reads 529
+        // ones of 576 instead of 450, and the lead the verdict needs is gone
+        // (`docs/48 §5`). A call whose polarity turns out inverted therefore
+        // keeps the constant -- which is the behaviour it had.
+        if let Some(decoder) = self.upstream_data.as_mut() {
+            decoder.measure_rotation_from(self.b1u_skip + 1);
+        }
         self.b1u_ones = [0; 2];
         self.b1u_scored = [0; 2];
         self.b1u_scoring = (B1U_FRAMES * crate::v92::UP_INTERVALS).saturating_sub(self.b1u_skip);

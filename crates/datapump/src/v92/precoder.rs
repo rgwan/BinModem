@@ -386,15 +386,32 @@ fn ceiling(a: i64, b: i64) -> i64 {
 /// non-negative. For k = 3 the class is eta = 2Ki + 2z Mi + p, so the parity
 /// bit p comes off the bottom of eta first and Ki is ((eta - p) / 2) modulo Mi.
 pub fn index_to_ki(eta: i32, modulus: u8, k: usize) -> u8 {
+    let class = index_to_ki_class(eta, modulus, k);
+    if opens_a_pair(k) {
+        // The pair's first index is measured from Ki + the offset the far end
+        // uses; see `PAIR_FIRST_INDEX_OFFSET`.
+        let modulus = i64::from(modulus.max(1));
+        ((i64::from(class) - pair_first_index_offset()).rem_euclid(modulus)) as u8
+    } else {
+        class
+    }
+}
+
+/// The same map without the far end's pair offset: which of the Mi classes an
+/// index belongs to, and nothing else.
+///
+/// This is the quantity that is *computable* rather than measured -- 6.4.2's
+/// class is invariant to which member of it the precoder picked and to the
+/// trellis, so a forward model of B1u's known content predicts it exactly
+/// (`docs/46`: 360/360 classes on an Agere). Which is what makes it the space a
+/// far end's rotation is measured in: the rotation of `docs/48` is
+/// `(observed class - predicted class) mod Mi`, per trellis position, and the
+/// decoder's own offset convention is expressed in the same units.
+pub fn index_to_ki_class(eta: i32, modulus: u8, k: usize) -> u8 {
     let modulus = i32::from(modulus.max(1));
     if k == TRELLIS_FRAME - 1 {
         let parity = eta.rem_euclid(2);
         (((eta - parity) / 2).rem_euclid(modulus)) as u8
-    } else if opens_a_pair(k) {
-        // The pair's first index is measured from Ki + the offset the far end
-        // uses; see `PAIR_FIRST_INDEX_OFFSET`.
-        (i32::try_from(i64::from(eta) - pair_first_index_offset()).unwrap_or(eta)
-            .rem_euclid(modulus)) as u8
     } else {
         eta.rem_euclid(modulus) as u8
     }
