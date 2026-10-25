@@ -58,6 +58,8 @@ pub mod upstream;
 
 use crate::v90::RATE_STEP;
 
+pub use upchoice::LevelSet;
+
 // ---------------------------------------------------------------------------
 // The upstream frame (6.4, Figure 1)
 // ---------------------------------------------------------------------------
@@ -540,6 +542,20 @@ pub struct Parameters {
     /// Which set each constellation frame index j = 0..5 uses, and so each
     /// pair of intervals (j, j + 6): CPd bits 222+alpha onward.
     pub indices: [u8; CONSTELLATION_FRAME],
+    /// Which level set [`sets`](Self::sets) was built on: `V92_LEVELSET`,
+    /// carried on the parameters rather than re-read where it is used.
+    ///
+    /// It belongs here because it is a property of the *pair* and not of the
+    /// wire: the same numbers mean "the far end runs the odd lattice, so its
+    /// mask is a ladder" in one arm and "the far end sends G.711 code values,
+    /// so its mask is a level table at scale `K`" in the other. The receiver is
+    /// the half that has to know which, and until this field existed it
+    /// answered by asking the environment again from inside the sample path --
+    /// a decision taken off a value nothing on the call had checked, in the one
+    /// arm whose whole purpose was to restore the old code. Carried here, the
+    /// answer is the one the design was built with, and no path below `feed`
+    /// reads an environment variable to find it.
+    pub levelset: LevelSet,
 }
 
 impl Parameters {
@@ -1042,6 +1058,7 @@ mod tests {
             filters: Filters { z2: vec![1.0], ..Filters::default() },
             sets: vec![(1..=16u16).map(|p| p * 100).collect()],
             indices: [0; CONSTELLATION_FRAME],
+            levelset: crate::v92::LevelSet::Uniform,
         };
         // K = 36 bits, M = 8^12 = 2^36, so the frame fits exactly; N = 32 is
         // 4 x M0, which leaves room at k = 3 as well.

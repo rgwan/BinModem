@@ -883,6 +883,7 @@ mod tests {
             filters,
             sets: vec![set],
             indices: [0; CONSTELLATION_FRAME],
+            levelset: crate::v92::LevelSet::Uniform,
         }
     }
 

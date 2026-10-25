@@ -42,8 +42,8 @@ use crate::v90::sequences::{
 };
 
 use super::{
-    CONSTELLATION_FRAME, CONSTELLATION_POINTS, CONSTELLATION_SETS, FilterLimits, Filters, Parameters, Trellis,
-    UP_INTERVALS, UP_RATES, four_g_from_gain, gain_from_4g, signed_q, to_signed_q,
+    CONSTELLATION_FRAME, CONSTELLATION_POINTS, CONSTELLATION_SETS, FilterLimits, Filters, LevelSet, Parameters,
+    Trellis, UP_INTERVALS, UP_RATES, four_g_from_gain, gain_from_4g, signed_q, to_signed_q,
 };
 
 // ---------------------------------------------------------------------------
@@ -799,6 +799,13 @@ impl TryFrom<&Cpd> for Parameters {
             filters,
             sets: sets.points,
             indices: sets.index,
+            // Not on the wire: Table 30 says nothing about which set the far
+            // end's points came from, and a CPd cannot. A reader of a CPd on
+            // its own has the default arm's answer, which is the set every
+            // call before docs/114 R1 used; a call that ran the other arm knows
+            // so from the [`Parameters`] its own design built, not from this
+            // conversion.
+            levelset: LevelSet::Uniform,
         })
     }
 }
@@ -1232,6 +1239,7 @@ mod tests {
             },
             sets: vec![(1..=24).map(|k| k * 400).collect(), (1..=20).map(|k| k * 500).collect()],
             indices: [0, 1, 0, 1, 0, 1],
+            levelset: crate::v92::LevelSet::Uniform,
         }
     }
 

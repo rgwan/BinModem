@@ -88,6 +88,7 @@ fn parameters(drn: u8, levels: usize) -> Parameters {
         filters: Filters { z2: vec![1.0], ..Filters::default() },
         sets: vec![(0..levels).map(|index| (2 * index + 1) as u16).collect()],
         indices: [0; CONSTELLATION_FRAME],
+        levelset: datapump::v92::LevelSet::Uniform,
     }
 }
 

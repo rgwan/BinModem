@@ -1213,6 +1213,7 @@ mod tests {
             filters: design.filters.clone(),
             sets: vec![(0..64).map(|index| (2 * index + 1) as u16).collect()],
             indices: [0; CONSTELLATION_FRAME],
+            levelset: crate::v92::LevelSet::Uniform,
         };
         let mut encoder = UpEncoder::new(&parameters).expect("feasible");
         let mut decoder = Decoder::new(&parameters);

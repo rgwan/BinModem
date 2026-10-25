@@ -62,7 +62,7 @@ use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
 use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, lc_for};
 use crate::v92::upchoice::{choose, pin};
-use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
+use crate::v92::{FilterLimits, LevelSet, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
 pub const FS: f64 = 8000.0;
@@ -2091,6 +2091,25 @@ fn code_grid_log() -> bool {
     })
 }
 
+/// The upstream slicer's table for one constellation set, which the level set
+/// and nothing else chooses.
+///
+/// `code` is docs/114 R4: `round(K a(eta))`, the far end's codes brought to
+/// this end's scale. `uniform` is the odd lattice's own points, the table every
+/// call before `fa36308` sliced on -- and it is returned by *ignoring* `k`, not
+/// by passing it a one that might one day stop being one. That is the whole
+/// point of the gate: on the odd lattice there is no scale to fit, a fit
+/// through the origin against `2 eta + 1` returns whatever the far end's mask
+/// averages to (433.75 on the replay corpus), and reading B1u at that scale is
+/// what took the default arm from 576 of 576 to 327 of 576. A `k` this arm
+/// cannot see cannot do that again.
+fn up_table(levelset: LevelSet, set: &[u16], k: f64) -> Vec<u16> {
+    match levelset {
+        LevelSet::Uniform => set.to_vec(),
+        LevelSet::Code => crate::v92::codegrid::scaled(set, k),
+    }
+}
+
 fn jp_offset() -> f64 {
     std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
 }
@@ -3680,7 +3699,7 @@ impl Modem {
                     "V.92: upstream drn {}, {:.1} kbit/s, levelset {}",
                     parameters.drn,
                     f64::from(parameters.rate()) / 1000.0,
-                    crate::v92::upchoice::levelset().name()
+                    parameters.levelset.name()
                 ));
                 self.parameters = Some(parameters);
             }
@@ -4210,9 +4229,20 @@ impl Modem {
         // times `K`, and a table at `K` costs the spacing the scale error takes
         // and adds nothing. With `K = 1` -- no mask read, or bit 128 set -- the
         // table is the design's, which is the behaviour every earlier call had.
+        //
+        // **What the level set decides, and what it is not allowed to decide.**
+        // R4 is about a far end whose CPd points *are* G.711 code values; on the
+        // odd lattice they are `a(eta) = 2 eta + 1`, there is no scale to fit and
+        // `K` has nothing to say. So the choice below is a choice of *path* and
+        // not a second computation: the uniform arm takes the line every call
+        // before `fa36308` took, point for point, and never reads `self.up_scale`
+        // at all. That is what makes it a restoration rather than a coincidence
+        // of `K` happening to be one -- `K` is not one on a mask the far end
+        // fills in, and a fit against the odd lattice returns 433.75, which read
+        // B1u at 327 of 576.
         let mut levels: Vec<f64> = Vec::new();
         for set in &parameters.sets {
-            for point in crate::v92::codegrid::scaled(set, self.up_scale) {
+            for point in up_table(parameters.levelset, set, self.up_scale) {
                 let level = parameters.gain * f64::from(point);
                 levels.push(level);
                 levels.push(-level);
@@ -4949,8 +4979,14 @@ impl Modem {
                 ));
                 let ack = cp.acknowledge;
                 let first = self.cpu.is_none();
+                // Which level set this call is running, read off the parameters
+                // the design built and not off the environment: the code arm is
+                // the only one bit 128 says anything about, and asking
+                // `V92_LEVELSET` again here is what kept the fallback armed in
+                // the arm meant to restore the old path.
+                let code_arm = self.parameters.as_ref().is_some_and(|p| p.levelset == LevelSet::Code);
                 self.read_code_grid(&cp, first);
-                if first && cp.codec.is_some() {
+                if first && cp.codec.is_some() && code_arm {
                     // docs/114 R3. Bit 128 says "the transmit constellations
                     // differ from the codec's D/A output constellations", so the
                     // mask below is *not* a level table for this far end's
@@ -5003,6 +5039,27 @@ impl Modem {
             self.up_scale_source = "design (no set)";
             return;
         };
+        // **The gate, and it is the whole of the fix.** Everything below -- the
+        // `K` fit, the level table `begin_b1u` builds at `K`, and the bit-128
+        // fallback that decides whether the fit is allowed at all -- is
+        // docs/114 R2a/R3/R4, and R1-R4 are a design on the far end's *code
+        // grid*. On the odd lattice there is no scale to fit: the design's
+        // points are the table, the far end's mask is a rate mask and not a
+        // level list, and a least-squares fit through the origin against eight
+        // points of `2 eta + 1` returns whatever the mask's codes happen to
+        // average to -- 433.75 on the replay corpus, from a mask whose codes
+        // run 256 to 2000. That number is meaningless and it is not harmless:
+        // it was `K` on the uniform arm, which read B1u at 327 of 576 where
+        // the same call at `cb51415` read 576 of 576.
+        //
+        // So the uniform arm does not fit, does not consult the mask, does not
+        // look at bit 128, and leaves `K` at one. It is the path `cb51415` took:
+        // no `read_code_grid` existed there, so the source below is named for
+        // the arm rather than for a decision, and the dump further down says so.
+        // What the mask says the far end's codes are, decoded through the law
+        // bit 35 names. This is a read of the CPu and not a decision: it is
+        // what the `V92_CODE_GRID` dump below prints either way, and it is
+        // computed here so that the dump stays where it is.
         let law = crate::v92::codegrid::law(cp.a_law);
         let codes: Vec<u16> = cp
             .points(0)
@@ -5010,19 +5067,26 @@ impl Modem {
             .map(|&ucode| crate::v92::codegrid::value_in(law, ucode))
             .filter(|&value| value > 0)
             .collect();
-        let fitted = if cp.codec.is_some() { None } else { crate::v92::codegrid::estimate_from_mask(set, &codes) };
-        match fitted {
-            Some(k) if k.is_finite() && k > 0.0 => {
-                self.up_scale = k;
-                self.up_scale_source = "mask";
-            }
-            _ if cp.codec.is_some() => {
-                self.up_scale = 1.0;
-                self.up_scale_source = "design (bit 128)";
-            }
-            _ => {
-                self.up_scale = 1.0;
-                self.up_scale_source = "design (no mask)";
+        // The fit and the bit-128 fallback, in the code arm only.
+        if parameters.levelset == LevelSet::Uniform {
+            self.up_scale = 1.0;
+            self.up_scale_source = "design (uniform)";
+        } else {
+            let fitted =
+                if cp.codec.is_some() { None } else { crate::v92::codegrid::estimate_from_mask(set, &codes) };
+            match fitted {
+                Some(k) if k.is_finite() && k > 0.0 => {
+                    self.up_scale = k;
+                    self.up_scale_source = "mask";
+                }
+                _ if cp.codec.is_some() => {
+                    self.up_scale = 1.0;
+                    self.up_scale_source = "design (bit 128)";
+                }
+                _ => {
+                    self.up_scale = 1.0;
+                    self.up_scale_source = "design (no mask)";
+                }
             }
         }
         if !first || !code_grid_log() {
@@ -6115,6 +6179,99 @@ mod tests {
         }
     }
 
+    /// The gate: the uniform arm never consults the `K` table.
+    ///
+    /// `d25ca78` made the level set a switch at the *transmitter* and left the
+    /// receiver fitting `K` in both arms, so the default arm sliced on a table
+    /// scaled by a number fitted against a lattice it does not describe: 433.75
+    /// out of the corpus mask, and B1u read 327 of 576 where `cb51415` read 576
+    /// of 576. This pins the gate from the inside, three ways, because "the
+    /// regression is gone" and "the test that says so can fail" are not the same
+    /// claim:
+    ///
+    /// 1. the uniform arm's table ignores `K` at *any* value, the fitted one
+    ///    included -- it is not a `K` that happens to be one;
+    /// 2. a fit is still taken in the code arm, so (1) is not vacuous;
+    /// 3. a uniform call fed the very mask that produced 433.75 leaves `K` at
+    ///    one, which is the property the replay numbers rest on.
+    #[test]
+    fn the_uniform_arm_never_consults_the_k_table() {
+        use crate::v92::codegrid;
+        use crate::v92::sequences::CpFamily;
+        let design = crate::v92::design::Design {
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        // 433.75 is not a made-up number: it is what `estimate_from_mask`
+        // returned on the replay corpus, where the far end's codes run 256 to
+        // 2000 against eight points of `2 eta + 1`.
+        const FITTED: f64 = 433.75;
+        // The mask's codes, as Ucodes: the far end's own values 256 ... 2000.
+        let codes: Vec<u8> = [256.0, 512.0, 768.0, 1024.0, 1280.0, 1536.0, 1792.0, 2000.0]
+            .iter()
+            .map(|&value| codegrid::nearest_code(value))
+            .collect();
+
+        // (1) The uniform table, at the fitted K and at one, is the design's own
+        // set -- unchanged, and unchanged by `K`.
+        let uniform = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform)
+            .expect("drn 1 on the odd lattice")
+            .parameters;
+        assert_eq!(uniform.levelset, LevelSet::Uniform);
+        let set = uniform.sets[0].clone();
+        assert_eq!(set, vec![1, 3, 5, 7, 9, 11, 13, 15]);
+        for k in [1.0f64, FITTED, 0.5, 1e6] {
+            assert_eq!(up_table(LevelSet::Uniform, &set, k), set, "K {k} reached the uniform table");
+        }
+        // And the same call in the code arm *is* moved by it, so the loop above
+        // is a statement about the level set and not about `scaled` being the
+        // identity on these points.
+        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code)
+            .expect("drn 1 on the grid")
+            .parameters;
+        assert_ne!(up_table(LevelSet::Code, &set, FITTED), set, "the code arm ignored K");
+
+        // (2) The read path. A uniform call and a code call, the same CPu.
+        let read = |levelset| {
+            let parameters =
+                crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, levelset)
+                    .expect("drn 1")
+                    .parameters;
+            let mut modem = Modem::default();
+            modem.parameters = Some(parameters);
+            modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, false)));
+            (modem.up_scale, modem.up_scale_source)
+        };
+        let (uniform_k, uniform_source) = read(LevelSet::Uniform);
+        assert_eq!(uniform_k, 1.0, "the uniform arm took a fit");
+        assert_eq!(uniform_source, "design (uniform)", "and its K has to say which arm left it at one");
+        // The code arm fits the same mask and *says* it fitted, which is what
+        // makes the assertion above a property of the level set and not of
+        // `read_code_grid` having stopped working altogether.
+        let (code_k, code_source) = read(LevelSet::Code);
+        assert_eq!(code_source, "mask", "the code arm must still fit");
+        // What the fit makes of the corpus mask against the *uniform* set is the
+        // number the regression sliced at: eight points of `2 eta + 1` against
+        // codes that run 256 to 2000 is a slope in the hundreds, and it is not
+        // one. This is the value the uniform arm must refuse to look at.
+        let values: Vec<u16> = codes.iter().map(|&code| codegrid::value(code)).collect();
+        assert!(values.iter().all(|&value| value > 0), "the mask must decode to levels");
+        let would_fit = codegrid::estimate_from_mask(&set, &values).expect("the mask fits something");
+        assert!(would_fit > 100.0, "the mask no longer fits big: {would_fit}");
+        assert_eq!(uniform_k, 1.0, "the uniform arm sliced at {would_fit}");
+        // And the code arm's own scale is the design's, because its set is
+        // already the far end's grid: a fit that lands on one there is the
+        // grid's premise, not the lattice's 433.
+        assert!((code_k - 1.0).abs() < 0.35, "the grid's own mask fits to {code_k}");
+        // (3) The tables the replay reads: the uniform arm's is the design's
+        // set whatever the fit says, the code arm's is `round(K a(eta))`.
+        assert_eq!(up_table(LevelSet::Uniform, &set, would_fit), set);
+        assert_ne!(up_table(LevelSet::Code, &code.sets[0], 1.0 + code_k), code.sets[0].clone());
+    }
+
     /// A far end whose `Su` never turns over -- 9.5.2.1.7's second clause
     /// missing, measured on this bench's HSF -- is carried out of `AwaitSu` by
     /// the **tolerance**, and the tolerance says so: its name, the periods the
@@ -6298,6 +6455,7 @@ mod tests {
             // Mi = 8 (N = 16 >= 2 Mi) and what `gain_for(8)` is the gain of.
             sets: vec![vec![1, 3, 5, 7, 9, 11, 13, 15]],
             indices: [0; crate::v92::CONSTELLATION_FRAME],
+            levelset: crate::v92::LevelSet::Uniform,
         }
     }
 

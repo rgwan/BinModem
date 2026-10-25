@@ -428,6 +428,11 @@ fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) ->
         // it -- `Parameters::step` reads the set.
         sets: vec![set],
         indices: [0; CONSTELLATION_FRAME],
+        // The set this call was built on, carried so that the receiver can see
+        // it: the K machinery is a property of the code arm alone, and asking
+        // the environment again at the receiver is what let it stay armed in
+        // the uniform arm (see `Parameters::levelset`).
+        levelset,
     })
 }
 

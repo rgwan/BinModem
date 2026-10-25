@@ -857,6 +857,7 @@ mod tests {
             filters: Filters { z2: vec![1.0], ..Default::default() },
             sets: vec![(1..=72).map(|p| p * 100).collect()],
             indices: [0; CONSTELLATION_FRAME],
+            levelset: crate::v92::LevelSet::Uniform,
         };
         parameters.fits().expect("the parameters are self-consistent");
         let moduli = Moduli12::from(&parameters);

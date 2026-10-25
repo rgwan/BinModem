@@ -43,7 +43,7 @@ use std::io::Write;
 
 use datapump::v32::{Mode, Scrambler};
 use datapump::v92::upstream::UpEncoder;
-use datapump::v92::{Filters, Parameters, Trellis, CONSTELLATION_FRAME};
+use datapump::v92::{Filters, LevelSet, Parameters, Trellis, CONSTELLATION_FRAME};
 use datapump::v92::precoder::index_to_ki;
 
 /// The twelve data frame intervals (6.4.1, Figure 1).
@@ -211,6 +211,7 @@ fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Op
             None => vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
         },
         indices: [0; CONSTELLATION_FRAME],
+        levelset: LevelSet::Uniform,
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
     encoder.reset_all();
@@ -267,6 +268,7 @@ fn b1u_etas(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Opti
             None => vec![(0..8).map(|index| (2 * index + 1) as u16).collect()],
         },
         indices: [0; CONSTELLATION_FRAME],
+        levelset: LevelSet::Uniform,
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
     encoder.reset_all();
