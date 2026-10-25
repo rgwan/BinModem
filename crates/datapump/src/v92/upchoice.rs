@@ -19,8 +19,26 @@
 //! 2 G / 2 >= 4.5 sigma        i.e.   LC <= sqrt(3) / (9 sigma)
 //! ```
 //!
-//! with G = sqrt(3) / (2 LC). Anything above that is refused and the next rung
-//! down is tried.
+//! with G = sqrt(3) / (2 LC).
+//!
+//! **What the code below does, and how it differs from the paragraph above.**
+//! [`choose`] compares `LC` against `sqrt(3) / (4.5 sigma)`, not
+//! `sqrt(3) / (9 sigma)` -- one factor of two looser, i.e. it admits rungs
+//! whose margin is `G >= 2.25 sigma` and whose own [`Choice::predicted`] is
+//! around 1e-4 rather than the 1e-5 the paragraph asks for. On the bench of
+//! `docs/72` (sigma ~ 1.4e-2) that factor is exactly the boundary between
+//! "24000 only" and "32000 legal": drn 7 has `LC = 16`, which the paragraph's
+//! `13.7` refuses and the code's `27.5` admits. `docs/86` §2 has the table.
+//!
+//! Neither number is being changed here: `docs/86` §2 records why the decision
+//! needs both the bench's own measured margins (which are looser -- levels are
+//! still comfortable at 32000 and only tight at 40000) and the bit layer's
+//! separate defect at 32000 (`docs/73`). Today no call reaches this search with
+//! more than one rung in the mask -- `digital.rs`'s rate mask is `& 1` -- so
+//! the factor is inert in production and decisive the day it is not.
+//!
+//! Anything above the bound the code uses is refused and the next rung down is
+//! tried.
 
 use super::design::Design;
 use super::{
