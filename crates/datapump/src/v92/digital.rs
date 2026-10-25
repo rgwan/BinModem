@@ -174,15 +174,17 @@ const SU_REPORT_LAG: u64 = 48;
 /// this bound.
 const SU_TOLERANCE_PERIODS: u32 = 32;
 
-/// And how well the line has to have matched the anchor over that whole hold.
+/// And how well the line has to have matched the anchor over that whole hold,
+/// **on average**.
 ///
 /// `kept` is the hunt's own correlation of each period against the anchor, and
 /// 0.90 is the gate at which a period counts as the same signal at all; asking
-/// for 0.95 over all thirty-two asks for a line *steadier* than that floor
-/// rather than merely at it. Measured: the HSF's Su holds at 0.999 over 6038
-/// periods (`hsf-su.md` section 2), while a taper, a drifting level or a codec
-/// renegotiation that still scrapes past 0.90 takes individual periods below
-/// 0.95.
+/// for a mean of 0.95 over all thirty-two asks for a line steadier than that
+/// floor rather than merely at it. The mean and not the worst period, because a
+/// real line's Su dips a period now and then while going nowhere -- measured on
+/// this bench's HSF, 0.947 against 0.999 on the same tone -- and a tolerance a
+/// single period can veto is a tolerance for a synthetic line only. Measured:
+/// the HSF's Su holds at 0.999 over 6038 periods (`hsf-su.md` section 2).
 const SU_TOLERANCE_COHERENCE: f64 = 0.95;
 
 /// And how much of it is measured: sixteen periods of the six-symbol shape,

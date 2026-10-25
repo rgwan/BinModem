@@ -339,7 +339,8 @@ struct Anchor {
     /// the anchor: dropping it is what lost the Ru-to-R-bar-u reversal that
     /// Phase 3 is waiting for.
     stray: u32,
-    /// Periods in a row the shape has matched, and the worst match among them.
+    /// Periods in a row the shape has matched, and how well they matched on
+    /// average.
     ///
     /// These are **bookkeeping, not decisions**: `held` counts matches and a
     /// miss in the middle of a hold does not reset it, which is right for
@@ -349,7 +350,7 @@ struct Anchor {
     /// second clause), so it gets its own pair, reset on any period that does
     /// not match the anchor.
     steady: u32,
-    worst: f64,
+    sum: f64,
 }
 
 /// A measured search for the second TRN1u, one rung at a time.
@@ -2314,7 +2315,14 @@ impl Receiver {
     #[must_use]
     pub fn su_held(&self) -> Option<(u32, f64)> {
         let anchor = self.anchor?;
-        (anchor.kind == Hunt::Su).then_some((anchor.steady, anchor.worst))
+        // The **mean** coherence over the hold and not its worst period: a real
+        // line's Su dips a period now and then while going nowhere (measured,
+        // 0.947 against 0.999 on the same tone), and a tolerance that a single
+        // period can veto is a tolerance for a synthetic line only.
+        (anchor.kind == Hunt::Su).then(|| {
+            let mean = if anchor.steady > 0 { anchor.sum / f64::from(anchor.steady) } else { 0.0 };
+            (anchor.steady, mean)
+        })
     }
 
     #[must_use]
@@ -2377,7 +2385,7 @@ impl Receiver {
                 // The hold a tolerance may be decided on: consecutive periods,
                 // and the worst of them -- see `Anchor::steady`.
                 anchor.steady += 1;
-                anchor.worst = anchor.worst.min(share);
+                anchor.sum += share;
                 if anchor.held == HELD_PERIODS {
                     match anchor.kind {
                         Hunt::Ru => self.events.push_back(Heard::Ru { at }),
@@ -2394,7 +2402,7 @@ impl Receiver {
             // so the continuous hold `Anchor::steady` counts ends here. Nothing
             // below decides anything on these two.
             anchor.steady = 0;
-            anchor.worst = 1.0;
+            anchor.sum = 0.0;
             let turned = turned_share(&window, &anchor.template, self.step) > TURNED_MATCHED;
             if !turned {
                 // Neither the sequence nor its inverse: this is one of the
@@ -2430,7 +2438,7 @@ impl Receiver {
                     anchor.template = window.try_into().unwrap_or([0.0; RU_PERIOD]);
                     anchor.held = 0;
                     anchor.steady = 0;
-                    anchor.worst = 1.0;
+                    anchor.sum = 0.0;
                     self.state = anchor.kind;
                     self.events.push_back(turned);
                     return true;
@@ -2475,7 +2483,7 @@ impl Receiver {
             held: 1,
             stray: 0,
             steady: 1,
-            worst: best.0,
+            sum: best.0,
         });
         self.state = best.1;
         true
