@@ -2126,10 +2126,6 @@ impl Modem {
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
             let fit_started = std::time::Instant::now();
-            if let Some(delta) = self.fe_pending.take() {
-                self.rx.fe_install(delta);
-                self.note(format!("V.92: fractional delay {delta:.3} installed at TRN2u"));
-            }
             if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
                 let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
                 self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
@@ -3809,6 +3805,17 @@ impl Modem {
                 // hunt reports the reversal it turns on up to a period late
                 // (see `Receiver::align_trn1u`).
                 self.refit_from = Some(at + TRN_START);
+                // The delay goes in *here*, before the second TRN1u, and that
+                // is the whole architecture: Phase 3 carries two TRN1u, the
+                // first is where the phase is measurable and the second is the
+                // spec's own "refit at the new phase" (9.5.2.1.9). CPt follows
+                // the second one, so installing between them puts every read
+                // that matters -- the refit's data, CPt, and everything after --
+                // on converted samples, with no window straddling the install.
+                if let Some(delta) = self.fe_pending.take() {
+                    self.rx.fe_install(delta);
+                    self.note(format!("V.92: fractional delay {delta:.3} installed before TRN1u 2"));
+                }
                 self.trn2_estimate = self.refit_from;
                 self.design_at = self.refit_from.map(|at| at + DESIGN_AFTER);
                 self.refit_tries = 0;
