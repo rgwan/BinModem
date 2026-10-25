@@ -3856,20 +3856,26 @@ impl Modem {
         // the boundary every time, rotate the offset between attempts: three
         // tries at most, each on the boundary the hunt finds next.
         {
-            const CANDIDATES: [i64; 3] = [2, 3, 1];
-            static ROTATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let tried = ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tried < CANDIDATES.len() {
-                let next = CANDIDATES[tried];
-                if next != crate::v92::precoder::pair_first_index_offset() {
-                    let was = crate::v92::precoder::set_pair_first_index_offset(next);
-                    self.note(format!(
-                        "V.92: pair-first index offset {was} -> {next} for the next candidate \
-                         (A{} of {})",
-                        tried + 1,
-                        CANDIDATES.len()
-                    ));
-                }
+            // Move to the next value *different from the one in force*, so the
+            // first failure actually changes something: the earlier form keyed
+            // the rotation off a counter that started at the constant's own
+            // value, so the first abandonment spent an attempt setting the
+            // offset to what it already was.
+            static SPENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            const TRIES: usize = 2;
+            let spent = SPENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if spent < TRIES {
+                let now = crate::v92::precoder::pair_first_index_offset();
+                let next = match now {
+                    2 => 3,
+                    3 => 1,
+                    _ => 2,
+                };
+                let was = crate::v92::precoder::set_pair_first_index_offset(next);
+                self.note(format!(
+                    "V.92: pair-first index offset {was} -> {next} for the next candidate (try {} of {TRIES})",
+                    spent + 1
+                ));
             }
         }
         self.upstream_data = None;
