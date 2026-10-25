@@ -154,6 +154,35 @@ const SU_BAR_TENTHS: u64 = 245;
 /// or take where in the period the anchor was taken.
 const SU_REPORT_LAG: u64 = 48;
 
+/// Periods a coherent `Su` has to be held, with no reversal and no break, before
+/// this end goes on without 9.5.2.1.7's `S-bar-u`.
+///
+/// Derived from the lengths the Recommendation fixes, not tuned to the bench.
+/// 8.5.6's Su is **144 symbols**, and the period that repeats is six
+/// ([`RU_PERIOD`](crate::v92::up_signals::RU_PERIOD)), so a conforming far end's
+/// reversal arrives **24 periods** after Su starts; the S-bar-u it turns into is
+/// **24.5T** (9.5.2.1.7), one more period; the hunt holds an anchor through up
+/// to [`STRAY_PERIODS`](crate::v92::receiver)'s five periods of the change
+/// before it gives up on it, and it compares once a period at the anchor's own
+/// phase, so a reversal can be two periods late in being visible. 24 + 1 + 5 + 2
+/// = **32 periods** is therefore the first count at which a conforming far end's
+/// reversal is certain to have been seen, and the tolerance fires there and not
+/// before. Measured: this bench's Agere reverses nine periods after its Su is
+/// reported (54 symbols, `hsf-su.md` section 3), twenty-three periods inside
+/// this bound.
+const SU_TOLERANCE_PERIODS: u32 = 32;
+
+/// And how well the line has to have matched the anchor over that whole hold.
+///
+/// `kept` is the hunt's own correlation of each period against the anchor, and
+/// 0.90 is the gate at which a period counts as the same signal at all; asking
+/// for 0.95 over all thirty-two asks for a line *steadier* than that floor
+/// rather than merely at it. Measured: the HSF's Su holds at 0.999 over 6038
+/// periods (`hsf-su.md` section 2), while a taper, a drifting level or a codec
+/// renegotiation that still scrapes past 0.90 takes individual periods below
+/// 0.95.
+const SU_TOLERANCE_COHERENCE: f64 = 0.95;
+
 /// And how much of it is measured: sixteen periods of the six-symbol shape,
 /// 12 ms of Su. Long enough that the phase is steady to a few thousandths of a
 /// symbol, short enough that Jp is on the line well before the far end has any
@@ -183,6 +212,64 @@ const REFIT_WINDOW: usize = 600;
 /// exactly the sequence, 0 nothing like it, and a window of anything else lands
 /// at about `1/sqrt(`[`ALIGN_WINDOW`]`)` = 0.04. Half is far past that.
 const REFIT_QUALITY: f64 = 0.5;
+
+/// How far past the point where the upstream stopped repeating every six
+/// samples the second TRN1u's first symbol may lie, in symbols.
+///
+/// A conforming far end's TRN1u begins at once: 9.5.2.1.10 puts it (24 + epsilon)T
+/// after the S-bar-u, and the S-bar-u is itself one period of six, so the point
+/// [`Receiver::su_ends`] measures is the point TRN1u starts at. A far end that
+/// answers a Jp it was never asked for answers from its own clock instead, and
+/// on this bench's HSF the gap between its tone stopping and its TRN1u's first
+/// symbol is measured at 96 symbols (`20261025-173736-hsf-bl1`, 12.9686 s to
+/// 12.9806 s). 256 is two and a half times the larger of the two, and it is also
+/// the whole of the search: 9.5.2.1.11's TRN1u is 2040T at least, so a fit still
+/// hunting past this is not hunting for TRN1u.
+const REFIT_SWEEP: u64 = 256;
+
+/// How much better the measured alignment has to read than the timetable's own
+/// estimate before it replaces it.
+///
+/// Both numbers are the *same* measurement -- one least-squares fit of the line
+/// against the sequence this end generates, over the same window -- so they are
+/// comparable. What is not comparable is their repeatability: on one window of
+/// one capture the figure moves 0.9 dB between a four-hundred- and a
+/// two-thousand-symbol window at the same alignment. Two decibels is more than
+/// the measurement's own spread, and below it the estimate stands -- the Agere's
+/// 3-of-3 call is measured on that path, and an interworking fix that moves a
+/// working far end's frame origin to gain nothing would be the wrong trade.
+const REFIT_MEASURED_DB: f64 = 2.0;
+
+/// How far back the end of the six-symbol upstream is looked for, and the window
+/// and the hold its measurement is taken with.
+///
+/// The refit fires [`REFIT_WINDOW`] in and will wait at most [`REFIT_WAIT`], so
+/// four thousand covers both with the history's own second in hand. The window
+/// is four periods of six (24 symbols, 3 ms): long enough for the measure to sit
+/// at 1.000 on Su and at a third of that on TRN1u -- measured, it reads 1.000 to
+/// 12.9685 s and 0.16 by 12.9695 s -- and short enough to put the boundary
+/// inside four symbols. The hold is two periods, so one lost period inside Su is
+/// not the end of it.
+const REFIT_MEASURE: u64 = 4_096;
+const SU_ENDS_WINDOW: usize = 24;
+const SU_ENDS_HOLD: usize = 48;
+
+/// How long the refit will wait, after the reversal, for a measured second
+/// TRN1u before taking the line as it stands.
+///
+/// 300 ms is what this bench measures a far end taking to answer a Jp it did not
+/// expect (the HSF), and it is the same allowance the `Su` tolerance makes. The
+/// wait is not free -- a CPt that arrives during it cannot be read -- so it is
+/// bounded rather than open-ended: past it the refit runs exactly where the
+/// timetable says, which is what it did before the measurement existed.
+const REFIT_WAIT: u64 = 2_400;
+
+/// How often the refit looks at the line while it is waiting, in symbols.
+///
+/// The boundary is found by scanning history, which costs a few hundred thousand
+/// multiplies: affordable once, not once a symbol. Sixty-four symbols is eight
+/// milliseconds, a tenth of the resolution the wait is worth.
+const REFIT_POLL: u64 = 64;
 
 /// How much worse than the fit already in place a refit may be, in decibels,
 /// and still be taken for the alignment's sake. The two-point stream's figure
@@ -1954,6 +2041,24 @@ fn blind_su() -> bool {
     })
 }
 
+/// Whether the `Su` tolerance is armed: on unless `V92_SU_TOLERANCE=off`.
+///
+/// This is a **product decision and not a diagnostic**: 9.5.2.1.7's second
+/// clause is missing from a far end this product has to interoperate with
+/// (measured, `hsf-su.md`), and waiting out 9.5.1.2.2 instead is not
+/// interoperation. It is not a widening of the detector -- the reversal test is
+/// untouched and runs first -- it is a bounded, logged tolerance for a `Su` that
+/// has held coherently for longer than a conforming one can ([`SU_TOLERANCE_PERIODS`]).
+fn su_tolerance() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("V92_SU_TOLERANCE").ok().as_deref(),
+            Some("0") | Some("off") | Some("no") | Some("false") | Some("none")
+        )
+    })
+}
+
 fn jp_offset() -> f64 {
     std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
 }
@@ -2049,6 +2154,13 @@ pub struct Modem {
     refit_from: Option<u64>,
     /// How many times that refit has moved its anchor on.
     refit_tries: u8,
+    /// The next symbol count at which the refit may look at the line again.
+    ///
+    /// The refit waits for the far end to begin its second TRN1u, and it finds
+    /// that by measuring the line (see `Receiver::su_ends`), which costs a scan
+    /// of history: affordable once, not once a symbol. `None` is "look as soon
+    /// as the window is in".
+    refit_poll: Option<u64>,
     /// The length of one CPt repetition in bits, once one has been read, and
     /// how far through the next repetition the reader has got. E1u is twelve
     /// zeroes in the place where that repetition's synchronisation would be,
@@ -2322,6 +2434,7 @@ impl Modem {
             jp_sent: false,
             refit_from: None,
             refit_tries: 0,
+            refit_poll: None,
             ja_bits: 0,
             ja_ones: 0,
             cp_bits: 0,
@@ -2693,184 +2806,235 @@ impl Modem {
         if self.stage == Stage::Dil
             && let Some(from) = self.refit_from
             && self.rx.symbols() >= from + REFIT_WINDOW as u64
+            && self.refit_poll.is_none_or(|at| self.rx.symbols() >= at)
         {
             let base = self.rx.history_base();
             let at = from.saturating_sub(base);
             let before = self.rx.fitted();
             let baseline = before.snr();
-            // Where the second TRN1u actually begins. The hunt reports the
-            // reversal up to a period late and the far end's whole grid has
-            // moved by epsilon since the first fit, so the estimate is good to
-            // tens of symbols, and a least-squares fit at the wrong alignment
-            // is a fit against the wrong sequence -- which is what kept this
-            // refit from ever happening on a real line.
-            //
-            // What the correlation has to say is *that* TRN1u is here; what it
-            // cannot say is *where* to the symbol. `docs/80` measured two
-            // alignments two symbols apart scoring 0.7206 and 0.6734 -- a gap
-            // no 512-symbol correlation can call -- where the one the
-            // correlation preferred fitted 7 dB worse, because the window
-            // carrying the most of TRN1u's shape was not the window TRN1u began
-            // at. So the correlation shortlists and the fit chooses, in
-            // `align_trn1u_by_fit`: no offset, no new constant, and the figure
-            // that decides is the same least-squares fit the threshold below
-            // judges.
-            // Aimed on *this* TRN1u, the second one: it follows our TRN1d, so
-            // by now the far end's transmit clock is locked to our rate and the
-            // upstream fractional phase is a property of the loop rather than a
-            // transient -- which is what the first TRN1u gives, and why aiming
-            // there produced 0.590 while this one produced 0.760 (`docs/83`
-            // §3.5).
-            // `fe_install` rebuilds the whole history from the raw stream, so
-            // the refit taken below sees one phase throughout.
-            // The **first** of the two measurements, and its target is CPt's
-            // and not the eye's: a two-point CPt is read by the linear fit
-            // taken here, so what has to be right is that the fit describes
-            // the line at the phase it will be installed at. `fe_aim_linear`
-            // maximises that fit; `docs/83` §3.6 measured why the eye criterion
-            // is not a substitute -- on a two-point stream its whole curve
-            // moves one per cent and it ranks the phase *against* the one the
-            // data mode needs.
-            if self.rx.fe_enabled() && fe_aim_wants(false) {
-                let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
-                let aimed = forced
-                    .map(|d| (d, f64::NAN))
-                    .or_else(|| self.rx.fe_aim_linear(at as usize, REFIT_WINDOW));
-                if let Some((delta, figure)) = aimed {
-                    self.rx.fe_install(delta);
-                    self.note(format!(
-                        "V.92: fractional delay {delta:.3} at TRN1u 2 (linear fit {figure:.2} dB)"
-                    ));
-                }
-            }
-            if self.rx.fe_enabled() && fe_metering() {
-                // Report only: the number is the far end's phase error, and the
-                // place to act on it is the next call's Jp, not this receiver.
-                if let Some((delta, figure)) = self.rx.fe_aim_linear(at as usize, REFIT_WINDOW) {
-                    self.note(format!(
-                        "V.92: phase meter, second TRN1u: {delta:.3} symbols (linear fit {figure:.2} dB)"
-                    ));
-                }
-            }
-            if self.rx.fe_enabled() && std::env::var_os("V92_FE_DEBUG").is_some() {
-                self.rx.fe_report_two(at as usize, REFIT_WINDOW);
-            }
-            let mut search: Option<(u64, f64)> = None;
-            let found = match self
-                .rx
-                .align_trn1u_by_fit(at, REFIT_SEARCH, ALIGN_WINDOW, REFIT_QUALITY, TRAIN_WINDOW)
-            {
-                Some((aligned, fit)) => {
-                    search = Some((aligned, fit));
-                    // 9.5.1.1.10: "the digital modem shall keep a modulo 12 data
-                    // frame interval count from the first symbol of TRN1u" --
-                    // the *second* one, and this is the first the alignment of
-                    // its first symbol is known to a symbol.
-                    self.rx.set_frame_origin(base + aligned);
-                    self.trn2_from = Some(base + aligned);
-                    // 9.6.1.1.1's design is scheduled here: see `design_at`.
-                    self.design_at = self.trn2_from.map(|at| at + DESIGN_AFTER);
-                    let anchor = (aligned as i64 + refit_offset()).max(0) as u64;
-                    let taken = self.rx.train_verified(anchor, TRAIN_WINDOW);
-                    // The two numbers this test is made of, taken where the
-                    // refit will be installed: the taps in place and the ones
-                    // just fitted, same samples, same reference, each at its
-                    // own whole-symbol anchor. `docs/81` measured the old pair
-                    // as incomparable -- the incumbent's figure came from the
-                    // *first* TRN1u, the refit's from the second, and the line
-                    // moves between them by more than the whole tolerance.
-                    let judged = taken
-                        .then(|| self.rx.best_on_window(before.sections(), anchor as usize, TRAIN_WINDOW))
-                        .flatten();
-                    if tracing() {
-                        eprintln!(
-                            "V92TRACE: refit at {aligned}, fit {fit:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
-                            self.rx.snr_db()
-                        );
+            // Where the six-symbol upstream actually stopped, measured on the
+            // line: Su and S-bar-u are one period of six (8.5.6), the second
+            // TRN1u is scrambled two-point (8.7.6), and the point between them
+            // is the one thing about this boundary that can be *measured*
+            // instead of assumed. `None` means the upstream has not stopped
+            // repeating: the far end has not begun its TRN1u yet.
+            let measured = self.rx.su_ends(REFIT_MEASURE, SU_ENDS_WINDOW, SU_ENDS_HOLD);
+            // Which is a reason to wait, not a reason to fit: a fit taken here
+            // is a fit against Su, and that is where 6.4 dB came from. Bounded
+            // by [`REFIT_WAIT`], past which the line is taken as it stands --
+            // and looked at once every [`REFIT_POLL`] symbols rather than once
+            // a symbol, because the measurement is a scan of history.
+            let waiting = measured.is_none() && self.rx.symbols() < from + REFIT_WAIT;
+            self.refit_poll = waiting.then(|| self.rx.symbols() + REFIT_POLL);
+            if !waiting {
+                // Where the second TRN1u actually begins. The hunt reports the
+                // reversal up to a period late and the far end's whole grid has
+                // moved by epsilon since the first fit, so the estimate is good to
+                // tens of symbols, and a least-squares fit at the wrong alignment
+                // is a fit against the wrong sequence -- which is what kept this
+                // refit from ever happening on a real line.
+                //
+                // What the correlation has to say is *that* TRN1u is here; what it
+                // cannot say is *where* to the symbol. `docs/80` measured two
+                // alignments two symbols apart scoring 0.7206 and 0.6734 -- a gap
+                // no 512-symbol correlation can call -- where the one the
+                // correlation preferred fitted 7 dB worse, because the window
+                // carrying the most of TRN1u's shape was not the window TRN1u began
+                // at. So the correlation shortlists and the fit chooses, in
+                // `align_trn1u_by_fit`: no offset, no new constant, and the figure
+                // that decides is the same least-squares fit the threshold below
+                // judges.
+                // Aimed on *this* TRN1u, the second one: it follows our TRN1d, so
+                // by now the far end's transmit clock is locked to our rate and the
+                // upstream fractional phase is a property of the loop rather than a
+                // transient -- which is what the first TRN1u gives, and why aiming
+                // there produced 0.590 while this one produced 0.760 (`docs/83`
+                // §3.5).
+                // `fe_install` rebuilds the whole history from the raw stream, so
+                // the refit taken below sees one phase throughout.
+                // The **first** of the two measurements, and its target is CPt's
+                // and not the eye's: a two-point CPt is read by the linear fit
+                // taken here, so what has to be right is that the fit describes
+                // the line at the phase it will be installed at. `fe_aim_linear`
+                // maximises that fit; `docs/83` §3.6 measured why the eye criterion
+                // is not a substitute -- on a two-point stream its whole curve
+                // moves one per cent and it ranks the phase *against* the one the
+                // data mode needs.
+                if self.rx.fe_enabled() && fe_aim_wants(false) {
+                    let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
+                    let aimed = forced
+                        .map(|d| (d, f64::NAN))
+                        .or_else(|| self.rx.fe_aim_linear(at as usize, REFIT_WINDOW));
+                    if let Some((delta, figure)) = aimed {
+                        self.rx.fe_install(delta);
+                        self.note(format!(
+                            "V.92: fractional delay {delta:.3} at TRN1u 2 (linear fit {figure:.2} dB)"
+                        ));
                     }
-                    taken.then(|| (self.rx.snr_db(), judged))
                 }
-                _ => None,
-            };
-            if self.diag.is_some()
-                && let Some((aligned, fit)) = search
-            {
-                // The pair the accept test was made of, printed as measured:
-                // the same window, the same reference, each tap set at its own
-                // whole-symbol anchor. The gap between them is the slack the
-                // rule would have needed to reject, so an always-accepting rule
-                // is visible here rather than inferred from the outcome.
-                let judged = match found {
-                    Some((_, judged)) => judged,
-                    None => None,
-                };
-                let (in_place, refit) = match judged {
-                    Some((a, b)) => (a, b),
-                    None => {
-                        let anchor = ((aligned as i64 + refit_offset()).max(0) as u64) as usize;
-                        let a = self.rx.score_of(before.sections().0, before.sections().1, anchor, 0, TRAIN_WINDOW);
-                        let b = self.rx.score_of(self.rx.taps(), self.rx.feedback(), anchor, 0, TRAIN_WINDOW);
-                        (a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))
+                if self.rx.fe_enabled() && fe_metering() {
+                    // Report only: the number is the far end's phase error, and the
+                    // place to act on it is the next call's Jp, not this receiver.
+                    if let Some((delta, figure)) = self.rx.fe_aim_linear(at as usize, REFIT_WINDOW) {
+                        self.note(format!(
+                            "V.92: phase meter, second TRN1u: {delta:.3} symbols (linear fit {figure:.2} dB)"
+                        ));
                     }
-                };
-                if std::env::var_os("V92_SCORE_TRACE").is_some() {
-                    eprintln!("V92DIAG: same window, own anchor: in place {in_place:.3} dB, refit {refit:.3} dB");
                 }
-                self.diag_line(&format!(
-                    "refit at {aligned}: fit {fit:.3} dB, on this window the taps in place read \
-                     {in_place:.3} dB and the refit {refit:.3} dB (the fit in place read \
-                     {baseline:.3} dB at the first TRN1u), so the refit leads it by {:.3} dB \
-                     against a tolerance of {} dB",
-                    refit - in_place,
-                    refit_slack()
-                ));
-            }
-            if self.diag.is_some() {
-                let line = match search {
-                    Some((aligned, fit)) => format!(
-                        "refit search around {at}: aligned {aligned} (expected {from}), \
-                         quality over {REFIT_QUALITY}, fit {fit:.3} dB, taken {found:?}, \
-                         snr now {:.1} dB, was {baseline:.1}, slack {}",
-                        self.rx.snr_db(),
-                        refit_slack()
-                    ),
-                    None => format!(
-                        "refit search around {at}: no alignment over {REFIT_QUALITY}, \
-                         snr {:.1} dB, was {baseline:.1}, slack {}",
-                        self.rx.snr_db(),
-                        refit_slack()
-                    ),
+                if self.rx.fe_enabled() && std::env::var_os("V92_FE_DEBUG").is_some() {
+                    self.rx.fe_report_two(at as usize, REFIT_WINDOW);
+                }
+                // The measured walk first: coarse to fine around the point where
+                // the upstream stopped repeating (see `Receiver::align_trn1u_from`).
+                // It returns an absolute symbol count, the estimate below is a
+                // history index, and everything downstream is the index.
+                let swept = measured
+                    .and_then(|onset| self.rx.align_trn1u_from(onset, REFIT_SWEEP, TRAIN_WINDOW))
+                    .map(|(onset, fit)| (onset.saturating_sub(base), fit));
+                let timed = self
+                    .rx
+                    .align_trn1u_by_fit(at, REFIT_SEARCH, ALIGN_WINDOW, REFIT_QUALITY, TRAIN_WINDOW);
+                let mut search: Option<(u64, f64)> = None;
+                let chosen = match (timed, swept) {
+                    // The estimate stands unless the measurement fits better by more
+                    // than a fit's own repeatability: see [`REFIT_MEASURED_DB`].
+                    (Some((timed_at, timed_fit)), Some((swept_at, swept_fit)))
+                        if swept_fit > timed_fit + REFIT_MEASURED_DB =>
+                    {
+                        self.note(format!(
+                            "V.92: second TRN1u at {}, measured from the end of the six-symbol \
+                             upstream at {} ({swept_fit:.1} dB, against {timed_fit:.1} dB at {} for \
+                             the timetable's estimate)",
+                            base + swept_at,
+                            measured.unwrap_or(0),
+                            base + timed_at
+                        ));
+                        search = Some((swept_at, swept_fit));
+                        Some(swept_at)
+                    }
+                    (Some((timed_at, timed_fit)), _) => {
+                        search = Some((timed_at, timed_fit));
+                        Some(timed_at)
+                    }
+                    (None, Some((swept_at, swept_fit))) => {
+                        search = Some((swept_at, swept_fit));
+                        Some(swept_at)
+                    }
+                    (None, None) => None,
                 };
-                self.diag_line(&line);
-            }
-            match found {
-                // And a fit that reads the line much worse than the one in place
-                // is not a refit: the taps would be worse for the CPt than what
-                // they replaced. "Much worse" is measured on one window, the one
-                // about to be installed, against the sequence this end
-                // generates, each tap set at its own whole-symbol anchor --
-                // `docs/81`'s finding was that the two figures the old test
-                // compared had been taken on two different TRN1u windows and so
-                // were not the same measurement at all.
-                Some((snr, Some((in_place, refit)))) if refit > in_place - refit_slack() => {
-                    self.refit_from = None;
-                    self.note(format!(
-                        "V.92: refit at the new phase, {snr:.1} dB ({refit:.1} dB on the window, \
-                         against {in_place:.1} dB for the taps it replaces)"
+                let found = match chosen {
+                    Some(aligned) => {
+                        let fit = search.map_or(f64::NAN, |(_, fit)| fit);
+                        // 9.5.1.1.10: "the digital modem shall keep a modulo 12 data
+                        // frame interval count from the first symbol of TRN1u" --
+                        // the *second* one, and this is the first the alignment of
+                        // its first symbol is known to a symbol.
+                        self.rx.set_frame_origin(base + aligned);
+                        self.trn2_from = Some(base + aligned);
+                        // 9.6.1.1.1's design is scheduled here: see `design_at`.
+                        self.design_at = self.trn2_from.map(|at| at + DESIGN_AFTER);
+                        let anchor = (aligned as i64 + refit_offset()).max(0) as u64;
+                        let taken = self.rx.train_verified(anchor, TRAIN_WINDOW);
+                        // The two numbers this test is made of, taken where the
+                        // refit will be installed: the taps in place and the ones
+                        // just fitted, same samples, same reference, each at its
+                        // own whole-symbol anchor. `docs/81` measured the old pair
+                        // as incomparable -- the incumbent's figure came from the
+                        // *first* TRN1u, the refit's from the second, and the line
+                        // moves between them by more than the whole tolerance.
+                        let judged = taken
+                            .then(|| self.rx.best_on_window(before.sections(), anchor as usize, TRAIN_WINDOW))
+                            .flatten();
+                        if tracing() {
+                            eprintln!(
+                                "V92TRACE: refit at {aligned}, fit {fit:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
+                                self.rx.snr_db()
+                            );
+                        }
+                        taken.then(|| (self.rx.snr_db(), judged))
+                    }
+                    _ => None,
+                };
+                if self.diag.is_some()
+                    && let Some((aligned, fit)) = search
+                {
+                    // The pair the accept test was made of, printed as measured:
+                    // the same window, the same reference, each tap set at its own
+                    // whole-symbol anchor. The gap between them is the slack the
+                    // rule would have needed to reject, so an always-accepting rule
+                    // is visible here rather than inferred from the outcome.
+                    let judged = match found {
+                        Some((_, judged)) => judged,
+                        None => None,
+                    };
+                    let (in_place, refit) = match judged {
+                        Some((a, b)) => (a, b),
+                        None => {
+                            let anchor = ((aligned as i64 + refit_offset()).max(0) as u64) as usize;
+                            let a = self.rx.score_of(before.sections().0, before.sections().1, anchor, 0, TRAIN_WINDOW);
+                            let b = self.rx.score_of(self.rx.taps(), self.rx.feedback(), anchor, 0, TRAIN_WINDOW);
+                            (a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))
+                        }
+                    };
+                    if std::env::var_os("V92_SCORE_TRACE").is_some() {
+                        eprintln!("V92DIAG: same window, own anchor: in place {in_place:.3} dB, refit {refit:.3} dB");
+                    }
+                    self.diag_line(&format!(
+                        "refit at {aligned}: fit {fit:.3} dB, on this window the taps in place read \
+                         {in_place:.3} dB and the refit {refit:.3} dB (the fit in place read \
+                         {baseline:.3} dB at the first TRN1u), so the refit leads it by {:.3} dB \
+                         against a tolerance of {} dB",
+                        refit - in_place,
+                        refit_slack()
                     ));
-                    // The reader and the CPt finder are left alone: a CPt is a
-                    // whole frame with a CRC, so those that cross the refit are
-                    // thrown out by it and the next repetition is read with the
-                    // new taps.
                 }
-                _ => {
-                    self.rx.restore(&before);
-                    // Move the anchor on and try again, a couple of times: the
-                    // far end may still be a little way from the reversal, and
-                    // a trial that lands in the gap between our Jp' and its
-                    // TRN1u has nothing to fit. Past that the first fit stands.
-                    self.refit_tries += 1;
-                    self.refit_from = (self.refit_tries < 3).then_some(from + REFIT_WINDOW as u64 / 2);
+                if self.diag.is_some() {
+                    let line = match search {
+                        Some((aligned, fit)) => format!(
+                            "refit search around {at}: aligned {aligned} (expected {from}), \
+                             quality over {REFIT_QUALITY}, fit {fit:.3} dB, taken {found:?}, \
+                             snr now {:.1} dB, was {baseline:.1}, slack {}",
+                            self.rx.snr_db(),
+                            refit_slack()
+                        ),
+                        None => format!(
+                            "refit search around {at}: no alignment over {REFIT_QUALITY}, \
+                             snr {:.1} dB, was {baseline:.1}, slack {}",
+                            self.rx.snr_db(),
+                            refit_slack()
+                        ),
+                    };
+                    self.diag_line(&line);
+                }
+                match found {
+                    // And a fit that reads the line much worse than the one in place
+                    // is not a refit: the taps would be worse for the CPt than what
+                    // they replaced. "Much worse" is measured on one window, the one
+                    // about to be installed, against the sequence this end
+                    // generates, each tap set at its own whole-symbol anchor --
+                    // `docs/81`'s finding was that the two figures the old test
+                    // compared had been taken on two different TRN1u windows and so
+                    // were not the same measurement at all.
+                    Some((snr, Some((in_place, refit)))) if refit > in_place - refit_slack() => {
+                        self.refit_from = None;
+                        self.note(format!(
+                            "V.92: refit at the new phase, {snr:.1} dB ({refit:.1} dB on the window, \
+                             against {in_place:.1} dB for the taps it replaces)"
+                        ));
+                        // The reader and the CPt finder are left alone: a CPt is a
+                        // whole frame with a CRC, so those that cross the refit are
+                        // thrown out by it and the next repetition is read with the
+                        // new taps.
+                    }
+                    _ => {
+                        self.rx.restore(&before);
+                        // Move the anchor on and try again, a couple of times: the
+                        // far end may still be a little way from the reversal, and
+                        // a trial that lands in the gap between our Jp' and its
+                        // TRN1u has nothing to fit. Past that the first fit stands.
+                        self.refit_tries += 1;
+                        self.refit_from = (self.refit_tries < 3).then_some(from + REFIT_WINDOW as u64 / 2);
+                    }
                 }
             }
         }
@@ -2977,35 +3141,55 @@ impl Modem {
         // (`/dev/shm/reports/hsf-su.md`). There is no reversal to detect, so
         // the digital modem's only conforming move is to wait out 9.5.1.2.2.
         //
-        // This arm is **not conformance and must never be the default**. It
-        // exists to answer the next question in one bench call: given a Jp it
-        // was never asked for, does this far end go on to 9.5.2.1.8? If it
-        // does, the interworking fix is a named quirk in the phase 3 state
-        // machine; if it does not, no amount of receiver work reaches Phase 4
-        // on this far end and that is worth knowing before more of it is done.
-        //
-        // The arithmetic is self-consistent even without the step: epsilon is
-        // measured on the Su that is on the line, and it is that Su the far end
-        // lengthens by (24 + epsilon)T. Nothing here assumes the half symbol
-        // arrived, because on this far end it did not.
-        if blind_su()
-            && self.stage == Stage::AwaitSu
+        // It is no longer the way this product gets on with such a far end: the
+        // tolerance below is on by default and reaches the same place with
+        // evidence behind it. What is left here is the **override** -- a bench
+        // arm that says "go now, ask nothing" -- so that a session can ask what
+        // a far end does with a Jp on its own terms without the tolerance's
+        // thirty-two periods in the way. It is off unless asked for, and
+        // `V92_SU_TOLERANCE=off` takes the tolerance out entirely, which is the
+        // way back to the old behaviour on both counts.
+        if self.stage == Stage::AwaitSu
             && let Some(found) = self.su_found
-            && self.now
-                >= found
-                    + crate::v92::SU_SYMBOLS as u64
-                    + SU_BAR_TENTHS / 10
-                    + 2 * crate::v92::up_signals::RU_PERIOD as u64
         {
-            // Where 9.5.2.1.7's reversal should have been: 144T of Su after the
-            // onset the hunt's report is a few periods behind.
-            let at = found + crate::v92::SU_SYMBOLS as u64 - SU_REPORT_LAG;
-            self.note(format!(
-                "V.92: Su never reversed in {} periods; asking for Jp anyway (V92_SU_BLIND)",
-                (self.now - found) / crate::v92::up_signals::RU_PERIOD as u64
-            ));
-            self.su_found = None;
-            self.su_reversal(at);
+            if blind_su()
+                && self.now
+                    >= found
+                        + crate::v92::SU_SYMBOLS as u64
+                        + SU_BAR_TENTHS / 10
+                        + 2 * crate::v92::up_signals::RU_PERIOD as u64
+            {
+                self.proceed_as_if_reversed(
+                    found,
+                    format!(
+                        "V.92: Su never reversed in {} periods; asking for Jp anyway (V92_SU_BLIND)",
+                        (self.now - found) / crate::v92::up_signals::RU_PERIOD as u64
+                    ),
+                );
+            } else if su_tolerance()
+                && let Some((held, coherence)) = self.rx.su_held()
+                && held >= SU_TOLERANCE_PERIODS
+                && coherence >= SU_TOLERANCE_COHERENCE
+            {
+                // A `Su` that has held the anchor, period after period, for
+                // longer than 8.5.6 and 9.5.2.1.7 can account for, without ever
+                // turning over. The reversal test is untouched and ran first:
+                // had there been a S-bar-u, the hunt would have reported it and
+                // this stage would long since have left AwaitSu, so reaching
+                // here *is* the measurement that it did not.
+                //
+                // What it does is what the blind arm does, to the symbol, since
+                // the position of the reversal Jp's epsilon is measured after is
+                // 9.5.2.1.7's and not the far end's, and it says which tolerance
+                // it used, how long the Su had been held and how well the line
+                // matched it.
+                self.proceed_as_if_reversed(
+                    found,
+                    format!(
+                        "V.92: Su held {held} periods with no reversal, coherent at {coherence:.3};                          completing Su by tolerance (V92_SU_TOLERANCE, 9.5.2.1.7)"
+                    ),
+                );
+            }
         }
         if let Some(at) = self.su_deadline
             && self.now > at
@@ -3086,6 +3270,24 @@ impl Modem {
             // restarted and only Su is of interest.
             _ => {}
         }
+    }
+
+    /// Go on as if 9.5.2.1.7's `S-bar-u` had arrived, at the position it would
+    /// have taken, naming the tolerance that justified it.
+    ///
+    /// Two callers need this -- the `V92_SU_BLIND` override and the tolerance
+    /// for a far end whose Su never reverses -- and they must not differ in
+    /// *where* they put the reversal: Jp's epsilon is measured on the Su that
+    /// follows it (9.5.2.1.7) and the far end's answer is (24 + epsilon)T after
+    /// that (9.5.2.1.8), so the position is the one place the two can agree to
+    /// disagree, and it is computed here once.
+    fn proceed_as_if_reversed(&mut self, found: u64, why: String) {
+        // Where 9.5.2.1.7's reversal should have been: 144T of Su after the
+        // onset, and the hunt's report is a few periods behind the onset.
+        let at = found + crate::v92::SU_SYMBOLS as u64 - SU_REPORT_LAG;
+        self.note(why);
+        self.su_found = None;
+        self.su_reversal(at);
     }
 
     fn begin_training(&mut self, reversal: u64) {
@@ -5314,6 +5516,12 @@ mod tests {
         ja: Option<TwoPointSender>,
         cp: Option<TwoPointSender>,
         second_trn: Trn1u,
+        /// Whether this far end's `Su` turns over at 144T as 9.5.2.1.7 says it
+        /// does, or never turns over at all. Which of the two it is decides
+        /// which of the two paths Phase 3 takes out of `AwaitSu`, and both are
+        /// measured on this bench: the Agere reverses 54 symbols after its Su is
+        /// reported, the HSF sends one unmodulated tone for 4.63 s.
+        reverses: bool,
     }
 
     impl Script {
@@ -5330,7 +5538,14 @@ mod tests {
                 sender.push(&cp.to_bits_in(Layout::V92, UP_INTERVALS));
                 sender
             });
-            Self { trn, ja: Some(ja), cp, second_trn: Trn1u::new() }
+            Self { trn, ja: Some(ja), cp, second_trn: Trn1u::new(), reverses: true }
+        }
+
+        /// The same call from a far end that breaks 9.5.2.1.7's second clause:
+        /// `Su` from its start to the point where it answers, with no
+        /// `S-bar-u` in it anywhere.
+        fn without_reversal(wanted: &Descriptor, rates: u32, cp: Option<Cp>) -> Self {
+            Self { reverses: false, ..Self::new(wanted, rates, cp) }
         }
 
         fn next(&mut self, n: u64) -> f64 {
@@ -5361,17 +5576,27 @@ mod tests {
             let bar2 = su2 + 400;
             let trn2 = bar2 + 40;
             let cpt = trn2 + 2400;
-            if n < bar1 {
-                return su(n, false);
-            }
-            if n < su2 {
-                return su(n, true);
-            }
-            if n < bar2 {
-                return su(n, false);
-            }
-            if n < trn2 {
-                return su(n, true);
+            if self.reverses {
+                if n < bar1 {
+                    return su(n, false);
+                }
+                if n < su2 {
+                    return su(n, true);
+                }
+                if n < bar2 {
+                    return su(n, false);
+                }
+                if n < trn2 {
+                    return su(n, true);
+                }
+            } else {
+                // One tone from the start of Su to the point where the far end
+                // answers: no reversal, no step, nothing the hunt can call a
+                // turn -- and it stops exactly where the tone was measured to
+                // stop, when the far end hears a Jp it never asked for.
+                if n < trn2 {
+                    return su(n, false);
+                }
             }
             if n < cpt {
                 return self.second_trn.next_symbol();
@@ -5407,6 +5632,61 @@ mod tests {
         assert_eq!(modem.upstream_rates(), Some(0x7ffff), "mask: {notes:?}");
         assert!(modem.circuit107(), "circuit 107 never came on: {notes:?}");
         assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes:?}", modem.phase());
+    }
+
+    /// A far end whose `Su` never turns over -- 9.5.2.1.7's second clause
+    /// missing, measured on this bench's HSF -- is carried out of `AwaitSu` by
+    /// the **tolerance**, and the tolerance says so: its name, the periods the
+    /// hunt held the Su for, and the coherence it held it at.
+    #[test]
+    fn a_su_that_never_reverses_is_completed_by_tolerance_and_logged() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let mut script = Script::without_reversal(&Descriptor::none(), 0x7ffff, Some(cp));
+        let modem = run(&mut script, SU_START + 144 + 24 + 400 + 40 + 2400 + 1600);
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("V92_SU_TOLERANCE"), "no tolerance event: {notes}");
+        assert!(
+            notes.contains(&format!("Su held {SU_TOLERANCE_PERIODS} periods")),
+            "the event has to say how many periods it held: {notes}"
+        );
+        // A tone this clean is the best case the coherence can read, and it is
+        // reported as measured rather than as a gate.
+        assert!(notes.contains("coherent at 1.000"), "{notes}");
+        // It is the tolerance and not the bench arm that carried the call.
+        assert!(!notes.contains("V92_SU_BLIND"), "{notes}");
+        // And it carried the call out of `AwaitSu`: Jp went out, and Phase 3 is
+        // waiting for the far end's answer to it.
+        assert!(notes.contains("Jp with epsilon"), "no Jp: {notes}");
+        assert_eq!(modem.stage, Stage::AwaitSuBar, "phase {} notes {notes}", modem.phase());
+        // The script stops its tone at the point a real far end does, and this
+        // end reads that stop as 9.5.2.1.8's second S-bar-u only when the step
+        // it was told to expect is not zero -- on this bench's HSF the Jp carried
+        // epsilon 47690, a third of a symbol, and the stop is what the hunt
+        // reported as the reversal. A perfectly clean synthetic line measures an
+        // epsilon of zero, so the stage it would take next is not this script's
+        // to exercise; what this test is for is the tolerance's own event and
+        // the Jp it produces.
+    }
+
+    /// And a far end that **does** turn over at 9.5.2.1.7's 144T is never
+    /// touched by it. This is the assertion the product's interoperation rests
+    /// on: the Agere on this bench reverses (54 symbols after its Su is
+    /// reported), the reversal test is untouched, and the tolerance needs
+    /// thirty-two periods -- twelve more than a conforming far end takes -- so
+    /// its stage is left long before the count could be reached.
+    #[test]
+    fn a_su_that_reverses_never_reaches_the_tolerance() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let mut script = Script::new(&Descriptor::none(), 0x7ffff, Some(cp));
+        let modem = run(&mut script, SU_START + 144 + 24 + 400 + 40 + 2400 + 1600);
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("Su reversed at"), "the reversal was not seen: {notes}");
+        assert!(
+            !notes.contains("V92_SU_TOLERANCE") && !notes.contains("Su held"),
+            "the tolerance fired on a Su that reverses: {notes}"
+        );
+        assert!(modem.cpt().is_some(), "{notes}");
+        assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes}", modem.phase());
     }
 
     /// 9.5.1.2.2: Su within 5100 ms of the start of TRN1d, however long TRN1d

@@ -89,6 +89,26 @@ const MATCHED: f64 = 0.90;
 /// And the gate for [`turned_share`]: see there.
 const TURNED_MATCHED: f64 = 0.75;
 
+/// What [`Receiver::repetition`] reads on the six-symbol upstream and what it
+/// reads on the training that follows it.
+///
+/// The two are not close: Su and S-bar-u are one period of six symbol for
+/// symbol (8.5.6), and the measure is an exact repetition at that lag whatever
+/// sub-symbol phase the far end is on, so a real Su reads 0.98 and above.
+/// TRN1u is a scrambled two-point stream (8.7.6) and reads about
+/// `1/sqrt(window)`: 0.2 for the twenty-four-sample window the refit's boundary
+/// search uses on the quiet line this bench has. 0.50 is between them with room
+/// for a notch the far end's own transmit filter puts in the middle of a
+/// reverse, and it is not tuned to any one far end: what it has to separate is
+/// "this sequence repeats every six samples" from "this one does not".
+const SU_REPETITION_LOW: f64 = 0.50;
+
+/// And the same measure one window *before* the boundary, which is the other
+/// half of the test: a stretch of line that has stopped repeating is only the
+/// end of Su if it was repeating before it. Below this the boundary search
+/// keeps looking, so the middle of TRN1u is never called its start.
+const SU_REPETITION_HIGH: f64 = 0.75;
+
 /// The coarser grid the shapes themselves are looked for on.
 ///
 /// It is the same problem one level up: Ru is three symbols up and three down,
@@ -319,6 +339,17 @@ struct Anchor {
     /// the anchor: dropping it is what lost the Ru-to-R-bar-u reversal that
     /// Phase 3 is waiting for.
     stray: u32,
+    /// Periods in a row the shape has matched, and the worst match among them.
+    ///
+    /// These are **bookkeeping, not decisions**: `held` counts matches and a
+    /// miss in the middle of a hold does not reset it, which is right for
+    /// reporting a sequence and wrong for asking "has this line held one
+    /// shape, coherently, without a break". That question is what a tolerance
+    /// for a far end whose `Su` never reverses has to be made of (9.5.2.1.7's
+    /// second clause), so it gets its own pair, reset on any period that does
+    /// not match the anchor.
+    steady: u32,
+    worst: f64,
 }
 
 /// Periods a shape must match in a row before the hunt calls it a signal.
@@ -1684,6 +1715,100 @@ impl Receiver {
         self.count.saturating_sub(self.history.len() as u64)
     }
 
+    /// How much of the line at `at` repeats exactly one six-symbol period
+    /// later: +1 for a sequence that is one period of six, about 0 for anything
+    /// with no six-symbol structure.
+    ///
+    /// Ru and R-bar-u (8.5.5), Su and S-bar-u (8.5.6) are all one period of
+    /// six, and they repeat at this lag **whatever sub-symbol phase they are
+    /// sent at**: a constant fractional offset is a constant rotation of the
+    /// six-point DFT, not a change of the period, so a far end half a symbol off
+    /// the network's instants still reads 1 here. The second TRN1u, CPt, E1u
+    /// and the data mode are scrambled two-point streams (8.7.6) and repeat not
+    /// at all. This is therefore the one number that says which side of
+    /// 9.5.2.1.11's boundary a stretch of line is on, and it needs no reference
+    /// sequence, no template and no gate tuned to a far end.
+    #[must_use]
+    pub fn repetition(&self, at: u64, window: usize) -> Option<f64> {
+        let first = at.checked_sub(self.history_base())? as usize;
+        let end = first.checked_add(window)?;
+        if window < RU_PERIOD || end + RU_PERIOD > self.history.len() {
+            return None;
+        }
+        let (mut together, mut left, mut right) = (0.0, 0.0, 0.0);
+        for n in first..end {
+            let a = self.history[n];
+            let b = self.history[n + RU_PERIOD];
+            together += a * b;
+            left += a * a;
+            right += b * b;
+        }
+        let power = (left * right).sqrt();
+        if !power.is_finite() || power <= 0.0 {
+            return None;
+        }
+        Some(together / power)
+    }
+
+    /// Where the six-symbol upstream gave way to the training that follows it,
+    /// **measured on the line**.
+    ///
+    /// This is 9.5.2.1.7-11's boundary -- the last of Su/S-bar-u on one side and
+    /// the second TRN1u on the other -- and it is the one thing about the second
+    /// TRN1u that can be measured rather than assumed. The hunt reports a
+    /// reversal up to a period late, a far end that answers a Jp late answers it
+    /// from its own clock, and a far end with no S-bar-u at all (the HSF on this
+    /// bench) simply drops its tone when it hears what it was waiting for: none
+    /// of that is visible in a symbol count this end keeps, and all of it is
+    /// visible in the line. A fit against the wrong alignment is a fit against
+    /// the wrong sequence, and it reads 6.4 dB where the same fit one alignment
+    /// over reads 14.5.
+    ///
+    /// [`Self::repetition`] is the measurement: the upstream stops repeating
+    /// every six samples exactly where TRN1u begins, and nothing else on the
+    /// line looks like that. The scan runs **backwards** from the newest sample
+    /// that has a full measurement behind it, so it finds the boundary nearest
+    /// *now* -- the second TRN1u's -- and not one from earlier in the call.
+    /// `search` is how far back to look, `window` how many samples each
+    /// repetition measurement is taken over, and `hold` how long the line has to
+    /// keep *not* repeating before the change is believed, so that one period
+    /// missing inside Su, or the notch a far end's own filter puts in the middle
+    /// of a reverse, is not read as the end of Su.
+    ///
+    /// What comes back is the last symbol at which the upstream was **still**
+    /// repeating -- biased a window early rather than late, because what the
+    /// caller does with it is search forward: a start a few symbols inside Su
+    /// costs the search nothing, and one a few symbols inside TRN1u would put
+    /// TRN1u's first symbol before it.
+    ///
+    /// `None` means the line has not stopped repeating anywhere in that stretch:
+    /// the upstream is still Su, and there is no second TRN1u yet.
+    #[must_use]
+    pub fn su_ends(&self, search: u64, window: usize, hold: usize) -> Option<u64> {
+        // The newest point that still has a full measurement `hold` symbols
+        // ahead of it: `repetition` needs its own window plus a period.
+        let newest = self.count.checked_sub((window + hold + RU_PERIOD) as u64)?;
+        let oldest = newest.saturating_sub(search).max(self.history_base() + window as u64);
+        let mut at = newest;
+        loop {
+            // A measurement that cannot be taken is a window of silence or a
+            // window the history has lost, and neither is a repeating upstream:
+            // keep looking rather than giving up on the whole scan.
+            if let (Some(here), Some(ahead)) = (
+                self.repetition(at, window),
+                self.repetition(at + hold as u64, window),
+            ) && here >= SU_REPETITION_HIGH
+                && ahead <= SU_REPETITION_LOW
+            {
+                return Some(at);
+            }
+            if at == oldest {
+                return None;
+            }
+            at -= 1;
+        }
+    }
+
     /// The line's own samples between two absolute symbol indices, clipped to
     /// what history still holds.
     ///
@@ -1828,6 +1953,78 @@ impl Receiver {
             );
         }
         Some((start as u64, snr))
+    }
+
+    /// What the least-squares fit reads with TRN1u's first symbol at `at`, and
+    /// nothing else: no verification, no Phase 4 design, no event.
+    ///
+    /// This is the figure [`Self::align_trn1u_from`] walks and the figure the
+    /// refit is installed on, so a search made of it compares like with like.
+    /// It leaves the receiver fitted at `at`, as every fit here does.
+    #[must_use]
+    pub fn fit_alignment(&mut self, at: u64, window: usize) -> Option<f64> {
+        let index = at.checked_sub(self.history_base())? as usize;
+        self.fit_window(index, window).then_some(self.snr_db)
+    }
+
+    /// Where TRN1u's first symbol is, **fitted** from a start that was measured
+    /// rather than correlated.
+    ///
+    /// [`Self::align_trn1u_by_fit`] chooses among the local maxima of the
+    /// correlation profile, and on a real line that profile is not the presence
+    /// test its docstring describes: a two-point stream arrives through a
+    /// channel that has already delayed it, and a normalised correlation against
+    /// the raw symbols measures the channel's *leading* tap, which on a
+    /// telephone line is nearly nothing. Measured on the HSF's second TRN1u
+    /// (`20261025-173736-hsf-bl1/rx8.raw`), the correlation peaks at 0.571 on
+    /// the transient where Su stops -- forty-four symbols from TRN1u's first
+    /// symbol, where the same measure reads 0.045 -- while the fit reads 6.6 dB
+    /// at the correlation's peak and 14.5 dB at the alignment it never
+    /// shortlisted.
+    ///
+    /// So the start is *measured* ([`Self::su_ends`]) and the fit walks the
+    /// stretch after it, coarse to fine: sixteen symbols, then two, then one.
+    /// `search` is how far past the measured start TRN1u may begin -- a
+    /// conforming far end's begins immediately (9.5.2.1.10: (24 + epsilon)T
+    /// after the S-bar-u, which is what `su_ends` has just measured the end of),
+    /// and a far end that answers a Jp it did not expect begins some way past
+    /// the end of its Su (measured ninety-nine symbols on the HSF).
+    pub fn align_trn1u_from(&mut self, onset: u64, search: u64, window: usize) -> Option<(u64, f64)> {
+        let lo = onset.max(self.history_base()).max(onset.min(1));
+        let hi = onset
+            .saturating_add(search)
+            .min(self.count.saturating_sub(TRAIN_TAPS as u64 + 1))
+            .max(lo);
+        let mut best = self.sweep_for_fit(lo, hi, 16, window)?;
+        for step in [2, 1] {
+            let from = best.0.saturating_sub(8 * step).max(lo);
+            let to = best.0.saturating_add(8 * step).min(hi);
+            if let Some(better) = self.sweep_for_fit(from, to, step, window)
+                && better.1 > best.1
+            {
+                best = better;
+            }
+        }
+        Some(best)
+    }
+
+    /// The best fit over `from..=to`, one alignment every `step` symbols: see
+    /// [`Self::align_trn1u_from`].
+    fn sweep_for_fit(&mut self, from: u64, to: u64, step: u64, window: usize) -> Option<(u64, f64)> {
+        let mut best: Option<(u64, f64)> = None;
+        let mut at = from;
+        loop {
+            if let Some(db) = self.fit_alignment(at, window)
+                && best.is_none_or(|(_, seen)| db > seen)
+            {
+                best = Some((at, db));
+            }
+            if at >= to {
+                break;
+            }
+            at = (at + step.max(1)).min(to);
+        }
+        best
     }
 
     /// The correlation profile [`Self::align_trn1u`] reads: for every start
@@ -2060,6 +2257,22 @@ impl Receiver {
         Some((kind, anchor.phase, anchor.held, anchor.stray, self.step))
     }
 
+    /// How long the hunt has held `Su` **without it turning over**, and how
+    /// poorly the line matched the anchor over that hold.
+    ///
+    /// `Some` only while the hunt is holding an unreversed `Su`: a reversal
+    /// moves the anchor to `Su turned`, and after that this is `None` until Su
+    /// is acquired again. The pair is what a tolerance for a far end whose
+    /// `Su` never sends 9.5.2.1.7's `S-bar-u` is decided on -- consecutive
+    /// periods, and the worst coherence among them -- and it changes no
+    /// decision of its own: [`Self::recognise`] decides exactly what it decided
+    /// before.
+    #[must_use]
+    pub fn su_held(&self) -> Option<(u32, f64)> {
+        let anchor = self.anchor?;
+        (anchor.kind == Hunt::Su).then_some((anchor.steady, anchor.worst))
+    }
+
     #[must_use]
     pub fn hunt_shares(&self, window: &[f64]) -> Option<(f64, f64)> {
         let anchor = self.anchor?;
@@ -2117,6 +2330,10 @@ impl Receiver {
                 // Still the same signal. The first period it is held for is
                 // when it is reported as having been found.
                 anchor.held += 1;
+                // The hold a tolerance may be decided on: consecutive periods,
+                // and the worst of them -- see `Anchor::steady`.
+                anchor.steady += 1;
+                anchor.worst = anchor.worst.min(share);
                 if anchor.held == HELD_PERIODS {
                     match anchor.kind {
                         Hunt::Ru => self.events.push_back(Heard::Ru { at }),
@@ -2129,6 +2346,11 @@ impl Receiver {
             // Neither the same window nor its inverse in place. Ask the other
             // question a reversal can be: the anchor turned over *at the step
             // the timetable is about to take* (see [`turned_share`]).
+            // Whatever the answer, this period is not the shape held so far,
+            // so the continuous hold `Anchor::steady` counts ends here. Nothing
+            // below decides anything on these two.
+            anchor.steady = 0;
+            anchor.worst = 1.0;
             let turned = turned_share(&window, &anchor.template, self.step) > TURNED_MATCHED;
             if !turned {
                 // Neither the sequence nor its inverse: this is one of the
@@ -2163,6 +2385,8 @@ impl Receiver {
                     };
                     anchor.template = window.try_into().unwrap_or([0.0; RU_PERIOD]);
                     anchor.held = 0;
+                    anchor.steady = 0;
+                    anchor.worst = 1.0;
                     self.state = anchor.kind;
                     self.events.push_back(turned);
                     return true;
@@ -2206,6 +2430,8 @@ impl Receiver {
             template: window.try_into().unwrap_or([0.0; RU_PERIOD]),
             held: 1,
             stray: 0,
+            steady: 1,
+            worst: best.0,
         });
         self.state = best.1;
         true
@@ -3386,6 +3612,110 @@ pub(crate) fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f6
 mod tests {
     use super::*;
     use crate::v92::up_signals::{ru, su};
+
+    /// The measure the refit's boundary is made of separates 8.5.6's Su from
+    /// 8.7.6's TRN1u without a reference sequence and without a sub-symbol
+    /// phase: Su is one period of six, TRN1u is scrambled and repeats not at
+    /// all.
+    #[test]
+    fn the_six_symbol_measure_reads_su_high_and_training_at_nothing() {
+        let mut rx = Receiver::new();
+        for n in 0..144u64 {
+            rx.feed(su(n, false) * 0.1);
+        }
+        for n in 0..120u64 {
+            rx.feed(su(n, false) * 0.1);
+            let lifted = rx.count.saturating_sub(30) as u64;
+            let share = rx.repetition(lifted, 24).expect("a measurement on Su");
+            assert!(share > 0.999, "Su reads {share} at {n}");
+        }
+        let mut trn = crate::v92::up_signals::Trn1u::new();
+        for _ in 0..300 {
+            rx.feed(trn.next_symbol() * 0.1);
+        }
+        let now = rx.count as u64;
+        // Every whole period of TRN1u the history still holds.
+        for at in (now - 200)..(now - 30) {
+            let share = rx.repetition(at, 24).expect("a measurement on TRN1u");
+            assert!(share < 0.5, "TRN1u reads {share} at {at}, {} from the end", now - at);
+        }
+    }
+
+    /// Where the six-symbol upstream ends is where the training begins, and the
+    /// fit finds TRN1u's first symbol from there -- over a stretch of something
+    /// that is *not* this end's reference in the middle, which is what the HSF
+    /// puts between its Su and its TRN1u.
+    #[test]
+    fn the_training_is_located_from_the_measured_end_of_su() {
+        let mut rx = Receiver::new();
+        let su_of = |rx: &mut Receiver, count: usize| {
+            for n in 0..count {
+                rx.feed(su(n as u64, false) * 0.1);
+            }
+        };
+        su_of(&mut rx, 144);
+        // The far end's own two-point stream, scrambled with the other
+        // polynomial: full-band, nothing like the reference this end was given,
+        // and ninety-six symbols long, which is the gap measured on the HSF.
+        let mut other = crate::v92::up_signals::Trn1u::with_mode(Mode::Call);
+        for _ in 0..96 {
+            rx.feed(other.next_symbol() * 0.1);
+        }
+        let mut trn = crate::v92::up_signals::Trn1u::new();
+        for _ in 0..600 {
+            rx.feed(trn.next_symbol() * 0.1);
+        }
+        let onset = rx.su_ends(2_048, 24, 48).expect("the end of Su");
+        assert!((120..=144).contains(&onset), "boundary at {onset}, Su ended at 144");
+        let (at, db) = rx.align_trn1u_from(onset, 256, 600).expect("an alignment");
+        // A symbol or two either way does not change the measurement: the fit's
+        // taps are a delay line, and a sequence fitted two symbols early with a
+        // two-symbol delay in the taps IS the sequence at the right alignment.
+        // What has to be true is that the fit *finds* it, and reads what TRN1u
+        // reads on a clean line.
+        assert!((236..=244).contains(&at), "TRN1u begins at 240, the fit says {at}");
+        assert!(db > 20.0, "the fit at the right alignment reads {db:.1} dB");
+    }
+
+    /// A two-point stream that reaches the receiver smoothed and half a symbol
+    /// late is still fitted, and over a plateau of alignments exactly as wide as
+    /// the equaliser's own feed-forward section.
+    ///
+    /// That is the shape of the refit's problem, and the shape of its answer.
+    /// The fit solves `reference = sum(taps * line)`, so the reference can be
+    /// read from the line only once every sample it needs has *arrived*: from
+    /// TRN1u's first sample onwards, and for as many alignments as the taps can
+    /// become a delay line -- [`TRAIN_TAPS`] of them. What the search is for is
+    /// that plateau; where inside it the alignment lands is the frame origin's
+    /// question and not the fit's, and Phase 4's frame phase survives a constant
+    /// offset from it.
+    #[test]
+    fn a_smoothed_two_point_stream_is_fitted_over_a_plateau_as_wide_as_the_equaliser() {
+        let mut trn = crate::v92::up_signals::Trn1u::new();
+        let mut sent = Vec::new();
+        for _ in 0..800 {
+            sent.push(trn.next_symbol() * 0.1);
+        }
+        let mut rx = Receiver::new();
+        for n in 0..144u64 {
+            rx.feed(su(n, false) * 0.1);
+        }
+        for n in 0..sent.len() {
+            let behind = |k: usize| if n >= k { sent[n - k] } else { 0.0 };
+            rx.feed(0.25 * behind(0) + 0.5 * behind(1) + 0.25 * behind(2));
+        }
+        let onset = rx.su_ends(2_048, 24, 48).expect("the end of Su");
+        let (at, db) = rx.align_trn1u_from(onset, 256, 600).expect("an alignment");
+        assert!(
+            (144..=144 + TRAIN_TAPS as u64).contains(&at),
+            "the fit chose {at}, and TRN1u's first sample is 144"
+        );
+        assert!(db > 12.0, "the fit reads {db:.1} dB at {at}");
+        // And before that plateau there is nothing to find, which is what makes
+        // the plateau's start a measurement rather than a preference.
+        let early = rx.fit_alignment(onset, 600);
+        assert!(early.is_none_or(|db| db < 6.0), "the fit reads {early:?} at the boundary itself");
+    }
 
     /// Ru, then R-bar-u, is found without knowing which way up the line is.
     #[test]
