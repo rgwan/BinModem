@@ -260,6 +260,17 @@ struct Measuring {
     /// `c` classes away from the model's, mod 8, when the model is read with
     /// global sign `sign` (`0` as 6.4.1 prints it, `1` complemented).
     counts: [[[u16; CLASSES]; TRELLIS_FRAME]; 2],
+    /// `half[sign][h]`: the k = 3 position measured on the **half-step grid**
+    /// that the class map is read on, `h = (eta - 2 * predicted) mod 2 * Mi`.
+    ///
+    /// At k = 3 6.4.2's class is `((eta - (eta mod 2)) / 2) mod Mi`
+    /// (`precoder.rs:430`), so one index step is *half* a class and the class
+    /// histogram cannot name it: an odd index offset is split across the two
+    /// classes that bracket it by the transmitted parity bit, which is what
+    /// `docs/136` measured as `22/18` on `g4`. The index itself is the
+    /// quantity the far end rotates, so this is the grid it is measured on;
+    /// `measure` folds it back to classes with [`Self::folded`].
+    half: [[u16; 2 * CLASSES]; 2],
     /// The class width this rung's moduli name, which is Mi: eight at 24 000
     /// and sixteen at 32 000. The histogram bins are mod this, not mod the
     /// array's width -- `CLASSES` is only how wide the array is.
@@ -290,6 +301,7 @@ impl Measuring {
             classes,
             first,
             counts: [[[0; CLASSES]; TRELLIS_FRAME]; 2],
+            half: [[0; 2 * CLASSES]; 2],
             seen: 0,
             model_cost,
             count_cost: std::time::Duration::ZERO,
@@ -306,11 +318,22 @@ impl Measuring {
         let k = index % TRELLIS_FRAME;
         self.seen += 1;
         let started = std::time::Instant::now();
-        let class = i64::from(index_to_ki_class(eta, modulus, k));
         let complement = self.classes as i64 - 1 - i64::from(predicted);
-        for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
-            let away = (class - predicted).rem_euclid(self.classes as i64);
-            self.counts[sign][k][away as usize] += 1;
+        if k == TRELLIS_FRAME - 1 {
+            // The half-step grid (see `Self::half`): one index step, not one
+            // class, is what the far end rotates at this position, so this is
+            // the count that can name an odd rotation at all.
+            let width = 2 * self.classes as i64;
+            for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
+                let away = (i64::from(eta) - 2 * predicted).rem_euclid(width);
+                self.half[sign][away as usize] += 1;
+            }
+        } else {
+            let class = i64::from(index_to_ki_class(eta, modulus, k));
+            for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
+                let away = (class - predicted).rem_euclid(self.classes as i64);
+                self.counts[sign][k][away as usize] += 1;
+            }
         }
         self.count_cost += started.elapsed();
     }
@@ -318,6 +341,58 @@ impl Measuring {
     /// Whether B1u has been measured for long enough.
     fn done(&self) -> bool {
         self.seen >= ROTATION_SYMBOLS || self.first + self.seen as usize >= self.predicted.len()
+    }
+
+    /// The k = 3 position, folded back to classes: for every candidate **index**
+    /// offset `offset`, the half-step histogram is shifted by it and halved
+    /// (`h -> h - offset -> floor(./2) mod Mi`, which is `index_to_ki_class` of
+    /// `eta - offset` exactly), and the bar in [`Self::measure`] is applied to
+    /// the folded class histogram -- the same bar, unchanged, on the right
+    /// quantity.
+    ///
+    /// The candidate that clears with the most samples wins, and on a tie the
+    /// smallest offset does, so the identity wins whenever the class grid
+    /// already had a mode: a line whose rotation is an even number of steps
+    /// reads exactly what it read before this, and only a line the class grid
+    /// split (`docs/136`: 40 of 40 split `22/18`) moves. The offsets are not
+    /// searched for a better-looking margin -- `docs/136 §3`'s control that
+    /// `g4`'s `offset = 2` folds back to `22/18` is preserved by this rule,
+    /// because `offset = 1` clears first.
+    fn folded(&self, union: bool, sign: usize) -> Position {
+        let width = 2 * self.classes;
+        let half: Vec<u32> = (0..width)
+            .map(|step| {
+                if union {
+                    u32::from(self.half[0][step]) + u32::from(self.half[1][step])
+                } else {
+                    u32::from(self.half[sign][step])
+                }
+            })
+            .collect();
+        let samples: u32 = half.iter().copied().sum();
+        let mut best: Option<Position> = None;
+        for offset in 0..width {
+            let mut bins: Vec<u32> = (0..self.classes).map(|_| 0).collect();
+            for (step, &count) in half.iter().enumerate() {
+                let shifted = (step as i64 - offset as i64).rem_euclid(width as i64) as usize;
+                bins[(shifted / 2) % self.classes] += count;
+            }
+            let mut ranked: Vec<(u32, usize)> =
+                bins.iter().enumerate().map(|(class, &count)| (count, class)).collect();
+            ranked.sort_unstable_by(|a, b| b.cmp(a));
+            let top = ranked[0];
+            let next = ranked.get(1).copied().unwrap_or((0, 0));
+            let clear = top.0 > 0 && top.0 * 2 >= samples && top.0 >= next.0 * 2;
+            if clear && best.as_ref().is_none_or(|&won| top.0 > won.best as u32) {
+                best = Some(Position {
+                    rotation: Some(top.1 as i64),
+                    best: top.0.min(u32::from(u16::MAX)) as u16,
+                    rival: next.0.min(u32::from(u16::MAX)) as u16,
+                    shift: offset as i32,
+                });
+            }
+        }
+        best.unwrap_or_default()
     }
 
     /// The rotation at each position where the mode is clear enough to be one,
@@ -356,7 +431,18 @@ impl Measuring {
         let agreement = |sign: usize| -> u32 {
             self.counts[sign]
                 .iter()
-                .map(|counts| u32::from(counts.iter().copied().max().unwrap_or(0)))
+                .enumerate()
+                .map(|(k, counts)| {
+                    // The k = 3 position is counted on the half-step grid; its
+                    // agreement with the model is still the largest bin, which
+                    // is the same number the class histogram gave when the
+                    // rotation was even.
+                    if k == TRELLIS_FRAME - 1 {
+                        u32::from(self.half[sign].iter().copied().max().unwrap_or(0))
+                    } else {
+                        u32::from(counts.iter().copied().max().unwrap_or(0))
+                    }
+                })
                 .sum()
         };
         let (first, second) = (agreement(0), agreement(1));
@@ -378,8 +464,12 @@ impl Measuring {
         // taken separately.
         let union = (first as u64) * 2 <= (second as u64) * 3 && (second as u64) * 2 <= (first as u64) * 3
             || first.max(second) == 0;
-        let mut positions = [Position { rotation: None, best: 0, rival: 0 }; TRELLIS_FRAME];
+        let mut positions = [Position::default(); TRELLIS_FRAME];
         for (k, counts) in self.counts[0].iter().enumerate() {
+            if k == TRELLIS_FRAME - 1 {
+                positions[k] = self.folded(union, sign);
+                continue;
+            }
             let histogram: Vec<u32> = (0..self.classes)
                 .map(|class| {
                     if union {
@@ -400,6 +490,7 @@ impl Measuring {
                 rotation: clear.then_some(best.1 as i64),
                 best: best.0.min(u32::from(u16::MAX)) as u16,
                 rival: next.0.min(u32::from(u16::MAX)) as u16,
+                shift: 0,
             };
         }
         Measurement { positions, samples: self.seen, first: self.first, union, reading: sign }
@@ -416,6 +507,16 @@ struct Position {
     best: u16,
     /// Samples that voted for the closest rival class.
     rival: u16,
+    /// At k = 3 only: the **index** offset the histograms were folded by, in
+    /// steps of 1, before the class map halved them. Zero at the other three
+    /// positions, where a class offset is already the whole story and
+    /// `PAIR_FIRST_INDEX_OFFSET` is applied by `index_to_ki` itself.
+    ///
+    /// This is the half of the fix `docs/136 §4.3` names: a rotation that is
+    /// an odd number of index steps cannot be written as a `Ki` difference at
+    /// all, so `push_etas` has to apply it *before* `index_to_ki_class` halves
+    /// the index, and the class part (`Self::rotation`) after.
+    shift: i32,
 }
 
 /// What one measurement of B1u decided, with the margin every position was
@@ -439,6 +540,12 @@ impl Measurement {
     /// clear enough, and nothing where the constant is to be kept.
     fn table(&self) -> [Option<i64>; TRELLIS_FRAME] {
         self.positions.map(|position| position.rotation)
+    }
+
+    /// The index offset in force at each position: the half-step part of the
+    /// k = 3 rotation, zero everywhere a class offset is the whole story.
+    fn shifts(&self) -> [i32; TRELLIS_FRAME] {
+        self.positions.map(|position| position.shift)
     }
 
     /// Whether every position read clearly enough to be taken.
@@ -488,6 +595,8 @@ fn trace_rotation(measuring: &Measuring, measurement: &Measurement) {
         measuring.count_cost.as_nanos()
     );
     for (sign, positions) in measuring.counts.iter().enumerate() {
+        let half: Vec<String> = measuring.half[sign].iter().map(u16::to_string).collect();
+        let _ = writeln!(file, "sign {sign} k 3 half [{}]", half.join(" "));
         for (k, counts) in positions.iter().enumerate() {
             let row: Vec<String> = counts.iter().map(u16::to_string).collect();
             let accepted = u8::from(measurement.positions[k].rotation.is_some());
@@ -690,6 +799,11 @@ pub struct Decoder {
     /// The rotation in force at each position: the measurement where it was
     /// clear enough, and nothing where the constant is to be kept.
     rotation: [Option<i64>; TRELLIS_FRAME],
+    /// The measurement's **index** offset at each position: zero except at
+    /// k = 3, where `docs/136` measured that the far end's rotation is an odd
+    /// number of index steps and a class offset cannot express it. Applied to
+    /// the index before `index_to_ki` halves it (`push_etas`).
+    shift: [i32; TRELLIS_FRAME],
     /// What the measurement decided, in one line, once it has run: the rotation
     /// per position, the count behind each of them against its best rival, and
     /// whether they were clear enough to be taken. `None` before the measurement
@@ -764,6 +878,7 @@ impl Decoder {
             decided: 0,
             measuring: None,
             rotation: [None; TRELLIS_FRAME],
+            shift: [0; TRELLIS_FRAME],
             rotation_line: None,
             by_content: false,
             pushed: 0,
@@ -807,6 +922,7 @@ impl Decoder {
                 let measurement = measuring.measure();
                 trace_rotation(measuring, &measurement);
                 self.rotation = measurement.table();
+                self.shift = measurement.shifts();
                 self.rotation_line = Some(measurement.line());
                 self.measuring = None;
             }
@@ -1135,7 +1251,23 @@ impl Decoder {
         for (k, &eta) in etas.iter().enumerate() {
             let interval = self.labels.len();
             let modulus = self.moduli.modulus(interval);
-            let mut ki = index_to_ki(eta, modulus, k);
+            // The index offset the measurement folded this position by, taken
+            // off the index **before** `index_to_ki` applies the class map.
+            // That is the whole of the k = 3 half-step fix: at k = 3 the map
+            // halves `eta` (`precoder.rs:430`), so a rotation of an odd number
+            // of index steps is not a class difference at all and the `Ki`
+            // correction below cannot express it -- it would have to round
+            // half a step, which is the `22/18` split `docs/136` measured.
+            // Removing the offset from the index first makes the class map
+            // name the right class whether the offset is even or odd, and the
+            // class part (`want`, below) then cancels what is left.
+            //
+            // Cost: one integer subtraction per symbol (`shift[k]` is zero at
+            // the other three positions, so they are unchanged by an identity
+            // subtract the CPU does not branch on), and no new branch: the
+            // `shift` array is a load of the same hot structure `rotation` and
+            // `named_rotation` are already loaded from.
+            let mut ki = index_to_ki(eta - self.shift[k], modulus, k);
             // The rotation in force at this position, as the difference from
             // the one `index_to_ki` has just applied: the measured one when
             // `V92_ROT` accepted it, `V92_K3`'s `rot=` table otherwise, and
@@ -1647,6 +1779,86 @@ mod tests {
         assert_eq!(at, Some(0), "the decoder lost the frame's place");
         // And the shifted symbol is the reason this is not a round trip of a
         // conforming line: the four indices of its frame are off the code's path.
+    }
+
+    /// **A rotation at k = 3 is an index offset, and is measured on the index
+    /// grid** (`docs/136`).
+    ///
+    /// At k = 3 6.4.2's class is `((eta - (eta mod 2)) / 2) mod Mi`, so one
+    /// index step is *half* a class. A far end whose rotation there is an odd
+    /// number of index steps therefore lands on two classes, split by the
+    /// transmitted parity bit, and the class-grid measurement reads that split
+    /// as `22/18` -- not a mode, so nothing is taken (`g4`, `docs/136 §1`).
+    ///
+    /// Two synthetic lines, both carrying B1u's own class sequence:
+    ///
+    /// * the **odd** one sends `eta = 2 * model - (1 - p)` at k = 3 with `p`
+    ///   the frame's parity bit, i.e. an index offset of one step: half the
+    ///   symbols land a class low (h = 7), half a class high (h = 0), exactly
+    ///   `g4`'s `[18 ... 22]`. On the class grid that is `20/20` and no mode;
+    ///   folded by the one index step it is `40/0` and reads **7**, which is
+    ///   what this line's k = 1 reads too -- `docs/132`'s "k = 1 is an
+    ///   outlier" puzzle, dissolved;
+    /// * the **even** one sends `eta = 2 * model + p`: an index offset of zero,
+    ///   which the class grid already names (`a6`'s `40/0`). It must read 0
+    ///   with no index offset, i.e. it must not move at all.
+    ///
+    /// The first case is also the one that fails on the code before the fix: it
+    /// returns no rotation at k = 3, and the decoder falls back to the constant
+    /// there for the whole of B1u.
+    #[test]
+    fn a_half_step_rotation_at_k3_is_measured_on_the_index_grid() {
+        let parameters = parameters(1, Trellis::Sixteen);
+        let bits = up_bits(parameters.drn);
+        assert!(parameters.moduli.iter().all(|&modulus| modulus == 8), "eight classes");
+        let classes = b1u_classes(bits, &parameters.moduli);
+        let set = Constellation::new(&parameters.sets[0]);
+        // What the other three positions read: a class offset each, and the
+        // pair-second slot at 7 for the odd line, as `g4` reads it.
+        for (classed, odd, want) in [
+            ([6, 7, 6], false, [6, 7, 6, 0]),
+            ([6, 7, 6], true, [6, 7, 6, 7]),
+        ] {
+            let mut measuring = Measuring::new(bits, parameters.moduli, 0).expect("eight classes");
+            for n in 0..ROTATION_SYMBOLS as usize {
+                let k = n % TRELLIS_FRAME;
+                let model = i64::from(classes[n]);
+                // The frame's own parity bit, transmitted and free (6.4.2): it
+                // is *not* the symbol parity, which is why an odd index offset
+                // splits the class histogram in two.
+                let parity = ((n / TRELLIS_FRAME) % 2) as i64;
+                let eta = if k == TRELLIS_FRAME - 1 {
+                    // `parity` is the free bit of 6.4.2, and `odd` is the one
+                    // index step this far end rotates by: the offset lands the
+                    // even-parity symbol a class low (h = 15) and the odd one on
+                    // the model (h = 0) -- `g4`'s `[18 ... 22]`, bin for bin.
+                    // Sixteen steps up is the same class and the same half-step
+                    // bin, and keeps the level inside the set.
+                    2 * model + parity - i64::from(odd) + 16
+                } else {
+                    model + classed[k]
+                };
+                let level = set.level(eta as i32).expect("every class has a member in the set");
+                let nearest = Bests::new(&set, level).nearest().expect("the set is not empty");
+                measuring.observe(parameters.moduli[n % UP_INTERVALS], nearest);
+            }
+            let measurement = measuring.measure();
+            assert_eq!(
+                measurement.table(),
+                want.map(Some),
+                "class offsets {classed:?}, odd index step at k = 3 = {odd}"
+            );
+            assert_eq!(
+                measurement.shifts()[TRELLIS_FRAME - 1],
+                i32::from(odd),
+                "the k = 3 fold has to be the index offset it was measured by, not a class offset"
+            );
+            assert_eq!(
+                measurement.positions[TRELLIS_FRAME - 1].best,
+                ROTATION_SYMBOLS as u16 / TRELLIS_FRAME as u16,
+                "a half-step rotation has to fold to one mode, not to the 22/18 split"
+            );
+        }
     }
 
     /// The rotation is *read off* B1u and not named.
