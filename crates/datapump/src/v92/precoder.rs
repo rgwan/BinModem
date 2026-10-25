@@ -111,6 +111,12 @@ pub const TIE_TO_SMALLER_INDEX: bool = true;
 /// That is a question for the design path, not for this constant.
 pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
 
+/// The offset in force this call; `i64::MIN` means "not read yet", so the
+/// environment or the constant decides on first use and `set_pair_first_index_offset`
+/// can move it afterwards.
+static OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+use std::sync::atomic::Ordering as StdOrdering;
+
 /// The offset in force: `PAIR_FIRST_INDEX_OFFSET` unless `V92_PAIR_OFFSET`
 /// overrides it, read once.
 ///
@@ -126,11 +132,32 @@ pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
 /// wrongly -- so this is the mechanism behind the "two states" the residual
 /// measurements kept landing in.
 pub fn pair_first_index_offset() -> i64 {
-    use std::sync::OnceLock;
-    static OFFSET: OnceLock<i64> = OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        std::env::var("V92_PAIR_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(PAIR_FIRST_INDEX_OFFSET)
-    })
+    let seen = OFFSET.load(StdOrdering::Relaxed);
+    if seen != i64::MIN {
+        return seen;
+    }
+    let start = std::env::var("V92_PAIR_OFFSET")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(PAIR_FIRST_INDEX_OFFSET);
+    OFFSET.store(start, StdOrdering::Relaxed);
+    start
+}
+
+/// Move the offset for the rest of this call, and report what it was.
+///
+/// The constant above is one far end's measurement; a call can be one off, and
+/// then half the symbols sit a lattice step out and read *better* while deciding
+/// about half the bits wrongly (`docs/88` §9, measured: 304 of 576 against 539
+/// at the right offset). The only honest answer at run time is to try: B1u's
+/// candidate hunt already gives up and looks for another boundary when a
+/// candidate does not read as ones, so this lets it rotate the offset between
+/// attempts instead of blaming the boundary. Bounded by the caller.
+#[must_use]
+pub fn set_pair_first_index_offset(value: i64) -> i64 {
+    let previous = pair_first_index_offset();
+    OFFSET.store(value, StdOrdering::Relaxed);
+    previous
 }
 
 /// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
