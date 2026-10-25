@@ -165,24 +165,41 @@ fn main() {
     // The model: the production scrambler and the production modulus encoder,
     // from the memories 8.7.1 zeroes.
     let predicted = predicted_classes(bits, &moduli);
+    // `V92_PREDICTED=FILE`: the model's five hundred and seventy-six classes,
+    // one digit a symbol, so that a decision trace taken off the receiver
+    // (`V92_ETA_TRACE`) can be lined up against them by a reader that knows
+    // where in B1u it is. A start search cannot answer that here: the scoring
+    // window starts one symbol after the boundary symbol and the model counts
+    // from the boundary symbol itself, so the right alignment is not a multiple
+    // of the trellis frame and every `k` below is then off by one.
+    if let Some(path) = std::env::var_os("V92_PREDICTED") {
+        let text: String = predicted.iter().map(|class| char::from(b'0' + class)).collect();
+        std::fs::write(path, format!("{text}\n")).expect("V92_PREDICTED is writable");
+    }
     // What the capture did: the class each level falls into, under the decoder's
     // own convention for turning an index into one.
     let observed = observed_classes(&levels, gain, &level_table, classes);
 
     println!("{} scored symbols from {path}: gain {gain:.9}, K {bits}, Mi {classes}", observed.len());
-    for k in 0..TRELLIS_FRAME {
-        let residual: f64 = observed.iter().filter(|s| s.k() == k).map(|s| s.residual).sum::<f64>()
-            / observed.iter().filter(|s| s.k() == k).count().max(1) as f64;
-        println!("  k {k}: mean |level / gain - a(eta)| = {residual:.3} (one level is 2)");
-    }
 
     // The model's symbol 0 is the first symbol of B1u; the capture's first
-    // `score` symbol is `b1u_skip + 1` after the boundary symbol, and neither
-    // file says so, so the start is measured rather than assumed.
+    // `score` symbol is one after the boundary symbol, and neither file says
+    // so, so the start is measured rather than assumed. It is measured before
+    // anything is printed per trellis position, because it moves them: the
+    // model's index of a captured symbol is `start + n`, and the trellis
+    // position is `that mod four` and not `n mod four`. The scoring window
+    // begins one symbol after B1u's first, so the two differ, and a tool that
+    // keyed the histograms on `n` would print four positions of noise on a
+    // capture whose classes are in fact perfect.
     let (start, right) = match start {
         Some(start) => (start, agreement(&observed, &predicted, start, classes)),
         None => best_start(&observed, &predicted, classes).into(),
     };
+    for k in 0..TRELLIS_FRAME {
+        let residual: f64 = observed.iter().filter(|s| s.k(start) == k).map(|s| s.residual).sum::<f64>()
+            / observed.iter().filter(|s| s.k(start) == k).count().max(1) as f64;
+        println!("  k {k}: mean |level / gain - a(eta)| = {residual:.3} (one level is 2)");
+    }
     println!("\nmodel symbol {start} lines up with the capture's first scored symbol ({right} classes)");
 
     for (name, complement) in [("model as 8.7.1 reads it", false), ("model complemented", true)] {
@@ -207,14 +224,14 @@ fn main() {
         println!("\n  n  frame  i  k   observed  predicted  diff  level");
         for symbol in &observed {
             let Some(&wanted) = predicted.get(start + symbol.n) else { break };
-            let diff = (symbol.class() as i64 - i64::from(wanted)).rem_euclid(classes as i64);
+            let diff = (symbol.class(start) as i64 - i64::from(wanted)).rem_euclid(classes as i64);
             println!(
                 "  {:3}  {:5}  {:2}  {}  {:8}  {:9}  {:4}  {:+.3}",
                 symbol.n,
                 (start + symbol.n) / UP_INTERVALS,
-                symbol.n % UP_INTERVALS,
-                symbol.k(),
-                symbol.class(),
+                (start + symbol.n) % UP_INTERVALS,
+                symbol.k(start),
+                symbol.class(start),
                 wanted,
                 diff,
                 symbol.eta
@@ -292,7 +309,7 @@ fn main() {
                 count(&only_offset, &only_rotation),
                 fit.offsets[k],
                 fit.rotations[k],
-                lattice_distance(&levels, gain, fit.gamma, fit.offsets[k], k, classes)
+                lattice_distance(&levels, gain, fit.gamma, fit.offsets[k], k, start, classes)
             );
         }
         let mut signed_best = None;
@@ -329,7 +346,7 @@ fn main() {
                 let total_at = levels
                     .iter()
                     .enumerate()
-                    .filter(|(n, _)| n % UP_INTERVALS % TRELLIS_FRAME == k && start + n < predicted.len())
+                    .filter(|&(n, _)| (start + n) % TRELLIS_FRAME == k && start + n < predicted.len())
                     .count();
                 println!(
                     "  {k}  {:+19.3}  {:+18.3}  {:8}  {right}/{total_at}",
@@ -364,7 +381,7 @@ fn main() {
                 for c in 0..16i64 {
                     for d in 0..16i64 {
                         let table = [a, b, c, d];
-                        let frames = frame_bits(&observed, bits, &moduli, table);
+                        let frames = frame_bits(&observed, bits, &moduli, table, start);
                         let clean = frames.iter().filter(|f| f.2 == bits as usize).count();
                         let ones: usize = frames.iter().map(|f| f.2).sum();
                         best.push((clean, ones, table));
@@ -431,7 +448,7 @@ fn main() {
             let mut mirrored = 0usize;
             for symbol in &observed {
                 let Some(&wanted) = model.get(start + symbol.n) else { break };
-                let class = (symbol.class() as i64 - offset.as_ref().map_or(0, |o| o[symbol.k()]))
+                let class = (symbol.class(start) as i64 - offset.as_ref().map_or(0, |o| o[symbol.k(start)]))
                     .rem_euclid(classes as i64) as usize;
                 same += usize::from(class == usize::from(wanted));
                 mirrored += usize::from(class == classes - 1 - usize::from(wanted));
@@ -443,7 +460,7 @@ fn main() {
     if per_frame {
         let table = offset.unwrap_or([0; TRELLIS_FRAME]);
         println!("\nper frame: rotation {table:?}, 1 = a one, . = a zero");
-        for (frame, bits_of, ones) in frame_bits(&observed, bits, &moduli, table) {
+        for (frame, bits_of, ones) in frame_bits(&observed, bits, &moduli, table, start) {
             let text: String = bits_of.iter().map(|&bit| if bit { '1' } else { '.' }).collect();
             println!("  {frame:3}  {ones:2}/{bits}  {text}");
         }
@@ -455,7 +472,7 @@ fn main() {
         // 6.4.1's differential step is what makes an inverted line decode the
         // same.
         let table = offset.unwrap_or([0; TRELLIS_FRAME]);
-        let (ones, total) = decode_classes(&observed, bits, &moduli, table);
+        let (ones, total) = decode_classes(&observed, bits, &moduli, table, start);
         println!("\nclasses alone decode to {ones}/{total} ones ({:.1} %)", 100.0 * ones as f64 / total as f64);
     }
 }
@@ -518,10 +535,18 @@ fn class_at_signed(
 /// whole half-step leaves the *class* alone and only changes how sure the slicer
 /// is. A Viterbi reads the distance and not just the class, so the fit has to
 /// come down on one side of that plateau, and this is the number that says which.
-fn lattice_distance(levels: &[f64], gain: f64, gamma: f64, offset: f64, k: usize, classes: usize) -> f64 {
+fn lattice_distance(
+    levels: &[f64],
+    gain: f64,
+    gamma: f64,
+    offset: f64,
+    k: usize,
+    start: usize,
+    classes: usize,
+) -> f64 {
     let (mut sum, mut count) = (0.0f64, 0usize);
     for (n, &level) in levels.iter().enumerate() {
-        if n % UP_INTERVALS % TRELLIS_FRAME != k {
+        if (start + n) % TRELLIS_FRAME != k {
             continue;
         }
         let target = level / gamma / gain - offset;
@@ -551,7 +576,7 @@ fn count_agree(
 ) -> usize {
     let mut right = 0usize;
     for (n, &level) in levels.iter().enumerate() {
-        let k = n % UP_INTERVALS % TRELLIS_FRAME;
+        let k = (start + n) % TRELLIS_FRAME;
         if only.is_some_and(|wanted| wanted != k) {
             continue;
         }
@@ -585,7 +610,7 @@ fn count_agree_signed(
 ) -> usize {
     let mut right = 0usize;
     for (n, &level) in levels.iter().enumerate() {
-        let k = n % UP_INTERVALS % TRELLIS_FRAME;
+        let k = (start + n) % TRELLIS_FRAME;
         if only.is_some_and(|wanted| wanted != k) {
             continue;
         }
@@ -681,7 +706,7 @@ fn fit_table(
                 if count == best.0 {
                     // Inside the plateau the class cannot choose; the distance
                     // can. Recorded separately so both are reported.
-                    let distance = lattice_distance(levels, gain, gamma, offset, k, classes);
+                    let distance = lattice_distance(levels, gain, gamma, offset, k, start, classes);
                     if count > best_distance.0 || (count == best_distance.0 && distance < best_distance.1) {
                         best_distance = (count, distance, offset, rotation);
                     }
@@ -782,8 +807,11 @@ struct Observed {
 }
 
 impl Observed {
-    fn k(&self) -> usize {
-        self.n % UP_INTERVALS % TRELLIS_FRAME
+    /// Which trellis position this symbol is in: the model's, so that a start
+    /// which is not a multiple of four is handled. `n` is the position in the
+    /// scoring window and the window's first symbol is model symbol `start`.
+    fn k(&self, start: usize) -> usize {
+        (start + self.n) % TRELLIS_FRAME
     }
 
     /// The class of the index: 6.4.2 backwards at offset zero, which is
@@ -793,8 +821,8 @@ impl Observed {
     /// eta = 2 Ki + 2 z Mi + p with p the parity of eta itself, so the parity
     /// comes off the bottom first. Either way the answer is invariant to z,
     /// which is the point: it is invariant to the free bit.
-    fn class(&self) -> usize {
-        if self.k() == TRELLIS_FRAME - 1 {
+    fn class(&self, start: usize) -> usize {
+        if self.k(start) == TRELLIS_FRAME - 1 {
             (((self.eta - self.eta.rem_euclid(2)) / 2).rem_euclid(self.classes as i32)) as usize
         } else {
             (self.eta.rem_euclid(self.classes as i32)) as usize
@@ -821,8 +849,8 @@ fn offset_histograms(
     for symbol in observed {
         let Some(&predicted) = predicted.get(start + symbol.n) else { break };
         let predicted = if complement { classes - 1 - usize::from(predicted) } else { usize::from(predicted) };
-        let offset = (symbol.class() + classes - predicted) % classes;
-        histograms[symbol.k()][offset] += 1;
+        let offset = (symbol.class(start) + classes - predicted) % classes;
+        histograms[symbol.k(start)][offset] += 1;
     }
     histograms
 }
@@ -862,6 +890,7 @@ fn frame_bits(
     bits: u32,
     moduli: &[u8; UP_INTERVALS],
     offset: [i64; TRELLIS_FRAME],
+    start: usize,
 ) -> Vec<(usize, Vec<bool>, usize)> {
     let moduli = Moduli12::new(*moduli);
     let mut decoder = modulus::Decoder::new();
@@ -869,15 +898,18 @@ fn frame_bits(
     let mut out = Vec::new();
     let mut labels = [0u8; UP_INTERVALS];
     for symbol in observed {
-        let k = symbol.k();
-        labels[symbol.n % UP_INTERVALS] =
-            (symbol.class() as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
-        if symbol.n % UP_INTERVALS == UP_INTERVALS - 1
+        // The model's frame grid, not the window's: a data frame is twelve
+        // symbols from B1u's first, and the scoring window does not start on
+        // one, so the boundary is `(start + n) mod twelve`.
+        let index = start + symbol.n;
+        let k = symbol.k(start);
+        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
+        if index % UP_INTERVALS == UP_INTERVALS - 1
             && let Ok(frame) = decoder.decode(&labels, &moduli, bits)
         {
             let frame_bits: Vec<bool> = frame.bits().collect();
             let ones = frame_bits.iter().filter(|&&bit| descrambler.descramble(bit)).count();
-            out.push((symbol.n / UP_INTERVALS, frame_bits, ones));
+            out.push((index / UP_INTERVALS, frame_bits, ones));
         }
     }
     out
@@ -893,6 +925,7 @@ fn decode_classes(
     bits: u32,
     moduli: &[u8; UP_INTERVALS],
     offset: [i64; TRELLIS_FRAME],
+    start: usize,
 ) -> (usize, usize) {
     let moduli = Moduli12::new(*moduli);
     let mut decoder = modulus::Decoder::new();
@@ -903,11 +936,12 @@ fn decode_classes(
     for symbol in observed {
         // The decoder's class map: the class rotated back by the offset it
         // applies at this position, which is `index_to_ki`'s pair offset at
-        // k = 0 and 2 and nothing elsewhere.
-        let k = symbol.k();
-        labels[symbol.n % UP_INTERVALS] =
-            (symbol.class() as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
-        if symbol.n % UP_INTERVALS == UP_INTERVALS - 1
+        // k = 0 and 2 and nothing elsewhere. The grid is the model's, so the
+        // frame closes on `(start + n) mod twelve`.
+        let index = start + symbol.n;
+        let k = symbol.k(start);
+        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
+        if index % UP_INTERVALS == UP_INTERVALS - 1
             && let Ok(frame) = decoder.decode(&labels, &moduli, bits)
         {
             for bit in frame.bits() {

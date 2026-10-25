@@ -282,7 +282,7 @@ impl Measuring {
     ///   plateau away would leave HSF short of the only configuration that
     ///   connects. A bar at 90 % would do exactly that, and is why the bar is
     ///   at half.
-    fn rotation(&self) -> [Option<i64>; TRELLIS_FRAME] {
+    fn measure(&self) -> Measurement {
         // Which reading of the model this line is on: the one whose four
         // positions agree best. Ties go to the first, and a tie is not a
         // measurement anyway -- the per-position bar below is what decides
@@ -293,37 +293,123 @@ impl Measuring {
                 .map(|counts| u32::from(counts.iter().copied().max().unwrap_or(0)))
                 .sum()
         };
-        let _sign = usize::from(agreement(1) > agreement(0));
-        let mut table = [None; TRELLIS_FRAME];
-        // Both readings of the model are allowed to explain a symbol, and at
-        // 32 000 both are needed: the far end there reflects whole frames on a
-        // chain of its own, so a frame reads against one reading or against the
-        // other and neither reading alone is a mode (`docs/74`). The rotation
-        // is a property of the far end's index map, which does not alternate,
-        // so it is the *union* that has to be sharp -- and it is: 90 of 90
-        // classes a position at 32 000, against 36 and 54 taken separately.
+        let (first, second) = (agreement(0), agreement(1));
+        let sign = usize::from(second > first);
+        // One reading, when the line is on one of them: at 24 000 an Agere
+        // reads 40 of 40 under the complemented model and about 14 of 40 under
+        // the other, so the wrong one is a flat histogram and nothing but a
+        // rival count. Mixing it in (the union below) does not move the mode
+        // but it does inflate the runner-up, which is exactly the number the
+        // margin is made of -- measured here: 40 against 0 under the reading
+        // that read the line, 40 against 14 under the union.
+        //
+        // Both readings, when neither explains the line alone: at 32 000 the
+        // far end reflects whole frames on a chain of its own, so a frame reads
+        // against one reading or against the other and neither alone is a mode
+        // (`docs/74`). The rotation is a property of the far end's index map,
+        // which does not alternate, so it is the union that has to be sharp --
+        // and it is: 90 of 90 classes a position at 32 000, against 36 and 54
+        // taken separately.
+        let union = (first as u64) * 2 <= (second as u64) * 3 && (second as u64) * 2 <= (first as u64) * 3
+            || first.max(second) == 0;
+        let mut positions = [Position { rotation: None, best: 0, rival: 0 }; TRELLIS_FRAME];
         for (k, counts) in self.counts[0].iter().enumerate() {
-            let union: Vec<u32> = (0..self.classes)
-                .map(|class| u32::from(counts[class]) + u32::from(self.counts[1][k][class]))
+            let histogram: Vec<u32> = (0..self.classes)
+                .map(|class| {
+                    if union {
+                        u32::from(counts[class]) + u32::from(self.counts[1][k][class])
+                    } else {
+                        u32::from(self.counts[sign][k][class])
+                    }
+                })
                 .collect();
             let samples: u32 = counts.iter().map(|&count| u32::from(count)).sum();
             let mut ranked: Vec<(u32, usize)> =
-                union.iter().enumerate().map(|(class, &count)| (count, class)).collect();
+                histogram.iter().enumerate().map(|(class, &count)| (count, class)).collect();
             ranked.sort_unstable_by(|a, b| b.cmp(a));
             let best = ranked[0];
             let next = ranked.get(1).copied().unwrap_or((0, 0));
-            if best.0 > 0 && best.0 * 2 >= samples && best.0 >= next.0 * 2 {
-                table[k] = Some(best.1 as i64);
-            }
+            let clear = best.0 > 0 && best.0 * 2 >= samples && best.0 >= next.0 * 2;
+            positions[k] = Position {
+                rotation: clear.then_some(best.1 as i64),
+                best: best.0.min(u32::from(u16::MAX)) as u16,
+                rival: next.0.min(u32::from(u16::MAX)) as u16,
+            };
         }
-        table
+        Measurement { positions, samples: self.seen, first: self.first, union, reading: sign }
+    }
+}
+
+/// One position's verdict, and the two counts it was taken on.
+#[derive(Clone, Copy, Debug, Default)]
+struct Position {
+    /// The rotation this position reads, or `None` when the vote was not clear
+    /// enough to be one and the constant is to be kept instead.
+    rotation: Option<i64>,
+    /// Samples that voted for [`Self::rotation`].
+    best: u16,
+    /// Samples that voted for the closest rival class.
+    rival: u16,
+}
+
+/// What one measurement of B1u decided, with the margin every position was
+/// decided on.
+#[derive(Clone, Debug)]
+struct Measurement {
+    positions: [Position; TRELLIS_FRAME],
+    samples: u64,
+    /// The model symbol the measurement started at, so that a log line can say
+    /// which part of B1u it read.
+    first: usize,
+    /// Whether both readings of the model were needed (`true`) or one
+    /// explained the line (`false`).
+    union: bool,
+    /// Which reading, when only one was used.
+    reading: usize,
+}
+
+impl Measurement {
+    /// The rotation in force at each position: the measurement where it was
+    /// clear enough, and nothing where the constant is to be kept.
+    fn table(&self) -> [Option<i64>; TRELLIS_FRAME] {
+        self.positions.map(|position| position.rotation)
+    }
+
+    /// Whether every position read clearly enough to be taken.
+    fn confident(&self) -> bool {
+        self.positions.iter().all(|position| position.rotation.is_some())
+    }
+
+    /// One line: what was measured, over which part of B1u, and how clearly.
+    ///
+    /// This is the line a 547 of 576 has to be diagnosable from. A reading that
+    /// is nearly right is the state that is hardest to see: the frame phase is
+    /// there (so the boundary is not the trouble) and the classes are almost
+    /// there (so the rotation is nearly right), and outside this line nothing
+    /// in the transcript says which of the two is short or by how much.
+    fn line(&self) -> String {
+        let table: Vec<String> =
+            self.positions.iter().map(|position| position.rotation.map_or("-".to_string(), |r| r.to_string())).collect();
+        let margin: Vec<String> =
+            self.positions.iter().map(|position| format!("{}/{}", position.best, position.rival)).collect();
+        let verdict = if self.confident() { "confident" } else { "ambiguous, constant kept where unclear" };
+        format!(
+            "rotation {} margin {} ({}) {} over {} symbols from B1u symbol {} ({})",
+            table.join(","),
+            margin.join(","),
+            verdict,
+            if self.union { "both readings" } else if self.reading == 1 { "complemented model" } else { "model as printed" },
+            self.samples,
+            self.first,
+            if self.union { "union" } else { "single reading" }
+        )
     }
 }
 
 /// `V92_ROT_TRACE`: what one measurement saw and what it accepted. Diagnostic,
 /// written once per decoder that finished one; nothing in the data path reads
 /// it.
-fn trace_rotation(measuring: &Measuring, table: &[Option<i64>; TRELLIS_FRAME]) {
+fn trace_rotation(measuring: &Measuring, measurement: &Measurement) {
     let Some(path) = std::env::var_os("V92_ROT_TRACE") else { return };
     let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
     use std::io::Write;
@@ -338,12 +424,11 @@ fn trace_rotation(measuring: &Measuring, table: &[Option<i64>; TRELLIS_FRAME]) {
     for (sign, positions) in measuring.counts.iter().enumerate() {
         for (k, counts) in positions.iter().enumerate() {
             let row: Vec<String> = counts.iter().map(u16::to_string).collect();
-            let _ =
-                writeln!(file, "sign {sign} k {k} [{}] accepted {}", row.join(" "), u8::from(table[k].is_some()));
+            let accepted = u8::from(measurement.positions[k].rotation.is_some());
+            let _ = writeln!(file, "sign {sign} k {k} [{}] accepted {}", row.join(" "), accepted);
         }
     }
-    let table: Vec<String> = table.iter().map(|entry| entry.map_or("-".to_string(), |v| v.to_string())).collect();
-    let _ = writeln!(file, "table {}", table.join(","));
+    let _ = writeln!(file, "measure {}", measurement.line());
 }
 
 /// B1u's class sequence: 8.7.1's forty-eight data frames of ones through 6.3's
@@ -401,6 +486,30 @@ fn trace_etas(decoder: &Decoder, stage: u64, etas: [i32; TRELLIS_FRAME]) {
         let _ = writeln!(file, "k {} moduli {}", decoder.bits_per_frame, moduli.join(" "));
     }
     let _ = writeln!(file, "{stage} {} {} {} {}", etas[0], etas[1], etas[2], etas[3]);
+}
+
+/// `V92_KI_TRACE`: every data frame's twelve Ki, in order, one frame a line --
+/// the bit layer's own input, before the mixed radix, the differential sign
+/// step and the descrambler touch it.
+///
+/// It exists because the two things a wrong B1u reading can be are not
+/// distinguishable from the bits alone: a class map that is off at some
+/// position gives the wrong Ki, and a correct Ki stream that comes out as the
+/// wrong bits is a fault in 6.4.1 or in the descrambler's state. Writing the
+/// Ki and the bits together is what separates them, and it is the only
+/// instrument that says which of the two a 547 of 576 is.
+fn trace_ki(labels: &[u8; UP_INTERVALS]) {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static FILE: OnceLock<Option<Arc<Mutex<std::fs::File>>>> = OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("V92_KI_TRACE")?);
+        Some(Arc::new(Mutex::new(std::fs::File::create(path).ok()?)))
+    });
+    let Some(file) = file else { return };
+    let Ok(mut file) = file.lock() else { return };
+    use std::io::Write;
+    let text: Vec<String> = labels.iter().map(u8::to_string).collect();
+    let _ = writeln!(file, "{}", text.join(" "));
 }
 
 /// The cheapest index of one symbol in each residue class modulo 4, which is
@@ -499,6 +608,16 @@ pub struct Decoder {
     /// The rotation in force at each position: the measurement where it was
     /// clear enough, and nothing where the constant is to be kept.
     rotation: [Option<i64>; TRELLIS_FRAME],
+    /// What the measurement decided, in one line, once it has run: the rotation
+    /// per position, the count behind each of them against its best rival, and
+    /// whether they were clear enough to be taken. `None` before the measurement
+    /// finishes and on a decoder nobody asked to measure.
+    ///
+    /// It is kept rather than printed because the measurement happens inside
+    /// the boundary gate's own decoders, thirteen of them, and what has to be
+    /// logged is the one the gate believed -- not thirteen lines, one of which
+    /// is right.
+    rotation_line: Option<String>,
     /// `V92_K3`'s `rot=` table, read once here so that the per-symbol path is
     /// an array index and not an environment lookup.
     named_rotation: [Option<i64>; TRELLIS_FRAME],
@@ -555,6 +674,7 @@ impl Decoder {
             decided: 0,
             measuring: None,
             rotation: [None; TRELLIS_FRAME],
+            rotation_line: None,
             by_content: false,
             pushed: 0,
             named_rotation: correction()
@@ -589,9 +709,13 @@ impl Decoder {
                 measuring.observe(modulus, eta);
             }
             if measuring.done() {
-                let table = measuring.rotation();
-                trace_rotation(measuring, &table);
-                self.rotation = table;
+                // Measured once and frozen: the data mode has no known payload
+                // to re-measure against, and re-measuring after the first
+                // decision would put two rotations in one B1u.
+                let measurement = measuring.measure();
+                trace_rotation(measuring, &measurement);
+                self.rotation = measurement.table();
+                self.rotation_line = Some(measurement.line());
                 self.measuring = None;
             }
         }
@@ -694,6 +818,12 @@ impl Decoder {
             return;
         }
         self.measuring = Measuring::new(self.bits_per_frame, self.params.moduli, first);
+    }
+
+    /// What [`Self::measure_rotation_from`] decided, in one line, once it has
+    /// finished. `None` before then, and on a decoder that was not asked.
+    pub fn rotation_line(&self) -> Option<&str> {
+        self.rotation_line.as_deref()
     }
 
     /// This frame's branch metrics, and one trellis step.
@@ -846,6 +976,7 @@ impl Decoder {
             if self.labels.len() == UP_INTERVALS {
                 let labels: [u8; UP_INTERVALS] =
                     std::mem::take(&mut self.labels).try_into().expect("twelve intervals");
+                trace_ki(&labels);
                 let known = self.by_content && self.pushed < B1U_FRAMES;
                 self.pushed += 1;
                 if !known {
@@ -1034,6 +1165,103 @@ mod tests {
         }
     }
 
+    /// `V92_ROT`'s measurement, pinned on lines that have no capture in them.
+    ///
+    /// Three shapes, which are the three a real call can have:
+    ///
+    /// * a rotation that happens to be the constant, `3, 0, 3, 0` -- the Agere's
+    ///   `prime-b`, where the measurement agrees with `PAIR_FIRST_INDEX_OFFSET`
+    ///   and therefore moves nothing;
+    /// * a rotation that is not, `0, 0, 0, 0` -- the same far end on the same
+    ///   bench one call later (`prime-a`), where the constant reads 399 of 576
+    ///   and this reads every bit;
+    /// * a line that does not hold still, where the mode is a tie. That is the
+    ///   case the old bar was one comparison short of: "at least half the
+    ///   samples" alone accepts a 20/20 split, and a rotation taken off a tie
+    ///   is a wrong rotation, which is about half the bits and reads as noise
+    ///   rather than as a fault.
+    ///
+    /// The line is built here rather than captured: 8.7.1's data frames of ones
+    /// through the encoder this crate sends with, and the far end's index map
+    /// applied to the level on the way out -- a rotation of `r` classes is an
+    /// index shift of `r` at k = 0, 1, 2 and of `2r` at k = 3, where 6.4.2's
+    /// class steps by `2 Mi`. Nothing else about the far end is modelled.
+    #[test]
+    fn the_rotation_is_measured_off_b1u_and_its_margin_is_reported() {
+        for table in [[3i64, 0, 3, 0], [0, 0, 0, 0]] {
+            let (decoded, line) = b1u_over_a_rotated_line(|k, _frame| table[k]);
+            let ones = decoded.iter().filter(|bit| **bit).count();
+            assert!(ones > 0, "{table:?}: nothing decoded");
+            assert_eq!(ones, decoded.len(), "{table:?}: {} bits of {} read as ones\n{line}", decoded.len() - ones, decoded.len());
+            assert!(
+                line.contains(&format!("rotation {}", table.map(|r| r.to_string()).join(","))),
+                "{table:?} was not the measured rotation: {line}"
+            );
+            assert!(line.contains("(confident)"), "{table:?}: {line}");
+            // The margin is the ones count of the chosen hypothesis against the
+            // best rival, per position: forty samples a position, one rotation
+            // applied to all of them, so forty to nothing every time. A bar
+            // without the runner-up half could not tell this from a tie.
+            assert!(line.contains("margin 40/0,40/0,40/0,40/0"), "{table:?}: {line}");
+        }
+        // Half the frames at one rotation and half at another, at k = 0 only:
+        // the other three positions are still unanimous, so the line has to say
+        // which position it would not take rather than throw the call away.
+        let (_, line) = b1u_over_a_rotated_line(|k, frame| if k != 0 { 0 } else if frame % 2 == 1 { 0 } else { 3 });
+        assert!(line.contains("ambiguous"), "{line}");
+        assert!(line.contains("rotation -,0,0,0"), "the tie was not the one reported: {line}");
+        // The three positions that did hold still are still taken: an ambiguous
+        // position costs the call that position's rotation and not the three
+        // that were clear.
+        assert!(line.contains("margin 21/19,40/0,40/0,40/0"), "{line}");
+    }
+
+    /// B1u over a synthetic far end whose class map is rotated per trellis
+    /// position: what the decoder read, and what it measured.
+    ///
+    /// `rotation(k, frame)` is that far end's rotation at trellis position `k`
+    /// of data frame `frame`, in classes. The line is built by stepping this
+    /// crate's own chain with `Ki + rotation` rather than by moving levels
+    /// about, and no other way would do: the rotation is part of the far end's
+    /// `Ki -> index` map, the trellis is applied to the indices it produces, so
+    /// a line whose levels were rotated after the encoder ran would be a line
+    /// no conforming far end can send -- and one the receiver is right to
+    /// deviate on.
+    fn b1u_over_a_rotated_line(rotation: impl Fn(usize, usize) -> i64) -> (Vec<bool>, String) {
+        let parameters = parameters(1, Trellis::Sixteen);
+        let bits = up_bits(parameters.drn);
+        let classes = b1u_classes(bits, &parameters.moduli);
+        let mut chain = Chain::new(&parameters).expect("the chain these parameters describe");
+        let mut decoder = Decoder::new(&parameters);
+        decoder.measure_rotation_from(0);
+        // B1u, and the survivor window's worth over, so that the last frame the
+        // decoder can decide is still one of B1u's.
+        let fed = B1U_FRAMES * UP_INTERVALS + TRELLIS_FRAME * (SURVIVOR_DEPTH + 2);
+        let mut decoded = Vec::new();
+        for n in 0..fed {
+            let k = n % TRELLIS_FRAME;
+            let want = rotation(k, n / UP_INTERVALS);
+            // The chain this crate sends with already carries the constant at
+            // k = 0 and 2, and that constant is not part of the far end being
+            // synthesised here: it is what the *measurement* is compared
+            // against. So the class handed to the chain is the model's plus the
+            // far end's rotation minus the constant the chain will add back.
+            let constant = if opens_a_pair(k) { pair_first_index_offset() } else { 0 };
+            let ki = (i64::from(classes[n % classes.len()]) + want - constant).rem_euclid(
+                i64::from(*parameters.moduli.iter().max().expect("twelve moduli")),
+            ) as u8;
+            let symbol = chain.step(ki);
+            decoder.feed(symbol.u);
+            decoded.extend(decoder.take_bits());
+        }
+        // Keep only the bits that are B1u's: the decoder decides its first
+        // frame a survivor window in, so the last `SURVIVOR_DEPTH + 1` frames
+        // of the feed are carried by symbols B1u never sent.
+        let keep = (B1U_FRAMES * UP_INTERVALS / TRELLIS_FRAME - (SURVIVOR_DEPTH + 1)) * (bits as usize / TRELLIS_FRAME);
+        decoded.truncate(keep.min(decoded.len()));
+        (decoded, decoder.rotation_line().unwrap_or_default().to_string())
+    }
+
     /// Where the decoded stream starts relative to the sent one, and how many
     /// bits differ from there to the end of the shorter.
     fn align(sent: &[bool], received: &[bool]) -> (Option<usize>, usize) {
@@ -1146,7 +1374,7 @@ mod tests {
                     measuring.observe(parameters.moduli[n % UP_INTERVALS], nearest);
                 }
                 assert_eq!(
-                    measuring.rotation(),
+                    measuring.measure().table(),
                     rotation.map(Some),
                     "rotation {rotation:?} with the model complemented = {complemented}"
                 );
@@ -1164,7 +1392,7 @@ mod tests {
             let nearest = Bests::new(&set, level).nearest().expect("the set is not empty");
             measuring.observe(parameters.moduli[n % UP_INTERVALS], nearest);
         }
-        assert_eq!(measuring.rotation(), [None; TRELLIS_FRAME], "noise was taken for a rotation");
+        assert_eq!(measuring.measure().table(), [None; TRELLIS_FRAME], "noise was taken for a rotation");
     }
 }
 

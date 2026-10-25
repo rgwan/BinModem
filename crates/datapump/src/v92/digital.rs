@@ -4190,6 +4190,13 @@ impl Modem {
                 return;
             };
             let failed = &readings[closest];
+            // The rotation the failed candidate measured, for the same reason
+            // the winner's is logged: a candidate that reads 547 of 576 has a
+            // mapping that is nearly right, and the measurement is what says
+            // whether "nearly" is the rotation's fault or not.
+            if let Some(line) = failed.straight.rotation_line() {
+                self.note(format!("V.92: {line}"));
+            }
             self.abandon_b1u(search.end, failed.origin, failed.back, failed.best(), failed.other(), failed.scored());
             return;
         };
@@ -4205,6 +4212,7 @@ impl Modem {
                 let _ = writeln!(file, "{} {sign} {text}", chosen.origin);
             }
         }
+        let rotation = chosen.straight.rotation_line().map(str::to_owned);
         self.upstream_data = Some(chosen.straight);
         self.b1u_probe = Some(chosen.probe);
         self.b1u_ones = chosen.ones;
@@ -4221,6 +4229,14 @@ impl Modem {
             self.upstream_scale,
             self.rx.taps()
         ));
+        // What the class rotation was measured to be, and on what margin. One
+        // line, whether or not it agreed with the constant: `547 of 576` is the
+        // reading whose frame phase is right and whose mapping is nearly right,
+        // and without this line nothing in the transcript separates that from a
+        // line of noise or from a rotation that was never taken.
+        if let Some(line) = rotation {
+            self.note(format!("V.92: {line}"));
+        }
         // The polarity verdict is unchanged, and it is the boundary's verdict:
         // it now runs on the chosen candidate's window instead of on the
         // window the run's end happened to open.
