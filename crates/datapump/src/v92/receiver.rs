@@ -1011,8 +1011,15 @@ impl Receiver {
         }
     }
 
-    /// The delay, in symbols, that best opens the eye on the TRN1u that begins
-    /// at history index `at`, and the residual it reads there.
+    /// [`Self::fe_aim`] from an absolute symbol count, which is what the caller
+    /// has: the window it is about to fit.
+    pub fn fe_aim_index(&self, from: u64, window: usize) -> Option<(f64, f64)> {
+        let at = from.saturating_sub(self.history_base()) as usize;
+        self.fe_aim(at, window)
+    }
+
+    /// The delay, in symbols, that best opens the eye on the training that
+    /// begins at history index `at`, and the residual it reads there.
     ///
     /// The figure is `docs/78`'s: the chain's own decision residual against the
     /// sequence we know was sent, measured with the chain's own structure --
