@@ -9,7 +9,7 @@ use datapump::v90::startup::{Digital, Status};
 use datapump::v90::ucode::Law;
 use ec::stack::Stack;
 use ec::{Params, Role as EcRole};
-use modem::{Modem, State};
+use modem::{Ended, Modem, State};
 use v8::{Access, CallFunction, Modulation, Modulations, Pcm, PcmRole};
 
 const FS: f64 = 16_000.0;
@@ -404,6 +404,156 @@ fn two_of_these_connect_at_pcm_rates_when_the_codewords_reach_the_encoder() {
     assert_eq!(rates[0], ("V.34", 33_600), "{rates:?}");
     assert_eq!(rates[1].0, "V.90", "{rates:?}");
     assert!(rates[1].1 >= 48_000, "{rates:?}");
+}
+
+/// Bring a pair up in V.90 data mode with V.42 running, the way every test
+/// below needs it.
+fn connected_pair() -> Pair {
+    let mut pair = Pair::new(Network::new(Law::Mu, FS).with_delay(0.015, FS).with_noise(1e-5), 0);
+    pair.straight = Some(0);
+    Pair::type_at(&mut pair.host, "AT+MS=V90");
+    Pair::type_at(&mut pair.caller, "AT+MS=V90");
+    pair.run(0.05);
+    Pair::type_at(&mut pair.host, "ATA");
+    Pair::type_at(&mut pair.caller, "ATD5551234");
+    for _ in 0..40 {
+        pair.run(1.0);
+        if pair.caller.state() == State::Data && pair.host.state() == State::Data {
+            break;
+        }
+    }
+    assert_eq!((pair.caller.state(), pair.host.state()), (State::Data, State::Data));
+    // Which of V.90 and V.34 does not matter here: what these tests are about
+    // is what happens to a connection V.42 is carrying, and V.42 is either.
+    pair.run(1.0);
+    pair.caller_said.clear();
+    pair.host_said.clear();
+    pair
+}
+
+/// Run until `done`, in the smallest steps the harness has, and say how long
+/// it took and when each side noticed the call was over.
+fn run_until(pair: &mut Pair, limit: f64, done: impl Fn(&Pair) -> bool) -> f64 {
+    let mut waited = 0.0;
+    while !done(pair) && waited < limit {
+        pair.run(0.05);
+        waited += 0.05;
+    }
+    waited
+}
+
+/// V.42 8.7.2, from the terminal's side: a hang-up on a connection V.42 is
+/// carrying is a DISC the far end answers before the carrier goes.
+///
+/// The order is the whole point. A carrier that stops between two samples is
+/// what a cut line looks like, and a far end that loses one reports the call
+/// as a carrier loss -- the one outcome a hang-up is not. So: the terminal is
+/// answered at once, the line stays up until the far end has acknowledged the
+/// DISC, and the far end ends the call as a peer clear rather than as a fault.
+#[test]
+fn a_hang_up_sends_a_disc_before_the_carrier_goes() {
+    let mut pair = connected_pair();
+    assert_eq!(pair.caller.compression_name(), Some("V.44"), "V.42 was not up");
+
+    pair.caller.hang_up();
+    pair.caller_said.extend(pair.caller.take_dte());
+    // The terminal has been answered and the carrier is still there: nothing
+    // has been said to the far end yet.
+    let said = String::from_utf8_lossy(&pair.caller_said).into_owned();
+    assert!(said.contains("OK"), "the terminal was not answered at once: {said:?}");
+    assert_eq!(pair.caller.state(), State::Data, "the carrier went before anything was said");
+
+    let mut cleared_at = None;
+    let mut waited = 0.0;
+    while pair.caller.state() != State::Command && waited < 10.0 {
+        pair.run(0.05);
+        waited += 0.05;
+        if cleared_at.is_none() && pair.host.ended_because() == Some(Ended::PeerCleared) {
+            cleared_at = Some(waited);
+        }
+    }
+    let said = String::from_utf8_lossy(&pair.caller_said).into_owned();
+    let notes = pair.caller.take_line_notes().join(" | ");
+    let what = format!(
+        "after {waited} s the caller is {:?} and said {said:?}, notes {notes:?}, the far end's excuse {:?}",
+        pair.caller.state(),
+        pair.host.ended_because()
+    );
+    assert_eq!(pair.caller.state(), State::Command, "{what}");
+    // The far end ended on the announcement, which is only possible if the
+    // DISC arrived while its carrier was still up -- i.e. before the carrier
+    // went.
+    assert_eq!(pair.host.ended_because(), Some(Ended::PeerCleared), "{what}");
+    assert!(cleared_at.is_some_and(|at| at < waited), "{what}");
+    let far_said = String::from_utf8_lossy(&pair.host_said).into_owned();
+    assert!(far_said.contains("NO CARRIER"), "{what}: the far end said {far_said:?}");
+    // Every DISC that was announced, and how it ended, is in one line.
+    assert!(notes.contains("hang-up: DISC"), "{what}");
+    // The far end's own record is the proof the DISC arrived while its
+    // carrier was up: only a DISC that it read could have ended its call as a
+    // peer clear, and it did that before this end's carrier went.
+    assert!(pair.host.ended_because() == Some(Ended::PeerCleared), "{what}");
+}
+
+/// The same from the other end: the far end's DISC is a *peer* clear, so the
+/// terminal gets NO CARRIER and the record says the peer cleared the call --
+/// not that the carrier failed.
+#[test]
+fn a_disc_from_the_far_end_ends_the_call_as_a_peer_clear() {
+    let mut pair = connected_pair();
+    pair.host.hang_up();
+    let waited = run_until(&mut pair, 10.0, |p| p.caller.state() == State::Command);
+    // The UA this end owed the far end is on the line behind the carrier
+    // going, so the far end needs a moment to read its own answer.
+    pair.run(0.25);
+    let said = String::from_utf8_lossy(&pair.caller_said).into_owned();
+    let notes = pair.caller.take_line_notes().join(" | ");
+    let what = format!(
+        "after {waited} s the caller is {:?} and said {said:?}, notes {notes:?}, excuse {:?}",
+        pair.caller.state(),
+        pair.caller.ended_because()
+    );
+    assert_eq!(pair.caller.state(), State::Command, "{what}");
+    assert_eq!(pair.caller.ended_because(), Some(Ended::PeerCleared), "{what}");
+    assert!(said.contains("NO CARRIER"), "{what}");
+    // And it is recorded as a peer clear on this side, not as a fault.
+    assert!(notes.contains("peer DISC"), "{what}");
+}
+
+/// A call V.42 is not carrying has nothing to announce itself with, and the
+/// line goes at once exactly as it always did -- said so in the log line, so
+/// that a batch of calls stays classifiable.
+#[test]
+fn a_hang_up_without_v42_drops_the_line_at_once() {
+    let mut pair = Pair::new(Network::new(Law::Mu, FS).with_delay(0.015, FS).with_noise(1e-5), 0);
+    pair.straight = Some(0);
+    // V.250 Table 20's `<orig_rqst>` of 0: no error control to negotiate, so
+    // no V.42 here to say goodbye with.
+    Pair::type_at(&mut pair.host, "AT+MS=V90");
+    Pair::type_at(&mut pair.caller, "AT+MS=V90");
+    Pair::type_at(&mut pair.caller, "AT+ES=0");
+    pair.run(0.05);
+    Pair::type_at(&mut pair.host, "ATA");
+    Pair::type_at(&mut pair.caller, "ATD5551234");
+    let mut waited = 0.0;
+    while (pair.caller.state() != State::Data || pair.host.state() != State::Data) && waited < 40.0 {
+        pair.run(1.0);
+        waited += 1.0;
+    }
+    assert_eq!((pair.caller.state(), pair.host.state()), (State::Data, State::Data));
+    pair.run(1.0);
+    pair.caller_said.clear();
+    pair.caller.hang_up();
+    pair.caller_said.extend(pair.caller.take_dte());
+    let said = String::from_utf8_lossy(&pair.caller_said).into_owned();
+    let notes = pair.caller.take_line_notes().join(" | ");
+    let what = format!("the caller is {:?} and said {said:?}, notes {notes:?}", pair.caller.state());
+    // No wait at all: the carrier is down on the same call.
+    assert_eq!(pair.caller.state(), State::Command, "{what}");
+    assert!(said.contains("OK"), "{what}");
+    assert!(notes.contains("not connected: no DISC"), "{what}");
+    // And nothing was said on the line before it went.
+    assert!(notes.contains("0 DISC sent"), "{what}");
 }
 
 /// Two of these in V.90 data mode, then one puts the line down: the other

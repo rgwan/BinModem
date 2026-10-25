@@ -309,6 +309,32 @@ pub struct Stack {
     watch: Option<Box<Answerer>>,
     /// Whether the error correction procedure is suspended (V.42 7.10).
     suspended: bool,
+    /// Whether a release this end asked for is still to be accounted for,
+    /// how many DISC frames have gone, and what became of it (see
+    /// [`Stack::release`]).
+    releasing: bool,
+    disc_sent: u32,
+    released: Option<Release>,
+    /// Whether the far end has asked for a release since this was last asked
+    /// (see [`Stack::peer_cleared`]).
+    peer_released: bool,
+}
+
+/// How a release this end asked for has got on (V.42 8.7.2, 8.7.3).
+///
+/// Worth telling apart, because it is the whole difference between a clear
+/// the far end was told about and one it has to infer from a carrier that
+/// stopped arriving -- and inferred, it is indistinguishable from the line
+/// having failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// DISC is out with T401 running and nothing has answered it yet.
+    Asking { attempts: u32 },
+    /// A DISC was answered with UA or DM, after `attempts` of them.
+    Acked { attempts: u32 },
+    /// N400 DISC commands went unanswered (8.7.3): the far end is not there
+    /// to be told.
+    Unanswered { attempts: u32 },
 }
 
 /// One end of the detection phase (7.2.1). Which one depends on the role.
@@ -495,6 +521,10 @@ impl Stack {
             unclaimed: Vec::new(),
             watch: None,
             suspended: false,
+            releasing: false,
+            disc_sent: 0,
+            released: None,
+            peer_released: false,
         }
     }
 
@@ -920,9 +950,53 @@ impl Stack {
         }
     }
 
-    /// Ask for it to be released.
+    /// Ask for it to be released (V.42 8.7.2), and watch for the answer.
+    ///
+    /// A release asked for while there is nothing to release is a request to
+    /// say nothing: LAPM sends no DISC from a disconnected state (8.8 answers
+    /// a DISC with DM, it does not send one), and [`Self::release`] then
+    /// reports nothing at all, so a caller that wants a line to bring down by
+    /// itself has to ask [`Self::is_connected`] first.
     pub fn disconnect(&mut self) {
+        if !self.lapm.is_connected() && self.lapm.state() != State::AwaitingRelease {
+            return;
+        }
         self.lapm.disconnect();
+        self.releasing = true;
+        self.disc_sent = 0;
+        self.released = None;
+    }
+
+    /// How the release asked for with [`Self::disconnect`] has got on.
+    ///
+    /// `None` when no release was asked for. This is what a modem needs
+    /// before it brings a carrier down: whether the far end has been told,
+    /// is about to be, or never will be.
+    pub fn release(&self) -> Option<Release> {
+        if !self.releasing {
+            return None;
+        }
+        Some(self.released.unwrap_or(Release::Asking { attempts: self.disc_sent }))
+    }
+
+    /// Whether anything is queued for the line that has not been handed to
+    /// the encoder yet.
+    ///
+    /// The one thing a peer's DISC owes it is a UA (8.8), and a modem that
+    /// brings its carrier down on the sample the DISC arrived sends that UA to
+    /// nobody. What it is bounded by is the frame itself: the encoder is
+    /// drained at the line rate, so this is false a frame's worth of time
+    /// later and never a timer's.
+    pub fn frames_waiting(&self) -> bool {
+        !self.encoder.is_empty()
+    }
+
+    /// Whether the far end has sent DISC since this was last called.
+    ///
+    /// A peer that says goodbye is not a carrier that failed, and only the
+    /// frame tells the two apart (V.42 8.8).
+    pub fn peer_cleared(&mut self) -> bool {
+        std::mem::take(&mut self.peer_released)
     }
 
     /// Suspend error correction: freeze the timers and change nothing else
@@ -1147,6 +1221,13 @@ impl Stack {
                 queued = true;
             }
             while let Some((frame, kind)) = self.lapm.poll_transmit() {
+                // Counted where the frame becomes bits, because that is the
+                // only place that knows one actually went out: a DISC handed
+                // back by `poll_transmit` in a stack nobody is pulling bits
+                // from has not been sent to anybody.
+                if matches!(frame, Frame::Disc { .. }) {
+                    self.disc_sent = self.disc_sent.saturating_add(1);
+                }
                 let body = frame.encode(DLCI_DATA, self.role, kind);
                 self.encoder.frame(&body);
                 self.note(true, true, &body);
@@ -1536,6 +1617,27 @@ impl Stack {
                     self.gave_up = true;
                     self.phase = Phase::Transparent;
                 }
+                // What became of a release this end asked for. 8.7.2 ends it
+                // on the UA or the DM that answers the DISC, and 8.7.3 on the
+                // N400th DISC going unanswered; both arrive here, and both
+                // are all a carrier-off can be given.
+                // The far end's own DISC (8.8) is an answer to one of ours
+                // as well as a statement of its own: it settles the release
+                // either way, and it is the modem above, not the stack, that
+                // decides what a call ending this way is worth telling the
+                // terminal.
+                Event::Released(cause @ (Cause::Local | Cause::NoResponse | Cause::Peer))
+                    if self.releasing =>
+                {
+                    self.released = Some(match cause {
+                        Cause::NoResponse => Release::Unanswered { attempts: self.disc_sent },
+                        _ => Release::Acked { attempts: self.disc_sent },
+                    });
+                    if cause == Cause::Peer {
+                        self.peer_released = true;
+                    }
+                }
+                Event::Released(Cause::Peer) => self.peer_released = true,
                 _ => {}
             }
         }
@@ -1896,6 +1998,73 @@ mod tests {
     /// and retransmission running underneath. Compression cannot tolerate a
     /// single octet delivered twice, out of order, or not at all, so this is
     /// where error control either holds the stream together or quietly stops.
+    /// V.42 8.7.3: a release asked for on a far end that never answers it
+    /// costs N400 DISC commands and then stops.
+    ///
+    /// This is what a carrier-off has to be given before it happens: the
+    /// count of DISCs that went out, and the fact that nothing came back.
+    /// The far end here is scripted straight -- it is fed this end's bits and
+    /// answers with continuous flags, which is the one shape of a far end
+    /// that is there and not listening.
+    #[test]
+    fn a_release_nobody_answers_costs_n400_discs_and_stops() {
+        use crate::hdlc::Decoder;
+        const N400: u32 = 3;
+        const T401_MS: u32 = 1000;
+        let params = Params { t401_ms: T401_MS, n400: N400, ..Params::default() };
+        let mut a = Stack::new(Role::Originator, params);
+        let mut b = Stack::new(Role::Answerer, params);
+        a.offer_compression(Compression::Both);
+        b.offer_compression(Compression::Both);
+        a.connect();
+        settle(&mut a, &mut b, 40_000, |_, bit| bit);
+        assert!(a.is_connected() && b.is_connected(), "the link never came up");
+
+        a.disconnect();
+        assert_eq!(a.release(), Some(Release::Asking { attempts: 0 }));
+
+        // The far end stops answering: flags only, for ever.
+        let mut decoder = Decoder::new(a.fcs());
+        let mut discs = 0;
+        let mut seen: Vec<String> = Vec::new();
+        let mut bits = 0u32;
+        let mut elapsed_ms = 0u32;
+        while matches!(a.release(), Some(Release::Asking { .. })) && bits < 200_000 {
+            let bit = a.next_bit();
+            match decoder.feed(bit) {
+                Some(Ok(body)) => {
+                    if seen.len() < 8 {
+                        seen.push(format!("{:02x?}", body));
+                    }
+                    if body.get(1).is_some_and(|c| c & !0x10 == 0x43) {
+                        discs += 1;
+                    }
+                }
+                Some(Err(e)) => {
+                    if seen.len() < 8 {
+                        seen.push(format!("bad {e:?}"));
+                    }
+                }
+                None => {}
+            }
+            a.feed_bit(true);
+            bits += 1;
+            if bits % 160 == 0 {
+                a.tick(16);
+                elapsed_ms += 16;
+            }
+        }
+        let what = format!("{discs} DISCs over {elapsed_ms} ms, saw {seen:?}");
+        assert_eq!(discs, N400 as usize, "{what}");
+        assert_eq!(a.release(), Some(Release::Unanswered { attempts: N400 }), "{what}");
+        assert!(!a.is_connected(), "{what}: still connected");
+        // Bounded by N400 T401s and by nothing else -- T401 grows by half on
+        // every expiry, so the floor is the first one and the ceiling is the
+        // last of them.
+        assert!(elapsed_ms >= N400 * T401_MS, "{what}");
+        assert!(elapsed_ms < 8 * N400 * T401_MS, "{what}");
+    }
+
     #[test]
     fn bulk_traffic_both_ways_survives_a_line_that_damages_frames() {
         let (mut a, mut b) = negotiated_pair();
