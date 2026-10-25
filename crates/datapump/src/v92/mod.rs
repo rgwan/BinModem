@@ -47,6 +47,7 @@ pub mod memo;
 pub mod modulus;
 pub mod precoder;
 pub mod receiver;
+pub mod rung;
 pub mod sequences;
 pub mod transmit;
 pub mod up_signals;
