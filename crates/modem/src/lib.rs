@@ -86,6 +86,14 @@ pub enum Ended {
     CarrierLost,
     /// The handshake never completed.
     NoAnswer,
+    /// The far end asked for the release, with a V.42 DISC, and this end
+    /// answered it (V.42 8.8).
+    ///
+    /// Told to the terminal as `NO CARRIER`, because the terminal did not ask
+    /// and has no other way of finding out -- and told apart from
+    /// [`Self::CarrierLost`] for the reason the whole of this exists: the far
+    /// end *said* it was going, so the line did not fail.
+    PeerCleared,
     /// The terminal asked for compression and the far end would not.
     NoCompression,
     /// The terminal asked for error control and there was none to be had.
@@ -941,6 +949,68 @@ pub struct Modem {
     /// into the gap is queued, and the far end is not listening for it yet
     /// either.
     announce: Option<u32>,
+    /// A hang-up this end asked for, while V.42 is saying goodbye on the
+    /// line (see [`Self::hang_up`]).
+    ///
+    /// The terminal has already been told; what is still owed is the far
+    /// end, which is owed a DISC before the carrier goes.
+    hang_up: Option<HangUp>,
+    /// The one line about how that goodbye ended, until somebody takes it
+    /// (see [`Self::take_line_notes`]).
+    hang_up_report: Option<HangUpReport>,
+    /// What ended the last call, once something did.
+    last_ended: Option<Ended>,
+}
+
+/// A call ending that is not done with the line yet.
+#[derive(Debug, Clone, Copy)]
+struct HangUp {
+    /// What to call it in the log line, since the terminal may already have
+    /// been answered and the ending still has to be reported somewhere.
+    why: Ended,
+    /// The line's own 8 kHz symbol instants spent in the wait. Counted here
+    /// rather than timed off a clock: the grid T401 counts on is this one.
+    symbols: u64,
+}
+
+/// How a hang-up ended, in the form the log line and the tests read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HangUpReport {
+    outcome: Disc,
+    /// DISC frames that went onto the line.
+    attempts: u32,
+    /// 8 kHz symbol instants spent between the request and the carrier going.
+    symbols: u64,
+    /// The rate the line was running at, so the symbols and the octets they
+    /// were worth can both be reported.
+    rate: u32,
+}
+
+/// Symbols the UA owed to a far end's own DISC is given to leave the line.
+///
+/// V.42 8.8: one U frame, which is address, control and a 16-bit check
+/// sequence -- four octets, 48 bits with a flag either side of it -- at this
+/// call's rate, plus [`UA_MARGIN_SYMBOLS`] for the pump's own buffering. A
+/// count of symbols on the line's grid, so it says the same thing at 2400 as
+/// at 33600 and never touches a wall clock (docs/101 §5.0).
+fn ua_symbols(rate: u32) -> u64 {
+    u64::from(UA_BITS * 8000 / rate.max(1) + UA_MARGIN_SYMBOLS)
+}
+
+const UA_BITS: u32 = 48;
+const UA_MARGIN_SYMBOLS: u32 = 64;
+
+/// Which of the three ways a hang-up ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disc {
+    /// The far end answered the DISC with UA or DM: it knows.
+    Acked,
+    /// N400 DISC commands went unanswered: it will not know.
+    Timeout,
+    /// V.42 was not up, so there was nothing to announce it with.
+    NotConnected,
+    /// The far end's own DISC, answered with a UA before the carrier went.
+    PeerCleared,
 }
 
 impl Modem {
@@ -982,6 +1052,9 @@ impl Modem {
             declared_lapm: false,
             pcm_role: None,
             announce: None,
+            hang_up: None,
+            hang_up_report: None,
+            last_ended: None,
         }
     }
 
@@ -1005,10 +1078,116 @@ impl Modem {
     /// escape wants a second of silence either side of it. A dial-in server
     /// ending a session it has already said goodbye to has no reason to wait
     /// for that, and nothing it sends after the goodbye would be data.
+    /// A hang-up on a connection V.42 is carrying is a DISC first and a
+    /// carrier-off second.
+    ///
+    /// The terminal has asked and is answered at once, as it always was: what
+    /// it asked for has happened, and waiting on a protocol goodbye would be
+    /// a second of nothing before its `OK`. The far end is owed more than
+    /// that. A carrier that stops between two samples is what a cut line
+    /// looks like, and the far end has no way to tell the two apart -- it
+    /// reports the call as a carrier loss and treats it as a fault. V.42
+    /// 8.7.2 has the announcement: a DISC, and T401 until UA or DM answers
+    /// it, and only then is there nothing left to say on the line.
+    ///
+    /// Bounded by the release itself and by nothing here: N400 (V.42
+    /// Appendix III.2's 16) DISC commands of T401 each, T401 being
+    /// [`ec::lapm::t401_for`] of this call's rate (Appendix IV's sum) grown
+    /// by half on every expiry and capped at `MAX_T401_MS`. Nothing is timed
+    /// off a wall clock: the wait runs on the same 8 kHz sample grid the
+    /// call does, which is the grid T401 is counted on.
     pub fn hang_up(&mut self) {
         if self.pump.is_some() || self.negotiation.is_some() || self.fax.is_some() {
-            self.end_call(Ended::LocalRequest);
+            self.start_hang_up(Ended::LocalRequest, true);
         }
+    }
+
+    /// What ended the last call, once one has ended.
+    pub fn ended_because(&self) -> Option<Ended> {
+        self.last_ended
+    }
+
+    /// The V.42 goodbye on its way out, before the carrier goes.
+    ///
+    /// `tell_dte` is false where the command interpreter has already said
+    /// `OK` for the `ATH` that got here, and true where a program asked
+    /// ([`Self::hang_up`]).
+    fn start_hang_up(&mut self, why: Ended, tell_dte: bool) {
+        if tell_dte {
+            self.answer_dte(why);
+        }
+        // V.42 up: announce the clear and hold the line open until the far
+        // end has heard it, or until N400 DISC commands say it never will.
+        if self.ec.as_ref().is_some_and(Stack::is_connected) {
+            if let Some(ec) = self.ec.as_mut() {
+                ec.disconnect();
+            }
+            self.hang_up = Some(HangUp { why, symbols: 0 });
+            return;
+        }
+        // Nothing to announce it with. Exactly what happened before there was
+        // a goodbye at all: the line goes now, and the log line says why.
+        self.note_hang_up(Disc::NotConnected, 0, 0);
+        self.drop_call();
+        self.last_ended = Some(why);
+    }
+
+    /// Watch the release, and bring the line down when it is over.
+    ///
+    /// One comparison per sample, and the log line is made only where it
+    /// ends: nothing here computes in the sample path.
+    fn watch_hang_up(&mut self) {
+        let Some(mut pending) = self.hang_up else { return };
+        pending.symbols = pending.symbols.saturating_add(1);
+        self.hang_up = Some(pending);
+        // The mirror of a release: the far end asked, the UA it is owed is on
+        // its way out, and the carrier goes when the frame has had the line
+        // for as long as the frame needs. One U frame is address, control and
+        // a 16-bit check sequence -- four octets, so 32 bits with a flag
+        // either side of it, 48 -- and the hold is that many symbols of this
+        // call's own rate, plus a fixed handful for the pump's buffering.
+        if pending.why == Ended::PeerCleared {
+            if pending.symbols < ua_symbols(self.rate) {
+                return;
+            }
+            self.note_hang_up(Disc::PeerCleared, 0, pending.symbols);
+            self.drop_call();
+            return;
+        }
+        // A retrain takes the line away for seconds and freezes T401 with it
+        // (see `Self::tick`), so waiting on the release through one would
+        // wait for ever. The far end is being told the same thing by the
+        // line's own silence.
+        let retraining = self
+            .pump
+            .as_ref()
+            .is_some_and(|p| matches!(p.status(), Progress::Retraining));
+        let Some(ec) = self.ec.as_ref() else {
+            // No stack to ask: whatever happened, no DISC was acknowledged.
+            self.note_hang_up(Disc::Timeout, 0, pending.symbols);
+            self.drop_call();
+            self.last_ended = Some(pending.why);
+            return;
+        };
+        let (outcome, attempts) = match ec.release() {
+            Some(ec::stack::Release::Asking { attempts }) if !retraining => return,
+            Some(ec::stack::Release::Acked { attempts }) => (Disc::Acked, attempts),
+            // Nothing answered it, or the line went away underneath the wait
+            // (a retrain freezes T401, so the wait cannot outlast one). Either
+            // way it is a DISC nobody acknowledged, and the count says how
+            // many were tried.
+            Some(ec::stack::Release::Asking { attempts })
+            | Some(ec::stack::Release::Unanswered { attempts }) => (Disc::Timeout, attempts),
+            None => (Disc::Timeout, 0),
+        };
+        self.note_hang_up(outcome, attempts, pending.symbols);
+        self.drop_call();
+        self.last_ended = Some(pending.why);
+    }
+
+    /// The one line a hang-up leaves, made here and not on every sample.
+    fn note_hang_up(&mut self, outcome: Disc, attempts: u32, symbols: u64) {
+        self.hang_up_report = Some(HangUpReport { outcome, attempts, symbols, rate: self.rate });
     }
 
     /// The line went away underneath the call.
@@ -1081,7 +1260,24 @@ impl Modem {
     /// None of it is visible from the terminal, and a call that stalls in
     /// phase 4 leaves nothing else to say which end stopped answering.
     pub fn take_line_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.line_notes)
+        let mut notes = std::mem::take(&mut self.line_notes);
+        // A hang-up's one line, made here and not on the sample that ended it:
+        // what the line cost is counted on the sample grid, but turning it
+        // into text is nobody's real-time work.
+        if let Some(report) = self.hang_up_report.take() {
+            let octets = u64::from(report.rate) * report.symbols / 8000 / 8;
+            let what = match report.outcome {
+                Disc::Acked => "DISC acked".to_owned(),
+                Disc::Timeout => format!("DISC timeout after {} retries", report.attempts),
+                Disc::NotConnected => "not connected: no DISC".to_owned(),
+                Disc::PeerCleared => "peer DISC: UA answered, reason peer clear".to_owned(),
+            };
+            notes.push(format!(
+                "hang-up: {what}; {} DISC sent, {} symbols = {} octets at {} bit/s",
+                report.attempts, report.symbols, octets, report.rate
+            ));
+        }
+        notes
     }
 
     /// Seconds since the call was placed.
@@ -1669,6 +1865,12 @@ impl Modem {
             State::Data | State::OnlineCommand => {
                 self.watch_for_retrain();
                 self.carry_data();
+                // A hang-up waiting on V.42's goodbye, which is the only
+                // thing that keeps the carrier on after one. One comparison
+                // a sample: the line is made where the wait ends, not here.
+                if self.hang_up.is_some() {
+                    self.watch_hang_up();
+                }
             }
             State::Command => {}
         }
@@ -2174,6 +2376,25 @@ impl Modem {
         // and reports `Failed`, which becomes this same NO CARRIER a moment
         // later and by a route that knows what it is doing.
         let retraining = matches!(pump.status(), Progress::Retraining);
+        // A far end that said goodbye with a DISC is not a carrier that
+        // failed, and the frame is the only thing that tells them apart
+        // (V.42 8.8). Read before the carrier is: a far end that clears the
+        // call this way takes its carrier down a moment later, and by then
+        // the DISC has already said which of the two this is.
+        if self.hang_up.is_none() && self.ec.as_mut().is_some_and(Stack::peer_cleared) {
+            // V.42 8.8 owes the far end a UA. It is queued by the stack on the
+            // sample the DISC was read, and it is given the line for as long
+            // as the frame itself takes -- not a timer, and no longer than a
+            // frame: the call ends as soon as it is out, and the carrier goes
+            // with it.
+            //
+            // The terminal hears at once either way. It did not ask for this
+            // and has nothing to gain from the microseconds.
+            self.answer_dte(Ended::PeerCleared);
+            self.last_ended = Some(Ended::PeerCleared);
+            self.hang_up = Some(HangUp { why: Ended::PeerCleared, symbols: 0 });
+            return;
+        }
         if !pump.carrier() && !retraining {
             self.end_call(Ended::CarrierLost);
             return;
@@ -2288,7 +2509,10 @@ impl Modem {
                 }
                 Action::HangUp => {
                     if self.pump.is_some() || self.negotiation.is_some() || self.fax.is_some() {
-                        self.drop_call();
+                        // The interpreter has already answered the `ATH`, so
+                        // this one is owed only the line's goodbye.
+                        self.start_hang_up(Ended::LocalRequest, false);
+                        self.last_ended = Some(Ended::LocalRequest);
                     }
                 }
                 Action::OffHook => {}
@@ -2711,14 +2935,46 @@ impl Modem {
         if std::env::var_os("MODEM_TRACE").is_some() {
             eprintln!("[modem] end_call: {why:?} in {:?}", self.state);
         }
+        // A hang-up still waiting on the line when something else ends the
+        // call -- the far end's carrier going, most of all -- was never
+        // acknowledged, and says so rather than vanishing.
+        if self.hang_up.is_some() {
+            let (outcome, attempts) = self.hang_up_outcome();
+            let symbols = self.hang_up.map_or(0, |h| h.symbols);
+            self.note_hang_up(outcome, attempts, symbols);
+        }
+        self.answer_dte(why);
         self.drop_call();
+        self.last_ended = Some(why);
+    }
+
+    /// How the DISC this end sent stands, for the log line and for a caller
+    /// that ends the call itself half way through one.
+    fn hang_up_outcome(&self) -> (Disc, u32) {
+        match self.ec.as_ref().and_then(Stack::release) {
+            Some(ec::stack::Release::Acked { attempts }) => (Disc::Acked, attempts),
+            Some(ec::stack::Release::Asking { attempts })
+            | Some(ec::stack::Release::Unanswered { attempts }) => (Disc::Timeout, attempts),
+            None => (Disc::Timeout, 0),
+        }
+    }
+
+    /// Give the terminal the result code this ending is owed, and nothing
+    /// else.
+    ///
+    /// Apart from [`Self::end_call`] so that a hang-up can answer the terminal
+    /// before it spends the line's time on V.42's goodbye ([`Self::hang_up`]).
+    fn answer_dte(&mut self, why: Ended) {
         self.at.emit(match why {
             Ended::LocalRequest => ResultCode::Ok,
             // 6.3.1: what a dial that did not get there reports.
             Ended::Aborted => ResultCode::NoCarrier,
-            Ended::CarrierLost | Ended::NoErrorControl | Ended::NoCompression => {
-                ResultCode::NoCarrier
-            }
+            // 8.8's ending, and told to the terminal exactly as a carrier that
+            // went away is: it did not ask and has no other way to know.
+            Ended::PeerCleared
+            | Ended::CarrierLost
+            | Ended::NoErrorControl
+            | Ended::NoCompression => ResultCode::NoCarrier,
             Ended::NoAnswer => ResultCode::NoAnswer,
         });
     }
@@ -2739,6 +2995,9 @@ impl Modem {
         // A call that ends before its CONNECT went out never connected, and
         // the terminal is about to be told why instead.
         self.announce = None;
+        // A goodbye in progress ends with the call it belonged to. Its line
+        // has been made already, or is being made by whoever is dropping it.
+        self.hang_up = None;
         self.outbound.clear();
         self.escape.reset();
         self.state = State::Command;
