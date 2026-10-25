@@ -29,18 +29,17 @@
 use std::collections::VecDeque;
 
 use crate::v32::{Mode, Scrambler};
-use crate::v34::trellis::{self, Code};
-
 use super::modulus::{self, FrameBits, Moduli12};
-use super::precoder::{
-    Constellation, code_for, index_to_ki, index_to_ki_class, label_of, opens_a_pair, pair_first_index_offset,
-};
+use super::precoder::{Constellation, index_to_ki, index_to_ki_class, opens_a_pair, pair_first_index_offset};
 use super::{B1U_FRAMES, Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 
 /// Trellis frames held before the oldest is decided on. Forty frames is a
-/// hundred and sixty symbols, twenty milliseconds: long enough for every code
-/// here to have settled, short enough that the tail a cleardown cuts off is
-/// nothing.
+/// hundred and sixty symbols, twenty milliseconds: the delay the rotation
+/// measurement needs before a decision is taken (a decided frame cannot be
+/// re-taken), and short enough that the tail a cleardown cuts off is nothing.
+///
+/// It is not a survivor path memory any more: the decision is the slice's own
+/// (`Decoder::fill`), so nothing is being waited for beyond the measurement.
 pub const SURVIVOR_DEPTH: usize = 40;
 
 /// `V92_K3`: the receive-side correction `docs/47` measures, and nothing else.
@@ -153,14 +152,12 @@ pub fn rotation_wanted() -> bool {
 /// How many symbols B1u is measured over: forty per trellis position, i.e.
 /// a hundred and sixty symbols of B1u's five hundred and seventy-six.
 ///
-/// Forty and not more because a decision cannot be re-taken: the Viterbi
-/// decides its first frame a hundred and sixty-four symbols in (`SURVIVOR_DEPTH`
-/// frames plus one, from the first symbol this decoder is fed), so a
-/// measurement that ran past that would either decide the first frames on the
-/// constant and the rest on the measurement -- two rotations in one B1u -- or
-/// have to hold the window open, which changes the decisions of exactly the
-/// frames it held. Forty samples a position is what fits before the first
-/// decision with the window untouched, and it is far more than the bar in
+/// Forty and not more because a decision cannot be re-taken: the first frame
+/// is decided a hundred and sixty-four symbols in (`SURVIVOR_DEPTH` frames plus
+/// one, from the first symbol this decoder is fed), so a measurement that ran
+/// past that would decide the first frames on the constant and the rest on the
+/// measurement -- two rotations in one B1u. Forty samples a position is what
+/// fits before the first decision, and it is far more than the bar in
 /// [`Measuring::rotation`] needs: `docs/46`'s plateaus are per-position
 /// properties of the far end, not something that only shows up after ninety
 /// symbols.
@@ -559,18 +556,11 @@ impl Bests {
     }
 }
 
-/// One trellis frame in the Viterbi's window: its branch metrics and the four
-/// indices each of them means.
+/// One trellis frame held in the decoder's delay line: the four symbols' own
+/// slice tables, and which frame of B1u it is.
 #[derive(Debug, Clone, Copy)]
 struct Stage {
-    /// `table[out * 16 + y]`, the cost of the best four indices for that (Y0,
-    /// y), or infinite when no indices make it.
-    table: [f64; 32],
-    /// Which residue class each of the four symbols was taken from, per
-    /// (out, y).
-    residues: [[(i32, i32, i32, i32); 16]; 2],
-    /// The per-symbol tables it was built from, so that a decision can name
-    /// the indices rather than the classes.
+    /// The per-symbol tables the indices are read off.
     bests: [Bests; TRELLIS_FRAME],
     /// Which trellis frame this is, counted from the first symbol of B1u.
     /// Three of them make a data frame (Figure 1), so only every third may
@@ -584,7 +574,6 @@ struct Stage {
 #[derive(Debug, Clone)]
 pub struct Decoder {
     moduli: Moduli12,
-    code: Code,
     params: Parameters,
     descrambler: Scrambler,
     modulus: modulus::Decoder,
@@ -593,11 +582,7 @@ pub struct Decoder {
     n: u64,
     frame: [Bests; TRELLIS_FRAME],
     filled: usize,
-    metrics: Vec<f64>,
     stages: VecDeque<Stage>,
-    /// `back[i][state]` is where the state at frame i + 1 came from, and
-    /// whether Y0 went out inverted to get there.
-    back: VecDeque<Vec<(u8, bool)>>,
     /// Ki decided but not yet a whole data frame's worth.
     labels: Vec<u8>,
     bits: Vec<bool>,
@@ -640,25 +625,8 @@ impl Decoder {
     /// symbol of B1u: every memory zero and n = 0, exactly as the encoder
     /// starts (8.7.1).
     pub fn new(parameters: &Parameters) -> Self {
-        let code = code_for(parameters.trellis);
-        let mut metrics = vec![f64::MAX; code.states()];
-        // Which convolutional state the encoder is assumed to be in at the
-        // first symbol this decoder is handed. Zero is right only if that
-        // symbol is the first symbol of B1u -- 8.7.1 zeroes the memories and
-        // then starts encoding -- and it is not: `b1u_skip` drops eighteen
-        // data frames first, so the far end's encoder has been running for
-        // 216 symbols by the time this sees anything. `V92_B1U_STATE` sweeps
-        // the assumption (diagnostic only; the default is the behaviour every
-        // number here was taken with).
-        let start = std::env::var("V92_B1U_STATE")
-            .ok()
-            .and_then(|text| text.parse::<usize>().ok())
-            .filter(|state| *state < code.states())
-            .unwrap_or(0);
-        metrics[start] = 0.0;
         Self {
             moduli: Moduli12::new(parameters.moduli),
-            code,
             params: parameters.clone(),
             descrambler: Scrambler::new(crate::v32::Mode::Answer),
             modulus: modulus::Decoder::new(),
@@ -666,9 +634,7 @@ impl Decoder {
             n: 0,
             frame: [Bests::default(); TRELLIS_FRAME],
             filled: 0,
-            metrics,
             stages: VecDeque::new(),
-            back: VecDeque::new(),
             labels: Vec::with_capacity(UP_INTERVALS),
             bits: Vec::new(),
             decided: 0,
@@ -826,118 +792,41 @@ impl Decoder {
         self.rotation_line.as_deref()
     }
 
-    /// This frame's branch metrics, and one trellis step.
+    /// This frame's four slices, and one frame of delay.
+    ///
+    /// **The decision is the slice's own.** The 4D trellis of 6.4.3 was tried
+    /// as a hard constraint here and it cannot be one: the index sequence this
+    /// far end sends does not lie on the code's path (a hundred and forty of
+    /// B1u's hundred and forty-three trellis frames, at best, need a Y0
+    /// inversion to reach it -- see `docs/96` §25), so a joint decision over
+    /// the code moves symbols off lattice points they sit 0.15 half-cells from
+    /// and onto points 1.9 half-cells away. It is the same 6.4.2 class either
+    /// way, and the class is all the bit layer needs: US6414989B1 col. 14, "the
+    /// receiver need only be concerned with the coset received". The window
+    /// stays because a decision cannot be re-taken -- the measurement above
+    /// takes forty symbols a position, and emitting bits early would put two
+    /// rotations in one B1u -- not because anything is being waited for.
     fn fill(&mut self) {
-        let mut stage = build(&self.frame, self.code);
-        stage.index = self.n / TRELLIS_FRAME as u64 - 1;
-        let states = self.code.states();
-        let mut next = vec![f64::MAX; states];
-        let mut from = vec![(0u8, false); states];
-        for (state, &metric) in self.metrics.iter().enumerate() {
-            if metric == f64::MAX {
-                continue;
-            }
-            let out = usize::from(self.code.output(state as u8));
-            for y in 0..16usize {
-                if y & !self.code.inputs() as usize != 0 {
-                    continue;
-                }
-                // Y0 is the state's own output and nothing else. V.34 lets a
-                // half frame invert it; V.92's upstream has no superframe to be
-                // half way through, so 6.4.3's parity is the only rule and a
-                // flipped table entry is not a path this receiver may take.
-                let cost = stage.table[out * 16 + y];
-                if cost == f64::MAX {
-                    continue;
-                }
-                let to = usize::from(self.code.next(state as u8, y as u8));
-                if metric + cost < next[to] {
-                    next[to] = metric + cost;
-                    from[to] = (state as u8, false);
-                }
-            }
-        }
-        let floor = next.iter().copied().fold(f64::MAX, f64::min);
-        if floor == f64::MAX {
-            // Nothing in the constellation is anywhere near the line: hold
-            // what is left of the window and start again rather than decide
-            // on noise.
-            self.stages.clear();
-            self.back.clear();
-            self.metrics.iter_mut().for_each(|metric| *metric = f64::MAX);
-            self.metrics[0] = 0.0;
-            return;
-        }
-        for metric in &mut next {
-            if *metric != f64::MAX {
-                *metric -= floor;
-            }
-        }
-        self.metrics = next;
+        let stage = Stage { bests: self.frame, index: self.n / TRELLIS_FRAME as u64 - 1 };
         self.stages.push_back(stage);
-        self.back.push_back(from);
-        // Belt and braces, and it does not fire with the acquisition skip this
-        // receiver uses: a measurement that has not finished by the time the
-        // window is full would leave the first frames decided on the constant
-        // and the rest on the measurement, so the window is held open until it
-        // has. With `ROTATION_SYMBOLS` of a hundred and sixty the measurement
-        // is in a hundred and sixty symbols in and the first decision is at a
-        // hundred and sixty-four, so nothing here is ever held and the
-        // decisions of a measured call are the decisions of an unmeasured one.
-        if self.measuring.is_some() {
-            return;
-        }
         while self.stages.len() > SURVIVOR_DEPTH {
             self.decide();
         }
     }
 
-    /// Decide the oldest frame in the window, from the cheapest path through
-    /// the whole window.
+    /// The oldest frame in the window, decided from its own four slices.
     fn decide(&mut self) {
-        let Some(best) = self
-            .metrics
-            .iter()
-            .enumerate()
-            .filter(|(_, metric)| **metric != f64::MAX)
-            .min_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(state, _)| state as u8)
-        else {
-            return;
-        };
-        // The state the oldest frame started in, by walking the window's own
-        // back pointers.
-        // `back[k][s]` is where the state after frame k came from, so the
-        // oldest frame's decision needs the state it *started* in: every
-        // pointer in the window, from the newest state back past the oldest.
-        let mut state = best;
-        for step in self.back.iter().rev() {
-            state = step[usize::from(state)].0;
-        }
         let stage = self.stages.pop_front().expect("a stage is held before one is decided");
-        self.back.pop_front();
-        let out = usize::from(self.code.output(state));
-        let mut chosen = (f64::MAX, 0usize);
-        for y in 0..16usize {
-            if y & !self.code.inputs() as usize != 0 {
-                continue;
-            }
-            let cost = stage.table[out * 16 + y];
-            if cost < chosen.0 {
-                chosen = (cost, y);
-            }
-        }
-        let residues = stage.residues[out][chosen.1];
         let mut etas = [0i32; TRELLIS_FRAME];
-        let classes = [residues.0, residues.1, residues.2, residues.3];
-        for (k, &residue) in classes.iter().enumerate() {
-            etas[k] = stage.bests[k].eta[residue.rem_euclid(4) as usize];
+        for (k, bests) in stage.bests.iter().enumerate() {
+            let Some(eta) = bests.nearest() else {
+                // Nothing in the constellation is anywhere near the line:
+                // drop this frame rather than decide on noise, and keep the
+                // delay line's own alignment.
+                return;
+            };
+            etas[k] = eta;
         }
-        debug_assert_eq!(
-            trellis::convert(label_of(etas[0], etas[1]), label_of(etas[2], etas[3])) & self.code.inputs(),
-            chosen.1 as u8,
-            "the indices decided on do not carry the inputs the path took"
-        );
         self.decided += 1;
         trace_etas(self, stage.index, etas);
         // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
@@ -1029,64 +918,6 @@ impl Decoder {
             self.bits.extend(bits);
         }
     }
-}
-
-/// The 32 costs of one frame: the best four indices for every (Y0, y).
-///
-/// The search is over residue classes -- four per symbol -- because a 4D subset
-/// label depends only on 2 x eta mod 8, and because the fourth index's parity
-/// is fixed by the first three and Y0 (6.4.2's class at k = 3).
-fn build(bests: &[Bests; TRELLIS_FRAME], code: Code) -> Stage {
-    let mut stage = Stage { table: [f64::MAX; 32], residues: [[(0, 0, 0, 0); 16]; 2], bests: *bests, index: 0 };
-    for out in 0..2usize {
-        for y in 0..16usize {
-            if y & !code.inputs() as usize != 0 {
-                continue;
-            }
-            let mut cost = f64::MAX;
-            let mut chosen = (0i32, 0i32, 0i32, 0i32);
-            for r0 in 0..4usize {
-                if bests[0].cost[r0] == f64::MAX {
-                    continue;
-                }
-                for r1 in 0..4usize {
-                    if bests[1].cost[r1] == f64::MAX {
-                        continue;
-                    }
-                    let first = label_of(r0 as i32, r1 as i32);
-                    for r2 in 0..4usize {
-                        if bests[2].cost[r2] == f64::MAX {
-                            continue;
-                        }
-                        let parity = (r0 + r1 + r2 + out) % 2;
-                        for r3 in (parity..4).step_by(2) {
-                            if bests[3].cost[r3] == f64::MAX {
-                                continue;
-                            }
-                            let second = label_of(r2 as i32, r3 as i32);
-                            // The code reads only the bits it has: 16 states
-                            // take Y1 and Y2, 32 add Y4 and 64 all four
-                            // (9.6.3.2), so a frame whose converter spells a
-                            // larger number is the same branch to a shorter
-                            // code.
-                            if trellis::convert(first, second) & code.inputs() != y as u8 {
-                                continue;
-                            }
-                            let total =
-                                bests[0].cost[r0] + bests[1].cost[r1] + bests[2].cost[r2] + bests[3].cost[r3];
-                            if total < cost {
-                                cost = total;
-                                chosen = (r0 as i32, r1 as i32, r2 as i32, r3 as i32);
-                            }
-                        }
-                    }
-                }
-            }
-            stage.table[out * 16 + y] = cost;
-            stage.residues[out][y] = chosen;
-        }
-    }
-    stage
 }
 
 #[cfg(test)]
@@ -1332,8 +1163,82 @@ mod tests {
         }
         assert_eq!(decoder.symbols(), (SURVIVOR_DEPTH * 4 * UP_INTERVALS) as u64);
         assert!(decoder.stages.len() <= SURVIVOR_DEPTH);
-        assert!(decoder.back.len() <= SURVIVOR_DEPTH);
         let _ = decoder.take_bits();
+    }
+
+    /// A level that sits on its own lattice point is decided by that point,
+    /// and not by the 4D code.
+    ///
+    /// B1u's thirty-one missing bits were seven of its hundred and ninety-two
+    /// decided Ki, each off by exactly one class, at symbols whose levels sat
+    /// **0.146 to 0.308 half-cells** from the lattice point that carries the
+    /// right index -- a hundred times closer to it than to the neighbour a
+    /// joint decision would have to move them to. The moves were forced: the
+    /// four indices this far end sent in those frames do not lie on the 4D
+    /// code's path, so a Viterbi over that code has to move one of the four,
+    /// and it moves the one that costs least.
+    ///
+    /// This builds exactly that sequence out of synthetic levels: B1u's own
+    /// classes through the production chain, every level displaced by one of
+    /// the residuals measured on the line, and one symbol displaced by a whole
+    /// lattice step so that the four indices of its frame are off the code's
+    /// path, as B1u's were. What has to come back is the slice's own reading at
+    /// every position -- the same bits the displaced classes decode to -- and
+    /// not a code-consistent reading of them.
+    #[test]
+    fn a_level_on_its_own_lattice_point_is_not_moved_by_the_code() {
+        // The residuals measured on the calls that read 547 of 576, in
+        // half-cells, and the symbol that was a whole step out (the equaliser
+        // had not settled: B1u's first data frames).
+        const RESIDUALS: [f64; 7] = [0.146, 0.174, 0.263, 0.308, 0.173, 0.156, 0.144];
+        const SHIFTED: usize = 30;
+        let parameters = parameters(1, Trellis::Sixteen);
+        let bits = up_bits(parameters.drn);
+        let moduli = Moduli12::new(parameters.moduli);
+        let classes = b1u_classes(bits, &parameters.moduli);
+        let mut chain = Chain::new(&parameters).expect("the chain these parameters describe");
+        let mut decoder = Decoder::new(&parameters);
+        decoder.measure_rotation_from(0);
+        let fed = B1U_FRAMES * UP_INTERVALS + TRELLIS_FRAME * (SURVIVOR_DEPTH + 2);
+        // The indices the *levels* fall into, and the bits they carry.
+        let mut labels: Vec<u8> = Vec::new();
+        let mut want: Vec<bool> = Vec::new();
+        let mut modulus = modulus::Decoder::new();
+        let mut scrambler = Scrambler::new(crate::v32::Mode::Answer);
+        let mut decoded = Vec::new();
+        for n in 0..fed {
+            let k = n % TRELLIS_FRAME;
+            let constant = if opens_a_pair(k) { pair_first_index_offset() } else { 0 };
+            let modulus_now = moduli.modulus(n % UP_INTERVALS);
+            let ki = (i64::from(classes[n % classes.len()]) - constant).rem_euclid(i64::from(modulus_now.max(1))) as u8;
+            let symbol = chain.step(ki);
+            let mut level = symbol.u;
+            if n < B1U_FRAMES * UP_INTERVALS {
+                level += if n % 2 == 0 { RESIDUALS[n % RESIDUALS.len()] } else { -RESIDUALS[n % RESIDUALS.len()] };
+                if n == SHIFTED {
+                    level -= 2.0;
+                }
+            }
+            decoder.feed(level);
+            decoded.extend(decoder.take_bits());
+            if n < B1U_FRAMES * UP_INTERVALS {
+                // What the slice says this level is: the same table the
+                // decoder slices with, read the same way.
+                let set = parameters.set_for(n % UP_INTERVALS).expect("a set");
+                let eta = Bests::new(&Constellation::new(set), level).nearest().expect("a nearest point");
+                labels.push(index_to_ki_class(eta, modulus_now, k));
+                if labels.len() == UP_INTERVALS {
+                    let frame: [u8; UP_INTERVALS] = labels.drain(..).collect::<Vec<u8>>().try_into().expect("twelve");
+                    let frame = modulus.decode(&frame, &moduli, bits).expect("the slice's own frame decodes");
+                    want.extend(frame.bits().map(|bit| scrambler.descramble(bit)));
+                }
+            }
+        }
+        let (at, errors) = align(&want, &decoded);
+        assert_eq!(errors, 0, "the decoded bits are not the ones the levels carry (offset {at:?})");
+        assert_eq!(at, Some(0), "the decoder lost the frame's place");
+        // And the shifted symbol is the reason this is not a round trip of a
+        // conforming line: the four indices of its frame are off the code's path.
     }
 
     /// The rotation is *read off* B1u and not named.
