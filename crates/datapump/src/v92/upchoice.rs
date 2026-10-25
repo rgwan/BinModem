@@ -54,6 +54,27 @@ use super::{
 /// trellis takes anything off it.
 pub const MARGIN: f64 = 4.5;
 
+/// CPd's bit 29, which 8.7.2 says extends E2u by one symbol.
+///
+/// One constant rather than a literal in `build`, because the *receiver* has
+/// to count the same number: [`E2U_SYMBOLS`] is this flag plus a data frame,
+/// and the boundary search in `digital.rs` slides its candidates over exactly
+/// that many symbols. A CPd that started asking for the extension while the
+/// receiver still counted twelve symbols would move B1u one symbol with
+/// nothing failing to compile, which is the silent breakage the constant
+/// exists to prevent.
+///
+/// False is what every call this end has made sends. The extension buys a far
+/// end nothing *here*: it lengthens the descrambled zero run by one symbol,
+/// and the boundary is read from the end of that run -- which the receiver
+/// measures over a candidate set rather than trusting a counter for (see
+/// `digital::E2U_SYMBOLS`).
+pub const EXTEND_E2U: bool = false;
+
+/// E2u's length in symbols (8.7.2): one data frame, plus whatever CPd bit 29
+/// asks for.
+pub const E2U_SYMBOLS: usize = UP_INTERVALS + if EXTEND_E2U { 1 } else { 0 };
+
 /// The gain a set of `levels` positive points on a spacing of two wants, with
 /// its mean square brought to one (8.8.3).
 ///
@@ -205,7 +226,7 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
     Some(Parameters {
         drn,
         trellis,
-        extend_e2u: false,
+        extend_e2u: EXTEND_E2U,
         gain,
         moduli,
         filters: design.filters.clone(),
@@ -289,6 +310,25 @@ mod tests {
                 / plain.sets.iter().map(Vec::len).sum::<usize>() as f64;
             assert!((plain.gain * plain.gain * power - 1.0).abs() < 1e-6);
         }
+    }
+
+    /// 8.7.2's extension bit and the receiver's count of E2u are one number.
+    ///
+    /// CPd bit 29 lengthens E2u by a symbol, and E2u is what the receiver's
+    /// boundary candidates are counted over (`digital::E2U_SYMBOLS`). Both come
+    /// from [`EXTEND_E2U`], so a future change to the bit cannot leave the
+    /// receiver searching a window that no longer contains the boundary.
+    #[test]
+    fn the_e2u_length_and_the_bit_this_end_sends_agree() {
+        let design = design_for(1e-9);
+        let parameters = pin(&design, 1, Trellis::Sixteen, 1e-9).expect("drn 1 is pinnable").parameters;
+        assert_eq!(parameters.extend_e2u, EXTEND_E2U, "CPd bit 29 is the constant the receiver counts from");
+        assert_eq!(E2U_SYMBOLS, UP_INTERVALS + usize::from(EXTEND_E2U));
+        assert_eq!(
+            crate::v92::digital::E2U_SYMBOLS,
+            E2U_SYMBOLS,
+            "the receiver's window and the sequence's length are the same number"
+        );
     }
 
     /// A channel with almost no noise carries the top of the ladder, a noisy

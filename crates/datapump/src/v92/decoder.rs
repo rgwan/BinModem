@@ -131,14 +131,22 @@ fn by_content_wanted() -> bool {
 /// agreement -- no far end is named, and a wrong choice cannot hurt: the bar
 /// below throws away a position that does not have a mode anyway.
 ///
-/// Unset, empty or `0` is off, and off is the constant and nothing else: the
-/// same classes, the same bits, the same files as before this existed.
+/// **On by default since `/dev/shm/reports/e2u-boundary.md`; `V92_ROT=0` is the
+/// off switch.** It used to be opt-in, on the argument that at 24 000 the
+/// constant *is* this far end's and the measurement has nothing to add. The two
+/// failing Agere captures of 2026-10-25 falsified that: at the same 24 000, the
+/// same analogue modem, the same line and the same B1u, `/tmp/agr-v90-interop/
+/// 152741-prime-b` measures `(3, 0, 3, 0)` -- the constant, 550 of 576 ones --
+/// and `152653-prime-a` measures `(0, 0, 0, 0)`, where the constant reads 399
+/// and the measurement reads **576 of 576**. So the pair-first offset is a
+/// per-call property of the far end's index map at this rung too, and 8.7.1
+/// makes it measurable on every call: it is not a number to assume.
 pub fn rotation_wanted() -> bool {
     use std::sync::OnceLock;
     static WANTED: OnceLock<bool> = OnceLock::new();
     *WANTED.get_or_init(|| match std::env::var("V92_ROT") {
-        Ok(text) => !text.trim().is_empty() && text.trim() != "0",
-        Err(_) => false,
+        Ok(text) => !(text.trim().is_empty() || text.trim() == "0"),
+        Err(_) => true,
     })
 }
 
@@ -674,13 +682,15 @@ impl Decoder {
     /// keeps the constant, which is what every B1u number before `docs/48` was
     /// taken with.
     pub fn measure_rotation_from(&mut self, first: usize) {
-        // `V92_ROT` asks for it anywhere; above 24 000 it is not optional,
-        // because `PAIR_FIRST_INDEX_OFFSET` is what an Agere's Mi = 8 line was
-        // measured at and at Mi = 16 that constant is not the far end's
-        // (`docs/74`). Nothing below 24 000 changes: there the measurement
-        // returns the constant it would have been taken as.
-        let wider = self.bits_per_frame > BITS_AT_THE_CONSTANT;
-        if (!rotation_wanted() && !wider) || self.measuring.is_some() {
+        // On unless `V92_ROT=0`, at every rung: above 24 000 because
+        // `PAIR_FIRST_INDEX_OFFSET` is what an Agere's Mi = 8 line was measured
+        // at and at Mi = 16 that constant is not the far end's (`docs/74`), and
+        // at 24 000 because that constant was measured on *one* line of that
+        // far end and the next call need not agree (see [`rotation_wanted`]:
+        // prime-a measures `(0, 0, 0, 0)` where prime-b measures `(3, 0, 3, 0)`).
+        // A call where the far end does agree leaves the measurement reporting
+        // the constant and nothing moves.
+        if !rotation_wanted() || self.measuring.is_some() {
             return;
         }
         self.measuring = Measuring::new(self.bits_per_frame, self.params.moduli, first);

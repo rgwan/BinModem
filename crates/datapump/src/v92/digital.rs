@@ -273,6 +273,318 @@ pub const B1D_FRAMES: usize = 48;
 /// over (see `Modem::score_b1u`).
 pub const B1U_FRAMES: usize = 48;
 
+/// Symbols in one B1u (8.7.1: forty-eight data frames of twelve symbols).
+pub const B1U_SYMBOLS: usize = B1U_FRAMES * crate::v92::UP_INTERVALS;
+
+/// How long E2u is, in symbols (8.7.2), from the flag this end puts in its own
+/// CPd -- one place, so that the sequence this end sends and the window the
+/// receiver searches for B1u's boundary cannot disagree. See
+/// [`crate::v92::upchoice::EXTEND_E2U`].
+pub const E2U_SYMBOLS: usize = crate::v92::upchoice::E2U_SYMBOLS;
+
+/// How far back from the run's end the boundary search looks, in symbols.
+///
+/// [`E2U_SYMBOLS`], which is what makes the candidate set complete (see
+/// [`Modem::begin_b1u`]), or zero for `V92_B1U_SEARCH=off` -- the runs's end
+/// taken as B1u's frame interval 0 with no search at all, which is what every
+/// B1u number published before `/dev/shm/reports/e2u-boundary.md` was taken
+/// with and is kept as the arm that measures the search.
+fn b1u_deepest() -> usize {
+    if std::env::var("V92_B1U_SEARCH").ok().as_deref() == Some("off") { 0 } else { E2U_SYMBOLS }
+}
+
+/// The level stream of a candidate's B1u, and where the zero run that opened
+/// the candidate ended.
+///
+/// 8.7.2's E2u is the thing the run is *made of*, and 8.7.1 puts B1u's frame
+/// interval 0 on the symbol after E2u's last one -- but the run is read
+/// through TRN2u's four points and its descrambler, and the first symbols of
+/// B1u do not stop reading as zeros because E2u has ended. So the run's end is
+/// where the *candidates* are counted from, not where B1u is taken to begin:
+/// see [`Modem::begin_b1u`].
+#[derive(Debug, Clone)]
+pub struct B1uSearch {
+    /// The symbol the run ended on: the first symbol carrying a non-zero bit
+    /// after E2u's frame of scrambled zeros. B1u's frame 0 is at or before it.
+    pub end: u64,
+    /// One level per symbol from `end + 1`, up to [`B1U_SYMBOLS`].
+    levels: Vec<f64>,
+}
+
+/// One candidate boundary's reading of B1u: the two decoders 8.7.1's known
+/// content is read with, and what they read.
+#[derive(Debug)]
+struct B1uReading {
+    /// Symbols back from the run's end that this candidate puts B1u's frame
+    /// interval 0 on. Zero is "the run ended on the last symbol of E2u"; what
+    /// the search measures is how far the run overran E2u into B1u.
+    back: usize,
+    /// Absolute symbol of B1u's frame interval 0, as this candidate claims.
+    origin: u64,
+    /// Ones each decoder read: `[0]` the line as it arrived, `[1]` it negated.
+    ones: [u64; 2],
+    /// Bits each of them read.
+    scored: [u64; 2],
+    /// And the bits themselves, kept for `V92_B1U_BITS` on the winner.
+    bits: [Vec<bool>; 2],
+    straight: Decoder,
+    probe: Decoder,
+}
+
+impl B1uReading {
+    /// The better of the two polarities -- 8.7.1 makes B1u all ones, so this
+    /// is what the boundary is judged on.
+    fn best(&self) -> u64 {
+        self.ones[0].max(self.ones[1])
+    }
+
+    /// The other one, which is the far end's seed read the wrong way up if the
+    /// candidate is a boundary at all.
+    fn other(&self) -> u64 {
+        self.ones[0].min(self.ones[1])
+    }
+
+    /// Bits read, whichever polarity read fewer.
+    fn scored(&self) -> u64 {
+        self.scored[0].min(self.scored[1])
+    }
+}
+
+/// Whether a candidate's reading is B1u at all: 8.7.1 makes it all ones, so
+/// three quarters of the window has to read as ones in the better of the two
+/// polarities and that polarity has to lead the other by an eighth of the
+/// window (see [`B1U_CONFIRM_EIGHTHS`] for why both).
+///
+fn reads_as_b1u(reading: &B1uReading) -> bool {
+    let scored = reading.scored();
+    scored > 0
+        && reading.best() * 8 >= scored * B1U_CONFIRM_EIGHTHS
+        && reading.best() >= reading.other() + scored / B1U_POLARITY_LEAD
+}
+
+/// Which of the candidates is believed, as an index into `readings`.
+///
+/// The **nearest the run's end** that reads as B1u, not the one that reads it
+/// best. 8.7.1 puts B1u's frame interval 0 on the symbol after E2u's last one,
+/// so the run's end is the reading that needs no explanation; a boundary
+/// further back is a claim that the run overran E2u, and 8.7.2 sanctions
+/// exactly one symbol of that (`upchoice::EXTEND_E2U`). The score's maximum on
+/// its own cannot carry that claim: twelve symbols back is the *same* frame
+/// phase -- twelve is a data frame, and four divides it -- so 8.7.1's content
+/// separates the two by only the one frame of differential reflection and the
+/// 23 bits of descrambler priming the shift costs, and on a synthesised line
+/// with no noise at all the twin reads 569 against the true boundary's 540
+/// (which of the two the chain's `d(-1) = 0` suits is not a property of the
+/// line). Believing the twin would put the whole data mode twelve symbols out,
+/// which no V.42 survives. So the gate answers *whether* a candidate is a
+/// boundary and the order answers *which* one.
+///
+/// `gate_off` has nothing to decide between candidates with, so it reports the
+/// best-reading one: that is the instrument's question ("what does the best
+/// boundary in the window read"), not the call's.
+fn choose_b1u_boundary(readings: &[B1uReading], gate_off: bool) -> Option<usize> {
+    if gate_off {
+        // Nothing to decide *between* candidates with the gate off: the
+        // question that knob leaves is "what does the best boundary in this
+        // window read", not "which boundary is it".
+        return best_b1u_reading(readings);
+    }
+    choose_b1u_boundary_by(readings, &reads_as_b1u, false)
+}
+
+/// [`choose_b1u_boundary`], with the verdict on one reading passed in.
+///
+/// The rule is separated from [`reads_as_b1u`] so that it can be tested on a
+/// line whose polarities are not the bench's -- a synthesised one has no noise,
+/// so the *negated* reading of its B1u is the far end's own pattern read
+/// backwards and comes out 476 of 576 ones, which is close enough to the true
+/// boundary's 540 that the lead the gate demands is not there. What this rule
+/// has to get right is the *order*, not the threshold.
+fn choose_b1u_boundary_by(
+    readings: &[B1uReading],
+    accept: &dyn Fn(&B1uReading) -> bool,
+    fall_back_to_best: bool,
+) -> Option<usize> {
+    if let Some(nearest) = (0..readings.len()).find(|&index| accept(&readings[index])) {
+        return Some(nearest);
+    }
+    fall_back_to_best.then(|| best_b1u_reading(readings)).flatten()
+}
+
+/// The best-reading candidate: best polarity, then the wider lead over the
+/// other one. Ties keep the nearest, because the comparison is strict.
+fn best_b1u_reading(readings: &[B1uReading]) -> Option<usize> {
+    let lead = |reading: &B1uReading| reading.best().saturating_sub(reading.other());
+    let mut best: Option<usize> = None;
+    for index in 0..readings.len() {
+        let Some(champion) = best else {
+            best = Some(index);
+            continue;
+        };
+        if (readings[index].best(), lead(&readings[index])) > (readings[champion].best(), lead(&readings[champion])) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+/// The two decoders one candidate boundary is read with: B1u as it arrived and
+/// B1u negated, built at the candidate's frame 0 and fed from `skip + 1`
+/// symbols after it.
+///
+/// Everything here is a function of the *candidate's* own origin, which is
+/// what lets thirteen of them be read at once: the memories 8.7.1 zeroes are
+/// zeroed at the candidate's first symbol, the descrambler is primed with the
+/// twenty-three bits of 8.7.1's known content that precede the symbol it is
+/// fed from, and the class rotation is measured from that symbol.
+fn b1u_decoders(parameters: &Parameters, skip: usize) -> (Decoder, Decoder) {
+    let mut straight = Decoder::new(parameters);
+    let mut probe = Decoder::new(parameters);
+    // 8.7.1 makes B1u's payload known, so the far end's differential chain at
+    // any of its frame boundaries is computable (`modulus::b1u_differential_at`
+    // -- the scrambled ones through 6.4.1's steps 1 to 3, with the moduli they
+    // are decoded with). This decoder does not start at B1u's frame 0: it is
+    // fed `skip + 1` symbols after the boundary, a whole number of data
+    // frames, so the first frame it decodes is B1u's frame
+    // `(skip + 1) / 12` and the chain's value there is not the `d(-1)` 8.7.1
+    // zeroes.
+    //
+    // **It is still not seeded by default, and that is a measurement.**
+    // Seeding it with the computed value takes B1u from 537 ones of 576 to
+    // 503, and every seed from 0 to 47 frames leaves exactly those two
+    // outcomes, one per value of d (24 000, `~/v92up-runs/c24-4.agr-tx.raw`,
+    // `/tmp/fe/ber` tags `seed-fix`, `seed18`): the two decodes differ in 36
+    // bits of 576, all of them in the two frames the seed's own reflection
+    // touches, and the better one is the value the untold decoder already
+    // holds. So the chain this receiver starts on carries 8.7.1's zero, the
+    // far end's d at frame 18 is the *complement* of the clause's chain if the
+    // frame is 18 at all, and the bits B1u is short by are not a reflection
+    // -- which is what the zero pattern shows: the first frame decoded reads
+    // 16 ones of 36 and the other fifteen carry nineteen zeros between them.
+    //
+    // A second premise was falsified the same way and is recorded here so that
+    // nobody re-derives it: sweeping the Viterbi's start state over all 0..63
+    // leaves the same 537 at states 0/1/16 and worse elsewhere, so the deficit
+    // is not the start state either. **The ceiling of any known-content
+    // seeding is 550**; the rest needs the slicing better, not the state.
+    //
+    // `V92_B1U_SEED_FRAMES=<n>` is that experiment: seed 6.4.1's chain `n`
+    // data frames into B1u. It is off unless asked for, and it is worth
+    // nothing -- seeding with the computed value takes 537 to 503.
+    let seed = std::env::var("V92_B1U_SEED_FRAMES").ok().and_then(|text| text.parse::<usize>().ok());
+    if let Some(frames) = seed {
+        let moduli = crate::v92::modulus::Moduli12::from(parameters);
+        let chain = crate::v92::modulus::b1u_differential_at(frames, &moduli, parameters.bits());
+        // The negated probe gets the other value: it reads the same symbols
+        // through an inverted line, which inverts 6.4.1's reflection step with
+        // it (`modulus`'s module comment), so its chain starts complemented.
+        straight.seed_differential(chain);
+        probe.seed_differential(!chain);
+        if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
+            eprintln!(
+                "V92B1U seed: frames_skipped={frames} moduli={:?} bits={} d={chain}",
+                moduli.values(),
+                parameters.bits()
+            );
+        }
+    }
+    // The same clause, applied to 6.3's descrambler, and unlike the
+    // differential chain above this one is **on by default** because it is
+    // worth bits: B1u frame 18 is not B1u frame 0 for the descrambler either,
+    // its twenty-three-bit memory is fed entirely by bits 8.7.1 makes known,
+    // and scoring the window against a register the far end never had costs
+    // the first twenty-three bits of it. Measured on `c24-4` at 24 000:
+    // **537 ones without, 550 with, exactly +13** (`/tmp/reports/b1u-seed.md`).
+    //
+    // This is a defect of the *instrument*, not of the receiver: the data mode
+    // path starts at B1u's own first symbol with a zeroed descrambler (8.7.1)
+    // and is not primed here. `V92_B1U_PRIME=0` restores the old reading,
+    // which is what every published "B1u N/576" before today was taken with.
+    if std::env::var("V92_B1U_PRIME").ok().as_deref() != Some("0") {
+        let bits = parameters.bits();
+        let first = (skip + 1) / crate::v92::UP_INTERVALS;
+        let stream = crate::v92::modulus::b1u_scrambled_bits(first, bits);
+        let keep = stream.len().min(23);
+        let preceding: Vec<bool> = stream[stream.len() - keep..].to_vec();
+        straight.seed_descrambler(&preceding);
+        // The negated probe reads the same symbols through an inverted line,
+        // which complements every bit it hands 6.3's descrambler (`modulus`'s
+        // module comment), so its memory is the complement of the same window
+        // -- the same treatment `V92_B1U_SEED_FRAMES` gives the differential
+        // chain.
+        let flipped: Vec<bool> = preceding.iter().map(|bit| !bit).collect();
+        probe.seed_descrambler(&flipped);
+    }
+    // `V92_ROT`: the class rotation is read off B1u rather than taken from
+    // `PAIR_FIRST_INDEX_OFFSET`, and it is read off the part of B1u this
+    // decoder is actually fed -- the symbol after the acquisition skip,
+    // counted from B1u's own first symbol. Off by default.
+    //
+    // Only the decoder reading the line as received is given it. The polarity
+    // measurement compares the two decoders' ones counts, and it can only do
+    // that if they differ by polarity and nothing else: given a measured
+    // rotation, the negated copy of an Agere reads 529 ones of 576 instead of
+    // 450, and the lead the verdict needs is gone (`docs/48 §5`). A call whose
+    // polarity turns out inverted therefore keeps the constant -- which is the
+    // behaviour it had.
+    straight.measure_rotation_from(skip + 1);
+    // Above 24 000 B1u's frames *can* be read against 8.7.1's known content
+    // instead of against 6.4.1's chain (`docs/74`), and it stops with B1u
+    // because nothing after it is known. It is off unless `V92_BY_CONTENT=1`
+    // asks for it: it is a workaround for a far end whose chain a payload
+    // cannot follow, and the chain is the default.
+    straight.read_by_content(true);
+    (straight, probe)
+}
+
+/// Score 8.7.1's known content at every candidate boundary the run's end
+/// allows, and hand them back for the choice.
+///
+/// `levels[0]` is the level of the symbol *after* the run's end, so candidate
+/// `back` claims B1u's frame interval 0 on symbol `end - back` and its
+/// decoders read `levels[skip - back]` through `levels[B1U_SYMBOLS - 1 -
+/// back]`. The candidate set is `back` in `0..=deepest`, and `deepest` is
+/// [`E2U_SYMBOLS`], which is what makes it complete: the run contains all
+/// twelve symbols of 8.7.2's E2u, so B1u's frame 0 is at most twelve symbols
+/// before the run's end, and every frame phase between there and the run's end
+/// is one of the thirteen.
+fn b1u_readings(
+    parameters: &Parameters,
+    end: u64,
+    levels: &[f64],
+    skip: usize,
+    deepest: usize,
+) -> Vec<B1uReading> {
+    let mut out = Vec::with_capacity(deepest + 1);
+    for back in 0..=deepest {
+        let origin = end.saturating_sub(back as u64);
+        // `skip` is the acquisition window, and it is measured from the
+        // candidate's own origin: the candidate that starts `back` symbols
+        // earlier has already had `back` of its window read.
+        let first = skip.saturating_sub(back);
+        let Some(last) = B1U_SYMBOLS.checked_sub(1 + back) else { continue };
+        if first > last || last >= levels.len() {
+            continue;
+        }
+        let (mut straight, mut probe) = b1u_decoders(parameters, skip);
+        let mut ones = [0u64; 2];
+        let mut scored = [0u64; 2];
+        let mut bits: [Vec<bool>; 2] = [Vec::new(), Vec::new()];
+        for &level in &levels[first..=last] {
+            for (which, sign) in [1.0, -1.0].into_iter().enumerate() {
+                let decoder = if which == 0 { &mut straight } else { &mut probe };
+                decoder.feed(sign * level);
+                let read = decoder.take_bits();
+                ones[which] += read.iter().filter(|bit| **bit).count() as u64;
+                scored[which] += read.len() as u64;
+                bits[which].extend_from_slice(&read);
+            }
+        }
+        out.push(B1uReading { back, origin, ones, scored, bits, straight, probe });
+    }
+    out
+}
+
 /// Data frames one downstream fill encodes at a time.
 ///
 /// It is the unit the codeword queue is topped up in, and so the unit in which
@@ -1850,8 +2162,10 @@ pub struct Modem {
     b1u_ones: [u64; 2],
     /// Bits each of them has read, for the margin the choice is made on.
     b1u_scored: [u64; 2],
-    /// Symbols of B1u still to be read both ways up before the choice is made.
-    b1u_scoring: usize,
+    /// The level stream of a candidate boundary's B1u, being collected so that
+    /// every candidate in [`E2U_SYMBOLS`] can be scored against 8.7.1's known
+    /// content before one of them is believed. See [`Self::begin_b1u`].
+    b1u_search: Option<B1uSearch>,
     /// Which way up the data mode is, +1 or -1, applied to the equaliser's
     /// output before the decoder sees it. See [`Self::b1u_scoring`].
     b1u_polarity: f64,
@@ -1999,7 +2313,7 @@ impl Modem {
             b1u_probe: None,
             b1u_ones: [0; 2],
             b1u_scored: [0; 2],
-            b1u_scoring: 0,
+            b1u_search: None,
             b1u_polarity: 1.0,
             peak: 0.0,
             notes: Vec::new(),
@@ -3318,23 +3632,58 @@ impl Modem {
         // prefilter the far end runs is this end's design of it, and on a line
         // with insertion loss it is never exact.
         self.rx.set_data_mode(levels);
-        self.upstream_data = Some(Decoder::new(&parameters));
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
         // run was found to have ended on.
         //
-        // Zero, and the zero is a measurement rather than a derivation: the
-        // detector fires on the symbol carrying the first non-zero bit after
-        // the run (see `symbol_upstream`), and 8.7.1 puts B1u's frame interval
-        // 0 on the symbol after E2u's last zero -- the same symbol. Measured
-        // both ways up on the two captures that matter here: on HSF
-        // `20261024-063632-a41c-off-d1` the run ends on symbol 108 733, symbol
-        // 108 734 carries the first non-zero bit *and* is the first symbol of
-        // the data mode's constellation (its level is 0.33 from the nearest of
-        // TRN2u's four points, where the run's symbols are 0.01 from them); on
-        // `/tmp/p0corr/ident.raw` the same two numbers are 111 431 and 111 432.
-        // It was 1 while the detector fired six symbols inside the run, which
-        // is where the "one symbol after the completion" reading came from.
-        const B1U_ORIGIN_AFTER_E2U: usize = 0;
+        // **Not on the run's end, and this is the measurement that says so.**
+        // The detector fires on the symbol carrying the first non-zero bit
+        // after the run (see `symbol_upstream`), and 8.7.1 does put B1u's
+        // frame interval 0 on the symbol after E2u's last *symbol* -- but the
+        // run is not E2u. It is read through TRN2u's four points and its
+        // descrambler, and it ends where the far end's data-mode symbols stop
+        // reading as zeros through them, which is not the same symbol:
+        //
+        // * `/tmp/agr-v90-interop/152741-prime-b/agr-tx.raw` (the call that
+        //   connects): the run's last zero is symbol 111 431 and B1u begins on
+        //   111 432 -- the run's end, and 550 of 576 ones when read from
+        //   there.
+        // * `/tmp/agr-v90-interop/152653-prime-a/agr-tx.raw` (the calls that
+        //   do not): the run's last zero is 111 577 and the detector fires on
+        //   111 578, but the data mode's constellation starts on **111 576**
+        //   -- the level alphabet changes there, from TRN2u's two magnitudes
+        //   (0.44, 1.34) to CPd's odd lattice (0.10, 0.30, 0.51, 0.71) -- so
+        //   the run overran E2u by two symbols, B1u was read two symbols into
+        //   its own frame 0, and the whole call read 311 of 576 ones, which is
+        //   chance. Every same-shaped candidate in that call then failed the
+        //   same way and it dropped with "no E2u that reads as B1u".
+        //
+        // Two symbols is not a tolerance to be tuned: it is how many of B1u's
+        // first symbols happen to descramble to zero through TRN2u's slicer,
+        // and it is a different number on every far end and every call (zero
+        // on prime-b, two on prime-a, and the old `V92_E2U_FROM` measurements
+        // moved the fire 720 symbols the *other* way when the arming was
+        // wrong). So it is measured per candidate rather than assumed: the run
+        // end gives the *set*, 8.7.1's known content gives the *answer*.
+        //
+        // The set is complete because 8.7.2 makes E2u exactly one data frame:
+        // the run contains all of it, so B1u's frame 0 is at most
+        // `E2U_SYMBOLS` symbols before the run's end, and the thirteen
+        // candidates `end - 0 ..= end - E2U_SYMBOLS` are every symbol that
+        // claim can put it on. They are also every *phase*: twelve symbols is
+        // the twelve-symbol data frame and, through 12 and 4, the four-symbol
+        // trellis frame as well, so exactly one candidate can be the far end's
+        // frame interval 0 and the others read a wrong frame phase, which is
+        // what makes the score separate them by 550 against 300.
+        //
+        // The cost is one bounded search at the boundary and nothing on the
+        // per-symbol path: thirteen candidates x the 361-symbol scoring
+        // window, once, on a level stream this end has to collect anyway. A
+        // candidate that reads as ones commits; if none does, the hunt goes on
+        // exactly as it did.
+        //
+        // `V92_B1U_SEARCH=off` takes the candidate set back to `back = 0`
+        // alone, which is the behaviour every B1u number published before
+        // `/dev/shm/reports/e2u-boundary.md` was taken with.
         // Data frames of B1u the decoder is not given, while the equaliser
         // settles onto the data-mode constellation.
         //
@@ -3401,160 +3750,33 @@ impl Modem {
         self.b1u_skip = std::env::var("V92_B1U_SKIP")
             .ok()
             .and_then(|text| text.parse().ok())
-            .unwrap_or(
-                B1U_ORIGIN_AFTER_E2U + B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1,
-            );
+            .unwrap_or(B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1);
         if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
             // Printed after the assignment, not before: this line said
             // `b1u_skip 0` on every call for as long as it existed, because it
             // was written above the line that sets the field.
             eprintln!(
-                "V92B1U begin at now={} gain={} sets={} upstream_delay={} origin={} acquire={} b1u_skip={}",
+                "V92B1U begin at now={} gain={} sets={} upstream_delay={} candidates={} b1u_skip={}",
                 self.now,
                 parameters.gain,
                 parameters.sets.len(),
                 self.upstream_delay,
-                B1U_ORIGIN_AFTER_E2U,
-                B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS,
+                b1u_deepest(),
                 self.b1u_skip
             );
         }
         // `b1u_pending` and the deadline stay armed: a candidate that does not
-        // read as B1u (see `decide_b1u_polarity`) hands the hunt back, and the
+        // read as B1u (see `decide_b1u_boundary`) hands the hunt back, and the
         // deadline is what ends the exchange if none of them does.
-        // Both ways up, until B1u says which one it is: 8.7.1 makes those 48
-        // data frames known, so the polarity that reads them as ones is the
-        // line's and the other is an equaliser that TRN2u's own seed left
-        // inverted. The window is the rest of B1u, and its bits are B1u's --
-        // which carry nothing -- so both decoders' output is dropped while it
-        // runs.
-        self.b1u_probe = Some(Decoder::new(&parameters));
-        // 8.7.1 makes B1u's payload known, so the far end's differential chain
-        // at any of its frame boundaries is computable (`modulus::b1u_differential_at`
-        // -- the scrambled ones through 6.4.1's steps 1 to 3, with the moduli
-        // they are decoded with). This decoder does not start at B1u's frame 0:
-        // it is fed from `b1u_skip + 1` symbols after the boundary, a whole
-        // number of data frames, so the first frame it decodes is B1u's frame
-        // `(b1u_skip + 1) / 12` and the chain's value there is not the `d(-1)`
-        // 8.7.1 zeroes.
         //
-        // **It is still not seeded by default, and that is a measurement.**
-        // Seeding it with the computed value takes B1u from 537 ones of 576 to
-        // 503, and every seed from 0 to 47 frames leaves exactly those two
-        // outcomes, one per value of d (24 000, `~/v92up-runs/c24-4.agr-tx.raw`,
-        // `/tmp/fe/ber` tags `seed-fix`, `seed18`): the two decodes differ in 36
-        // bits of 576, all of them in the two frames the seed's own reflection
-        // touches, and the better one is the value the untold decoder already
-        // holds. So the chain this receiver starts on carries 8.7.1's zero, the
-        // far end's d at frame 18 is the *complement* of the clause's chain if
-        // the frame is 18 at all, and the bits B1u is short by are not a
-        // reflection -- which is what [`Self::score_b1u`]'s zero pattern shows:
-        // the first frame decoded reads 16 ones of 36 and the other fifteen
-        // carry nineteen zeros between them.
-        //
-        // A second premise was falsified the same way and is recorded here so
-        // that nobody re-derives it: sweeping the Viterbi's start state over all
-        // 0..63 leaves the same 537 at states 0/1/16 and worse elsewhere, so the
-        // deficit is not the start state either. What is left of it is 13 bits
-        // of descrambler history (recovered by the priming below) plus 26 slicer
-        // and Viterbi decisions spread over eight of the fifteen later frames at
-        // the 0.1011 half-cell residual this equaliser leaves. **The ceiling of
-        // any known-content seeding is 550**; the rest needs the slicing better,
-        // not the state.
-        //
-        // `V92_B1U_SEED_FRAMES=<n>` is that experiment: seed 6.4.1's chain `n`
-        // data frames into B1u. It is off unless asked for, and it is worth
-        // nothing -- seeding with the computed value takes 537 to 503.
-        let seed = std::env::var("V92_B1U_SEED_FRAMES").ok().and_then(|text| text.parse::<usize>().ok());
-        if let Some(frames) = seed {
-            let moduli = crate::v92::modulus::Moduli12::from(&parameters);
-            let chain = crate::v92::modulus::b1u_differential_at(frames, &moduli, parameters.bits());
-            // The negated probe gets the other value: it reads the same symbols
-            // through an inverted line, which inverts 6.4.1's reflection step
-            // with it (`modulus`'s module comment), so its chain starts
-            // complemented. Seeded here and not at allocation because
-            // [`Self::decide_b1u_polarity`] may swap the two decoders, and then
-            // the probe is the one carrying the call.
-            if let Some(decoder) = self.upstream_data.as_mut() {
-                decoder.seed_differential(chain);
-            }
-            if let Some(decoder) = self.b1u_probe.as_mut() {
-                decoder.seed_differential(!chain);
-            }
-            if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
-                eprintln!(
-                    "V92B1U seed: frames_skipped={frames} moduli={:?} bits={} d={chain}",
-                    moduli.values(),
-                    parameters.bits()
-                );
-            }
-        }
-        // The same clause, applied to 6.3's descrambler, and unlike the
-        // differential chain above this one is **on by default** because it is
-        // worth bits: B1u frame 18 is not B1u frame 0 for the descrambler
-        // either, its twenty-three-bit memory is fed entirely by bits 8.7.1
-        // makes known, and scoring the window against a register the far end
-        // never had costs the first twenty-three bits of it. Measured on
-        // `c24-4` at 24 000: **537 ones without, 550 with, exactly +13**
-        // (`/tmp/reports/b1u-seed.md`).
-        //
-        // This is a defect of the *instrument*, not of the receiver: the data
-        // mode path starts at B1u's own first symbol with a zeroed descrambler
-        // (8.7.1) and is not primed here. `V92_B1U_PRIME=0` restores the old
-        // reading, which is what every published "B1u N/576" before today was
-        // taken with.
-        if std::env::var("V92_B1U_PRIME").ok().as_deref() != Some("0") {
-            let bits = parameters.bits();
-            let first = (self.b1u_skip + 1) / crate::v92::UP_INTERVALS;
-            let stream = crate::v92::modulus::b1u_scrambled_bits(first, bits);
-            let keep = stream.len().min(23);
-            let preceding: Vec<bool> = stream[stream.len() - keep..].to_vec();
-            if let Some(decoder) = self.upstream_data.as_mut() {
-                decoder.seed_descrambler(&preceding);
-            }
-            // The negated probe reads the same symbols through an inverted
-            // line, which complements every bit it hands 6.3's descrambler
-            // (`modulus`'s module comment), so its memory is the complement of
-            // the same window -- the same treatment `V92_B1U_SEED_FRAMES` gives
-            // the differential chain.
-            if let Some(decoder) = self.b1u_probe.as_mut() {
-                let flipped: Vec<bool> = preceding.iter().map(|b| !b).collect();
-                decoder.seed_descrambler(&flipped);
-            }
-        }
-        // `V92_ROT`: the class rotation is read off B1u rather than taken from
-        // `PAIR_FIRST_INDEX_OFFSET`, and it is read off the part of B1u this
-        // decoder is actually fed -- the symbol after the acquisition skip,
-        // counted from B1u's own first symbol. Off by default.
-        //
-        // Only the decoder reading the line as received is given it. The
-        // polarity measurement above compares the two decoders' ones counts,
-        // and it can only do that if they differ by polarity and nothing else:
-        // given a measured rotation, the negated copy of an Agere reads 529
-        // ones of 576 instead of 450, and the lead the verdict needs is gone
-        // (`docs/48 §5`). A call whose polarity turns out inverted therefore
-        // keeps the constant -- which is the behaviour it had.
-        if let Some(decoder) = self.upstream_data.as_mut() {
-            decoder.measure_rotation_from(self.b1u_skip + 1);
-            // Above 24 000 B1u's frames *can* be read against 8.7.1's known
-            // content instead of against 6.4.1's chain (`docs/74`), and it
-            // stops with B1u because nothing after it is known. It is off
-            // unless `V92_BY_CONTENT=1` asks for it: it is a workaround for a
-            // far end whose chain a payload cannot follow, and the chain is
-            // the default.
-            decoder.read_by_content(true);
-        }
+        // The window is B1u's forty-eight data frames, collected whole and
+        // then read at every candidate boundary in it (`b1u_readings`). The
+        // bits are B1u's, so they carry nothing: both decoders' output is
+        // dropped once the reading is taken, whichever boundary wins.
+        self.b1u_search = Some(B1uSearch { end: self.now, levels: Vec::with_capacity(B1U_SYMBOLS) });
         self.b1u_ones = [0; 2];
         self.b1u_scored = [0; 2];
-        self.b1u_scoring = (B1U_FRAMES * crate::v92::UP_INTERVALS).saturating_sub(self.b1u_skip);
         self.b1u_polarity = 1.0;
-        self.note(format!(
-            "V.92: B1u from symbol {}, {} bit/s, scale {:.3}, taps {:?}",
-            self.now,
-            parameters.rate(),
-            self.upstream_scale,
-            self.rx.taps()
-        ));
     }
 
     /// Keep B1d's codeword queue fed from the downstream encoder (V.90 8.6.1).
@@ -3615,31 +3837,26 @@ impl Modem {
         // 9.6.1.1.6: once E2u has ended, the receiver is B1u's -- the data mode
         // modulation rather than four points -- and every symbol from there is
         // a data frame's worth of the decoder's.
-        if self.upstream_data.is_some() {
-            // The acquisition window first, then the polarity measurement, and
-            // only then the decoder that will carry the call: both windows are
-            // B1u's, and both are dropped.
-            //
-            // A candidate costs 576 symbols to confirm, so the symbol B1u
-            // really begins on can fall inside a candidate's window: measured
-            // on `/tmp/p0corr/g712.raw`, the detector fires at 115366 and B1u
-            // begins at 115510, a hundred and forty-four symbols later. Keeping
-            // the hunt alive through the window to catch it was tried and is
-            // *not* the answer: on both proven-V.92 Agere captures
-            // (`012503-mask3`, `012713-mask3c`) the data-mode bit stream throws
-            // spurious zero runs at 116102 and 120594, each of which restarted
-            // the probe and cost the call its connection -- 7128 and 2063 bytes
-            // became nothing. A candidate therefore owns the window it opened,
-            // and a boundary it swallowed is one this end fails on rather than
-            // guesses at.
-            if self.b1u_skip > 0 {
-                self.b1u_skip -= 1;
-                return;
-            }
-            if self.b1u_scoring > 0 {
-                self.score_b1u(symbol);
-                return;
-            }
+        //
+        // A candidate costs B1u's 576 symbols to confirm, so the symbol B1u
+        // really begins on can fall inside another candidate's window: measured
+        // on `/tmp/p0corr/g712.raw`, the detector fires at 115366 and B1u
+        // begins at 115510, a hundred and forty-four symbols later. Keeping the
+        // hunt alive through the window to catch it was tried and is *not* the
+        // answer: on both proven-V.92 Agere captures (`012503-mask3`,
+        // `012713-mask3c`) the data-mode bit stream throws spurious zero runs
+        // at 116102 and 120594, each of which restarted the probe and cost the
+        // call its connection -- 7128 and 2063 bytes became nothing. A
+        // candidate therefore owns the window it opened, and a boundary it
+        // swallowed is one this end fails on rather than guesses at.
+        //
+        // What the window is *for* has changed: it is the stretch every
+        // candidate boundary is read over (`collect_b1u`), and the choice
+        // between them is 8.7.1's known content rather than the run counter
+        // that opened them. See [`Self::begin_b1u`].
+        if self.b1u_search.is_some() {
+            self.collect_b1u(symbol);
+            return;
         }
         // The polarity the measurement above found, then whatever diagnostic
         // transform `V92_B1U_ADJ` asks for (see `adjust_b1u_level`). Done
@@ -3835,7 +4052,7 @@ impl Modem {
     /// So the polarity that reads those frames as ones is the line's, and it is
     /// measurable by decoding them both ways up -- which is what this does. The
     /// bits are B1u's, which carry no information, so both are dropped.
-    fn score_b1u(&mut self, symbol: Symbol) {
+    fn collect_b1u(&mut self, symbol: Symbol) {
         let level = symbol.value;
         if let Some(file) = b1u_levels_file()
             && let Ok(mut file) = file.lock()
@@ -3847,34 +4064,101 @@ impl Modem {
         // The same transform the data path takes (`V92_B1U_ADJ`), so that a
         // diagnostic asked for here is measured on the reading the criterion
         // uses and not on a reading nothing else sees. Empty is the default and
-        // does nothing.
+        // does nothing. Applied once per symbol and not once per candidate,
+        // because it keeps state: `dc` subtracts a running mean.
         let level = self.adjust_b1u_level(level);
-        for (which, sign) in [1.0, -1.0].into_iter().enumerate() {
-            let decoder = if which == 0 {
-                self.upstream_data.as_mut()
-            } else {
-                self.b1u_probe.as_mut()
-            };
-            let Some(decoder) = decoder else { continue };
-            decoder.feed(sign * level);
-            let bits = decoder.take_bits();
-            self.b1u_ones[which] += bits.iter().filter(|bit| **bit).count() as u64;
-            self.b1u_scored[which] += bits.len() as u64;
-            if let Some(file) = b1u_bits_file()
-                && let Ok(mut file) = file.lock()
-            {
-                use std::io::Write;
-                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
-                let _ = writeln!(file, "{} {} {text}", self.now, if which == 0 { 1 } else { -1 });
-            }
-        }
-        self.b1u_scoring -= 1;
-        if self.b1u_scoring == 0 {
-            self.decide_b1u_polarity();
+        let Some(search) = self.b1u_search.as_mut() else { return };
+        search.levels.push(level);
+        if search.levels.len() >= B1U_SYMBOLS {
+            self.decide_b1u_boundary();
         }
     }
 
-    /// Which way up B1u came, from the two readings [`Self::score_b1u`] took.
+    /// Which candidate boundary 8.7.1's known content reads as ones from, and
+    /// the commit of that one.
+    ///
+    /// 8.7.1 makes B1u forty-eight data frames of scrambled *ones*, so the far
+    /// end's payload over the whole of it is known, and the two readings of it
+    /// at one candidate are enough to say whether that candidate is B1u's frame
+    /// interval 0 at all: the right polarity reads ones, and a boundary that is
+    /// a symbol or two out reads a wrong data-frame phase, which the
+    /// differential chain, the descrambler and the Viterbi turn into about half
+    /// ones -- the same distinction the polarity measurement already stands on.
+    ///
+    /// So the run's end does not decide anything by itself; it says where to
+    /// look (see [`Self::begin_b1u`] for the measurement and for why the set is
+    /// complete), and this picks the one candidate that reads B1u. The gate is
+    /// the same one a single candidate had to pass: a search is not a licence
+    /// to believe its best answer, so a best candidate that still does not read
+    /// as ones hands the hunt back through [`Self::abandon_b1u`].
+    fn decide_b1u_boundary(&mut self) {
+        let Some(search) = self.b1u_search.take() else { return };
+        let Some(parameters) = self.parameters.clone() else { return };
+        let mut readings = b1u_readings(&parameters, search.end, &search.levels, self.b1u_skip, b1u_deepest());
+        if readings.is_empty() {
+            // A `V92_B1U_SKIP` that leaves no symbol of the window to read is
+            // not a boundary either; hand the hunt back rather than leave it
+            // waiting for a window that has already gone.
+            self.abandon_b1u(search.end, search.end, 0, 0, 0, 0);
+            return;
+        }
+        // `V92_B1U_GATE=off` accepts every candidate, which is what measuring
+        // the data mode below a boundary takes: the criterion lives above the
+        // thing being measured, so a run that cannot pass it still has to be
+        // able to say what it reads. See [`choose_b1u_boundary`] for which of
+        // the candidates is believed and why it is not the best-reading one.
+        let gate_off = std::env::var("V92_B1U_GATE").ok().as_deref() == Some("off");
+        if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
+            let scores: Vec<String> = readings
+                .iter()
+                .map(|reading| format!("back={} {}/{}", reading.back, reading.best(), reading.scored()))
+                .collect();
+            eprintln!("V92B1U candidates from end={} skip={}: {}", search.end, self.b1u_skip, scores.join(" "));
+        }
+        let Some(winner) = choose_b1u_boundary(&readings, gate_off) else {
+            // Not a boundary, not even the best of them. This is the whole
+            // point of the criterion: a receiver that goes on to read data from
+            // a place it has just failed to read B1u from does not need the far
+            // end's agreement, it needs a boundary it actually has.
+            let Some(closest) = best_b1u_reading(&readings) else {
+                self.abandon_b1u(search.end, search.end, 0, 0, 0, 0);
+                return;
+            };
+            let failed = &readings[closest];
+            self.abandon_b1u(search.end, failed.origin, failed.back, failed.best(), failed.other(), failed.scored());
+            return;
+        };
+        let (back, origin) = (readings[winner].back, readings[winner].origin);
+        let chosen = readings.swap_remove(winner);
+        if let Some(file) = b1u_bits_file()
+            && let Ok(mut file) = file.lock()
+        {
+            use std::io::Write;
+            for (which, bits) in chosen.bits.iter().enumerate() {
+                let text: String = bits.iter().map(|bit| if *bit { '1' } else { '0' }).collect();
+                let sign = if which == 0 { 1 } else { -1 };
+                let _ = writeln!(file, "{} {sign} {text}", chosen.origin);
+            }
+        }
+        self.upstream_data = Some(chosen.straight);
+        self.b1u_probe = Some(chosen.probe);
+        self.b1u_ones = chosen.ones;
+        self.b1u_scored = chosen.scored;
+        self.b1u_skip = 0;
+        self.note(format!(
+            "V.92: B1u from symbol {origin}, {} bit/s, run end {} back {back}, scale {:.3}, taps {:?}",
+            parameters.rate(),
+            search.end,
+            self.upstream_scale,
+            self.rx.taps()
+        ));
+        // The polarity verdict is unchanged, and it is the boundary's verdict:
+        // it now runs on the chosen candidate's window instead of on the
+        // window the run's end happened to open.
+        self.decide_b1u_polarity();
+    }
+
+    /// Which way up B1u came, from the two readings [`Self::decide_b1u_boundary`] took.
     ///
     /// The margin is not a taste: B1u's data is *all* ones, so the right
     /// polarity reads every bit as one and the wrong one reads a fixed wrong
@@ -3893,23 +4177,10 @@ impl Modem {
         let inverted = std::env::var("V92_B1U_POLARITY").ok().as_deref() != Some("off")
             && scored > 0
             && flipped > straight + scored / B1U_POLARITY_LEAD;
-        let (best, other) = (straight.max(flipped), straight.min(flipped));
-        // `V92_B1U_GATE=off` accepts every candidate, which is what measuring
-        // the data mode below a boundary takes: the criterion lives above the
-        // thing being measured, so a run that cannot pass it still has to be
-        // able to say what it reads.
-        let reads_as_b1u = std::env::var("V92_B1U_GATE").ok().as_deref() == Some("off")
-            || (scored > 0
-                && best * 8 >= scored * B1U_CONFIRM_EIGHTHS
-                && best >= other + scored / B1U_POLARITY_LEAD);
-        if !reads_as_b1u {
-            // Not a boundary. This is the whole point of the criterion: a
-            // receiver that goes on to read data from a place it has just
-            // failed to read B1u from does not need the far end's agreement, it
-            // needs a boundary it actually has.
-            self.abandon_b1u(best, other, scored);
-            return;
-        }
+        // The gate itself now lives in [`Self::decide_b1u_boundary`], which is
+        // the only caller: a candidate that does not read as B1u is abandoned
+        // there, with the boundary it claimed in hand, before this runs. What
+        // is left here is the verdict on a window that has already passed it.
         if inverted {
             // The equaliser that was reading *this* polarity all along, not the
             // one that read the other and would have a window of the wrong sign
@@ -3926,6 +4197,7 @@ impl Modem {
         self.b1u_deadline = None;
         self.awaiting_e2u = false;
         let verdict = if inverted { "inverted, negating" } else { "as received" };
+        let best = straight.max(flipped);
         self.note(format!(
             "V.92: B1u confirmed at {scored} bits: polarity {verdict} ({straight} ones straight, \
              {flipped} negated), {:.1} % ones",
@@ -3946,11 +4218,17 @@ impl Modem {
     /// went out -- which the wider arming in [`Self::arm_e2u_search`] makes
     /// possible: without it, a first candidate that fails while Ed is still
     /// unsent would leave a hunt with nothing to end it.
-    fn abandon_b1u(&mut self, best: u64, other: u64, scored: u64) {
-        let now = self.now;
+    ///
+    /// The symbol in the note is the candidate *boundary* that lost, not the
+    /// symbol the verdict was reached on. It used to be `self.now`, which is
+    /// the end of the 576-symbol window and so a number that looks like a
+    /// boundary and is not one: `/dev/shm/reports/e2u-boundary.md` reads 722
+    /// symbols of distance between one call's failing candidate and another's
+    /// good one, and 576 of those 722 are this stamp.
+    fn abandon_b1u(&mut self, end: u64, origin: u64, back: usize, best: u64, other: u64, scored: u64) {
         self.note(format!(
-            "V.92: candidate B1u at {now} does not read as B1u ({best}/{scored} ones one way up, \
-             {other} the other), still hunting E2u"
+            "V.92: candidate B1u at {origin} (run end {end}, back {back}) does not read as B1u \
+             ({best}/{scored} ones one way up, {other} the other), still hunting E2u"
         ));
         // A candidate that does not read as ones can be the wrong *boundary* or
         // the wrong pair-first offset. It is the boundary: the offset no longer
@@ -3961,9 +4239,9 @@ impl Modem {
         // ones is blamed on the boundary again, as it was before the rotation.
         self.upstream_data = None;
         self.b1u_probe = None;
+        self.b1u_search = None;
         self.b1u_ones = [0; 2];
         self.b1u_scored = [0; 2];
-        self.b1u_scoring = 0;
         self.b1u_polarity = 1.0;
         self.rx.set_slicer(Slicer::FourPoint);
         self.awaiting_e2u = true;
@@ -4425,6 +4703,9 @@ mod tests {
     use crate::v90::sign::Redundancy;
     use crate::v92::sequences::{DownFamily, DownFinder};
     use crate::v92::up_signals::{ru, su, Trn1u, TwoPointSender};
+    use crate::v92::upstream::UpEncoder;
+    use crate::v92::modulus::B1U_ACQUIRE_FRAMES;
+    use crate::v92::Filters;
 
     /// A CPt of the shape the analogue modem sends in Phase 3: one constellation
     /// used in all six intervals, at the rate `drn` names.
@@ -5068,5 +5349,144 @@ mod tests {
         }
         assert_eq!(sent, next_end, "the DIL stopped mid-segment");
         assert_eq!(source.out(), Out::Ri, "the DIL was not followed by Ri");
+    }
+    // ---------------------------------------------------------------------
+    // E2u's end and B1u's boundary
+    // ---------------------------------------------------------------------
+
+    /// A CPd-shaped parameter set at 24 000: drn 1, twelve moduli of eight
+    /// (K = 36 bits a frame), one eight-point set and the gain 8.8.3 gives it.
+    fn b1u_parameters() -> Parameters {
+        Parameters {
+            drn: 1,
+            trellis: Trellis::Sixteen,
+            extend_e2u: crate::v92::upchoice::EXTEND_E2U,
+            gain: crate::v92::upchoice::gain_for(8),
+            moduli: [8; crate::v92::UP_INTERVALS],
+            // 8.8.3's own reference prefilter: one tap, so v(n) is u(n) and the
+            // synthesised line is the constellation itself.
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            // Eight positive points, which is what 6.4.2's k = 3 rule needs at
+            // Mi = 8 (N = 16 >= 2 Mi) and what `gain_for(8)` is the gain of.
+            sets: vec![vec![1, 3, 5, 7, 9, 11, 13, 15]],
+            indices: [0; crate::v92::CONSTELLATION_FRAME],
+        }
+    }
+
+    /// B1u as the far end transmits it (8.7.1: forty-eight data frames of
+    /// scrambled ones through 6.4's chain from zeroed memories), plus enough
+    /// symbols past it for the last candidate's window to be whole.
+    ///
+    /// The levels are `G v(n)`, which is what a perfect line would carry and
+    /// what the decoder divides by `G` again, so this is a line with no
+    /// channel and no noise: every bit a candidate gets wrong here is a bit the
+    /// candidate's own frame phase got wrong.
+    fn b1u_line() -> Vec<f64> {
+        let parameters = b1u_parameters();
+        let mut encoder = UpEncoder::new(&parameters).expect("drn 1's parameters encode");
+        let mut levels: Vec<f64> = encoder.b1u().iter().map(|symbol| symbol.out).collect();
+        while levels.len() < B1U_SYMBOLS + E2U_SYMBOLS + 4 {
+            levels.push(encoder.next_symbol(|| true).out);
+        }
+        levels
+    }
+
+    /// The reading of the boundary at `back`, and the gate it is held to.
+    fn reading(levels: &[f64], end: u64, skip: usize, back: usize) -> B1uReading {
+        let parameters = b1u_parameters();
+        let readings = b1u_readings(&parameters, end, levels, skip, E2U_SYMBOLS);
+        readings.into_iter().find(|reading| reading.back == back).expect("the candidate is in the set")
+    }
+
+    /// Which candidate the search would commit to, on the same levels.
+    ///
+    /// "Reads as B1u" is the rule's input here and is passed in: on a
+    /// synthesised line the gate's *lead* between the polarities is not there
+    /// (see [`choose_b1u_boundary_by`]), and the threshold is measured on the
+    /// captures by `V92_B1U_GATE`. What is under test is the ordering.
+    fn chosen_back(levels: &[f64], end: u64, skip: usize) -> usize {
+        let parameters = b1u_parameters();
+        let readings = b1u_readings(&parameters, end, levels, skip, E2U_SYMBOLS);
+        // The gate's ratio, without its polarity lead: see the note above.
+        let accept = |reading: &B1uReading| reading.best() * 8 >= reading.scored() * B1U_CONFIRM_EIGHTHS;
+        let winner = choose_b1u_boundary_by(&readings, &accept, false).expect("a boundary in the window");
+        readings[winner].back
+    }
+
+    /// B1u's 576 symbols, read from the run's end, are ones -- and nothing
+    /// eleven symbols either side of it is.
+    ///
+    /// This is the property the search stands on: 8.7.1 makes the content
+    /// known, and the twelve-symbol data frame plus the four-symbol trellis
+    /// frame make exactly one of the thirteen candidate phases the far end's.
+    #[test]
+    fn one_candidate_phase_reads_b1u_as_ones() {
+        let levels = b1u_line();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        // The run ends on B1u's own last E2u symbol: the fire symbol is B1u's
+        // frame interval 0, and the buffer starts one symbol into B1u.
+        let buffer: Vec<f64> = levels[1..=B1U_SYMBOLS].to_vec();
+        assert_eq!(chosen_back(&buffer, 1_000, skip), 0, "the run ended where B1u begins");
+        let at_the_boundary = reading(&buffer, 1_000, skip, 0);
+        assert!(
+            at_the_boundary.best() * 10 >= at_the_boundary.scored() * 9,
+            "{}/{} ones at the boundary",
+            at_the_boundary.best(),
+            at_the_boundary.scored()
+        );
+        for back in 1..=E2U_SYMBOLS {
+            let off = reading(&buffer, 1_000, skip, back);
+            assert!(
+                off.best() * 2 < off.scored() * 3,
+                "a boundary {back} symbols out still read {}/{} ones",
+                off.best(),
+                off.scored()
+            );
+        }
+    }
+
+    /// The failing captures' shape: the run overruns E2u by two symbols, so the
+    /// naive counter's answer reads chance and the boundary two symbols behind
+    /// it reads ones.
+    ///
+    /// Measured on `/tmp/agr-v90-interop/152653-prime-a/agr-tx.raw`, where the
+    /// data mode's constellation starts on 111 576 and the zero run ends on
+    /// 111 577: the fire symbol 111 578 read 311 of 576 ones and 111 576 reads
+    /// them all. This test has no capture in it -- a synthesised B1u with the
+    /// same tail structure -- because the point is the *rule*, not that
+    /// recording.
+    #[test]
+    fn a_run_that_overruns_e2u_is_read_from_the_boundary_behind_it() {
+        let levels = b1u_line();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        // B1u's frame interval 0 is levels[0]; the run ended two symbols later,
+        // so the fire symbol is levels[2] and the buffer starts at levels[3].
+        let buffer: Vec<f64> = levels[3..=B1U_SYMBOLS + 2].to_vec();
+        assert_eq!(chosen_back(&buffer, 1_000, skip), 2, "the boundary is two symbols behind the run's end");
+        let true_boundary = reading(&buffer, 1_000, skip, 2);
+        let naive = reading(&buffer, 1_000, skip, 0);
+        assert!(
+            true_boundary.best() * 10 >= true_boundary.scored() * 9,
+            "{}/{} ones at the boundary",
+            true_boundary.best(),
+            true_boundary.scored()
+        );
+        assert!(
+            naive.best() < true_boundary.best(),
+            "the run's end ({}/{}) is not worse than the boundary ({}/{})",
+            naive.best(),
+            naive.scored(),
+            true_boundary.best(),
+            true_boundary.scored()
+        );
+        // And the naive answer is not merely second: it fails the gate the
+        // receiver holds a candidate to, which is the reason the calls this
+        // test is modelled on dropped instead of connecting.
+        assert!(
+            naive.best() * 8 < naive.scored() * B1U_CONFIRM_EIGHTHS,
+            "the run's end passed the confirm gate at {}/{} ones",
+            naive.best(),
+            naive.scored()
+        );
     }
 }
