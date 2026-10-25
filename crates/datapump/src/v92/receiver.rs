@@ -352,6 +352,35 @@ struct Anchor {
     worst: f64,
 }
 
+/// A measured search for the second TRN1u, one rung at a time.
+///
+/// The ladder lives on the receiver rather than in the digital modem because
+/// what it walks is the history, and because it has to give the taps back
+/// between rungs -- see [`Receiver::ladder_step`].
+#[derive(Debug, Clone)]
+struct Ladder {
+    /// Where the search starts and where it stops, both absolute symbol counts:
+    /// a second search over a different stretch is a new ladder.
+    onset: u64,
+    end: u64,
+    /// The rung to try next, and the best rung so far with the fit it read.
+    at: u64,
+    best: Option<(u64, f64)>,
+    /// The taps in place when the search began.
+    in_place: Fitted,
+}
+
+/// What one rung of a [`Receiver::ladder_step`] search did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LadderStep {
+    /// Rungs left: come back.
+    Continue,
+    /// The best alignment, and what the fit read there.
+    Done(u64, f64),
+    /// No rung fitted: there is no training in that stretch.
+    Empty,
+}
+
 /// Periods a shape must match in a row before the hunt calls it a signal.
 ///
 /// Ru is 384T and Su 144T, so sixty-four and twenty-four periods of it are on
@@ -877,6 +906,8 @@ pub struct Receiver {
     /// What the first good match looked like: the polarity everything after
     /// it is measured against, and the phase it was taken at.
     anchor: Option<Anchor>,
+    /// The search [`Self::ladder_step`] is part-way through, when there is one.
+    ladder: Option<Ladder>,
     /// A reference sequence handed to the next fit instead of TRN1u's own, for
     /// the fit that Phase 4 is trained with: TRN2u is scrambled ones (8.7.6) and
     /// its symbols are known, which is a better anchor than TRN1u because they
@@ -961,6 +992,7 @@ impl Receiver {
             step: 0.0,
             state: Hunt::Searching,
             anchor: None,
+            ladder: None,
             pending_levels: None,
             phase_four: None,
             design_forward: Vec::new(),
@@ -1955,20 +1987,29 @@ impl Receiver {
         Some((start as u64, snr))
     }
 
-    /// What the least-squares fit reads with TRN1u's first symbol at `at`, and
-    /// nothing else: no verification, no Phase 4 design, no event.
+    /// What the least-squares fit reads with TRN1u's first symbol at the
+    /// **absolute** sample `at`, and nothing else: no verification, no Phase 4
+    /// design, no event.
     ///
     /// This is the figure [`Self::align_trn1u_from`] walks and the figure the
     /// refit is installed on, so a search made of it compares like with like.
     /// It leaves the receiver fitted at `at`, as every fit here does.
     #[must_use]
     pub fn fit_alignment(&mut self, at: u64, window: usize) -> Option<f64> {
-        let index = at.checked_sub(self.history_base())? as usize;
-        self.fit_window(index, window).then_some(self.snr_db)
+        self.fit_alignment_with(at, window, TRAIN_TAPS)
     }
 
-    /// Where TRN1u's first symbol is, **fitted** from a start that was measured
-    /// rather than correlated.
+    /// [`Self::fit_alignment`] with `forward` taps rather than [`TRAIN_TAPS`],
+    /// for a caller that is asking *where* the training begins rather than *how
+    /// well* the line fits it: see [`Self::align_trn1u_from`].
+    #[must_use]
+    pub fn fit_alignment_with(&mut self, at: u64, window: usize, forward: usize) -> Option<f64> {
+        let index = at.checked_sub(self.history_base())? as usize;
+        self.fit_with(index, window, forward, 0).then_some(self.snr_db)
+    }
+
+    /// One rung of a measured search for the second TRN1u: where the training
+    /// that follows Su begins, walked a rung at a time.
     ///
     /// [`Self::align_trn1u_by_fit`] chooses among the local maxima of the
     /// correlation profile, and on a real line that profile is not the presence
@@ -1977,54 +2018,57 @@ impl Receiver {
     /// the raw symbols measures the channel's *leading* tap, which on a
     /// telephone line is nearly nothing. Measured on the HSF's second TRN1u
     /// (`20261025-173736-hsf-bl1/rx8.raw`), the correlation peaks at 0.571 on
-    /// the transient where Su stops -- forty-four symbols from TRN1u's first
-    /// symbol, where the same measure reads 0.045 -- while the fit reads 6.6 dB
+    /// the transient where Su stops -- sixty-five symbols before TRN1u's first
+    /// symbol, where the same measure reads 0.045 -- while the fit reads 3.2 dB
     /// at the correlation's peak and 14.5 dB at the alignment it never
     /// shortlisted.
     ///
-    /// So the start is *measured* ([`Self::su_ends`]) and the fit walks the
-    /// stretch after it, coarse to fine: sixteen symbols, then two, then one.
-    /// `search` is how far past the measured start TRN1u may begin -- a
-    /// conforming far end's begins immediately (9.5.2.1.10: (24 + epsilon)T
-    /// after the S-bar-u, which is what `su_ends` has just measured the end of),
-    /// and a far end that answers a Jp it did not expect begins some way past
-    /// the end of its Su (measured ninety-nine symbols on the HSF).
-    pub fn align_trn1u_from(&mut self, onset: u64, search: u64, window: usize) -> Option<(u64, f64)> {
-        let lo = onset.max(self.history_base()).max(onset.min(1));
-        let hi = onset
-            .saturating_add(search)
-            .min(self.count.saturating_sub(TRAIN_TAPS as u64 + 1))
-            .max(lo);
-        let mut best = self.sweep_for_fit(lo, hi, 16, window)?;
-        for step in [2, 1] {
-            let from = best.0.saturating_sub(8 * step).max(lo);
-            let to = best.0.saturating_add(8 * step).min(hi);
-            if let Some(better) = self.sweep_for_fit(from, to, step, window)
-                && better.1 > best.1
-            {
-                best = better;
-            }
+    /// So the alignment is *measured* ([`Self::su_ends`]) and the fit walks
+    /// forward from there. What it walks is fixed by the fit itself: `reference
+    /// = sum(taps * line)` can only be read from samples that have already
+    /// arrived, so an alignment at or after TRN1u's first sample fits and one
+    /// before it cannot, and the section is [`TRAIN_TAPS`] long, so every
+    /// alignment up to a section past that first sample fits as a delay line.
+    /// The walk is a ladder of `step` symbols covering `search`, and the fit
+    /// picks the rung.
+    ///
+    /// **One rung per call**, because this runs in the sample pump: a fit is
+    /// about a millisecond and the pump has eight samples in one, so a burst of
+    /// seventeen is a burst that starves the real-time loop and takes the far
+    /// end with it -- measured here, the Agere walked away from a refit that
+    /// spent twenty milliseconds in one go and connected on the same code with
+    /// the burst spent a rung at a time (`docs/93`). The taps in place are given
+    /// back after each rung, so the loop slices with the filter it had.
+    #[must_use]
+    pub fn ladder_step(&mut self, onset: u64, search: u64, step: u64, window: usize) -> LadderStep {
+        let end = onset.saturating_add(search);
+        let mut ladder = match self.ladder.take() {
+            Some(ladder) if ladder.onset == onset && ladder.end == end => ladder,
+            _ => Ladder {
+                onset,
+                at: onset.max(self.history_base()),
+                end,
+                best: None,
+                in_place: self.fitted(),
+            },
+        };
+        let at = ladder.at;
+        if let Some(db) = self.fit_alignment(at, window)
+            && ladder.best.is_none_or(|(_, seen)| db > seen)
+        {
+            ladder.best = Some((at, db));
         }
-        Some(best)
-    }
-
-    /// The best fit over `from..=to`, one alignment every `step` symbols: see
-    /// [`Self::align_trn1u_from`].
-    fn sweep_for_fit(&mut self, from: u64, to: u64, step: u64, window: usize) -> Option<(u64, f64)> {
-        let mut best: Option<(u64, f64)> = None;
-        let mut at = from;
-        loop {
-            if let Some(db) = self.fit_alignment(at, window)
-                && best.is_none_or(|(_, seen)| db > seen)
-            {
-                best = Some((at, db));
-            }
-            if at >= to {
-                break;
-            }
-            at = (at + step.max(1)).min(to);
+        let in_place = ladder.in_place.clone();
+        self.restore(&in_place);
+        ladder.at = at.saturating_add(step.max(1));
+        if ladder.at <= end {
+            self.ladder = Some(ladder);
+            return LadderStep::Continue;
         }
-        best
+        match ladder.best {
+            Some((at, db)) => LadderStep::Done(at, db),
+            None => LadderStep::Empty,
+        }
     }
 
     /// The correlation profile [`Self::align_trn1u`] reads: for every start
@@ -3667,7 +3711,22 @@ mod tests {
         }
         let onset = rx.su_ends(2_048, 24, 48).expect("the end of Su");
         assert!((120..=144).contains(&onset), "boundary at {onset}, Su ended at 144");
-        let (at, db) = rx.align_trn1u_from(onset, 256, 600).expect("an alignment");
+        // One rung per call, as the sample pump takes it.
+        // The gap this script puts between Su and TRN1u is ninety-six symbols,
+        // so the ladder has to reach past it: the search is where the caller's
+        // own knowledge of the far end goes, and `digital.rs` passes its own.
+        let (mut at, mut db) = (0, 0.0);
+        for _ in 0..64 {
+            match rx.ladder_step(onset, 160, 8, 600) {
+                LadderStep::Continue => continue,
+                LadderStep::Done(found, fit) => {
+                    at = found;
+                    db = fit;
+                }
+                LadderStep::Empty => panic!("no alignment fitted"),
+            }
+            break;
+        }
         // A symbol or two either way does not change the measurement: the fit's
         // taps are a delay line, and a sequence fitted two symbols early with a
         // two-symbol delay in the taps IS the sequence at the right alignment.
@@ -3705,7 +3764,21 @@ mod tests {
             rx.feed(0.25 * behind(0) + 0.5 * behind(1) + 0.25 * behind(2));
         }
         let onset = rx.su_ends(2_048, 24, 48).expect("the end of Su");
-        let (at, db) = rx.align_trn1u_from(onset, 256, 600).expect("an alignment");
+        // The gap this script puts between Su and TRN1u is ninety-six symbols,
+        // so the ladder has to reach past it: the search is where the caller's
+        // own knowledge of the far end goes, and `digital.rs` passes its own.
+        let (mut at, mut db) = (0, 0.0);
+        for _ in 0..64 {
+            match rx.ladder_step(onset, 160, 8, 600) {
+                LadderStep::Continue => continue,
+                LadderStep::Done(found, fit) => {
+                    at = found;
+                    db = fit;
+                }
+                LadderStep::Empty => panic!("no alignment fitted"),
+            }
+            break;
+        }
         assert!(
             (144..=144 + TRAIN_TAPS as u64).contains(&at),
             "the fit chose {at}, and TRN1u's first sample is 144"

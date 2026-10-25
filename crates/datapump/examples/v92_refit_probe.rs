@@ -25,7 +25,7 @@
 use std::env;
 use std::fs;
 
-use datapump::v92::receiver::Receiver;
+use datapump::v92::receiver::{LadderStep, Receiver};
 
 fn values<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<[T; 2]> {
     let at = args.iter().position(|a| a == flag)?;
@@ -147,13 +147,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some([a, b]) = values::<u64>(&args, "--locator") {
+        // A cheap fit's profile: which alignment does a short section like,
+        // against which one the full section likes?
+        let every: u64 = value(&args, "--every").unwrap_or(4);
+        let taps: usize = value(&args, "--taps").unwrap_or(32);
+        let short: usize = value(&args, "--window").unwrap_or(192);
+        println!("\n  locator, {taps} taps over {short} samples, with the full fit beside it:");
+        let mut at = a;
+        while at <= b {
+            let cheap = rx.fit_alignment_with(at, short, taps);
+            let full = rx.fit_alignment(at, 1200);
+            println!(
+                "  {at} t={:.4} {taps}tap {} full {}",
+                at as f64 / 8000.0,
+                cheap.map_or("-".to_owned(), |db| format!("{db:.2}")),
+                full.map_or("-".to_owned(), |db| format!("{db:.2}"))
+            );
+            at += every;
+        }
+    }
+
     if let Some(onset) = value::<u64>(&args, "--sweep") {
         // The measured walk the refit now makes: from where the six-symbol
         // upstream ended, coarse to fine, choosing the alignment the fit likes.
-        let search: u64 = value(&args, "--search").unwrap_or(256);
+        let search: u64 = value(&args, "--search").unwrap_or(128);
+        let step: u64 = value(&args, "--every").unwrap_or(8);
         let fit_window: usize = value(&args, "--fit-window").unwrap_or(1200);
-        println!("\n  sweep from {onset} +/-{search}, fit window {fit_window}:");
-        match rx.align_trn1u_from(onset, search, fit_window) {
+        println!("\n  ladder from {onset} up {search} by {step}, fit window {fit_window}:");
+        // One rung per call, as the sample pump takes it.
+        let mut rungs = 0;
+        let mut done = None;
+        loop {
+            rungs += 1;
+            match rx.ladder_step(onset, search, step, fit_window) {
+                LadderStep::Continue => continue,
+                LadderStep::Done(at, fit) => done = Some((at, fit)),
+                LadderStep::Empty => {}
+            }
+            break;
+        }
+        println!("  {rungs} rungs");
+        match done {
             Some((at, fit)) => {
                 println!("  TRN1u's first symbol at {at} (t={:.4}), fit {fit:.2} dB", at as f64 / 8000.0);
                 let taken = rx.train_verified(at.saturating_sub(base), fit_window);

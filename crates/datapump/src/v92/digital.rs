@@ -52,7 +52,9 @@ use crate::v92::receiver::reference;
 use crate::v92::design::{Channel, Design, design};
 use crate::v92::epsilon;
 use crate::v92::exchange::{Context, Exchange};
-use crate::v92::receiver::{ALIGN_WINDOW, Heard, Receiver, Slicer, Symbol, TRAIN_WINDOW};
+use crate::v92::receiver::{
+    ALIGN_WINDOW, Heard, LadderStep, Receiver, Slicer, Symbol, TRAINED_SNR_DB, TRAIN_WINDOW,
+};
 use crate::v92::sequences::{
     CpFamily, Cpd, J, JP_PRIME_BITS, Jp, Suvd, UpFinder, trn2u_unit,
 };
@@ -214,31 +216,39 @@ const REFIT_WINDOW: usize = 600;
 const REFIT_QUALITY: f64 = 0.5;
 
 /// How far past the point where the upstream stopped repeating every six
-/// samples the second TRN1u's first symbol may lie, in symbols.
+/// samples the second TRN1u's first symbol may lie, and the step the ladder of
+/// fits walks that stretch on.
 ///
 /// A conforming far end's TRN1u begins at once: 9.5.2.1.10 puts it (24 + epsilon)T
 /// after the S-bar-u, and the S-bar-u is itself one period of six, so the point
 /// [`Receiver::su_ends`] measures is the point TRN1u starts at. A far end that
 /// answers a Jp it was never asked for answers from its own clock instead, and
 /// on this bench's HSF the gap between its tone stopping and its TRN1u's first
-/// symbol is measured at 96 symbols (`20261025-173736-hsf-bl1`, 12.9686 s to
-/// 12.9806 s). 256 is two and a half times the larger of the two, and it is also
-/// the whole of the search: 9.5.2.1.11's TRN1u is 2040T at least, so a fit still
-/// hunting past this is not hunting for TRN1u.
-const REFIT_SWEEP: u64 = 256;
-
-/// How much better the measured alignment has to read than the timetable's own
-/// estimate before it replaces it.
+/// fit is measured at seventy-one symbols (`20261025-173736-hsf-bl1`, 12.9686 s
+/// to 12.9806 s, and the fit's own plateau begins at 12.9757 s).
 ///
-/// Both numbers are the *same* measurement -- one least-squares fit of the line
-/// against the sequence this end generates, over the same window -- so they are
-/// comparable. What is not comparable is their repeatability: on one window of
-/// one capture the figure moves 0.9 dB between a four-hundred- and a
-/// two-thousand-symbol window at the same alignment. Two decibels is more than
-/// the measurement's own spread, and below it the estimate stands -- the Agere's
-/// 3-of-3 call is measured on that path, and an interworking fix that moves a
-/// working far end's frame origin to gain nothing would be the wrong trade.
-const REFIT_MEASURED_DB: f64 = 2.0;
+/// 128 is that gap plus a whole feed-forward section, because the fit cannot see
+/// TRN1u until the section can be a delay line -- which is also why the step is
+/// eight: the plateau is [`TRAIN_TAPS`] wide, so eight always lands on it. The
+/// ladder is therefore seventeen fits.
+const REFIT_SWEEP: u64 = 128;
+const REFIT_LADDER: u64 = 8;
+
+/// The fit the timetable's estimate has to read for the refit to keep the
+/// alignment it gives, in decibels: the receiver's own gate for "a linear fit of
+/// the second TRN1u describes this line well enough to read a two-point CPt"
+/// ([`TRAINED_SNR_DB`]).
+///
+/// Both figures are the same measurement -- one least-squares fit of the line
+/// against the sequence this end generates, over the same window -- so the
+/// comparison between them is fair. What this decides is *whose* alignment is
+/// trusted, and the tie goes to the estimate, because it is the one the 3-of-3
+/// Agere call is measured on: on this bench that call's estimate fits at 13.5 dB
+/// and its measured alignment at 15.8, and both read CPt, so a working far end's
+/// frame origin is not moved to gain two decibels. The HSF's estimate fits at
+/// 6.4 dB -- under the gate, which is why its CPt was never read at all -- and
+/// its measured alignment at 14.5.
+const REFIT_ESTIMATE_DB: f64 = TRAINED_SNR_DB;
 
 /// How far back the end of the six-symbol upstream is looked for, and the window
 /// and the hold its measurement is taken with.
@@ -2819,12 +2829,37 @@ impl Modem {
             // instead of assumed. `None` means the upstream has not stopped
             // repeating: the far end has not begun its TRN1u yet.
             let measured = self.rx.su_ends(REFIT_MEASURE, SU_ENDS_WINDOW, SU_ENDS_HOLD);
+            // The timetable's own estimate of where the second TRN1u begins,
+            // chosen by the correlation and the fit exactly as it always was.
+            // This is the refit on every call whose far end is conforming: the
+            // measurement below is a **recovery path and not a routine one**,
+            // and it runs only where this fit says the line was not fitted at
+            // all -- see [`REFIT_ESTIMATE_DB`]. A conforming far end therefore
+            // pays exactly what it always paid, which is what keeps its frame
+            // origin and its critical window where they were measured.
+            let timed = self
+                .rx
+                .align_trn1u_by_fit(at, REFIT_SEARCH, ALIGN_WINDOW, REFIT_QUALITY, TRAIN_WINDOW);
+            let usable = timed.is_some_and(|(_, fit)| fit >= REFIT_ESTIMATE_DB);
+            // And the recovery: the search the line itself places, one rung per
+            // look, because a fit is about a millisecond and this loop has eight
+            // samples in one -- so the ladder is a rung at a time with the taps
+            // handed back between rungs (`Receiver::ladder_step`). Seventeen
+            // rungs is a hundred milliseconds of wall clock and no burst at all.
+            let ladder = match (usable, measured) {
+                (false, Some(onset)) => {
+                    Some(self.rx.ladder_step(onset, REFIT_SWEEP, REFIT_LADDER, TRAIN_WINDOW))
+                }
+                _ => None,
+            };
             // Which is a reason to wait, not a reason to fit: a fit taken here
             // is a fit against Su, and that is where 6.4 dB came from. Bounded
             // by [`REFIT_WAIT`], past which the line is taken as it stands --
             // and looked at once every [`REFIT_POLL`] symbols rather than once
             // a symbol, because the measurement is a scan of history.
-            let waiting = measured.is_none() && self.rx.symbols() < from + REFIT_WAIT;
+            let busy = matches!(ladder, Some(LadderStep::Continue));
+            let waiting = busy
+                || (!usable && measured.is_none() && self.rx.symbols() < from + REFIT_WAIT);
             self.refit_poll = waiting.then(|| self.rx.symbols() + REFIT_POLL);
             if !waiting {
                 // Where the second TRN1u actually begins. The hunt reports the
@@ -2888,18 +2923,16 @@ impl Modem {
                 // the upstream stopped repeating (see `Receiver::align_trn1u_from`).
                 // It returns an absolute symbol count, the estimate below is a
                 // history index, and everything downstream is the index.
-                let swept = measured
-                    .and_then(|onset| self.rx.align_trn1u_from(onset, REFIT_SWEEP, TRAIN_WINDOW))
-                    .map(|(onset, fit)| (onset.saturating_sub(base), fit));
-                let timed = self
-                    .rx
-                    .align_trn1u_by_fit(at, REFIT_SEARCH, ALIGN_WINDOW, REFIT_QUALITY, TRAIN_WINDOW);
+                let swept = match ladder {
+                    Some(LadderStep::Done(at, fit)) => Some((at.saturating_sub(base), fit)),
+                    _ => None,
+                };
                 let mut search: Option<(u64, f64)> = None;
                 let chosen = match (timed, swept) {
-                    // The estimate stands unless the measurement fits better by more
-                    // than a fit's own repeatability: see [`REFIT_MEASURED_DB`].
+                    // The estimate stands unless the line says the fit taken at it
+                    // cannot read a two-point CPt at all: see [`REFIT_ESTIMATE_DB`].
                     (Some((timed_at, timed_fit)), Some((swept_at, swept_fit)))
-                        if swept_fit > timed_fit + REFIT_MEASURED_DB =>
+                        if timed_fit < REFIT_ESTIMATE_DB && swept_fit > timed_fit =>
                     {
                         self.note(format!(
                             "V.92: second TRN1u at {}, measured from the end of the six-symbol \
