@@ -25,12 +25,28 @@
 //! [`Chain`](super::precoder::Chain) takes its parity bit from the three
 //! indices before it and Y0. That is why the per-frame table below is built
 //! over residue classes rather than over points.
+//!
+//! **Two decoders, one switch.** [`TrellisMode`] and `V92_TRELLIS` choose how a
+//! trellis frame's four indices are decided. The default, `slice`, decides each
+//! of them from its own nearest point and is the one every B1u number in
+//! `docs/96` is taken with. `viterbi` decides all four jointly over 9.6.3.2's
+//! code, and is off until it has been validated: `docs/96` §25 deleted it
+//! because the candidate set could not hold the answer, and that measurement
+//! was made through the wrong 2D pair order (`docs/110`) -- with
+//! [`inverse_map`](super::precoder::inverse_map) corrected the 4D constraint is
+//! the one the far end obeys, so the decoder it deleted is worth another look.
+//! Nothing on the bench changes until `V92_TRELLIS=viterbi` is set.
 
 use std::collections::VecDeque;
 
 use crate::v32::{Mode, Scrambler};
+use crate::v34::trellis::{self, Code};
+
 use super::modulus::{self, FrameBits, Moduli12};
-use super::precoder::{Constellation, index_to_ki, index_to_ki_class, opens_a_pair, pair_first_index_offset};
+use super::precoder::{
+    Constellation, code_for, index_to_ki, index_to_ki_class, inverse_map, label_of, opens_a_pair,
+    pair_first_index_offset,
+};
 use super::{B1U_FRAMES, Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bits};
 
 /// Trellis frames held before the oldest is decided on. Forty frames is a
@@ -38,9 +54,62 @@ use super::{B1U_FRAMES, Parameters, TRELLIS_FRAME, UP_INTERVALS, UP_RATES, up_bi
 /// measurement needs before a decision is taken (a decided frame cannot be
 /// re-taken), and short enough that the tail a cleardown cuts off is nothing.
 ///
-/// It is not a survivor path memory any more: the decision is the slice's own
-/// (`Decoder::fill`), so nothing is being waited for beyond the measurement.
+/// In `slice` it is not a survivor path memory: the decision is the slice's
+/// own (`Decoder::fill`), so nothing is being waited for beyond the
+/// measurement. In `viterbi` it is the survivor depth again -- forty frames is
+/// twenty-four constraint lengths of the 16-state code, so a window's
+/// traceback starts from a path that has converged.
 pub const SURVIVOR_DEPTH: usize = 40;
+
+/// Which decision a trellis frame's four indices get: `V92_TRELLIS`.
+///
+/// * [`Slice`](Self::Slice) -- **the default**. Each of the four indices is the
+///   nearest point of its own symbol, in its own 6.4.2 class, and the 4D code
+///   is not consulted (`Decoder::fill`).
+/// * [`Viterbi`](Self::Viterbi) -- a maximum-likelihood path through
+///   9.6.3.2's code over the whole survivor window (`Decoder::fill`,
+///   [`build`]), with 6.4.3's parity at `k = 3` as the branch constraint and
+///   [`inverse_map`] (with `docs/110`'s pair order) as the label chain.
+///
+/// Read once per [`Decoder`], so a caller that wants a different one has to ask
+/// before the decoder is built; [`Decoder::with_trellis`] says so without the
+/// environment. Unset, `slice`, or anything else is `Slice` -- a bench run
+/// that does not set the variable is the run it was before this existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrellisMode {
+    Slice,
+    Viterbi,
+}
+
+impl TrellisMode {
+    /// `V92_TRELLIS=viterbi` asks for the joint decision; everything else,
+    /// including nothing at all, leaves the slicing decoder in place.
+    pub fn from_env() -> Self {
+        match std::env::var("V92_TRELLIS").ok().as_deref() {
+            Some("viterbi" | "VITERBI") => Self::Viterbi,
+            _ => Self::Slice,
+        }
+    }
+}
+
+/// `V92_B1U_STATE`: which convolutional state the encoder is assumed to be in
+/// at the first symbol this decoder is handed, for [`TrellisMode::Viterbi`].
+///
+/// `None` -- the default, and the maximum-likelihood answer to an unknown
+/// start -- gives every state the same metric, so the survivor path is free to
+/// begin anywhere. A number pins that one state instead, which is the sweep the
+/// deleted decoder used (`docs/96` §25): zero state is right only if the symbol
+/// handed over is B1u's first, and it is not -- `b1u_skip` drops eighteen data
+/// frames first, so the far end's encoder has been running for 216 symbols by
+/// then. Neither reading is a bench measurement; `docs/110` §5 measures the far
+/// end's state at a *trace's* first frame and says what that does and does not
+/// settle.
+fn start_state(states: usize) -> Option<usize> {
+    std::env::var("V92_B1U_STATE")
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|state| *state < states)
+}
 
 /// `V92_K3`: the receive-side correction `docs/47` measures, and nothing else.
 ///
@@ -557,9 +626,18 @@ impl Bests {
 }
 
 /// One trellis frame held in the decoder's delay line: the four symbols' own
-/// slice tables, and which frame of B1u it is.
+/// slice tables, the 4D branch metrics built from them, and which frame of B1u
+/// it is.
 #[derive(Debug, Clone, Copy)]
 struct Stage {
+    /// `table[out * 16 + y]`: the cost of the best four indices for that
+    /// (Y0, y), or infinite when no indices make it. Only [`build`] fills this,
+    /// and [`build`] only runs for [`TrellisMode::Viterbi`]; the slicing
+    /// decoder leaves it infinite and never reads it.
+    table: [f64; 32],
+    /// Which residue class each of the four symbols was taken from, per
+    /// (out, y), so that a decision names indices and not classes.
+    residues: [[(i32, i32, i32, i32); 16]; 2],
     /// The per-symbol tables the indices are read off.
     bests: [Bests; TRELLIS_FRAME],
     /// Which trellis frame this is, counted from the first symbol of B1u.
@@ -569,11 +647,25 @@ struct Stage {
     index: u64,
 }
 
+impl Stage {
+    /// A stage with no branch metrics: what [`TrellisMode::Slice`] keeps,
+    /// since a decision taken from four nearest points reads none of them.
+    fn sliced(bests: [Bests; TRELLIS_FRAME], index: u64) -> Self {
+        Self { table: [f64::MAX; 32], residues: [[(0, 0, 0, 0); 16]; 2], bests, index }
+    }
+}
+
 /// The upstream decoder: one equalised level a symbol in, bits out every
 /// twelve.
 #[derive(Debug, Clone)]
 pub struct Decoder {
     moduli: Moduli12,
+    code: Code,
+    /// Which of the two decisions a frame gets; see [`TrellisMode`].
+    mode: TrellisMode,
+    /// Path metrics, one per convolutional state, live only in
+    /// [`TrellisMode::Viterbi`].
+    metrics: Vec<f64>,
     params: Parameters,
     descrambler: Scrambler,
     modulus: modulus::Decoder,
@@ -583,6 +675,11 @@ pub struct Decoder {
     frame: [Bests; TRELLIS_FRAME],
     filled: usize,
     stages: VecDeque<Stage>,
+    /// `back[i][state]` is `(where the state at frame i + 1 came from, the
+    /// inputs that took it there)`, so a traceback can name the branch as well
+    /// as the state. Parallel to `stages`, and empty in
+    /// [`TrellisMode::Slice`].
+    back: VecDeque<Vec<(u8, u8)>>,
     /// Ki decided but not yet a whole data frame's worth.
     labels: Vec<u8>,
     bits: Vec<bool>,
@@ -625,8 +722,27 @@ impl Decoder {
     /// symbol of B1u: every memory zero and n = 0, exactly as the encoder
     /// starts (8.7.1).
     pub fn new(parameters: &Parameters) -> Self {
+        Self::with_trellis(parameters, TrellisMode::from_env())
+    }
+
+    /// The same decoder, with the trellis decision named instead of read off
+    /// `V92_TRELLIS`. Offline instruments and tests use this so that both
+    /// decisions can be measured in one process, where an environment variable
+    /// cannot be one thing for one decoder and another for the next.
+    pub fn with_trellis(parameters: &Parameters, mode: TrellisMode) -> Self {
+        let code = code_for(parameters.trellis);
+        // The maximum-likelihood start to an unknown state: every state equal.
+        // `V92_B1U_STATE` pins one instead (a sweep, not a default).
+        let mut metrics = vec![0.0f64; code.states()];
+        if let Some(state) = start_state(code.states()) {
+            metrics.iter_mut().for_each(|metric| *metric = f64::MAX);
+            metrics[state] = 0.0;
+        }
         Self {
             moduli: Moduli12::new(parameters.moduli),
+            code,
+            mode,
+            metrics,
             params: parameters.clone(),
             descrambler: Scrambler::new(crate::v32::Mode::Answer),
             modulus: modulus::Decoder::new(),
@@ -635,6 +751,7 @@ impl Decoder {
             frame: [Bests::default(); TRELLIS_FRAME],
             filled: 0,
             stages: VecDeque::new(),
+            back: VecDeque::new(),
             labels: Vec::with_capacity(UP_INTERVALS),
             bits: Vec::new(),
             decided: 0,
@@ -753,6 +870,13 @@ impl Decoder {
         self.decided
     }
 
+    /// Which decision this decoder takes, and at which code's rate: what a
+    /// bench log or an offline instrument needs to say which of the two it
+    /// measured.
+    pub fn trellis_mode(&self) -> TrellisMode {
+        self.mode
+    }
+
     /// The rate this decoder was built for, in bit/s.
     pub fn rate(&self) -> u32 {
         self.bits_per_frame * 8000 / UP_INTERVALS as u32
@@ -792,30 +916,130 @@ impl Decoder {
         self.rotation_line.as_deref()
     }
 
-    /// This frame's four slices, and one frame of delay.
+    /// This frame's four slices, one decision step, and one frame of delay.
     ///
-    /// **The decision is the slice's own.** The 4D trellis of 6.4.3 was tried
-    /// as a hard constraint here and it cannot be one: the index sequence this
-    /// far end sends does not lie on the code's path (a hundred and forty of
-    /// B1u's hundred and forty-three trellis frames, at best, need a Y0
-    /// inversion to reach it -- see `docs/96` §25), so a joint decision over
-    /// the code moves symbols off lattice points they sit 0.15 half-cells from
-    /// and onto points 1.9 half-cells away. It is the same 6.4.2 class either
-    /// way, and the class is all the bit layer needs: US6414989B1 col. 14, "the
-    /// receiver need only be concerned with the coset received". The window
-    /// stays because a decision cannot be re-taken -- the measurement above
-    /// takes forty symbols a position, and emitting bits early would put two
-    /// rotations in one B1u -- not because anything is being waited for.
+    /// **In `slice` the decision is the slice's own.** The 4D trellis of 6.4.3
+    /// was tried as a hard constraint here and it cannot be one: the index
+    /// sequence this far end sends does not lie on the code's path (a hundred
+    /// and forty of B1u's hundred and forty-three trellis frames, at best, need
+    /// a Y0 inversion to reach it -- see `docs/96` §25), so a joint decision
+    /// over the code moves symbols off lattice points they sit 0.15 half-cells
+    /// from and onto points 1.9 half-cells away. It is the same 6.4.2 class
+    /// either way, and the class is all the bit layer needs: US6414989B1 col.
+    /// 14, "the receiver need only be concerned with the coset received". The
+    /// window stays because a decision cannot be re-taken -- the measurement
+    /// above takes forty symbols a position, and emitting bits early would put
+    /// two rotations in one B1u -- not because anything is being waited for.
+    ///
+    /// **In `viterbi` it is the cheapest path's**, and `docs/96` §25's reason
+    /// for deleting it is gone: that measurement built its candidate set with
+    /// the 2D pair's indices the wrong way round (`docs/110`), which is the
+    /// same wrong constraint that made the far end's own stream look
+    /// unreachable. With [`inverse_map`] corrected the branch constraint is the
+    /// one the far end obeys.
     fn fill(&mut self) {
-        let stage = Stage { bests: self.frame, index: self.n / TRELLIS_FRAME as u64 - 1 };
-        self.stages.push_back(stage);
+        let index = self.n / TRELLIS_FRAME as u64 - 1;
+        match self.mode {
+            TrellisMode::Slice => {
+                let stage = Stage::sliced(self.frame, index);
+                self.stages.push_back(stage);
+            }
+            TrellisMode::Viterbi => {
+                if !self.step(index) {
+                    return;
+                }
+                // The measurement has to be finished before the first frame is
+                // decided, or one B1u would be read on two rotations. It is in
+                // a hundred and sixty symbols and the first decision is at a
+                // hundred and sixty-four, so nothing is ever held here.
+                if self.measuring.is_some() {
+                    return;
+                }
+            }
+        }
         while self.stages.len() > SURVIVOR_DEPTH {
             self.decide();
         }
     }
 
-    /// The oldest frame in the window, decided from its own four slices.
+    /// One trellis step of the maximum-likelihood path: this frame's four
+    /// branch metrics, the metrics they leave every state with, and the back
+    /// pointers that say where each one came from.
+    ///
+    /// Returns false when no state is reachable, which is the signal to hold
+    /// what is left of the window rather than decide on noise.
+    fn step(&mut self, index: u64) -> bool {
+        let mut stage = build(&self.frame, self.code);
+        stage.index = index;
+        let states = self.code.states();
+        let mut next = vec![f64::MAX; states];
+        let mut from = vec![(0u8, 0u8); states];
+        for (state, &metric) in self.metrics.iter().enumerate() {
+            if metric == f64::MAX {
+                continue;
+            }
+            let out = usize::from(self.code.output(state as u8));
+            for y in 0..16usize {
+                if y & !self.code.inputs() as usize != 0 {
+                    continue;
+                }
+                // Y0 is the state's own output and nothing else. V.34 lets a
+                // half frame invert it; V.92's upstream has no superframe to be
+                // half way through, so 6.4.3's parity is the only rule and a
+                // flipped table entry is not a path this receiver may take.
+                let cost = stage.table[out * 16 + y];
+                if cost == f64::MAX {
+                    continue;
+                }
+                let to = usize::from(self.code.next(state as u8, y as u8));
+                if metric + cost < next[to] {
+                    next[to] = metric + cost;
+                    from[to] = (state as u8, y as u8);
+                }
+            }
+        }
+        let floor = next.iter().copied().fold(f64::MAX, f64::min);
+        if floor == f64::MAX {
+            // Nothing in the constellation is anywhere near the line: hold
+            // what is left of the window and start again rather than decide
+            // on noise.
+            self.stages.clear();
+            self.back.clear();
+            self.metrics.iter_mut().for_each(|metric| *metric = f64::MAX);
+            self.metrics[0] = 0.0;
+            return false;
+        }
+        for metric in &mut next {
+            if *metric != f64::MAX {
+                *metric -= floor;
+            }
+        }
+        self.metrics = next;
+        self.stages.push_back(stage);
+        self.back.push_back(from);
+        true
+    }
+
+    /// The oldest frame in the window, decided by the switch in [`TrellisMode`].
     fn decide(&mut self) {
+        let decided = match self.mode {
+            TrellisMode::Slice => self.decide_from_its_own_slice(),
+            TrellisMode::Viterbi => self.decide_from_the_path(),
+        };
+        let Some((index, etas)) = decided else { return };
+        self.decided += 1;
+        trace_etas(self, index, etas);
+        // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
+        // first symbol of B1u begins one. A decision that lands in the middle
+        // of one -- which is every decision until the window has passed -- has
+        // no whole data frame's worth of indices and is dropped.
+        if !self.labels.is_empty() || index.is_multiple_of(3) {
+            self.push_etas(etas);
+        }
+    }
+
+    /// The oldest frame in the window, decided from its own four slices.
+    fn decide_from_its_own_slice(&mut self) -> Option<(u64, [i32; TRELLIS_FRAME])> {
         let stage = self.stages.pop_front().expect("a stage is held before one is decided");
         let mut etas = [0i32; TRELLIS_FRAME];
         for (k, bests) in stage.bests.iter().enumerate() {
@@ -823,19 +1047,58 @@ impl Decoder {
                 // Nothing in the constellation is anywhere near the line:
                 // drop this frame rather than decide on noise, and keep the
                 // delay line's own alignment.
-                return;
+                return None;
             };
             etas[k] = eta;
         }
-        self.decided += 1;
-        trace_etas(self, stage.index, etas);
-        // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
-        // first symbol of B1u begins one. A decision that lands in the middle
-        // of one -- which is every decision until the window has passed -- has
-        // no whole data frame's worth of indices and is dropped.
-        if !self.labels.is_empty() || stage.index.is_multiple_of(3) {
-            self.push_etas(etas);
+        Some((stage.index, etas))
+    }
+
+    /// The oldest frame in the window, decided by tracing the cheapest path
+    /// through the whole window back from the best final state.
+    ///
+    /// The traceback follows the survivor's **own** branch, not the cheapest
+    /// branch at the state it passes through: `docs/96` §25 measured both and
+    /// they differ (532 against 545 of 576), because the two are the same only
+    /// where the window's best path is the best path to that state. Each back
+    /// pointer therefore carries the inputs as well as the predecessor, and the
+    /// frame's indices are read off the branch metric table for the state the
+    /// branch left.
+    fn decide_from_the_path(&mut self) -> Option<(u64, [i32; TRELLIS_FRAME])> {
+        let state = self
+            .metrics
+            .iter()
+            .enumerate()
+            .filter(|(_, metric)| **metric != f64::MAX)
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(state, _)| state as u8)?;
+        let stage = self.stages.pop_front().expect("a stage is held before one is decided");
+        // The oldest frame's own pointers, kept aside: the walk below ends on
+        // the state the oldest frame *left* in, and this is what it did.
+        let oldest = self.back.pop_front().expect("a stage has a back pointer in the viterbi mode");
+        // Walking every pointer in what is left of the window, newest first,
+        // lands on the state the oldest frame left in -- which is where the
+        // oldest frame's own pointer is read.
+        let mut state = state;
+        for step in self.back.iter().rev() {
+            state = step[usize::from(state)].0;
         }
+        let (from, y) = oldest[usize::from(state)];
+        // 6.4.2's k = 3 parity is over indices and not over labels, and the
+        // branch's indices are the cheapest ones for its (Y0, y): Y0 is the
+        // output of the state the branch left.
+        let out = usize::from(self.code.output(from));
+        let (r0, r1, r2, r3) = stage.residues[out][usize::from(y)];
+        let mut etas = [0i32; TRELLIS_FRAME];
+        for (k, residue) in [r0, r1, r2, r3].iter().enumerate() {
+            etas[k] = stage.bests[k].eta[residue.rem_euclid(4) as usize];
+        }
+        debug_assert_eq!(
+            inverse_map(etas) & self.code.inputs(),
+            y & self.code.inputs(),
+            "the indices decided on do not carry the inputs the path took"
+        );
+        Some((stage.index, etas))
     }
 
     /// One frame's indices to Ki, and twelve symbols' worth to bits.
@@ -920,6 +1183,77 @@ impl Decoder {
     }
 }
 
+/// The 32 costs of one frame: the best four indices for every (Y0, y).
+///
+/// The search is over residue classes -- four per symbol -- because a 4D subset
+/// label depends only on 2 x eta mod 8, and because the fourth index's parity
+/// is fixed by the first three and Y0 (6.4.2's class at k = 3).
+///
+/// **The label chain is the one `docs/110` found**, and that is the whole
+/// difference between this table and the one `docs/96` §25 measured as
+/// hopeless: 6.4.3's pair has its real part *second*, so `label_of` is fed
+/// `(eta of the second symbol, eta of the first)`. Read the other way round,
+/// the far end's own index stream is on no path of any 9.6.3.2 code at any
+/// initial state; read this way it is on the 16-state code's path in 218 900 of
+/// 218 900 frames (`docs/110` §3).
+fn build(bests: &[Bests; TRELLIS_FRAME], code: Code) -> Stage {
+    let mut stage = Stage {
+        table: [f64::MAX; 32],
+        residues: [[(0, 0, 0, 0); 16]; 2],
+        bests: *bests,
+        index: 0,
+    };
+    for out in 0..2usize {
+        for y in 0..16usize {
+            if y & !code.inputs() as usize != 0 {
+                continue;
+            }
+            let mut cost = f64::MAX;
+            let mut chosen = (0i32, 0i32, 0i32, 0i32);
+            for r0 in 0..4usize {
+                if bests[0].cost[r0] == f64::MAX {
+                    continue;
+                }
+                for r1 in 0..4usize {
+                    if bests[1].cost[r1] == f64::MAX {
+                        continue;
+                    }
+                    let first = label_of(r1 as i32, r0 as i32);
+                    for r2 in 0..4usize {
+                        if bests[2].cost[r2] == f64::MAX {
+                            continue;
+                        }
+                        let parity = (r0 + r1 + r2 + out) % 2;
+                        for r3 in (parity..4).step_by(2) {
+                            if bests[3].cost[r3] == f64::MAX {
+                                continue;
+                            }
+                            let second = label_of(r3 as i32, r2 as i32);
+                            // The code reads only the bits it has: 16 states
+                            // take Y1 and Y2, 32 add Y4 and 64 all four
+                            // (9.6.3.2), so a frame whose converter spells a
+                            // larger number is the same branch to a shorter
+                            // code.
+                            if trellis::convert(first, second) & code.inputs() != y as u8 {
+                                continue;
+                            }
+                            let total =
+                                bests[0].cost[r0] + bests[1].cost[r1] + bests[2].cost[r2] + bests[3].cost[r3];
+                            if total < cost {
+                                cost = total;
+                                chosen = (r0 as i32, r1 as i32, r2 as i32, r3 as i32);
+                            }
+                        }
+                    }
+                }
+            }
+            stage.table[out * 16 + y] = cost;
+            stage.residues[out][y] = chosen;
+        }
+    }
+    stage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1327,50 @@ mod tests {
                 assert!(skipped.is_some(), "{trellis:?} drn {drn}: the streams do not line up");
                 assert_eq!(errors, 0, "{trellis:?} drn {drn}: {errors} bits wrong");
             }
+        }
+    }
+
+    /// The same round trip with [`TrellisMode::Viterbi`] deciding the frames.
+    ///
+    /// Over a channel with nothing in it the two decisions have to agree
+    /// everywhere, and both have to come back with every bit: the branch
+    /// constraint 6.4.3's parity puts on a frame is one our own transmitter
+    /// satisfies by construction, so the joint decision has nothing to move.
+    /// This is the self-loop `docs/110` §7 asks for before the Viterbi is
+    /// trusted with anything: it says the two ends of *our* chain still agree
+    /// after the pair order changed under them.
+    ///
+    /// It is not evidence about the far end, and says so: both ends run the
+    /// same tables, so a convention error made once passes here. `docs/110` is
+    /// the far-end evidence.
+    #[test]
+    fn the_viterbi_and_the_slice_agree_over_a_channel_with_nothing_in_it() {
+        for trellis in [Trellis::Sixteen, Trellis::ThirtyTwo, Trellis::SixtyFour] {
+            let parameters = parameters(1, trellis);
+            let mut encoder = UpEncoder::new(&parameters).expect("feasible");
+            let mut sliced = Decoder::with_trellis(&parameters, TrellisMode::Slice);
+            let mut viterbi = Decoder::with_trellis(&parameters, TrellisMode::Viterbi);
+            let mut random = Random::new(0x5eed);
+            let mut sent = Vec::new();
+            let mut from_slice = Vec::new();
+            let mut from_viterbi = Vec::new();
+            for _ in 0..(SURVIVOR_DEPTH * 6 * UP_INTERVALS) {
+                let symbol = encoder.next_symbol(|| {
+                    let bit = random.next();
+                    sent.push(bit);
+                    bit
+                });
+                sliced.feed(symbol.u);
+                viterbi.feed(symbol.u);
+                from_slice.extend(sliced.take_bits());
+                from_viterbi.extend(viterbi.take_bits());
+            }
+            assert_eq!(viterbi.trellis_mode(), TrellisMode::Viterbi);
+            assert_eq!(sliced.decided(), viterbi.decided(), "{trellis:?}: the two decided a different number of frames");
+            assert_eq!(from_slice, from_viterbi, "{trellis:?}: the two decisions differ over a perfect channel");
+            let (skipped, errors) = align(&sent, &from_viterbi);
+            assert!(skipped.is_some(), "{trellis:?}: the streams do not line up");
+            assert_eq!(errors, 0, "{trellis:?}: {errors} bits wrong through the viterbi");
         }
     }
 
