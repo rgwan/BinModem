@@ -354,7 +354,12 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
     // chance (291 of 576 against 543 for the same line with `z2 = [1]`). Moving
     // the main tap to index zero removes the latency and keeps whatever
     // filtering the design actually did.
-    let one_code = 1.0 / 32768.0;
+    // Four Q0.15 codes, not one: the live design measured on the Agere had its
+    // front taps at +/-2 codes (6.2e-5, `docs/94` §7), so a one-code test never
+    // fired and the eight symbols of latency stayed. Four codes is 1.2e-4, i.e.
+    // 0.04 per cent of a level spacing -- below anything the line can resolve,
+    // and it is the *latency* that costs, not these taps.
+    let one_code = 4.0 / 32768.0;
     let mut delay = main;
     if main > 0 && filters.z2[..main].iter().all(|value| value.abs() < one_code) {
         filters.z2.drain(..main);

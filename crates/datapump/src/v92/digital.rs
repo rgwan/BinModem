@@ -2887,7 +2887,7 @@ impl Modem {
                 if tracing() {
                     let f = &parameters.filters;
                     eprintln!(
-                        "V92TRACE: CPd drn {} gain {:.4} moduli {:?} sets {:?} filters z1 {} p1 {} z2 {} p2 {} limits {:?}/{:?}/{:?}",
+                        "V92TRACE: CPd drn {} gain {:.4} moduli {:?} sets {:?} filters z1 {} p1 {} z2 {} p2 {} limits {:?}/{:?}/{:?} coeffs z1 {:?} p1 {:?} z2 {:?} p2 {:?}",
                         parameters.drn,
                         parameters.gain,
                         parameters.moduli,
@@ -2898,7 +2898,11 @@ impl Modem {
                         f.p2.len(),
                         self.settings.limits.sections,
                         self.settings.limits.total,
-                        self.settings.limits.most
+                        self.settings.limits.most,
+                        f.z1,
+                        f.p1,
+                        f.z2,
+                        f.p2
                     );
                 }
                 if let Some(path) = std::env::var_os("V92_CPD_TRACE") {
