@@ -35,6 +35,7 @@
 
 pub mod analogue;
 pub mod anspcm;
+pub mod codegrid;
 pub mod decoder;
 pub mod design;
 pub mod digital;
@@ -545,6 +546,21 @@ impl Parameters {
     /// K, the data bits in one twelve-symbol frame at this rate.
     pub fn bits(&self) -> u32 {
         up_bits(self.drn)
+    }
+
+    /// The distance between the two closest points of the first constellation
+    /// set, on the line: `G` times the set's smallest adjacent gap.
+    ///
+    /// This is what a symbol error has to cross, and the quantity
+    /// [`upchoice`](super::upchoice) scores `[6.4.2]`'s classes against. For the
+    /// odd lattice `a(eta) = 2 eta + 1` the smallest gap was two and this was
+    /// `2 G`; on the far end's code grid the gaps are the codec's own steps, so
+    /// it is `G` times the smallest of them ([`codegrid::min_gap`]). Zero for a
+    /// set with one point, which has no adjacent pair and no decision to make.
+    pub fn step(&self) -> f64 {
+        let Some(set) = self.sets.first() else { return 0.0 };
+        let gap = codegrid::min_gap(set);
+        if gap.is_finite() { self.gain * gap } else { 0.0 }
     }
 
     /// The upstream rate, rounded down as [`up_rate`] rounds it.

@@ -2072,6 +2072,25 @@ fn su_tolerance() -> bool {
     })
 }
 
+/// Whether `V92_CODE_GRID` armed the one-per-call field dump (docs/114 R6).
+///
+/// One variable for the whole report -- CPu bit 35, bit 128, bits 52:67, the
+/// mask blocks, SUVu bits 27:31 and the `K` this end fitted from them -- because
+/// the question they exist to answer is asked with all of them at once: what
+/// does this far end say its code grid is, and does the number this end read out
+/// of it agree with the levels on the line. `eprintln!` and nothing else: no
+/// path below reads these, and a call without the variable set is bit-identical
+/// to one made before this existed.
+fn code_grid_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("V92_CODE_GRID").ok().as_deref(),
+            None | Some("0") | Some("off") | Some("no") | Some("false")
+        )
+    })
+}
+
 fn jp_offset() -> f64 {
     std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
 }
@@ -2267,6 +2286,19 @@ pub struct Modem {
     /// The analogue modem's CPu, once it has arrived: the downstream's data
     /// mode parameters (9.6.1.1.5).
     cpu: Option<Cp>,
+    /// `K`, the far code to this end's level scale, as
+    /// [`codegrid::estimate_from_mask`] read it out of the last CPu (docs/114
+    /// R2a/R4). One is "the far end's codes are this end's numbers", which is
+    /// what a CPd designed on the code grid assumes, so it is also what a call
+    /// with no mask at all uses.
+    up_scale: f64,
+    /// Where [`Self::up_scale`] came from, for the log: `"mask"`, `"design"`
+    /// or `"design (bit 128)"`.
+    up_scale_source: &'static str,
+    /// SUVu bits 27:31 as the far end last reported them: `None` is the printed
+    /// 16, "no measurement has been taken". Kept only for the one-per-call
+    /// dump (`V92_CODE_GRID`), never for a decision -- `docs/114` R5.
+    suvu_level: Option<f64>,
     /// `V92_B1U_ADJ`: what to do to the data-mode level before the decoder
     /// sees it. Empty means nothing, which is the only behaviour in use.
     b1u_adjust: String,
@@ -2514,6 +2546,9 @@ impl Modem {
             cpd: None,
             parameters: None,
             cpu: None,
+            up_scale: 1.0,
+            up_scale_source: "design",
+            suvu_level: None,
             e2u_zeroes: 0,
             awaiting_e2u: false,
             b1u_pending: false,
@@ -4162,14 +4197,28 @@ impl Modem {
     /// starts a data frame at what is now symbol 0.
     fn begin_b1u(&mut self) {
         let Some(parameters) = self.parameters.clone() else { return };
+        // docs/114 R4: the slicer's levels are `round(K a(eta))` for the far
+        // code to this end's scale `K`, not `a(eta)` as designed. With CPd on
+        // the code grid the design's own points *are* code values, so `K` away
+        // from one means the far end's codes are arriving at this end's scale
+        // times `K`, and a table at `K` costs the spacing the scale error takes
+        // and adds nothing. With `K = 1` -- no mask read, or bit 128 set -- the
+        // table is the design's, which is the behaviour every earlier call had.
         let mut levels: Vec<f64> = Vec::new();
         for set in &parameters.sets {
-            for &point in set {
+            for point in crate::v92::codegrid::scaled(set, self.up_scale) {
                 let level = parameters.gain * f64::from(point);
                 levels.push(level);
                 levels.push(-level);
             }
         }
+        self.note(format!(
+            "V.92: upstream level table at K {:.5} ({}) over {} point(s), gap {:.0} LSB",
+            self.up_scale,
+            self.up_scale_source,
+            parameters.sets.first().map_or(0, Vec::len),
+            crate::v92::codegrid::min_gap(parameters.sets.first().map_or(&[][..], Vec::as_slice)),
+        ));
         levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         // The slicer moves to CPd's constellation and the equaliser stays: the
@@ -4852,6 +4901,11 @@ impl Modem {
         match family {
             CpFamily::Suvu(suvu) => {
                 self.note(format!("V.92: SUVu, ack {}", suvu.ack));
+                // Table 27 bits 27:31, remembered for `V92_CODE_GRID`'s dump and
+                // for nothing else: 0.25 dB and relative, so it cannot place a
+                // point (docs/114 §1.5, R5). The Agere on this bench sends the
+                // printed 16, "no measurement has been taken", on every frame.
+                self.suvu_level = suvu.level;
                 // 9.6.2.1.4's other half, and the half that decides *when*:
                 // the analogue modem transmits E2u "after [it] has sent a CPu
                 // or SUVu sequence with the acknowledgement bit set". An
@@ -4888,6 +4942,25 @@ impl Modem {
                     crate::v90::sequences::data_rate(cp.drn).unwrap_or(0) as f64 / 1000.0
                 ));
                 let ack = cp.acknowledge;
+                let first = self.cpu.is_none();
+                self.read_code_grid(&cp, first);
+                if first && cp.codec.is_some() {
+                    // docs/114 R3. Bit 128 says "the transmit constellations
+                    // differ from the codec's D/A output constellations", so the
+                    // mask below is *not* a level table for this far end's
+                    // transmitter and this end must not read it as one. What is
+                    // left is the behaviour every call had before the code grid
+                    // existed: slice on the design's own levels, measured
+                    // rather than reported. Named once per call, because a far
+                    // end that has said it will say it on every repeat.
+                    self.note(format!(
+                        "V.92: CPu bit 128 set -- the far end's transmit levels are not its codec's, \
+                         so the upstream slicer keeps the design's measured levels and no code table \
+                         is built from its mask ({} masks, delta {})",
+                        cp.constellations.len(),
+                        cp.codec.as_ref().map_or(0, Vec::len)
+                    ));
+                }
                 self.cpu = Some(cp);
                 if let Some(exchange) = self.exchange.as_mut() {
                     exchange.peer_cp(PeerCp { ack }, now);
@@ -4897,6 +4970,82 @@ impl Modem {
             // never sees one.
             CpFamily::Cpus(_) | CpFamily::Cpt(_) => {}
         }
+    }
+
+    /// Read the far end's code grid out of a CPu: `K` for the upstream slicer
+    /// (docs/114 R2a/R4) and, under `V92_CODE_GRID`, the one-per-call dump of
+    /// the fields that report it (R6).
+    ///
+    /// `K` is the fit of this end's design against the codes the far end says it
+    /// will put on the line -- the mask read through the law bit 35 names. A far
+    /// end that snaps a uniform ladder onto its codes reports *fewer* codes than
+    /// the design has points, which is why the fit pairs by position rather than
+    /// by nearest (`codegrid::estimate_from_mask`).
+    ///
+    /// Nothing here changes what is computed per symbol: `K` is turned into the
+    /// slicer's levels once, at `begin_b1u`, and this end's own levels are what
+    /// is used when there is no mask to read or when bit 128 says the mask is
+    /// not about the far end's transmit path.
+    fn read_code_grid(&mut self, cp: &Cp, first: bool) {
+        let Some(parameters) = self.parameters.as_ref() else {
+            self.up_scale = 1.0;
+            self.up_scale_source = "design (no CPd)";
+            return;
+        };
+        let Some(set) = parameters.sets.first() else {
+            self.up_scale = 1.0;
+            self.up_scale_source = "design (no set)";
+            return;
+        };
+        let law = crate::v92::codegrid::law(cp.a_law);
+        let codes: Vec<u16> = cp
+            .points(0)
+            .iter()
+            .map(|&ucode| crate::v92::codegrid::value_in(law, ucode))
+            .filter(|&value| value > 0)
+            .collect();
+        let fitted = if cp.codec.is_some() { None } else { crate::v92::codegrid::estimate_from_mask(set, &codes) };
+        match fitted {
+            Some(k) if k.is_finite() && k > 0.0 => {
+                self.up_scale = k;
+                self.up_scale_source = "mask";
+            }
+            _ if cp.codec.is_some() => {
+                self.up_scale = 1.0;
+                self.up_scale_source = "design (bit 128)";
+            }
+            _ => {
+                self.up_scale = 1.0;
+                self.up_scale_source = "design (no mask)";
+            }
+        }
+        if !first || !code_grid_log() {
+            return;
+        }
+        let blocks: Vec<String> = cp.constellations.iter().map(|mask| format!("{mask:032x}")).collect();
+        let union = cp.constellations.iter().fold(0u128, |all, mask| all | mask);
+        let popcount = union.count_ones();
+        let highest = 127 - union.leading_zeros().min(127);
+        eprintln!(
+            "V92_CODE_GRID: bit35 codec {} bit128 {} bit52:67 {} ({} x TRN1d at the codec's D/A) \
+             SUVu27:31 {} mask {} blocks [{}] popcount {} max Ucode {} design LC {} fit K {:.5} ({}) codes {}",
+            if cp.a_law { "A-law" } else { "mu-law" },
+            if cp.codec.is_some() { "set" } else { "clear" },
+            cp.trn1d_ratio,
+            f64::from(cp.trn1d_ratio) / 8192.0,
+            match self.suvu_level {
+                None => "16 (no measurement)".to_owned(),
+                Some(level) => format!("{level:.2} dB"),
+            },
+            cp.constellations.len(),
+            blocks.join(" "),
+            popcount,
+            highest,
+            set.len(),
+            self.up_scale,
+            self.up_scale_source,
+            codes.len()
+        );
     }
 
     /// Record what happened, and say it out loud when the trace is on: a bench
@@ -5857,6 +6006,96 @@ mod tests {
         assert_eq!(modem.upstream_rates(), Some(0x7ffff), "mask: {notes:?}");
         assert!(modem.circuit107(), "circuit 107 never came on: {notes:?}");
         assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes:?}", modem.phase());
+    }
+
+    /// A CPd for drn 1 as `upchoice` would send it, and a `Modem` holding it.
+    fn modem_with_cpd() -> Modem {
+        let design = crate::v92::design::Design {
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let parameters = crate::v92::upchoice::pin(&design, 1, Trellis::Sixteen, 1e-9)
+            .expect("drn 1 is pinnable")
+            .parameters;
+        let mut modem = Modem::default();
+        modem.parameters = Some(parameters);
+        modem
+    }
+
+    /// A CPu carrying `codes` in interval 0's mask, with bit 128 as asked.
+    fn cpu_with_mask(codes: &[u8], differ: bool) -> Cp {
+        let mask = codes.iter().fold(0u128, |mask, &ucode| mask | 1 << ucode);
+        Cp {
+            data_mode: true,
+            drn: 1,
+            intervals: [0; INTERVALS],
+            constellations: vec![mask],
+            codec: differ.then(|| vec![mask]),
+            ..Cp::default()
+        }
+    }
+
+    /// docs/114 R3: a far end that sets bit 128 says its transmit levels are not
+    /// its codec's, and the mask it sends with that is not a level table. The
+    /// call falls back to the design's own measured levels -- **the slice path
+    /// does not move**, which is asserted as the table being bit-identical --
+    /// and says so once, by name.
+    #[test]
+    fn a_far_end_that_sets_bit_128_falls_back_and_says_so() {
+        use crate::v92::codegrid;
+        use crate::v92::sequences::CpFamily;
+        let mut modem = modem_with_cpd();
+        let set = modem.parameters.clone().expect("a CPd").sets[0].clone();
+        // The mask a code-transparent far end would report for this design.
+        let codes: Vec<u8> = set.iter().map(|&point| codegrid::nearest_code(f64::from(point))).collect();
+
+        modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, true)));
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("bit 128 set"), "the fallback has to name itself: {notes}");
+        assert_eq!(modem.up_scale, 1.0, "bit 128 must not move the slicer's scale");
+        assert_eq!(modem.up_scale_source, "design (bit 128)");
+        // And with K = 1 the table is the design's own, point for point: this is
+        // what "the slice path is unchanged" means in code.
+        assert_eq!(codegrid::scaled(&set, modem.up_scale), set, "the fallback changed the levels");
+        // A second CPu on the same call does not repeat the event: it is one
+        // event per call, not one per repeat.
+        modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, true)));
+        let again = modem.clone().take_notes().join("\n");
+        assert_eq!(again.matches("bit 128 set").count(), 1, "{again}");
+    }
+
+    /// docs/114 R2a/R4: with bit 128 clear the mask *is* about the far end's
+    /// transmitter, so `K` is fitted from it and the slicer's table is built at
+    /// that scale rather than at one.
+    #[test]
+    fn a_code_transparent_mask_sets_k_and_the_table_follows_it() {
+        use crate::v92::codegrid;
+        use crate::v92::sequences::CpFamily;
+        let mut modem = modem_with_cpd();
+        let set = modem.parameters.clone().expect("a CPd").sets[0].clone();
+        for k in [1.0f64, 0.98, 1.03] {
+            // What the far end reports when its codes arrive at this end's scale
+            // times k: the mask is a list of Ucodes, so the fit has to see them
+            // as codes and not as levels.
+            let mut codes: Vec<u8> =
+                set.iter().map(|&point| codegrid::nearest_code(k * f64::from(point))).collect();
+            codes.dedup();
+            modem.cpu = None;
+            modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, false)));
+            assert_eq!(modem.up_scale_source, "mask", "k {k}: no fit was taken");
+            assert!((modem.up_scale - k).abs() < 0.05 * k, "k {k} came back as {}", modem.up_scale);
+            // The table is `round(K a(eta))`, and at K = 1 it is the design's own
+            // -- so a call whose far end is on this end's scale is untouched.
+            let table = codegrid::scaled(&set, modem.up_scale);
+            if k == 1.0 {
+                assert_eq!(table, set);
+            } else {
+                assert_ne!(table, set, "k {k}: the table did not move");
+            }
+        }
     }
 
     /// A far end whose `Su` never turns over -- 9.5.2.1.7's second clause

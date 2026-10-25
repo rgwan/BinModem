@@ -56,6 +56,7 @@
 //! Anything above the bound the code uses is refused and the next rung down is
 //! tried.
 
+use super::codegrid;
 use super::design::Design;
 use super::{
     CONSTELLATION_FRAME, CONSTELLATION_POINTS, GAIN_LARGEST, Parameters, Trellis, UP_INTERVALS, UP_RATES,
@@ -101,6 +102,14 @@ pub const E2U_SYMBOLS: usize = UP_INTERVALS + if EXTEND_E2U { 1 } else { 0 };
 ///
 /// A uniform alphabet at 1, 3, ..., 2 LC - 1 has a mean square of
 /// ((2 LC)^2 - 1) / 3, and G is its reciprocal square root.
+///
+/// This is the *odd lattice's* gain and is no longer what [`build`] sends: a
+/// design on the far end's code grid takes its gain from the code ladder's own
+/// mean square ([`codegrid::gain_for`]). It is kept because it is the reference
+/// the module comment above is written in and because a reader comparing the
+/// two designs needs both numbers side by side -- at 24 000 the odd lattice
+/// asks for G = 0.1085 and the code ladder for G = 6.17e-4, which are the same
+/// transmit power on two different sets of numbers.
 pub fn gain_for(levels: usize) -> f64 {
     let span = 2.0 * levels as f64;
     (3.0 / (span * span - 1.0).max(1.0)).sqrt()
@@ -149,7 +158,7 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
         if (levels as f64) > room {
             continue;
         }
-        let spacing = 2.0 * parameters.gain;
+        let spacing = parameters.step();
         let predicted = 2.0 * normal_tail(spacing / (2.0 * sigma.max(f64::MIN_POSITIVE)));
         return Some(Choice { parameters, sigma, predicted });
     }
@@ -181,7 +190,7 @@ pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Cho
     parameters.fits().ok()?;
     let carried = design.scale * design.scale * noise.max(0.0);
     let sigma = (design.residual * design.residual + carried).sqrt();
-    let spacing = 2.0 * parameters.gain;
+    let spacing = parameters.step();
     let predicted = 2.0 * normal_tail(spacing / (2.0 * sigma.max(f64::MIN_POSITIVE)));
     Some(Choice { parameters, sigma, predicted })
 }
@@ -215,7 +224,15 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
     if levels > CONSTELLATION_POINTS {
         return None;
     }
-    let gain = gain_for(levels);
+    // docs/114 R1: the points are the far end's own code values, not the odd
+    // lattice. `levels` is 6.4.2's LC, unchanged, so the class arithmetic and
+    // the moduli above are untouched; what changes is where the points sit.
+    let set = codegrid::grid(levels)?;
+    // 8.8.3 fixes G from the set's own mean square and from nothing else, so
+    // the change of shape moves G with it: the odd lattice's 0.1085 at LC = 8
+    // becomes the code ladder's 6.17e-4, and `ms(v G)` is 1 either way. G is
+    // not a grid knob and is not used as one (docs/114 R8).
+    let gain = codegrid::gain_for(&set);
     if gain > GAIN_LARGEST {
         // More power than CPd's field carries: the rung would go out quieter
         // than the design asked for and every level would be off by that much.
@@ -261,7 +278,7 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
         filters: design.filters.clone(),
         // One set of `levels` positive points on a spacing of two, shared by
         // every constellation frame: the simple case of CPd's six.
-        sets: vec![(0..levels).map(|index| (2 * index + 1) as u16).collect()],
+        sets: vec![set],
         indices: [0; CONSTELLATION_FRAME],
     })
 }
@@ -465,9 +482,18 @@ mod tests {
             assert_eq!(2 * lc, 2 * modulus, "{rate}: N against k = 3's 2 x Mi");
             parameters.fits().unwrap_or_else(|error| panic!("{rate}: {error}"));
             // Table 30's gain field: "4 x G > 0" in unsigned Q0.16.
+            //
+            // The tolerance is 1 %, not 0.1 %: on the far end's code grid `G`
+            // is the codec's own scale (6.17e-4 at 24 000, `codegrid::gain_for`)
+            // rather than the odd lattice's 0.1085, so the field's quantum is
+            // 1/262144 of that, i.e. 0.6 % -- exactly the resolution `docs/114`
+            // R8 warns about, and it is why `G` is not used as a grid knob. At
+            // 0.6 % the gain is 0.05 dB, five times finer than the 0.25 dB
+            // `Table 27` bits 27:31 report in, so nothing this end can measure
+            // would see it.
             let four_g = crate::v92::four_g_from_gain(parameters.gain);
             assert!(four_g > 0);
-            assert!((crate::v92::gain_from_4g(four_g) - parameters.gain).abs() / parameters.gain < 1e-3);
+            assert!((crate::v92::gain_from_4g(four_g) - parameters.gain).abs() / parameters.gain < 1e-2);
             table.push((rate, lc, 2 * lc, four_g));
         }
         println!("rate, LC, N, 4G: {table:?}");
