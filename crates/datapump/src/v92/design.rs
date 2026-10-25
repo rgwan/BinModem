@@ -359,18 +359,78 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
     // fired and the eight symbols of latency stayed. Four codes is 1.2e-4, i.e.
     // 0.04 per cent of a level spacing -- below anything the line can resolve,
     // and it is the *latency* that costs, not these taps.
-    let one_code = 4.0 / 32768.0;
+    let one_code = ONE_CODE;
     let mut delay = main;
     if main > 0 && filters.z2[..main].iter().all(|value| value.abs() < one_code) {
         filters.z2.drain(..main);
         delay = 0;
     }
-    if filters.z2.len() == 1 {
-        // Nothing but the main tap survives: send the identity rather than a
-        // one-code section, so the CPd is 480 bits and says what happens.
-        filters = Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() };
+    Ok(collapse_pure_delay(Design { filters, residual: unreached.sqrt(), scale, limited, delay }))
+}
+
+/// Four Q0.15 codes: the threshold under which a tap is not worth sending.
+///
+/// One code is 2^-15, so a tap below one code is not representable in the field
+/// it would be sent in. Four -- 1.2e-4, 0.04 per cent of a level spacing -- is
+/// where the live design's own taps came in (`docs/94` section 7: on the Agere
+/// bench every tap but the main one was 0 to 2 codes), and a one-code test
+/// never fired on them.
+const ONE_CODE: f64 = 4.0 / 32768.0;
+
+/// A section whose only tap is its main one is an identity with latency: send
+/// the identity instead and let the latency go with it.
+///
+/// `z2 = 0.9999 * delta(n - 8)` is spectrally a no-op (`Z2 = 0.0 dB` at all
+/// twenty-one tones, `Z2H = H` at every one) that still costs 750 bits of CPd
+/// and, worse, **eight symbols of latency**, which rotates the twelve-symbol
+/// data frame and the four-symbol trellis phase of everything the far end sends
+/// afterwards -- B1u then reads chance (291 of 576 against 543 for the same line
+/// with `z2 = [1]`: `docs/94` sections 6.1 and 7.1). `z2 = [1]` is the same
+/// line, one code shorter, and no delay at all.
+///
+/// It lives here, and *both* builders call it, because there are two of them:
+/// [`design`], the least-squares inverse of the TRN1u fit, and [`from_reading`],
+/// the magnitude-only shaper built from phase 2's L1 probing -- which is what
+/// `Prefilter::Reading`, the default, puts in CPd. The live design was the
+/// second one, so a trim that lived inside the first never ran on a call at all
+/// (`docs/94` section 7.3).
+///
+/// The main tap has to carry the whole section *and* be a unit gain: a section
+/// that is 0.5 with no other taps is not an identity, and sending `[1]` for it
+/// would move the far end's levels by 6 dB.
+fn collapse_pure_delay(mut design: Design) -> Design {
+    let Some(main) = design
+        .filters
+        .z2
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .map(|(at, _)| at)
+    else {
+        return design;
+    };
+    if !(0.98..=1.02).contains(&design.filters.z2[main]) {
+        return design;
     }
-    Ok(Design { filters, residual: unreached.sqrt(), scale, limited, delay })
+    if design
+        .filters
+        .z2
+        .iter()
+        .enumerate()
+        .any(|(at, value)| at != main && value.abs() >= ONE_CODE)
+    {
+        return design;
+    }
+    // The unit tap is Q0.15's own 32767/32768 once `to_signed_q` saturates it,
+    // which is 3e-5 out: the same section `V92_PRE=none` sends, and the one the
+    // far end has been measured running (`docs/94` section 7.1).
+    design.filters = Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() };
+    // No filter is being sent and nothing was scaled: the far end's output is on
+    // the levels' own scale, and an identity shortens nothing.
+    design.scale = 1.0;
+    design.delay = 0;
+    design.residual = 0.0;
+    design
 }
 
 /// 8.8.3's answer when nothing the design can send is admissible: the far end
@@ -1030,13 +1090,19 @@ pub fn from_reading(reading: &Reading, limits: &FilterLimits) -> Result<(Design,
         tilt_after_db: after_high - after_low,
         tones,
     };
-    let design = Design {
+    // A shaper whose answer is a pure delay is an identity with latency, and
+    // the latency is not free: this is the builder the live CPd comes from, so
+    // the collapse has to be here as well as in `design` (see
+    // [`collapse_pure_delay`]). `delay` is `m - 1` by construction -- the
+    // section is linear phase and its main tap is the middle one -- so an
+    // identity's eight symbols of latency are exactly what this removes.
+    let design = collapse_pure_delay(Design {
         filters,
         residual,
         scale: 1.0,
         limited: lz2 < READING_TAPS,
         delay: m - 1,
-    };
+    });
     Ok((design, predicted))
 }
 
@@ -1464,8 +1530,11 @@ mod tests {
             let (design, predicted) = from_reading(&reading, &plan)
                 .unwrap_or_else(|error| panic!("{tilt} dB tilt: {error}"));
             assert_eq!(design.scale, 1.0, "{tilt} dB tilt needed a scale");
+            // One is allowed: a reading with nothing to shape is answered with
+            // the identity itself (`collapse_pure_delay`), whose unit tap is
+            // 32767/32768 in the field and needs no headroom.
             assert!(
-                design.filters.z2.iter().all(|tap| tap.abs() <= TAP_HEADROOM + 1e-9),
+                design.filters.z2.iter().all(|tap| tap.abs() <= 1.0 + 1e-9),
                 "{tilt} dB tilt: {:?}",
                 design.filters.z2
             );
