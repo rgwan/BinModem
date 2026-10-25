@@ -1630,6 +1630,9 @@ pub struct Modem {
     /// symbols half a symbol, and the taps fitted before it are half a symbol
     /// out for everything after.
     refit_from: Option<u64>,
+    /// The delay the first TRN1u asked for, waiting for the TRN2u that can
+    /// absorb it: see `fe_install` below.
+    fe_pending: Option<f64>,
     /// How many times that refit has moved its anchor on.
     refit_tries: u8,
     /// The length of one CPt repetition in bits, once one has been read, and
@@ -1888,6 +1891,7 @@ impl Modem {
             su_from: None,
             jp_sent: false,
             refit_from: None,
+            fe_pending: None,
             refit_tries: 0,
             ja_bits: 0,
             ja_ones: 0,
@@ -2122,6 +2126,10 @@ impl Modem {
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
             let fit_started = std::time::Instant::now();
+            if let Some(delta) = self.fe_pending.take() {
+                self.rx.fe_install(delta);
+                self.note(format!("V.92: fractional delay {delta:.3} installed at TRN2u"));
+            }
             if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
                 let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
                 self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
@@ -2396,12 +2404,27 @@ impl Modem {
             // symbol, and `docs/78` measured one whole symbol as worth 0.2 per
             // cent of residual, so installing a delay without re-fitting would
             // buy nothing.
+            // Measured here because this is where the phase is observable, and
+            // installed at TRN2u because that is where it can be *absorbed*.
+            // Installing it here was tried and breaks the call: the fit window
+            // [at, at + 1200] straddles the install, so the taps are fitted on
+            // one phase while everything after is read at another, and Ja is
+            // lost (measured: trained at 15.6 dB, then "reading Ja down - / up -"
+            // and a fallback to V.90 phase 2). At TRN2u the fit that follows is
+            // entirely on converted samples, which is what `docs/77` found to be
+            // the only workable enable point.
+            // `V92_FE_DELTA` overrides the aim, for separating "the mechanism
+            // does not work" from "the criterion chooses badly" -- the two
+            // questions this measurement has to keep apart.
+            let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
             if self.rx.fe_enabled()
-                && let Some((delta, residual)) = self.rx.fe_aim(at as usize, TRAIN_WINDOW)
+                && let Some((delta, residual)) = forced
+                    .map(|d| (d, f64::NAN))
+                    .or_else(|| self.rx.fe_aim(at as usize, TRAIN_WINDOW))
             {
-                self.rx.fe_install(delta);
+                self.fe_pending = Some(delta);
                 self.note(format!(
-                    "V.92: fractional delay {delta:.3} symbols (eye residual {residual:.4})"
+                    "V.92: fractional delay {delta:.3} symbols aimed (eye residual {residual:.4})"
                 ));
             }
             if self.rx.train_near(at, TRAIN_SEARCH) {

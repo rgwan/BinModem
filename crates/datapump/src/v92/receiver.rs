@@ -994,8 +994,20 @@ impl Receiver {
     /// Install a delay and hold it, as the fixed non-integer loop delay this
     /// receiver assumes: estimated once, then never tracked.
     pub fn fe_install(&mut self, delta: f64) {
-        if let Some(fe) = self.fe.as_mut() {
+        // The line is a property of the *signal*, not of the moment it was
+        // fitted, so the history is rebuilt from the raw stream rather than
+        // left half converted. Without this every fit whose window straddles
+        // the install is made on one phase and read on another: wired in that
+        // way the call trained TRN1u at 15.6 dB and then lost Ja entirely.
+        let raw = {
+            let Some(fe) = self.fe.as_mut() else { return };
             fe.install(delta);
+            fe.raw()
+        };
+        let conv = fracdelay::replay(&raw, delta);
+        if conv.len() == self.history.len() {
+            self.history.clear();
+            self.history.extend(conv);
         }
     }
 
@@ -3576,6 +3588,11 @@ fn eye_residual(conv: &[f64], at: usize, span: usize, mode: Mode) -> Option<f64>
         return None;
     }
     let y: Vec<f64> = (0..span).map(|n| conv[at + n] / scale).collect();
+    if std::env::var_os("V92_FE_DEBUG").is_some() {
+        let a: Vec<String> = (0..8).map(|n| format!("{:.3}", y[n])).collect();
+        let b: Vec<String> = (0..8).map(|n| format!("{:.3}", s[n])).collect();
+        eprintln!("V92FEDBG2: at {at} scale {scale:.4} y[{}] s[{}]", a.join(","), b.join(","));
+    }
     let m = rows + fb;
     let mut a = vec![vec![0.0f64; m + 1]; m];
     let mut row = vec![0.0f64; m];
@@ -3594,7 +3611,12 @@ fn eye_residual(conv: &[f64], at: usize, span: usize, mode: Mode) -> Option<f64>
             for q in p..m {
                 a[p][q] += rp * row[q];
             }
-            a[p][m] += rp * y[n];
+            // The target is the *symbol*, not the sample: the fit is s from y,
+            // which is what an equaliser is. Regressing y on its own past
+            // reproduces the ISI instead of removing it, and then the residual
+            // is |y - s| -- which is what made every candidate read
+            // mean|s| and look flat.
+            a[p][m] += rp * s[n];
         }
     }
     // Symmetric: the upper triangle was filled, so mirror it before solving.
