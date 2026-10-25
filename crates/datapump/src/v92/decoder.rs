@@ -715,6 +715,13 @@ pub struct Decoder {
     /// Data frames read so far, so that `by_content` stops at the end of B1u:
     /// 8.7.1's 48 frames are the only ones whose content is known.
     pushed: usize,
+    /// Every decided frame's four indices, youngest last, while an offline
+    /// instrument has asked for them ([`Self::keep_decisions`]). Empty by
+    /// default: the bit stream is what the modem wants and the indices are what
+    /// a *measurement* wants, and only one of the two belongs in a call.
+    decisions: Vec<[i32; TRELLIS_FRAME]>,
+    /// Whether the above is being filled.
+    keeping: bool,
 }
 
 impl Decoder {
@@ -760,6 +767,8 @@ impl Decoder {
             rotation_line: None,
             by_content: false,
             pushed: 0,
+            decisions: Vec::new(),
+            keeping: false,
             named_rotation: correction()
                 .and_then(|fix| fix.rotation)
                 .map_or([None; TRELLIS_FRAME], |table| table.map(Some)),
@@ -875,6 +884,23 @@ impl Decoder {
     /// measured.
     pub fn trellis_mode(&self) -> TrellisMode {
         self.mode
+    }
+
+    /// Keep every decided frame's four indices, for [`Self::take_decisions`].
+    ///
+    /// **Off unless asked for, and it stays off**: this is the instrument an
+    /// offline measurement of the two decisions needs (`examples/
+    /// v92_trellis_gain.rs`), and it costs a `Vec` that grows for as long as
+    /// nobody takes it. A call runs without it. `V92_ETA_TRACE` is the same
+    /// data on disk, for one decoder at a time.
+    pub fn keep_decisions(&mut self, on: bool) {
+        self.keeping = on;
+    }
+
+    /// The frames decided since the last call, oldest first, each with the four
+    /// indices the decision named.
+    pub fn take_decisions(&mut self) -> Vec<[i32; TRELLIS_FRAME]> {
+        std::mem::take(&mut self.decisions)
     }
 
     /// The rate this decoder was built for, in bit/s.
@@ -1028,6 +1054,9 @@ impl Decoder {
         };
         let Some((index, etas)) = decided else { return };
         self.decided += 1;
+        if self.keeping {
+            self.decisions.push(etas);
+        }
         trace_etas(self, index, etas);
         // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
         // first symbol of B1u begins one. A decision that lands in the middle
