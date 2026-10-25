@@ -1059,9 +1059,16 @@ impl Receiver {
         if span <= TRAIN_TAPS + DFE_FEEDBACK {
             return None;
         }
+        // The search covers half a symbol, not a whole one. On a two-point
+        // sequence a delay and that delay plus half a symbol open the eye
+        // equally well -- the second reads the sequence inverted -- so the
+        // criterion is invariant to the half-symbol shift and a search over
+        // [0, 1) returns whichever of the pair the coarse grid lands nearer,
+        // which is how this first returned 0.760 where the answer is 0.245.
+        // Restricting to [0, 0.5) fixes the branch without a constant.
         let mut best: Option<(f64, f64)> = None;
         for k in 0..=FE_COARSE {
-            let d = k as f64 / FE_COARSE as f64;
+            let d = 0.5 * k as f64 / FE_COARSE as f64;
             let conv = fracdelay::replay(&raw, d);
             let scored = eye_residual(&conv, at, span, self.reference_mode);
             if std::env::var_os("V92_FE_DEBUG").is_some() {
@@ -1081,11 +1088,11 @@ impl Receiver {
         // symbols as costing 0.9 dB, so a twentieth of a symbol is not fine
         // enough to be the answer.
         if let Some((d0, _)) = best {
-            let reach = 1.0 / FE_COARSE as f64;
+            let reach = 0.5 / FE_COARSE as f64;
             let mut refined: Option<(f64, f64)> = None;
             for k in 0..=FE_FINE {
                 let d = d0 - reach + 2.0 * reach * (k as f64 / FE_FINE as f64);
-                if !(0.0..1.0).contains(&d) {
+                if !(0.0..0.5).contains(&d) {
                     continue;
                 }
                 let conv = fracdelay::replay(&raw, d);
