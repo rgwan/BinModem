@@ -435,6 +435,81 @@ impl Decoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The chain B1u carries, which 8.7.1 makes known (9.6.1.1.6)
+// ---------------------------------------------------------------------------
+
+/// Data frames of B1u this receiver drops before it decodes anything: eighteen.
+///
+/// 8.7.1's forty-eight data frames carry no information -- they are scrambled
+/// ones, sent so that the far end's receiver can settle -- so a receiver is
+/// entitled to drop the ones it cannot slice yet, and [`crate::v92::digital`]
+/// drops exactly this many whole data frames (216 symbols) and then feeds its
+/// decoder. Whole frames, because the twelve-symbol frame phase and the
+/// four-symbol trellis phase have to survive the drop.
+///
+/// It lives here because it is the argument [`b1u_differential_at`] is called
+/// with on a B1u that begins where this end thinks it does: the frame the
+/// decoder starts on is B1u's frame 18, not its frame 0.
+pub const B1U_ACQUIRE_FRAMES: usize = 18;
+
+/// The far end's d(f - 1) at the first data frame of B1u this receiver reads.
+///
+/// 8.7.1 makes B1u "48 data frames of scrambled binary ones", sent after the
+/// "scrambler, modulus encoder, convolutional encoder, precoder and prefilter
+/// memories are initialized to zero". Nothing in it depends on the line, so
+/// the transmitter's differential chain over B1u is a function of the clause:
+/// the bits are [`crate::v32::Scrambler`]'s, at the answering end's polynomial
+/// and from its zeroed register (6.3), fed binary ones; the whole frames of
+/// that stream go through 6.4.1's steps 1 to 3 with the moduli they will be
+/// decoded with; and the `d` after `frames_skipped` of them is what a decoder's
+/// memory has to hold when it starts reading from there.
+///
+/// `frames_skipped` is not zero here. [`crate::v92::digital`] does not begin
+/// decoding at B1u's first symbol: it drops eighteen whole data frames while
+/// the slicer settles (`B1U_ACQUIRE_FRAMES`), so the first frame this end
+/// decodes is B1u's frame 18 -- and [`D_BEFORE_THE_FIRST_FRAME`], which is
+/// frame 0's value, is then one frame's reflection out. One frame read through
+/// the wrong reflection is 36 wrong bits against B1u's 576; measured on an
+/// Agere at 24 000 it was 39 of 576 (one frame, whose R comes out complemented
+/// because M = 8^12 is a power of two, plus three).
+///
+/// A `bits` the moduli cannot carry is no B1u at all, and the answer there is
+/// the clause's own default rather than a chain nothing computed.
+pub fn b1u_differential_at(frames_skipped: usize, moduli: &Moduli12, bits: u32) -> bool {
+    if !moduli.fits(bits) {
+        return D_BEFORE_THE_FIRST_FRAME;
+    }
+    let stream = b1u_scrambled_bits(frames_skipped, bits);
+    let mut encoder = Encoder::new();
+    for frame in stream.chunks(bits as usize) {
+        encoder
+            .encode(FrameBits::from_bits(frame), moduli)
+            .expect("`fits` proved the moduli carry this many bits");
+    }
+    encoder.d()
+}
+
+/// The bits B1u actually carries: 8.7.1's binary ones through 6.3's GPA
+/// scrambler, from its zeroed register and running on from frame to frame.
+///
+/// This is the far end's own scrambled stream for the first `frames` data
+/// frames of B1u, and it is what a receiver reading B1u's *modulus* chain has
+/// to reproduce -- the differential state above is one use of it, and the
+/// descrambler's own memory is another: a receiver that starts reading at B1u
+/// frame 18 has no history for its descrambler either, and 6.3's polynomial is
+/// fed by the bits it reads, so the 23 bits before it are known here too.
+pub fn b1u_scrambled_bits(frames: usize, bits: u32) -> Vec<bool> {
+    let mut scrambler = crate::v32::Scrambler::new(crate::v32::Mode::Answer);
+    let mut stream = Vec::with_capacity(frames * bits as usize);
+    for _ in 0..frames {
+        for _ in 0..bits {
+            stream.push(scrambler.scramble(true));
+        }
+    }
+    stream
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +863,85 @@ mod tests {
         assert_eq!(moduli.values(), &MIXED);
         assert_eq!(moduli.product(), parameters.product());
         assert!(moduli.fits(parameters.bits()), "drn 13 does not fit its own moduli");
+    }
+
+    /// 8.7.1's payload is known, so the far end's differential chain over it is
+    /// known too: worked by hand, three bits a frame, M = 8.
+    ///
+    /// The scrambler is zeroed and fed ones, so its first outputs are
+    /// 1, 1, 1, 1, 1, 0, ...: the x^-5 tap first sees an output at n = 5 and no
+    /// tap sees anything before n = 0 has been shifted in, so the first five
+    /// are ones. Frame 0 is `111`, R = 7, and 2R = 14 > M - 1 = 7, so s(0) = 1
+    /// and d(0) = 1 on d(-1) = 0. Frame 1 is `110`, R = 3, 2R = 6 < 7, so
+    /// s(1) = 0 and d(1) = 0 xor 1 = 1 again -- the chain is at one after two
+    /// frames, which is not where the clause's d(-1) leaves a decoder.
+    #[test]
+    fn b1u_carries_the_chain_8_7_1_makes_known() {
+        let moduli = Moduli12::new([2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(moduli.product(), 8);
+        assert!(moduli.fits(3));
+        // The stream those claims rest on: five ones and the x^-5 tap's first
+        // turn at n = 5.
+        assert_eq!(
+            b1u_scrambled_bits(2, 3),
+            vec![true, true, true, true, true, false],
+            "8.7.1's scrambled ones are not what this reader thinks"
+        );
+        assert_eq!(b1u_differential_at(0, &moduli, 3), D_BEFORE_THE_FIRST_FRAME);
+        assert!(b1u_differential_at(1, &moduli, 3), "frame 0's R is over the middle");
+        assert!(b1u_differential_at(2, &moduli, 3), "frame 1 turns the chain back");
+
+        // And the chain is what actually decodes B1u: the labels the encoder
+        // makes at frame 1 come back out of it with the seed, and do not
+        // without.
+        let mut scrambler = crate::v32::Scrambler::new(crate::v32::Mode::Answer);
+        let mut encoder = Encoder::new();
+        let mut labels = [0u8; UP_INTERVALS];
+        for _ in 0..2 {
+            let bits: Vec<bool> = (0..3).map(|_| scrambler.scramble(true)).collect();
+            labels = encoder.encode(FrameBits::from_bits(&bits), &moduli).expect("a frame that fits");
+        }
+        let frame = FrameBits::new(3, 3);
+        let mut seeded = Decoder::new();
+        seeded.set_d(b1u_differential_at(2, &moduli, 3));
+        assert_eq!(seeded.decode(&labels, &moduli, 3), Ok(frame));
+        let mut unseeded = Decoder::new();
+        assert_eq!(
+            unseeded.decode(&labels, &moduli, 3),
+            Ok(FrameBits::new(4, 3)),
+            "the unseeded chain read the frame back, so this test proves nothing"
+        );
+    }
+
+    /// The frame this receiver starts B1u on is not B1u's frame 0, and the seed
+    /// is what says so: eighteen frames of the 24 000 rung's moduli (M = 8^12,
+    /// K = 36, an Agere SV92PP's CPd) leave the chain at one, where a decoder
+    /// that never looked holds zero.
+    ///
+    /// This is the pin the fix rests on: it fails if the seeding is dropped, if
+    /// it is handed a zero skip, or if the chain is computed over the wrong
+    /// payload -- 537 ones of 576 on `/tmp/fe/ber` is exactly one frame's worth,
+    /// and the frame is the one this value decides.
+    #[test]
+    fn the_frame_b1u_is_read_from_is_not_frame_zero() {
+        let moduli = Moduli12::new([8; UP_INTERVALS]);
+        assert_eq!(moduli.product(), 1u128 << 36, "the 24 000 rung's moduli");
+        assert!(moduli.fits(36));
+        let at_frame_zero = b1u_differential_at(0, &moduli, 36);
+        let at_the_skip = b1u_differential_at(B1U_ACQUIRE_FRAMES, &moduli, 36);
+        assert_eq!(at_frame_zero, D_BEFORE_THE_FIRST_FRAME);
+        assert!(at_the_skip, "eighteen frames of scrambled ones left the chain at zero");
+        assert_ne!(
+            at_the_skip, at_frame_zero,
+            "a zero skip seeds what the decoder already has, so the fix does nothing"
+        );
+        // And it is not a constant of the call: the chain moves frame by frame
+        // with s(f), which for these moduli is the top bit of R (M - 1 is one
+        // short of a power of two), so the neighbours of the frame the decoder
+        // starts on are 0, 1, 1, 0 from frame 17.
+        assert!(!b1u_differential_at(17, &moduli, 36));
+        assert!(b1u_differential_at(18, &moduli, 36));
+        assert!(b1u_differential_at(19, &moduli, 36));
+        assert!(!b1u_differential_at(20, &moduli, 36));
     }
 }

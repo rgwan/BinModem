@@ -616,6 +616,35 @@ impl Decoder {
         self.by_content = on && by_content_wanted() && self.bits_per_frame > BITS_AT_THE_CONSTANT;
     }
 
+    /// Start 6.4.1's sign chain somewhere other than 8.7.1's zero.
+    ///
+    /// For a decoder built at B1u's boundary but fed from later in it: the
+    /// first data frame it decodes is B1u's frame `frames_skipped`, and the far
+    /// end's d(f - 1) there is
+    /// [`b1u_differential_at`](crate::v92::modulus::b1u_differential_at) --
+    /// known, because 8.7.1 makes B1u's payload known. A decoder nobody calls
+    /// this on keeps the clause's `d(-1)`, which is what every other caller
+    /// (E2u, RM, FB1u, a rate renegotiation) has to keep.
+    pub fn seed_differential(&mut self, d: bool) {
+        self.modulus.set_d(d);
+    }
+
+    /// Prime 6.3's descrambler with the bits that went out before the first one
+    /// this decoder is fed.
+    ///
+    /// 8.7.1 makes them known for the same reason it makes the differential
+    /// state known -- B1u's frames are scrambled ones, so the stream before
+    /// this decoder starts is
+    /// [`b1u_scrambled_bits`](crate::v92::modulus::b1u_scrambled_bits) -- and
+    /// they matter because the descrambler is fed by what it decodes: from a
+    /// zeroed register its first twenty-three outputs are wrong, however
+    /// perfectly the levels are read.
+    pub fn seed_descrambler(&mut self, preceding: &[bool]) {
+        for &bit in preceding {
+            self.descrambler.descramble(bit);
+        }
+    }
+
     /// Symbols fed since the first symbol of B1u.
     pub fn symbols(&self) -> u64 {
         self.n

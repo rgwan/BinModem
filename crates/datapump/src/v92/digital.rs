@@ -3361,7 +3361,12 @@ impl Modem {
         // The equaliser is not gated: `symbol_upstream` withholds symbols from
         // `upstream_data` and the receiver behind it keeps running, which is
         // the same rule `upstream_drop_until` follows for TRN2u.
-        const B1U_ACQUIRE_FRAMES: usize = 18;
+        //
+        // The number itself lives beside the chain it seeds, because it is also
+        // `b1u_differential_at`'s argument: dropping whole data frames is what
+        // makes the first frame decoded here B1u's frame 18 and not its frame
+        // 0 (`modulus::B1U_ACQUIRE_FRAMES`).
+        const B1U_ACQUIRE_FRAMES: usize = crate::v92::modulus::B1U_ACQUIRE_FRAMES;
         // The design's own delay is *not* taken off here, and that is a
         // measurement rather than a preference.
         //
@@ -3424,6 +3429,99 @@ impl Modem {
         // which carry nothing -- so both decoders' output is dropped while it
         // runs.
         self.b1u_probe = Some(Decoder::new(&parameters));
+        // 8.7.1 makes B1u's payload known, so the far end's differential chain
+        // at any of its frame boundaries is computable (`modulus::b1u_differential_at`
+        // -- the scrambled ones through 6.4.1's steps 1 to 3, with the moduli
+        // they are decoded with). This decoder does not start at B1u's frame 0:
+        // it is fed from `b1u_skip + 1` symbols after the boundary, a whole
+        // number of data frames, so the first frame it decodes is B1u's frame
+        // `(b1u_skip + 1) / 12` and the chain's value there is not the `d(-1)`
+        // 8.7.1 zeroes.
+        //
+        // **It is still not seeded by default, and that is a measurement.**
+        // Seeding it with the computed value takes B1u from 537 ones of 576 to
+        // 503, and every seed from 0 to 47 frames leaves exactly those two
+        // outcomes, one per value of d (24 000, `~/v92up-runs/c24-4.agr-tx.raw`,
+        // `/tmp/fe/ber` tags `seed-fix`, `seed18`): the two decodes differ in 36
+        // bits of 576, all of them in the two frames the seed's own reflection
+        // touches, and the better one is the value the untold decoder already
+        // holds. So the chain this receiver starts on carries 8.7.1's zero, the
+        // far end's d at frame 18 is the *complement* of the clause's chain if
+        // the frame is 18 at all, and the bits B1u is short by are not a
+        // reflection -- which is what [`Self::score_b1u`]'s zero pattern shows:
+        // the first frame decoded reads 16 ones of 36 and the other fifteen
+        // carry nineteen zeros between them.
+        //
+        // A second premise was falsified the same way and is recorded here so
+        // that nobody re-derives it: sweeping the Viterbi's start state over all
+        // 0..63 leaves the same 537 at states 0/1/16 and worse elsewhere, so the
+        // deficit is not the start state either. What is left of it is 13 bits
+        // of descrambler history (recovered by the priming below) plus 26 slicer
+        // and Viterbi decisions spread over eight of the fifteen later frames at
+        // the 0.1011 half-cell residual this equaliser leaves. **The ceiling of
+        // any known-content seeding is 550**; the rest needs the slicing better,
+        // not the state.
+        //
+        // `V92_B1U_SEED_FRAMES=<n>` is that experiment: seed 6.4.1's chain `n`
+        // data frames into B1u. It is off unless asked for, and it is worth
+        // nothing -- seeding with the computed value takes 537 to 503.
+        let seed = std::env::var("V92_B1U_SEED_FRAMES").ok().and_then(|text| text.parse::<usize>().ok());
+        if let Some(frames) = seed {
+            let moduli = crate::v92::modulus::Moduli12::from(&parameters);
+            let chain = crate::v92::modulus::b1u_differential_at(frames, &moduli, parameters.bits());
+            // The negated probe gets the other value: it reads the same symbols
+            // through an inverted line, which inverts 6.4.1's reflection step
+            // with it (`modulus`'s module comment), so its chain starts
+            // complemented. Seeded here and not at allocation because
+            // [`Self::decide_b1u_polarity`] may swap the two decoders, and then
+            // the probe is the one carrying the call.
+            if let Some(decoder) = self.upstream_data.as_mut() {
+                decoder.seed_differential(chain);
+            }
+            if let Some(decoder) = self.b1u_probe.as_mut() {
+                decoder.seed_differential(!chain);
+            }
+            if std::env::var_os("V92_RX_BITS").is_some() || tracing() {
+                eprintln!(
+                    "V92B1U seed: frames_skipped={frames} moduli={:?} bits={} d={chain}",
+                    moduli.values(),
+                    parameters.bits()
+                );
+            }
+        }
+        // The same clause, applied to 6.3's descrambler, and unlike the
+        // differential chain above this one is **on by default** because it is
+        // worth bits: B1u frame 18 is not B1u frame 0 for the descrambler
+        // either, its twenty-three-bit memory is fed entirely by bits 8.7.1
+        // makes known, and scoring the window against a register the far end
+        // never had costs the first twenty-three bits of it. Measured on
+        // `c24-4` at 24 000: **537 ones without, 550 with, exactly +13**
+        // (`/tmp/reports/b1u-seed.md`).
+        //
+        // This is a defect of the *instrument*, not of the receiver: the data
+        // mode path starts at B1u's own first symbol with a zeroed descrambler
+        // (8.7.1) and is not primed here. `V92_B1U_PRIME=0` restores the old
+        // reading, which is what every published "B1u N/576" before today was
+        // taken with.
+        if std::env::var("V92_B1U_PRIME").ok().as_deref() != Some("0") {
+            let bits = parameters.bits();
+            let first = (self.b1u_skip + 1) / crate::v92::UP_INTERVALS;
+            let stream = crate::v92::modulus::b1u_scrambled_bits(first, bits);
+            let keep = stream.len().min(23);
+            let preceding: Vec<bool> = stream[stream.len() - keep..].to_vec();
+            if let Some(decoder) = self.upstream_data.as_mut() {
+                decoder.seed_descrambler(&preceding);
+            }
+            // The negated probe reads the same symbols through an inverted
+            // line, which complements every bit it hands 6.3's descrambler
+            // (`modulus`'s module comment), so its memory is the complement of
+            // the same window -- the same treatment `V92_B1U_SEED_FRAMES` gives
+            // the differential chain.
+            if let Some(decoder) = self.b1u_probe.as_mut() {
+                let flipped: Vec<bool> = preceding.iter().map(|b| !b).collect();
+                decoder.seed_descrambler(&flipped);
+            }
+        }
         // `V92_ROT`: the class rotation is read off B1u rather than taken from
         // `PAIR_FIRST_INDEX_OFFSET`, and it is read off the part of B1u this
         // decoder is actually fed -- the symbol after the acquisition skip,
