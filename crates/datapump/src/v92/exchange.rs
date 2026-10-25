@@ -59,17 +59,6 @@ use super::{PeerCp, PeerSuv, SequenceKind};
 /// exchange count samples at different rates.
 pub const CP_REPEAT_GRACE: f64 = 0.100;
 
-/// How long, in samples, the digital modem keeps sending SUVd' after the
-/// exchange is ready to send Ed (9.6.1.1.4), before Ed actually goes out.
-///
-/// 9.6.1.1.4 does not say how soon Ed follows the acknowledged sequence, and
-/// the analogue modem conditions its receiver for B1d only after it has
-/// received Ed (9.6.2.1.x). Holding plain SUVd' on the line -- which 9.6.1.1.1
-/// permits ("SUVd repeatedly") -- rather than Ed for this long gives the far
-/// end's phase-4 receiver that much more settling time before the short Ed and
-/// the B1d behind it arrive.
-pub const E_HOLD: u64 = 3200;
-
 /// Which instant of a received sequence the repeat window is measured to.
 ///
 /// 9.6.1.1.3 says "up to and including the entire CPu or SUVu sequence that is
@@ -248,8 +237,6 @@ pub struct Exchange {
     wait_for_cp: bool,
     /// When that wait runs out.
     hold_until: Option<u64>,
-    /// When E may go out, after holding SUVd' (see [`E_HOLD`]).
-    e_hold_until: Option<u64>,
     /// The kind in flight and the acknowledge bit it went out with.
     sending: Option<(SequenceKind, bool)>,
     /// The peer's last SUV asked for or granted a silent period.
@@ -283,7 +270,6 @@ impl Exchange {
             need_single_cp: true,
             wait_for_cp: false,
             hold_until: None,
-            e_hold_until: None,
             sending: None,
             peer_silence: false,
             peer_asked_silence: false,
@@ -396,13 +382,13 @@ impl Exchange {
             return SequenceKind::B1;
         }
         if self.sent_ack && self.peer_acked {
-            // Hold SUVd' a little longer before Ed (see [`E_HOLD`]).
-            match self.e_hold_until {
-                None => self.e_hold_until = Some(now.saturating_add(E_HOLD)),
-                Some(until) if now >= until => return SequenceKind::E,
-                Some(_) => {}
-            }
-            return SequenceKind::Suv;
+            // Ed goes at the boundary that follows both halves, and no later:
+            // "the digital modem shall complete sending the current CPd or
+            // SUVd sequence and transmit Ed" (9.6.1.1.4; 9.6.2.1.4 says the
+            // same for E2u), and Figures 12 to 18 all draw Ed in the box
+            // directly after the last SUVd'. Holding SUVd' instead would let
+            // the far end's E2u and B1u reach us while we still sent SUVd'.
+            return SequenceKind::E;
         }
         if self.cp_due(now) {
             return SequenceKind::Cp;
