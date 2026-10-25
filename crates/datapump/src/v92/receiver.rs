@@ -1340,6 +1340,16 @@ impl Receiver {
                 best = Some(r);
             }
         }
+        // A criterion with no signal is not an answer. The figure is the mean
+        // decision residual in units of the mean |level| of the known sequence,
+        // so a fit that describes nothing reads exactly 1.0 -- and an argmin
+        // taken over a table of 1.0s is an arbitrary delay wearing a number.
+        // Measured: `c24-4` reads 0.0139 and the 537's TRN2u 0.99986 on the
+        // bench arm that lost the call; 0.35 is 25x above every real value and
+        // three times below the degenerate one.
+        if best.is_some_and(|(_, figure)| !(figure < FE_RESIDUAL_SANE)) {
+            return None;
+        }
         best
     }
 
@@ -1418,6 +1428,13 @@ impl Receiver {
             if let Some(r) = refined {
                 best = Some(r);
             }
+        }
+        // The same guard in the other unit: a linear fit below this describes
+        // noise, and installing a delay on the strength of it is worse than
+        // installing none. The two-point fit reads 15.7 dB on `c24-4` and
+        // 21.7 on the 537, so the floor is not close to either.
+        if best.is_some_and(|(_, figure)| !(figure > FE_FIT_SANE_DB)) {
+            return None;
         }
         best
     }
@@ -3782,36 +3799,43 @@ mod tests {
         rx
     }
 
-    /// The four-point aim sees a fractional delay on a line whose phase is
-    /// deliberately between sampling instants, and picks a delay that reads the
-    /// known sequence better than doing nothing does.
+    /// The four-point aim has a signal on a line it is aligned to, and refuses
+    /// to answer on one it is not.
     ///
-    /// This is the mechanism's own test, and it is deliberately *not* a test of
-    /// the number: what it guards is that the criterion responds to the phase
-    /// (a fit can absorb a fraction of a symbol almost completely -- `docs/78`
-    /// measured one whole symbol as worth 0.2 per cent on a free filter) and
-    /// that the line, when it is in the path, is the thing it is measuring.
+    /// The second half is the test that matters, and it is here because the
+    /// first version of this test passed for the wrong reason. `trn2u_from` is
+    /// in history coordinates, and the line delays by `FE_HALF` samples even at
+    /// delta = 0 (its taps are a unit impulse there), so a caller that says
+    /// "TRN2u begins at symbol 0" is 63 symbols out: the reference is a
+    /// different stretch of the sequence, the held-out residual reads 1.0 --
+    /// the signature of a fit that describes nothing -- and an argmin over a
+    /// table of 1.0s is an arbitrary delay wearing a number. That is what
+    /// `FE_RESIDUAL_SANE` refuses, and the assertion below is that it does.
+    ///
+    /// What this test deliberately does *not* assert is which absolute delay a
+    /// synthesised line should prefer: on a channel built as one fractional
+    /// sinc the criterion's figure falls monotonically as the delay grows
+    /// (35.3 dB at 0.00 against 21.4 at 0.55), which is not the shape the same
+    /// code gives on a captured line (a minimum at 0.30, `docs/84` §4), so the
+    /// synthetic case is a test of the mechanism and not of the answer.
     #[test]
-    fn the_four_point_aim_picks_a_better_instant_than_doing_nothing() {
+    fn the_four_point_aim_answers_where_it_is_aligned_and_refuses_where_it_is_not() {
         let rx = trn2u_on_a_delayed_line(12.4, 3000);
-        let raw = rx.fe.as_ref().map(FracDelay::raw).expect("no line");
-        let (at, span, skip) = rx.trn2u_window(1200, 0).expect("no window");
-        let known = rx.trn2u_known(skip + span + 4).expect("no sequence");
-        let sections = sections_in_use();
-        let split = span * 3 / 5;
-        let (_, flat, _, _) = rx
-            .held_out(&raw, 0.0, &known, at, span, skip, sections, split, false)
-            .expect("no figure at zero delay");
-        let (delta, aimed) = rx.fe_aim_four(0, 1200).expect("the aim found nothing");
+        let aligned = fracdelay::FE_HALF as u64;
+        let (delta, figure) = rx.fe_aim_four(aligned, 1200).expect("no answer on an aligned line");
         assert!(
-            aimed < flat,
-            "aiming at {delta:.3} reads {aimed:.5}, no better than doing nothing at {flat:.5}"
+            (0.0..1.0).contains(&delta),
+            "the aim chose {delta:.3}, which is not a delay"
         );
-        // The line is 0.4 of a symbol late, so the instant that reads best is
-        // 0.6 of a symbol further on (a whole symbol is a no-op).
         assert!(
-            (delta - 0.6).abs() <= 0.15 || (delta - 0.1).abs() <= 0.15,
-            "the aim chose {delta:.3} on a line 0.4 of a symbol late"
+            figure < 0.05,
+            "an aligned line read a held-out residual of {figure:.4} (a describing fit is ~0.015)"
+        );
+        // The same line, addressed as if the sequence began at symbol 0: the
+        // reference is 63 symbols out and there is nothing to measure.
+        assert!(
+            rx.fe_aim_four(0, 1200).is_none(),
+            "a misaligned reference was answered instead of refused"
         );
     }
 
@@ -4016,6 +4040,19 @@ const FE_FINE: usize = 10;
 /// `trn2u_from` is exact and `train_on_trn2u` searches nothing. Kept as the
 /// reach a caller outside this module may use for the same job.
 pub const FE_SLIP: usize = 4;
+
+/// The worst four-point held-out residual the aim will act on.
+///
+/// The figure is in units of the mean |level| of the known sequence, so a fit
+/// that describes nothing reads 1.0. A real one reads 0.014 on `c24-4`; the 537
+/// read 0.99986 on the bench arm that lost the call (`docs/87`). Below this the
+/// table has a shape to have a minimum in; above it the argmin is arbitrary.
+const FE_RESIDUAL_SANE: f64 = 0.35;
+
+/// And the worst two-point linear fit, in decibels, the aim will act on: below
+/// it the fit is describing noise. Measured 15.7 dB on `c24-4`, 21.7 on the
+/// 537, and `fit_at` refuses anything at or below zero already.
+const FE_FIT_SANE_DB: f64 = 6.0;
 
 /// `V92_FE`: the fixed fractional delay line ahead of the equaliser.
 ///
