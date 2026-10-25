@@ -2126,23 +2126,6 @@ impl Modem {
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
             let fit_started = std::time::Instant::now();
-            // Measured and installed here. Both TRN1u precede our TRN1d, and
-            // until the far end's transmit clock is locked to ours the upstream
-            // fractional phase is a transient, not a property of the loop;
-            // TRN2u follows TRN1d, so this is the first point at which the
-            // measured phase means anything.
-            if self.rx.fe_enabled()
-                && let Some((delta, residual)) = std::env::var("V92_FE_DELTA")
-                    .ok()
-                    .and_then(|t| t.parse::<f64>().ok())
-                    .map(|d| (d, f64::NAN))
-                    .or_else(|| self.rx.fe_aim_index(self.trn2u_from, TRAIN_WINDOW))
-            {
-                self.rx.fe_install(delta);
-                self.note(format!(
-                    "V.92: fractional delay {delta:.3} at TRN2u (eye residual {residual:.4})"
-                ));
-            }
             if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
                 let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
                 self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
@@ -2247,6 +2230,26 @@ impl Modem {
             // `align_trn1u_by_fit`: no offset, no new constant, and the figure
             // that decides is the same least-squares fit the threshold below
             // judges.
+            // Aimed on *this* TRN1u, the second one: it follows our TRN1d, so
+            // by now the far end's transmit clock is locked to our rate and the
+            // upstream fractional phase is a property of the loop rather than a
+            // transient -- which is what the first TRN1u gives, and why aiming
+            // there produced 0.590. It is a two-point sequence, so moving the
+            // sampling instant across it is as direct as the measurement gets.
+            // `fe_install` rebuilds the whole history from the raw stream, so
+            // the refit taken below sees one phase throughout.
+            if self.rx.fe_enabled() {
+                let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
+                let aimed = forced
+                    .map(|d| (d, f64::NAN))
+                    .or_else(|| self.rx.fe_aim(at as usize, REFIT_WINDOW));
+                if let Some((delta, residual)) = aimed {
+                    self.rx.fe_install(delta);
+                    self.note(format!(
+                        "V.92: fractional delay {delta:.3} at TRN1u 2 (eye residual {residual:.4})"
+                    ));
+                }
+            }
             let mut search: Option<(u64, f64)> = None;
             let found = match self
                 .rx
