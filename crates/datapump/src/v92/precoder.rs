@@ -459,6 +459,11 @@ pub fn code_for(trellis: Trellis) -> Code {
 
 /// The 3-bit subset label of a pair of indices: Figure 9/V.34 on the
 /// odd-integer coordinates, which 6.4.3 "calculated as 2 x y(k) + 1".
+///
+/// `first` is the index that becomes the point's `x` coordinate and `second`
+/// the one that becomes its `y`. 6.4.3 calls a 2D symbol's `x` its real part
+/// and its `y` the imaginary one, so it is the *second* index of a trellis
+/// frame's pair that goes in first -- see [`inverse_map`].
 pub fn label_of(first: i32, second: i32) -> u8 {
     trellis::label((2 * first + 1, 2 * second + 1))
 }
@@ -472,8 +477,19 @@ pub fn label_of(first: i32, second: i32) -> u8 {
 /// V.34's y(2m) and y(2m+1), their labels come from Figure 9/V.34 and the four
 /// bits from Table 13/V.34, both of which `v34::trellis` already carries and
 /// tests against the rendered pages.
+///
+/// **The 2D symbol's real part is the SECOND index of the pair** (`docs/110`).
+/// 6.4.3's "2 x y(k) + 1" is a coordinate and `Figure 9/V.34` is labelled
+/// `(x, y)`, so the pair's second index is `x` and its first is `y`. Read the
+/// other way round the four `Y` bits are still Table 13's, but every label is
+/// Figure 9 transposed -- which is why `f587d11` could not find this by
+/// permuting `Y1..Y4`: a `(Re, Im)` swap is not a bit permutation, and it
+/// leaves the label alone exactly for pairs whose two indices have the same
+/// parity. On the far end's own index stream the wrong order reads chance
+/// against 9.6.3.2's 16-state code; the right one reads 218 900 of 218 900
+/// frames on 11 captures (`docs/110` §3, §6).
 pub fn inverse_map(etas: [i32; TRELLIS_FRAME]) -> u8 {
-    trellis::convert(label_of(etas[0], etas[1]), label_of(etas[2], etas[3]))
+    trellis::convert(label_of(etas[1], etas[0]), label_of(etas[3], etas[2]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1044,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 6.4.3's inverse map reads each 2D pair's **second** index as the real
+    /// part, and this test is what stops that going back (`docs/110`).
+    ///
+    /// `docs/110` §3 and §6: on the far end's own index stream the 16-state
+    /// code closes in 218 900 of 218 900 frames with the pair read as
+    /// `(Im, Re)` and not at all with it read as `(Re, Im)`, and exactly that
+    /// one convention (12 of 718 848 combinations, all of them the same
+    /// physical map) reaches 100 %. `f587d11` looked for it by permuting
+    /// `Y1..Y4` and could not see it, because transposing Figure 9 is not a
+    /// bit permutation: it changes the label for **every** pair whose two
+    /// indices have different parity and for **none** of the pairs whose
+    /// indices agree -- 144 of 144 and 0 of 145 over a +/-8 sweep.
+    ///
+    /// Pinned two ways, so that neither an edit to `inverse_map` nor an edit to
+    /// `label_of`'s own convention can restore the old reading quietly: the
+    /// map is written out here from 6.4.3 and Figure 9 alone (the point's `x`
+    /// is `2 x Re + 1`, and the pair's real part is its second index), and the
+    /// count of frames on which the transposed reading differs is asserted.
+    #[test]
+    fn the_inverse_map_reads_each_pair_s_real_part_from_its_second_index() {
+        // The pair's second index with the pair's first as the other coordinate.
+        let doc = |etas: [i32; TRELLIS_FRAME]| {
+            let a = trellis::label((2 * etas[1] + 1, 2 * etas[0] + 1));
+            let b = trellis::label((2 * etas[3] + 1, 2 * etas[2] + 1));
+            trellis::convert(a, b)
+        };
+        // And the reading this chain used until `docs/110` found the pair order.
+        let transposed = |etas: [i32; TRELLIS_FRAME]| {
+            let a = trellis::label((2 * etas[0] + 1, 2 * etas[1] + 1));
+            let b = trellis::label((2 * etas[2] + 1, 2 * etas[3] + 1));
+            trellis::convert(a, b)
+        };
+        for first in -8..=8 {
+            for second in -8..=8 {
+                assert_eq!(
+                    label_of(first, second) != label_of(second, first),
+                    (first - second).rem_euclid(2) == 1,
+                    "({first}, {second}): transposing Figure 9 changes the label exactly when the pair's low bits differ"
+                );
+            }
+        }
+        let (mut differ, mut agree) = (0usize, 0usize);
+        for e0 in -4..=4 {
+            for e1 in -4..=4 {
+                for e2 in -4..=4 {
+                    for e3 in -4..=4 {
+                        let etas = [e0, e1, e2, e3];
+                        assert_eq!(
+                            inverse_map(etas),
+                            doc(etas),
+                            "{etas:?}: the inverse map is not 6.4.3 read with the real part second"
+                        );
+                        if inverse_map(etas) != transposed(etas) {
+                            differ += 1;
+                        } else {
+                            agree += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // 9^4 frames, and the two readings agree on exactly those whose two
+        // pairs each hold indices of equal parity (41 of 81 pairs, either
+        // side of the mirror): 41 x 41.
+        assert_eq!((differ, agree), (4880, 1681), "the transposed reading is not the one the map takes");
     }
 
     /// Pitfall P-12: the precoder is not a modulo precoder, so a feedback
