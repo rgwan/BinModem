@@ -1109,6 +1109,354 @@ impl Receiver {
         best
     }
 
+    /// The receiver as it would be with the whole history replayed at `delta`:
+    /// the conversion the aim is asking about, applied to the samples the
+    /// windows below are addressed by.
+    ///
+    /// A clone per candidate rather than replaying into the live stream, which
+    /// is what makes the search safe: nothing the aim tries is visible to the
+    /// chain until `fe_install` puts the winner in.
+    fn at_delay(&self, raw: &[f64], delta: f64) -> Receiver {
+        let mut probe = self.clone();
+        probe.fe = None;
+        let conv = fracdelay::replay(raw, delta);
+        if conv.len() == probe.history.len() {
+            probe.history.clear();
+            probe.history.extend(conv);
+        }
+        probe
+    }
+
+    /// Where TRN2u's own window is: the three numbers a four-point fit is made
+    /// of, taken exactly as [`Self::train_on_trn2u`] takes them, so that the
+    /// aim scores the window the fit will really use.
+    fn trn2u_window(&self, window: usize, trn2u_from: u64) -> Option<(usize, usize, usize)> {
+        let length = self.history.len();
+        if length < 2 * TRAIN_TAPS || length < window.min(2 * PROBE) {
+            return None;
+        }
+        let start = length.saturating_sub(window).max(PROBE);
+        let origin = trn2u_from.saturating_sub(self.history_base());
+        if origin as usize > start {
+            return None;
+        }
+        let offset = start.saturating_sub(origin as usize);
+        let span = window.min(length - start);
+        let lag = CHANNEL_DELAY.min(offset);
+        let skip = start as i64 - lag as i64 - origin as i64;
+        if skip < 0 {
+            return None;
+        }
+        Some((start, span, skip as usize))
+    }
+
+    /// TRN2u's known levels from its first symbol: 8.7.6's scrambled ones on
+    /// Table 28's four points, in the mapping [`Self::train_on_trn2u`] reads
+    /// the line with. The differential sign encoder's seed is a global sign,
+    /// and a least-squares fit absorbs a global sign in its forward section, so
+    /// nothing here has to resolve it.
+    fn trn2u_known(&self, length: usize) -> Option<Vec<f64>> {
+        let bits = reference_from(0, 2 * length + 4, self.reference_mode)?;
+        trn2u_levels(&bits, length, 0, 0, false)
+    }
+
+    /// What a set of taps reads on a window against the *known* levels behind
+    /// it: the fit's own signal to noise, the mean decision residual in units
+    /// of the mean |level|, and the fraction of symbols that land on the wrong
+    /// point.
+    ///
+    /// Two figures rather than one because they answer different questions. The
+    /// signal to noise is the chain's own number -- it is what the fits are
+    /// accepted on -- and it is dominated by wherever the equaliser is quietest.
+    /// The wrong-point fraction is the decision itself, which is what a four
+    /// point sequence makes measurable and a two point one does not (on two
+    /// points it is the residual's tail, on four it is a tier).
+    fn read_window(
+        &self,
+        forward: &[f64],
+        feedback: &[f64],
+        reference: &[f64],
+        at: usize,
+        two_point: bool,
+    ) -> (f64, f64, f64) {
+        let rows = forward.len().saturating_sub(1);
+        let span = reference.len();
+        let (mut signal, mut noise, mut l1, mut scale, mut wrong, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let four = four_point_levels();
+        for n in rows..span {
+            let mut model = 0.0;
+            for (k, &tap) in forward.iter().enumerate() {
+                model += tap * self.history[at + n - k];
+            }
+            for (j, &tap) in feedback.iter().enumerate() {
+                if j + 1 > n {
+                    break;
+                }
+                model += tap * reference[n - 1 - j];
+            }
+            let error = reference[n] - model;
+            noise += error * error;
+            signal += reference[n] * reference[n];
+            l1 += error.abs();
+            scale += reference[n].abs();
+            let decided = if two_point {
+                if model < 0.0 { -1.0 } else { 1.0 }
+            } else {
+                nearest(&four, model).map_or(f64::NAN, |(level, _)| level)
+            };
+            if (decided - reference[n]).abs() > 1e-6 {
+                wrong += 1.0;
+            }
+            count += 1.0;
+        }
+        if count == 0.0 || noise <= 0.0 || scale <= 0.0 {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
+        let snr = 10.0 * ((signal / count) / (noise / count)).log10();
+        (snr, l1 / scale, wrong / count)
+    }
+
+    /// One candidate delay on a window of known levels: fit the chain's own
+    /// `sections` on the first `fit_len` symbols and read the rest, which the
+    /// fit never saw.
+    ///
+    /// The held-out half is the point of the exercise: a fitted filter has
+    /// sixty-four free numbers over some thousand equations and can put the
+    /// sampling phase's own smooth filter inside itself, which is why the
+    /// in-sample residual on the two-point TRN1u came out flat to one per cent
+    /// (`docs/83` §3.6). `fit_len == span` gives the in-sample figure instead,
+    /// which is the one the chain's own acceptance gates use.
+    #[allow(clippy::too_many_arguments)]
+    fn held_out(
+        &self,
+        raw: &[f64],
+        delta: f64,
+        known: &[f64],
+        at: usize,
+        span: usize,
+        skip: usize,
+        sections: (usize, usize),
+        fit_len: usize,
+        two_point: bool,
+    ) -> Option<(f64, f64, f64)> {
+        if fit_len < sections.0 + sections.1 || fit_len > span {
+            return None;
+        }
+        let mut probe = self.at_delay(raw, delta);
+        if two_point {
+            probe.pending_levels = None;
+            if !probe.fit_at(at, fit_len, skip as u64, sections.0, sections.1) {
+                return None;
+            }
+        } else {
+            probe.pending_levels = Some(known.to_vec());
+            if !probe.fit_at(at, fit_len, skip as u64, sections.0, sections.1) {
+                return None;
+            }
+        }
+        let (fit_snr, _, _) = probe.read_window(&probe.forward.clone(), &probe.feedback.clone(), &known[skip..skip + fit_len], at, two_point);
+        if fit_len == span {
+            return Some((fit_snr, f64::NAN, f64::NAN));
+        }
+        let (forward, feedback) = (probe.forward.clone(), probe.feedback.clone());
+        let (held_snr, l1, wrong) =
+            probe.read_window(&forward, &feedback, &known[skip + fit_len..skip + span], at + fit_len, two_point);
+        Some((held_snr, l1, wrong))
+    }
+
+    /// The aim's second measurement, on the four-point training sequence.
+    ///
+    /// Why here, and why this sequence. `docs/83` §3.6 measured the two-point
+    /// TRN1u's own decision residual against the quantity that judges the
+    /// chain -- B1u's level residual -- and found it not merely weak but
+    /// **anti-correlated** where it matters: the delay that reads best on B1u
+    /// (0.31) reads *worst* on TRN1u, and the whole TRN1u curve moves one per
+    /// cent. A two-point stream has so much margin that the sampling phase's
+    /// own defect is hidden under it, and a half-symbol shift is not a defect
+    /// on it at all but the same sequence inverted.
+    ///
+    /// TRN2u is the first known stretch after the far end's clock has agreed
+    /// with ours (it follows TRN1d by the whole of CPt and E1u) *and* it is
+    /// four levels, so
+    ///
+    /// * a half-symbol shift is not an alias there -- the inner and outer
+    ///   tiers land in the wrong places, which is a decision rather than a
+    ///   sign flip, so the search can cover a whole symbol;
+    /// * the decision margin is a quarter of the inner level rather than half
+    ///   the outer one, so the same ISI reads bigger against it;
+    /// * it is the stretch the Phase 4 fit is designed on, so what the aim
+    ///   maximises and what the data mode inherits are the same object;
+    /// * it is known symbol for symbol (8.7.6's scrambled ones, scrambler
+    ///   reset at E1u, `trn2u_from` known), so no decision is ever fed back.
+    pub fn fe_aim_four(&self, trn2u_from: u64, window: usize) -> Option<(f64, f64)> {
+        let fe = self.fe.as_ref()?;
+        let raw = fe.raw();
+        let (at, span, skip) = self.trn2u_window(window, trn2u_from)?;
+        let known = self.trn2u_known(skip + span + 4)?;
+        let sections = sections_in_use();
+        // A whole symbol, not half of one: the half-symbol invariance that
+        // forced the two-point search into `[0, 0.5)` is a property of a
+        // two-point sequence, and this is not one.
+        let split = span * 3 / 5;
+        let mut best: Option<(f64, f64)> = None;
+        for k in 0..=FE_COARSE {
+            let d = k as f64 / FE_COARSE as f64;
+            let figure = self.held_out(&raw, d, &known, at, span, skip, sections, split, false);
+            if std::env::var_os("V92_FE_DEBUG").is_some() {
+                eprintln!("V92AIM4: d {d:.3} at {at} span {span} skip {skip} figure {:?}", figure);
+            }
+            if let Some((_, l1, _)) = figure
+                && best.map_or(true, |(_, b)| l1 < b)
+            {
+                best = Some((d, l1));
+            }
+        }
+        if let Some((d0, _)) = best {
+            let reach = 1.0 / FE_COARSE as f64;
+            let mut refined: Option<(f64, f64)> = None;
+            for k in 0..=FE_FINE {
+                let d = d0 - reach + 2.0 * reach * (k as f64 / FE_FINE as f64);
+                if !(0.0..1.0).contains(&d) {
+                    continue;
+                }
+                if let Some((_, l1, _)) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false)
+                    && refined.map_or(true, |(_, b)| l1 < b)
+                {
+                    refined = Some((d, l1));
+                }
+            }
+            if let Some(r) = refined {
+                best = Some(r);
+            }
+        }
+        best
+    }
+
+    /// The aim's first measurement, on the two-point training sequence that
+    /// precedes CPt -- and the figure is *not* the eye.
+    ///
+    /// `docs/83` §3.6 is why: an eye-style residual on a two-point stream is
+    /// nearly blind to the sampling instant. What CPt actually needs is that
+    /// the linear fit taken here describes the line at the phase the refit will
+    /// be installed at, because a two-point CPt is read by that fit and not by
+    /// the four-point one. `docs/66` §4 has the failure this names: on the 537
+    /// the first fit read 21.1 dB and the refit at the new phase 12.8, so the
+    /// refit was rejected, CPt arrived half a symbol out and Ri never went out.
+    /// The linear fit is the sensitive instrument for exactly that: this
+    /// module's own table has 166 dB at a whole-symbol instant, 156 at a
+    /// quarter, 157 at three quarters and **19 at half a symbol**, because a
+    /// linear equaliser asked to invert a sum of two symbols amplifies the band
+    /// the far end removed.
+    ///
+    /// The figure is that fit's own signal to noise over the whole window and
+    /// not held out, because the acceptance gate the refit has to clear is
+    /// taken on the same window (`REFIT_QUALITY`, against the taps in place).
+    pub fn fe_aim_linear(&self, from: usize, window: usize) -> Option<(f64, f64)> {
+        let fe = self.fe.as_ref()?;
+        let raw = fe.raw();
+        // The alignment first, exactly as `fe_aim` does: the fit the caller is
+        // about to take is `train_near`'s window, and a reference a few symbols
+        // out of it reads as noise.
+        let mut probe = self.clone();
+        probe.fe = None;
+        if !probe.train_near(from as u64, FE_SEARCH) {
+            return None;
+        }
+        let at = probe.trained_at;
+        let span = window.min(raw.len().saturating_sub(at));
+        if span <= 2 * TRAIN_TAPS {
+            return None;
+        }
+        let sections = (TRAIN_TAPS, 0);
+        let known = reference_from(0, span, self.reference_mode)?;
+        // Half a symbol, for the reason `docs/83` §3.6 gives: on a two-point
+        // sequence a delay and that delay plus half a symbol are the same
+        // measurement, the second reading the sequence inverted. A search over
+        // the whole symbol therefore returns whichever branch its window
+        // happens to favour -- measured here, 0.82 on one window and 0.25 on
+        // the next, both correct for CPt and 0.54 apart for everything after --
+        // and a phase that jumps by half a symbol between the two measurements
+        // is a phase nothing downstream was aligned to.
+        let mut best: Option<(f64, f64)> = None;
+        for k in 0..=FE_COARSE {
+            let d = 0.5 * k as f64 / FE_COARSE as f64;
+            let figure = self.held_out(&raw, d, &known, at, span, 0, sections, span, true);
+            if std::env::var_os("V92_FE_DEBUG").is_some() {
+                eprintln!("V92AIM1: d {d:.3} at {at} span {span} figure {:?}", figure.map(|f| f.0));
+            }
+            if let Some((db, _, _)) = figure
+                && best.map_or(true, |(_, b)| db > b)
+            {
+                best = Some((d, db));
+            }
+        }
+        if let Some((d0, _)) = best {
+            let reach = 0.25 / FE_COARSE as f64;
+            let mut refined: Option<(f64, f64)> = None;
+            for k in 0..=FE_FINE {
+                let d = d0 - reach + 2.0 * reach * (k as f64 / FE_FINE as f64);
+                if !(0.0..0.5).contains(&d) {
+                    continue;
+                }
+                if let Some((db, _, _)) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true)
+                    && refined.map_or(true, |(_, b)| db > b)
+                {
+                    refined = Some((d, db));
+                }
+            }
+            if let Some(r) = refined {
+                best = Some(r);
+            }
+        }
+        best
+    }
+
+    /// Every criterion this project has measured on the two-point training, at
+    /// every candidate delay: the linear fit's own figure, the same held out,
+    /// and the eye residual `docs/83` §3.6 used. Printed, never acted on:
+    /// `V92_FE_DEBUG=1`.
+    pub fn fe_report_two(&self, from: usize, window: usize) {
+        let Some(fe) = self.fe.as_ref() else { return };
+        let raw = fe.raw();
+        let mut probe = self.clone();
+        probe.fe = None;
+        let at = if probe.train_near(from as u64, FE_SEARCH) { probe.trained_at } else { from };
+        let span = window.min(raw.len().saturating_sub(at));
+        let sections = (TRAIN_TAPS, 0);
+        let split = span * 3 / 5;
+        let Some(known) = reference_from(0, span, self.reference_mode) else { return };
+        for k in 0..=FE_COARSE {
+            let d = k as f64 / FE_COARSE as f64;
+            let conv = fracdelay::replay(&raw, d);
+            let eye = eye_residual(&conv, at, span, self.reference_mode);
+            let (lin, _, _) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            let (linx, l1, wrong) = self.held_out(&raw, d, &known, at, span, 0, sections, split, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            eprintln!("V92FE2: d {d:.3} lin {lin:.4} linx {linx:.4} l1 {l1:.5} wrong {wrong:.5} eye {:.5}", eye.map_or(f64::NAN, |v| v));
+        }
+    }
+
+    /// The same for the four-point training, which is where the second
+    /// measurement is taken. All four figures the experiment compared: the
+    /// chain's own fit in sample and held out, the held-out residual and the
+    /// held-out wrong-point fraction, and a linear fit held out -- because "is
+    /// the feedback section what hides the phase" is one number, not an
+    /// argument.
+    pub fn fe_report_four(&self, trn2u_from: u64, window: usize) {
+        let Some(fe) = self.fe.as_ref() else { return };
+        let raw = fe.raw();
+        let Some((at, span, skip)) = self.trn2u_window(window, trn2u_from) else { return };
+        let Some(known) = self.trn2u_known(skip + span + 4) else { return };
+        let sections = sections_in_use();
+        let split = span * 3 / 5;
+        for k in 0..=FE_COARSE {
+            let d = k as f64 / FE_COARSE as f64;
+            let (fit4, _, _) = self.held_out(&raw, d, &known, at, span, skip, sections, span, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            let (fit4x, l1, wrong) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            let (lin4x, _, _) = self.held_out(&raw, d, &known, at, span, skip, (TRAIN_TAPS, 0), split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            eprintln!("V92FE4: d {d:.3} fit4 {fit4:.4} fit4x {fit4x:.4} l1 {l1:.5} wrong {wrong:.5} lin4x {lin4x:.4}");
+        }
+    }
+
     /// What the receiver has to say, one event at a time.
     pub fn heard(&mut self) -> Option<Heard> {
         self.events.pop_front()
@@ -3377,6 +3725,95 @@ mod tests {
     /// bits in a symbol is the magnitude, which way up the differential sign
     /// chain is, and how far behind the samples the decision sits. All three are
     /// searched, and the fit says which is right.
+    /// Symbols of TRN2u as 8.7.6 has them, through a channel with a chosen
+    /// fractional delay, fed to a receiver that has the delay line.
+    ///
+    /// The line's `delay` is the whole story of this test: the far end's
+    /// symbols arrive `delay` samples late, which is a phase between sampling
+    /// instants, and the aim's job is to read the four-point sequence well
+    /// enough to see it. A synthesised line is what makes the answer knowable;
+    /// on a captured one it is `docs/83` §3.7's B1u curve that judges it.
+    fn trn2u_on_a_delayed_line(delay: f64, symbols: usize) -> Receiver {
+        let mut channel = Vec::with_capacity(25);
+        for k in 0..25i64 {
+            let t = k as f64 - delay;
+            let arg = std::f64::consts::PI * 2.0 * 0.95 * t;
+            let sinc = if arg.abs() < 1e-12 { 2.0 * 0.95 } else { arg.sin() / arg * 2.0 * 0.95 };
+            let window = 0.54 - 0.46 * (std::f64::consts::PI * (t - 12.0) / 13.0).cos();
+            channel.push(sinc * window);
+        }
+        let bits = reference_from(0, 2 * symbols + 4, Mode::Answer).unwrap();
+        let mut sigma = 0i64;
+        let mut sent = Vec::with_capacity(symbols);
+        for j in 0..symbols {
+            if bits.get(2 * j + 1).is_some_and(|&b| b < 0.0) {
+                sigma ^= 1;
+            }
+            let tier = if bits.get(2 * j).is_some_and(|&b| b < 0.0) { 3.0 } else { 1.0 };
+            sent.push(if sigma == 1 { -tier } else { tier } / 5f64.sqrt());
+        }
+        let mut rx = Receiver::new();
+        rx.fe = Some(FracDelay::new(HISTORY));
+        let mut past: VecDeque<f64> = VecDeque::new();
+        for &symbol in &sent {
+            past.push_front(symbol);
+            if past.len() > channel.len() {
+                past.pop_back();
+            }
+            let mut seen = 0.0;
+            for (k, &tap) in channel.iter().enumerate() {
+                seen += tap * past.get(k).copied().unwrap_or(0.0);
+            }
+            rx.feed(seen);
+            while rx.heard().is_some() {}
+        }
+        rx.set_slicer(Slicer::FourPoint);
+        rx
+    }
+
+    /// The four-point aim sees a fractional delay on a line whose phase is
+    /// deliberately between sampling instants, and picks a delay that reads the
+    /// known sequence better than doing nothing does.
+    ///
+    /// This is the mechanism's own test, and it is deliberately *not* a test of
+    /// the number: what it guards is that the criterion responds to the phase
+    /// (a fit can absorb a fraction of a symbol almost completely -- `docs/78`
+    /// measured one whole symbol as worth 0.2 per cent on a free filter) and
+    /// that the line, when it is in the path, is the thing it is measuring.
+    #[test]
+    fn the_four_point_aim_picks_a_better_instant_than_doing_nothing() {
+        let rx = trn2u_on_a_delayed_line(12.4, 3000);
+        let raw = rx.fe.as_ref().map(FracDelay::raw).expect("no line");
+        let (at, span, skip) = rx.trn2u_window(1200, 0).expect("no window");
+        let known = rx.trn2u_known(skip + span + 4).expect("no sequence");
+        let sections = sections_in_use();
+        let split = span * 3 / 5;
+        let (_, flat, _) = rx
+            .held_out(&raw, 0.0, &known, at, span, skip, sections, split, false)
+            .expect("no figure at zero delay");
+        let (delta, aimed) = rx.fe_aim_four(0, 1200).expect("the aim found nothing");
+        assert!(
+            aimed < flat,
+            "aiming at {delta:.3} reads {aimed:.5}, no better than doing nothing at {flat:.5}"
+        );
+        // The line is 0.4 of a symbol late, so the instant that reads best is
+        // 0.6 of a symbol further on (a whole symbol is a no-op).
+        assert!(
+            (delta - 0.6).abs() <= 0.15 || (delta - 0.1).abs() <= 0.15,
+            "the aim chose {delta:.3} on a line 0.4 of a symbol late"
+        );
+    }
+
+    /// Without the line there is nothing to aim, and nothing is what the aim
+    /// says -- the disabled receiver must not be able to reach the delay at all.
+    #[test]
+    fn the_aim_has_nothing_to_say_without_the_line() {
+        let mut rx = trn2u_on_a_delayed_line(12.4, 3000);
+        rx.fe = None;
+        assert!(rx.fe_aim_four(0, 1200).is_none());
+        assert!(rx.fe_aim_linear(2400, 600).is_none());
+    }
+
     #[test]
     fn the_phase_four_fit_is_trained_on_trn2u_itself() {
         let mut channel = Vec::with_capacity(25);
@@ -3561,6 +3998,13 @@ const FE_COARSE: usize = 20;
 /// `TRAIN_SEARCH` gives the fit that follows it.
 const FE_SEARCH: u64 = 64;
 const FE_FINE: usize = 10;
+
+/// Symbols either side of the nominal one a whole-symbol alignment search may
+/// reach. Used where the aim *is* allowed to look for the sequence's own first
+/// symbol -- which, on TRN2u, it is not: 8.7.6 resets the scrambler at E1u, so
+/// `trn2u_from` is exact and `train_on_trn2u` searches nothing. Kept as the
+/// reach a caller outside this module may use for the same job.
+pub const FE_SLIP: usize = 4;
 
 /// `V92_FE`: the fixed fractional delay line ahead of the equaliser.
 ///

@@ -1580,6 +1580,36 @@ impl Source {
     }
 }
 
+/// Which of the aim's two measurements to take: `V92_FE_AIM=first`, `second`,
+/// `both` (default) or `off`.
+///
+/// Two measurements, two targets, because the two stretches they are taken on
+/// are read by two different things. The first is on the second TRN1u, before
+/// CPt, and maximises the *linear* fit CPt is read with; the second is on
+/// TRN2u, and maximises the four-point decision-feedback fit the data mode is
+/// read with. Keeping them separable is what makes "the mechanism is wrong"
+/// and "the criterion chooses badly" two measurements rather than one argument.
+fn fe_aim_wants(second: bool) -> bool {
+    match std::env::var("V92_FE_AIM").ok().as_deref() {
+        Some("off") | Some("0") | Some("none") => false,
+        Some("first") | Some("trn1u") => !second,
+        Some("second") | Some("trn2u") => second,
+        _ => true,
+    }
+}
+
+/// How many symbols of the training the aim is allowed to look at:
+/// `V92_FE_WINDOW`, defaulting to whatever the caller would fit.
+///
+/// The criterion's dynamic range is a few per cent and it is measured on a
+/// thousand symbols, so how much line it is given is an experimental variable
+/// and not a constant: on TRN2u the aim may look at the whole stretch the fit
+/// will be built from, and TRN2u has twice the fit's window on the line by the
+/// time the fit is taken.
+fn fe_window(default: usize) -> usize {
+    std::env::var("V92_FE_WINDOW").ok().and_then(|t| t.parse().ok()).unwrap_or(default)
+}
+
 /// Where the Phase 3 state machine has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -1630,9 +1660,6 @@ pub struct Modem {
     /// symbols half a symbol, and the taps fitted before it are half a symbol
     /// out for everything after.
     refit_from: Option<u64>,
-    /// The delay the first TRN1u asked for, waiting for the TRN2u that can
-    /// absorb it: see `fe_install` below.
-    fe_pending: Option<f64>,
     /// How many times that refit has moved its anchor on.
     refit_tries: u8,
     /// The length of one CPt repetition in bits, once one has been read, and
@@ -1891,7 +1918,6 @@ impl Modem {
             su_from: None,
             jp_sent: false,
             refit_from: None,
-            fe_pending: None,
             refit_tries: 0,
             ja_bits: 0,
             ja_ones: 0,
@@ -2125,6 +2151,26 @@ impl Modem {
         // first symbol, and the exchange that has to be read has not started.
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
+            // The **second** measurement, on the four-point training, taken
+            // just before the fit that will inherit it: same window, same
+            // reference, so what the aim maximises is what the data mode is
+            // fitted with. `fe_install` rebuilds the history from the raw
+            // stream, so the fit below is entirely on converted samples.
+            if self.rx.fe_enabled() && fe_aim_wants(true) {
+                let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
+                let aimed = forced
+                    .map(|d| (d, f64::NAN))
+                    .or_else(|| self.rx.fe_aim_four(self.trn2u_from, fe_window(TRAIN_WINDOW)));
+                if let Some((delta, figure)) = aimed {
+                    self.rx.fe_install(delta);
+                    self.note(format!(
+                        "V.92: fractional delay {delta:.3} at TRN2u (four-point residual {figure:.5} held out)"
+                    ));
+                }
+            }
+            if self.rx.fe_enabled() && std::env::var_os("V92_FE_DEBUG").is_some() {
+                self.rx.fe_report_four(self.trn2u_from, fe_window(TRAIN_WINDOW));
+            }
             let fit_started = std::time::Instant::now();
             if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
                 let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
@@ -2234,21 +2280,32 @@ impl Modem {
             // by now the far end's transmit clock is locked to our rate and the
             // upstream fractional phase is a property of the loop rather than a
             // transient -- which is what the first TRN1u gives, and why aiming
-            // there produced 0.590. It is a two-point sequence, so moving the
-            // sampling instant across it is as direct as the measurement gets.
+            // there produced 0.590 while this one produced 0.760 (`docs/83`
+            // §3.5).
             // `fe_install` rebuilds the whole history from the raw stream, so
             // the refit taken below sees one phase throughout.
-            if self.rx.fe_enabled() {
+            // The **first** of the two measurements, and its target is CPt's
+            // and not the eye's: a two-point CPt is read by the linear fit
+            // taken here, so what has to be right is that the fit describes
+            // the line at the phase it will be installed at. `fe_aim_linear`
+            // maximises that fit; `docs/83` §3.6 measured why the eye criterion
+            // is not a substitute -- on a two-point stream its whole curve
+            // moves one per cent and it ranks the phase *against* the one the
+            // data mode needs.
+            if self.rx.fe_enabled() && fe_aim_wants(false) {
                 let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
                 let aimed = forced
                     .map(|d| (d, f64::NAN))
-                    .or_else(|| self.rx.fe_aim(at as usize, REFIT_WINDOW));
-                if let Some((delta, residual)) = aimed {
+                    .or_else(|| self.rx.fe_aim_linear(at as usize, REFIT_WINDOW));
+                if let Some((delta, figure)) = aimed {
                     self.rx.fe_install(delta);
                     self.note(format!(
-                        "V.92: fractional delay {delta:.3} at TRN1u 2 (eye residual {residual:.4})"
+                        "V.92: fractional delay {delta:.3} at TRN1u 2 (linear fit {figure:.2} dB)"
                     ));
                 }
+            }
+            if self.rx.fe_enabled() && std::env::var_os("V92_FE_DEBUG").is_some() {
+                self.rx.fe_report_two(at as usize, REFIT_WINDOW);
             }
             let mut search: Option<(u64, f64)> = None;
             let found = match self
@@ -2429,20 +2486,14 @@ impl Modem {
             // and a fallback to V.90 phase 2). At TRN2u the fit that follows is
             // entirely on converted samples, which is what `docs/77` found to be
             // the only workable enable point.
-            // `V92_FE_DELTA` overrides the aim, for separating "the mechanism
-            // does not work" from "the criterion chooses badly" -- the two
-            // questions this measurement has to keep apart.
-            let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
-            if self.rx.fe_enabled()
-                && let Some((delta, residual)) = forced
-                    .map(|d| (d, f64::NAN))
-                    .or_else(|| self.rx.fe_aim(at as usize, TRAIN_WINDOW))
-            {
-                self.fe_pending = Some(delta);
-                self.note(format!(
-                    "V.92: fractional delay {delta:.3} symbols aimed (eye residual {residual:.4})"
-                ));
-            }
+            // The aim is **not** taken here. `docs/83` §3.5, corrected by the
+            // user against the Recommendation: this is the TRN1u *before* our
+            // TRN1d, so the far end's transmit loop is not yet locked to our
+            // rate and the fractional phase on the line is a transient rather
+            // than a property of the loop. Measured on the same capture, the
+            // same criterion reads 0.590 here and 0.760 on the second TRN1u.
+            // The first legal measurement is the second TRN1u, below; the
+            // second is TRN2u, in `timers`.
             if self.rx.train_near(at, TRAIN_SEARCH) {
                 self.stage = Stage::ReadJa;
                 self.note(format!("V.92: TRN1u trained at {:.1} dB", self.rx.snr_db()));
