@@ -30,12 +30,28 @@
 //! "24000 only" and "32000 legal": drn 7 has `LC = 16`, which the paragraph's
 //! `13.7` refuses and the code's `27.5` admits. `docs/86` §2 has the table.
 //!
-//! Neither number is being changed here: `docs/86` §2 records why the decision
-//! needs both the bench's own measured margins (which are looser -- levels are
-//! still comfortable at 32000 and only tight at 40000) and the bit layer's
-//! separate defect at 32000 (`docs/73`). Today no call reaches this search with
-//! more than one rung in the mask -- `digital.rs`'s rate mask is `& 1` -- so
-//! the factor is inert in production and decisive the day it is not.
+//! # This rule is now a sanity check, not the decision
+//!
+//! The deciding arithmetic is [`rung`](super::rung): a measured residual sets a
+//! **ceiling** on the rung, `sigma_abs <= 2 G(LC) SIGMA_MAX` at a per-symbol
+//! error probability of 1e-7, and `digital.rs` hands [`choose`] the Ja mask AND
+//! that ceiling. [`MARGIN`]'s bound is the same shape with a looser constant
+//! and a looser target: in `LC` terms the ceiling permits
+//! `LC <= sqrt(3) * 0.0939 / (2 sigma)` and this rule `LC <= sqrt(3) / (4.5
+//! sigma)`, so for every rung of the ladder `residual_max(LC) < sqrt(3) / (4.5
+//! LC)` by a factor of about 2.4 -- a rung the ceiling permits is always a rung
+//! this rule permits. It therefore cannot bite on a mask that has already been
+//! through the ceiling, which is what
+//! [`the_ceiling_is_always_tighter_than_the_spacing_rule`] pins.
+//!
+//! What it still does is the one thing a ceiling cannot do for a caller that
+//! has none: refuse a rung on a spacing no measurement vouched for. That is
+//! every caller in this crate's tests and [`choose`] used without a mask, so it
+//! is kept as a sanity bound rather than deleted -- deleted, [`choose`] would
+//! answer the top of the ladder at any noise at all, and it is the only number
+//! standing between a caller with no measurement and a rung nothing measured.
+//! It is no longer the rule the *call* is made on, and it must not become one
+//! again: 4.5 sigma is a citation of 1e-5, not this crate's 1e-7.
 //!
 //! Anything above the bound the code uses is refused and the next rung down is
 //! tried.
@@ -52,6 +68,11 @@ use super::{
 /// Q(4.5) is 3.4e-6 and a PAM alphabet's worst case is twice that, so a design
 /// landing exactly here has a symbol error rate of about 7e-6 before the
 /// trellis takes anything off it.
+///
+/// **A sanity check, not the rule.** The rule a call is made on is
+/// [`rung`](super::rung)'s measured ceiling, which is about 2.4 times tighter
+/// in `LC` at every rung of the ladder; this bound can therefore only refuse a
+/// rung to a caller that supplied no ceiling. See the module comment.
 pub const MARGIN: f64 = 4.5;
 
 /// CPd's bit 29, which 8.7.2 says extends E2u by one symbol.
@@ -137,16 +158,24 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
 
 /// A rung the caller has pinned instead of searched for.
 ///
-/// This is the bench's stress arm and nothing else. [`choose`] refuses a rung
-/// on 6.4.2's spacing judgement and on the noise estimate behind it; pinning
-/// one exists to *measure* what that judgement was standing in front of. Table
-/// 30 and the class rules are still asked -- a parameter set that cannot be
-/// encoded, or whose set cannot carry its classes, returns `None` -- and the
-/// spacing judgement is reported through `sigma` and `predicted` rather than
-/// applied.
+/// [`choose`] refuses a rung on 6.4.2's spacing judgement and on the noise
+/// estimate behind it; pinning one builds it without asking that judgement.
+/// Table 30 and the class rules are still asked -- a parameter set that cannot
+/// be encoded, or whose set cannot carry its classes, returns `None` -- and the
+/// spacing is reported through `sigma` and `predicted` rather than applied.
 ///
-/// It cannot become a default by accident: the only caller reads
-/// `V92_UP_RATE`, and the 24 000 path never reaches it.
+/// Two callers, both of them a decision already made before this function is
+/// reached:
+///
+/// * the bench's stress arm, which reads `V92_UP_RATE` and pins the receive
+///   path at a spacing the design would refuse, and
+/// * the floor of [`rung`](super::rung)'s ceiling: a measurement that permits
+///   no rung of the ladder leaves the slowest one, because the alternative is
+///   no call at all. The sanity rule below that floor would refuse even 24 000
+///   at the fit's own noise, so the floor cannot go through [`choose`].
+///
+/// It cannot become a default by accident: neither caller searches at another
+/// rung on the strength of a better line assumed rather than measured.
 pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Choice> {
     let parameters = build(design, drn, trellis)?;
     parameters.fits().ok()?;
@@ -271,6 +300,34 @@ mod tests {
         let norm = taps.iter().map(|t| t * t).sum::<f64>().sqrt();
         taps.iter_mut().for_each(|t| *t /= norm);
         design(&Channel { taps, noise, signal: 1.0 }, &plan()).expect("designable")
+    }
+
+    /// The measured ceiling is strictly tighter than [`MARGIN`]'s spacing rule,
+    /// at every rung of the ladder -- so the rule reduced to a sanity check
+    /// cannot be what moves a rate.
+    ///
+    /// The two bounds are the same shape with different constants. The ceiling
+    /// permits an absolute residual of `residual_max(LC) = 2 G(LC) SIGMA_MAX`;
+    /// the sanity rule permits `sqrt(3) / (4.5 LC)`. Every rung the ceiling
+    /// permits is a rung this rule permits, by about 2.4 times, which is why a
+    /// mask that has been through `rung::apply_ceiling` cannot be narrowed
+    /// further here -- and why `MARGIN` is not the rule the call is made on.
+    #[test]
+    fn the_ceiling_is_always_tighter_than_the_spacing_rule() {
+        for drn in 1..=UP_RATES as u8 {
+            let lc = crate::v92::rung::lc_for(drn);
+            let ceiling = crate::v92::rung::residual_max(lc);
+            let sanity = 3f64.sqrt() / (MARGIN * lc as f64);
+            assert!(
+                ceiling < sanity,
+                "drn {drn} (LC {lc}): the ceiling {ceiling:.5} is not tighter than the sanity rule {sanity:.5}"
+            );
+            assert!(
+                sanity / ceiling > 2.0,
+                "drn {drn}: the sanity rule is only {:.2} times the ceiling",
+                sanity / ceiling
+            );
+        }
     }
 
     /// `gain_for` is 8.8.3's: a uniform set on a spacing of two, brought to a

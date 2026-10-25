@@ -60,7 +60,8 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::upchoice::{choose, pin};
+use crate::v92::rung::{Sigma, apply_ceiling, ceiling_rung, lc_for};
+use crate::v92::upchoice::{Choice, choose, pin};
 use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
@@ -2412,6 +2413,27 @@ fn prefilter_source() -> Prefilter {
     prefilter_for(std::env::var("V92_Z2").ok().as_deref())
 }
 
+/// What the rate ladder decided, in the numbers it decided on.
+///
+/// A rung being *refused* is a pass in this design, and it looks like
+/// nothing happening: the measured residual and the ceiling it implies
+/// therefore go in the log beside the rung that came out, so that a bench
+/// call can be audited for the criterion and not only for its rate.
+struct RateDecision {
+    /// The Phase 3 fit's residual, in index steps of the LC = 8 grid, with
+    /// the direction of its own error (`crate::v92::rung::Bound`).
+    measured: Sigma,
+    /// The highest rung that residual permits, or `None` when it permits
+    /// none at all.
+    ceiling: Option<u8>,
+    /// The rungs on offer: the Ja mask AND the ceiling, or the pin when
+    /// the bench set one.
+    mask: u32,
+    /// Whether it was the ceiling, rather than the mask, that left only the
+    /// slowest rung -- i.e. whether this call is a refusal.
+    empty: bool,
+}
+
 impl Modem {
     /// From the end of Phase 2, silent until the analogue modem says Ru.
     #[must_use]
@@ -3744,76 +3766,86 @@ impl Modem {
         // section that is already on its final amplitude.
         self.upstream_scale = sent_scale;
         self.upstream_delay = designed.delay;
-        // The rate this end asks for. The analogue modem's Ja says which rungs
-        // it allows; this end takes the slowest of those, because the number
-        // that decides how far up the ladder a line carries is the *noise*, and
-        // the only figure for it available here is the two-point fit's -- which
-        // on a telephone line is mostly the 4000 Hz the line does not have, not
-        // noise. Asking for a rung the receiver cannot then demodulate would end
-        // the call in Phase 4, which is exactly where V.92's last attempt this
-        // far stopped.
+        // The rate this end asks for, which has two inputs and it is the
+        // second that was missing. The analogue modem's Ja says which rungs it
+        // is willing to offer at all (Table 20); the *measurement* says which
+        // of those the line will carry, and that is a ceiling
+        // (`crate::v92::rung`). The candidates are the AND of the two:
+        //
+        //     mask = (Ja mask) AND (the rungs the measured residual permits)
+        //
+        // A ceiling can only take a rung away. Nothing here raises one by
+        // assuming a better line than the one that was measured, which is what
+        // the retry this replaces did: it walked the ladder at a sigma from
+        // `rx.snr_db()` and divided the assumed noise by four each time a rung
+        // was refused, nine times over. Six decibels a rung out of a number
+        // that had not moved is not a measurement, it is a decision that the
+        // line must be better than it looked.
         const SLOWEST: u32 = 1;
+        /// The rung that mask names, which is the ladder's slowest (drn 1).
+        const SLOWEST_DRN: u8 = 1;
         // The bench's stress arm, and nothing else. `V92_UP_RATE=48000` pins
         // the rung naming that rate so that the *receive* path can be measured
         // at a spacing the design would otherwise refuse. Unset -- which is
-        // every call a user makes -- the two lines below are the only ones that
-        // run, and `ja` is the same `1` it has always been. An unparsable or
-        // off-ladder rate is a bench mistake and leaves the default alone
-        // rather than silently choosing something else.
+        // every call a user makes -- the lines below are the only ones that
+        // run, and the mask is Ja's, narrowed by the measurement. An
+        // unparsable or off-ladder rate is a bench mistake and leaves the
+        // default alone rather than silently choosing something else.
         let pinned = std::env::var("V92_UP_RATE").ok().and_then(|rate| {
             let rate = rate.trim().parse::<u32>().ok()?;
             (1..=crate::v92::UP_RATES as u8).rev().find(|&drn| crate::v92::up_rate(drn) == rate)
         });
-        let ja = match pinned {
-            Some(drn) => 1u32 << (drn - 1),
-            None => {
-                let ja = self.ja.upstream_rates().unwrap_or(0) & SLOWEST;
-                if ja == 0 { SLOWEST } else { ja }
-            }
-        };
         let trellis = Trellis::Sixteen;
-        // The noise the design is told about, and the one number in this file
-        // that is a reading of the line rather than of a fit. TRN1u is a
-        // two-point stream with two thirds of its power at 4000 Hz, where a
-        // telephone line has a null: the residual of a fit against it is mostly
-        // that null and not noise, so it reads 13 dB on a line whose own SNR is
-        // 40. Taking it at its word would say no rung of the ladder carries any
-        // real line at all, which is what it said here first.
+        // The measurement, by name: `Receiver::snr_db`, the signal-to-residual
+        // ratio of the **Phase 3 TRN1u fit**. It is the only quantity of the
+        // line that exists after that fit and before CPd goes out -- nothing
+        // later in the call has happened yet -- and it is deliberately the only
+        // one: a second estimator invented inside the sample path is how the
+        // retry loop above got a number that was never a measurement.
         //
-        // So it is used as a *floor* on the assumed SNR and the rung is the
-        // slowest the schedule allows (`ja`), searched down from there: a slower
-        // rung than the line carries costs bandwidth, a faster one costs the
-        // call, and there is no measurement here that would justify the risk of
-        // the second.
-        // The rung search at one assumed noise, with 6 dB taken off the noise
-        // each time the ladder refuses: the fit's own noise is an estimate of
-        // the line at 4000 Hz, where a loop has a null, so it is a floor and
-        // not a reading (see above).
-        let snr = self.rx.snr_db();
-        let rung = |designed: &crate::v92::design::Design| {
-            let mut noise = 10f64.powf(-snr / 10.0);
-            for _ in 0..9 {
-                if let Some(found) = choose(designed, noise, ja, trellis) {
-                    return Some((found, noise));
-                }
-                noise /= 4.0;
-            }
-            // A pinned rung that 6.4.2's spacing judgement refused. Table 30 and
-            // the class rules are still asked; the spacing question is answered
-            // in the log instead of by refusing, because the arm exists to
-            // measure what that judgement was protecting.
-            let drn = pinned?;
-            let noise = 10f64.powf(-snr / 10.0);
-            let found = pin(designed, drn, trellis, noise)?;
-            let room = if found.sigma > 0.0 { 3f64.sqrt() / (4.5 * found.sigma) } else { f64::INFINITY };
-            eprintln!(
-                "V92TRACE: upstream rate pinned to drn {drn} ({} bit/s): design sigma {:.2e}, the spacing rule allows LC <= {room:.0}, this set has LC {} (N {})",
-                found.parameters.rate(),
-                found.sigma,
-                found.parameters.sets[0].len(),
-                2 * found.parameters.sets[0].len()
-            );
-            Some((found, noise))
+        // Which way its error goes decides which way the ceiling can be wrong,
+        // so the bound is named rather than assumed. TRN1u is a two-point
+        // stream with two thirds of its power at 4000 Hz, where a telephone
+        // line has a null, so the residual of a fit against it is mostly that
+        // null and not noise: it reads 13 dB on a line whose own SNR is 40. Too
+        // much residual for the same signal is a *floor* on the SNR, hence a
+        // ceiling on the assumed noise, hence an **upper bound on sigma** --
+        // the safe direction, because the ceiling falls as sigma rises, so an
+        // upper bound under-offers and can never invent a rung. That is what
+        // `Sigma::from_design` carries as `Bound::Upper`, and the cost is a
+        // rung refused that the line may have carried: bandwidth, not the call.
+        // (Were the quantity a *lower* bound it would be optimistic; the
+        // ceiling from it could then sit above the truth, and
+        // `rung::ceiling_rung` refuses to spend one anywhere but drn 1.)
+        let fit_snr_db = self.rx.snr_db();
+        let noise = 10f64.powf(-fit_snr_db / 10.0);
+        let ja = self.ja.upstream_rates().unwrap_or(0);
+        let rung = |designed: &crate::v92::design::Design| -> Option<(Choice, RateDecision)> {
+            let measured = Sigma::from_design(designed, noise);
+            let ceiling = ceiling_rung(measured, lc_for);
+            let allowed = match pinned {
+                Some(drn) => 1u32 << (drn - 1),
+                None => apply_ceiling(ja, measured, lc_for),
+            };
+            // A ceiling that leaves nothing does not license a rung below the
+            // ladder's slowest: 24 000 is what a measurement that permits
+            // nothing still gets, because the alternative is no call at all.
+            // Which of the two left it there is what the log carries.
+            let (mask, empty) = if allowed == 0 { (SLOWEST, true) } else { (allowed, false) };
+            let decision = RateDecision { measured, ceiling, mask, empty };
+            let found = match pinned {
+                Some(drn) => pin(designed, drn, trellis, noise),
+                // A ceiling that permits nothing has *already* decided the
+                // rung -- the slowest, because the alternative is no call --
+                // and the spacing sanity rule must not veto that decision from
+                // below. It would: at the fit's own noise it refuses even 24
+                // 000, which is the state the nine-times-and-a-quarter retry
+                // existed to escape. So the floor is built without it, and the
+                // log says the measurement, not the rule, put the call there.
+                None if empty => pin(designed, SLOWEST_DRN, trellis, noise),
+                None => choose(designed, noise, mask, trellis),
+            }?;
+            Some((found, decision))
         };
         let mut found = rung(&designed);
         if found.is_none() && degraded.is_none() {
@@ -3838,7 +3870,7 @@ impl Modem {
         if let Some(reason) = degraded {
             self.note(format!("V.92: upstream design degraded to identity ({reason})"));
         }
-        let Some((mut choice, noise)) = found else {
+        let Some((mut choice, decision)) = found else {
             eprintln!(
                 "V92TRACE: no upstream rung carries this line (fit noise {:.2e}, residual {:.1} dB, ja {ja:#x})",
                 channel.noise,
@@ -3859,6 +3891,32 @@ impl Modem {
                 designed.scale,
                 designed.residual_db()
             );
+        }
+        // The rate decision, in the numbers it was made on: the residual the
+        // Phase 3 fit measured, the ceiling that implies, the mask that came
+        // out of the AND, and the rung. A refusal is invisible without them.
+        let ceiling = match decision.ceiling {
+            Some(drn) => format!("drn {drn}"),
+            None => "none".to_string(),
+        };
+        self.note(format!(
+            "V.92: upstream rate: sigma {:.4} index steps at LC {}, ceiling {}, mask {:#07x}, chose drn {} at {} bit/s",
+            decision.measured.steps(),
+            crate::v92::rung::REFERENCE_LC,
+            ceiling,
+            decision.mask,
+            choice.parameters.drn,
+            choice.parameters.rate()
+        ));
+        if decision.empty {
+            // The event the ceiling exists to make visible.
+            self.note(format!(
+                "V.92: the measurement leaves no rung of the ladder (sigma {:.4} index steps, {:.4} at LC {} is the slowest rung's budget); keeping the slowest, drn 1 at {} bit/s",
+                decision.measured.steps(),
+                crate::v92::rung::sigma_max(crate::v92::rung::REFERENCE_LC),
+                crate::v92::rung::REFERENCE_LC,
+                crate::v92::up_rate(1)
+            ));
         }
         Some(choice.parameters.clone())
     }
