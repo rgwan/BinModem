@@ -284,6 +284,12 @@ fn probe_replay_raw() {
     let mut shown = 0usize;
     let mut ec_said = String::new();
     let mut answered = false;
+    // Every note, kept as well as printed, so that the three signal-to-noise
+    // figures this path produces can be reported side by side at the end. They
+    // are three different measurements on one call and they are not
+    // interchangeable: a comparison that read one of them as another has
+    // already been published once (docs/133).
+    let mut notes: Vec<String> = Vec::new();
     for (i, &s) in line.iter().enumerate() {
         if !answered && i as f64 / fs >= answer_at {
             answered = true;
@@ -293,6 +299,7 @@ fn probe_replay_raw() {
         dte.extend(modem.take_dte());
         for text in modem.take_line_notes() {
             println!("  {:>7.3}  {text}", i as f64 / fs);
+            notes.push(text);
         }
         let now = (modem.state(), modem.line_phase().to_owned());
         let ec_now = modem.error_control_phase();
@@ -344,4 +351,45 @@ fn probe_replay_raw() {
         println!("  written to {out}");
     }
     println!("  ended in {:?}, {} damaged frames\n", modem.state(), modem.damaged_frames());
+    replay_stages(&notes);
+}
+
+/// The three figures a replay produces, on one line each, labelled.
+///
+/// `probe_replay_raw` records a call, and the receiver reports its progress
+/// through three separate numbers that a reader can and did mistake for each
+/// other: the phase 3 equaliser trained on the first TRN1u, the refit taken on
+/// the second TRN1u after the phase reversal, and the phase 4 receiver fitted
+/// on TRN2u -- which is the one the upstream rung's sigma is measured with.
+/// Printing them as a block makes the comparison against a bench log a
+/// like-for-like one, and makes it visible that the TRN1u pair sits near
+/// 13 dB on both paths while only the TRN2u fit is near 34.
+fn replay_stages(notes: &[String]) {
+    let find = |needle: &str| -> Option<String> {
+        notes
+            .iter()
+            .rev()
+            .find(|n| n.contains(needle))
+            .map(|n| n.trim_start_matches("V.92: ").to_owned())
+    };
+    println!("  REPLAY-STAGES (three different quantities; compare like for like)");
+    for (label, needle) in [
+        ("phase 3, trained on TRN1u ", "TRN1u trained at"),
+        ("refit on second TRN1u    ", "refit at the new phase"),
+        ("phase 4, fitted on TRN2u ", "fitted on TRN2u"),
+        ("rung measurement         ", "index steps at LC"),
+        ("B1u boundary             ", "B1u from symbol"),
+        ("B1u contents             ", "B1u confirmed at"),
+    ] {
+        match find(needle) {
+            Some(text) => {
+                // The taps list is thousands of characters and is in the log
+                // above; the boundary's own three numbers are what is compared.
+                let text = text.split(", taps").next().unwrap_or(&text).to_owned();
+                println!("    {label} {text}");
+            }
+            None => println!("    {label} (not reached)"),
+        }
+    }
+    println!();
 }
