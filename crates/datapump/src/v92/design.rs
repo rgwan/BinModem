@@ -326,7 +326,46 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
         return Err("a prefilter coefficient does not fit q0.15");
     }
     filters.fits(limits)?;
-    Ok(Design { filters, residual: unreached.sqrt(), scale, limited, delay: main })
+
+    // A prefilter that is a pure delay is an identity with latency, and it is
+    // not free: measured on the Agere at 24000 (`/tmp/reports/z2-path-diagnosis.md`,
+    // `docs/94` P0), the design this end produced was
+    // `z2 = 0.9999 * delta(n - 8)` with every other tap below 6.2e-5 -- a
+    // spectrally flat no-op (Z2 = 0.0 dB at all 21 tones, `Z2H = H` at every
+    // one) that still cost 750 bits of CPd and, worse, **eight symbols of
+    // latency this end did not account for**, which rotates the twelve-symbol
+    // data frame and the four-symbol trellis phase. Sending `z2 = [1]` instead
+    // is the same line, one code shorter, and the delay goes away.
+    //
+    // One code is 2^-15: a tap below that is not representable in the field it
+    // would be sent in, so "nothing but the main tap survives quantisation" is
+    // the test, not "the other taps are small".
+    // One code is 2^-15: a tap below that is not representable in the field it
+    // would be sent in, so it is a pure delay and the far end need not run it.
+    // Trim those off the front and the *latency* goes with them, which is what
+    // the failure below is actually about:
+    //
+    // measured on the Agere at 24000 (`/tmp/reports/z2-path-diagnosis.md`,
+    // `docs/94` P0), this end's design was `0.9999 * delta(n - 8)` with every
+    // other tap below 6.2e-5 -- spectrally a no-op (`Z2 = 0.0 dB` at all 21
+    // tones, `Z2H = H` everywhere) that still cost 750 bits of CPd and, worse,
+    // **eight symbols of latency this end did not account for**: it rotates the
+    // twelve-symbol data frame and the four-symbol trellis phase, and B1u reads
+    // chance (291 of 576 against 543 for the same line with `z2 = [1]`). Moving
+    // the main tap to index zero removes the latency and keeps whatever
+    // filtering the design actually did.
+    let one_code = 1.0 / 32768.0;
+    let mut delay = main;
+    if main > 0 && filters.z2[..main].iter().all(|value| value.abs() < one_code) {
+        filters.z2.drain(..main);
+        delay = 0;
+    }
+    if filters.z2.len() == 1 {
+        // Nothing but the main tap survives: send the identity rather than a
+        // one-code section, so the CPd is 480 bits and says what happens.
+        filters = Filters { z1: Vec::new(), p1: Vec::new(), z2: vec![1.0], p2: Vec::new() };
+    }
+    Ok(Design { filters, residual: unreached.sqrt(), scale, limited, delay })
 }
 
 /// 8.8.3's answer when nothing the design can send is admissible: the far end
