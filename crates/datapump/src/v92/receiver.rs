@@ -279,6 +279,13 @@ impl Fitted {
     pub fn snr(&self) -> f64 {
         self.snr_db
     }
+
+    /// The taps it holds, for a reader that needs to ask what *those* read on
+    /// another window: see [`Receiver::score_of`].
+    #[must_use]
+    pub fn sections(&self) -> (&[f64], &[f64]) {
+        (&self.forward, &self.feedback)
+    }
 }
 
 /// The signal to noise a successful training has to reach.
@@ -1192,6 +1199,121 @@ impl Receiver {
     /// thousand multiplies and can afford to look a long way either side.
     #[must_use]
     pub fn align_trn1u(&self, from: u64, search: u64, window: usize) -> Option<(u64, f64)> {
+        let profile = self.align_profile(from, search, window)?;
+        let mut best: Option<(f64, f64, usize)> = None;
+        for &(start, quality, magnitude) in &profile {
+            if best.is_none_or(|(found, _, _)| quality > found) {
+                best = Some((quality, magnitude, start));
+            }
+        }
+        if std::env::var_os("V92_PHASE3_DIAG").is_some() {
+            // `docs/80` needs the whole profile and not the winner: the fit that
+            // follows this search reads 6 dB when the alignment is taken two
+            // symbols early, and the question is whether the peak is the peak.
+            let mut peaks: Vec<(f64, usize)> =
+                profile.iter().map(|&(start, quality, _)| (quality, start)).collect();
+            peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+            peaks.truncate(5);
+            eprintln!("V92DIAG: align_trn1u(from {from} +/-{search}, window {window}) peaks {peaks:?}");
+        }
+        if std::env::var_os("V92_TRACE").is_some() {
+            eprintln!("V92TRACE: align_trn1u(from {from} +/-{search}) best {best:?}");
+        }
+        best.map(|(quality, _, start)| (start as u64, quality))
+    }
+
+    /// Where TRN1u begins, chosen by the fit against the known sequence rather
+    /// than by the correlation's height.
+    ///
+    /// [`Self::align_trn1u`] returns the alignment whose window carries the
+    /// most of TRN1u's shape, and that is not always the alignment TRN1u begins
+    /// at. `docs/80` measured two alignments two symbols apart on one line that
+    /// scored 0.7206 and 0.6734 -- a gap a 512-symbol correlation cannot call,
+    /// and one that went the wrong way -- while the equaliser fitted against the
+    /// sequence this end already knows read 6.1 dB at the first and 13.6 at the
+    /// second. The correlation measures how much of the window's own energy has
+    /// TRN1u's *shape*, and a neighbouring stretch of the line (the S-bar-u's
+    /// tail, a CPt's boundary) can raise that without being TRN1u. The fit
+    /// measures the question actually being asked: whether the sequence we know
+    /// explains these samples. `docs/78` is the same error the other way round
+    /// -- a phase estimator aiming at a correlation peak when the eye was the
+    /// thing being judged.
+    ///
+    /// So the correlation stays, as a *shortlist*: a local maximum of the
+    /// profile that clears `beats` is somewhere worth fitting, and the fit
+    /// chooses between them. No constant is introduced that is not already the
+    /// caller's own -- `beats` is its verification floor and `fit_window` the
+    /// window it will install -- and nothing here is per-capture: the reference
+    /// is the sequence this end generates and the figure is the least-squares
+    /// fit of the samples against it.
+    ///
+    /// Leaves the receiver fitted at the winner and returns that alignment with
+    /// the fit it read, so that the figure the caller compares against its
+    /// threshold is the very fit it will install.
+    pub fn align_trn1u_by_fit(
+        &mut self,
+        from: u64,
+        search: u64,
+        window: usize,
+        beats: f64,
+        fit_window: usize,
+    ) -> Option<(u64, f64)> {
+        let profile = self.align_profile(from, search, window)?;
+        // Every local maximum of the profile the caller would have believed on
+        // its own, tallest first, so that two candidates that fit equally are
+        // separated by the correlation and not by the order of the scan.
+        let mut shortlist: Vec<(f64, usize)> = Vec::new();
+        for (i, &(start, quality, _)) in profile.iter().enumerate() {
+            if quality <= beats {
+                continue;
+            }
+            let left = (i > 0).then(|| profile[i - 1].1);
+            let right = profile.get(i + 1).map(|&(_, q, _)| q);
+            if left.is_some_and(|q| quality < q) || right.is_some_and(|q| quality < q) {
+                continue;
+            }
+            shortlist.push((quality, start));
+        }
+        shortlist.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let diag = std::env::var_os("V92_PHASE3_DIAG").is_some();
+        let mut best: Option<(usize, f64)> = None;
+        for &(quality, start) in &shortlist {
+            if !self.fit_window(start, fit_window) {
+                if diag {
+                    eprintln!("V92DIAG: align by fit: {start} ({quality:.3}) no fit");
+                }
+                continue;
+            }
+            if diag {
+                eprintln!(
+                    "V92DIAG: align by fit: {start} quality {quality:.3} fit {:.3} dB",
+                    self.snr_db
+                );
+            }
+            if best.is_none_or(|(_, seen)| self.snr_db > seen) {
+                best = Some((start, self.snr_db));
+            }
+        }
+        let (start, snr) = best?;
+        // Leave the winner's taps in place rather than the last candidate's: a
+        // caller that takes this fit must not inherit a filter the search
+        // itself rejected, and the refit is taken on the winner below.
+        if !self.fit_window(start, fit_window) {
+            return None;
+        }
+        if diag {
+            eprintln!(
+                "V92DIAG: align by fit chose {start} at {snr:.3} dB of {} candidates",
+                shortlist.len()
+            );
+        }
+        Some((start as u64, snr))
+    }
+
+    /// The correlation profile [`Self::align_trn1u`] reads: for every start
+    /// within `search` of `from`, how much of that window's own energy is
+    /// TRN1u, and the raw correlation's magnitude.
+    fn align_profile(&self, from: u64, search: u64, window: usize) -> Option<Vec<(usize, f64, f64)>> {
         let len = self.history.len();
         let window = window.min(len);
         if window <= RU_PERIOD {
@@ -1203,12 +1325,7 @@ impl Receiver {
         if lo > hi {
             return None;
         }
-        let mut best: Option<(f64, f64, usize)> = None;
-        // `docs/80` needs the whole profile and not the winner: the fit that
-        // follows this search reads 6 dB when the alignment is taken two
-        // symbols early, and the question is whether the peak is the peak.
-        let diag = std::env::var_os("V92_PHASE3_DIAG").is_some();
-        let mut peaks: Vec<(f64, usize)> = Vec::new();
+        let mut profile = Vec::with_capacity(hi - lo + 1);
         for start in lo..=hi {
             let (mut together, mut power) = (0.0, 0.0);
             for (n, &wanted) in reference.iter().enumerate() {
@@ -1223,22 +1340,48 @@ impl Receiver {
             // 1 when the line carries exactly the sequence wanted, nothing like
             // it anywhere else.
             let quality = together.abs() / power.sqrt() / (window as f64).sqrt();
-            if diag {
-                peaks.push((quality, start));
+            profile.push((start, quality, together.abs() / power.sqrt()));
+        }
+        Some(profile)
+    }
+
+    /// What a set of taps reads on a window, by the same functional the fit
+    /// scores itself with: the same samples, the same reference, the taps
+    /// given rather than solved for.
+    ///
+    /// It exists because the refit's accept test compares a fit taken at one
+    /// alignment against a fit taken at another, and those two numbers are not
+    /// measurements of the same thing -- see `docs/81`. Scored on the window
+    /// the refit is actually taken at, they are: same samples, same sequence,
+    /// only the taps differ, which is what "is this filter worse" means.
+    #[must_use]
+    pub fn score_of(&self, forward: &[f64], feedback: &[f64], at: usize, skip: usize, window: usize) -> Option<f64> {
+        let end = (at + window).min(self.history.len());
+        let span = end.checked_sub(at)?;
+        let rows = forward.len().checked_sub(1)?;
+        if span <= rows.max(1) + feedback.len() + skip {
+            return None;
+        }
+        let reference = reference_from(skip, span, self.reference_mode)?;
+        let (mut signal, mut noise) = (0.0, 0.0);
+        for n in rows..span {
+            let mut model = 0.0;
+            for (k, &tap) in forward.iter().enumerate() {
+                model += tap * self.history[at + n - k];
             }
-            if best.is_none_or(|(found, _, _)| quality > found) {
-                best = Some((quality, together.abs() / power.sqrt(), start));
+            for (j, &tap) in feedback.iter().enumerate() {
+                if j + 1 > n {
+                    break;
+                }
+                model += tap * reference[n - 1 - j];
             }
+            let error = reference[n] - model;
+            noise += error * error;
+            signal += reference[n] * reference[n];
         }
-        if diag {
-            peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
-            peaks.truncate(5);
-            eprintln!("V92DIAG: align_trn1u(from {from} +/-{search}, window {window}) peaks {peaks:?}");
-        }
-        if std::env::var_os("V92_TRACE").is_some() {
-            eprintln!("V92TRACE: align_trn1u(from {from} +/-{search}) best {best:?}");
-        }
-        best.map(|(quality, _, start)| (start as u64, quality))
+        let count = (span - rows).max(1) as f64;
+        let (signal, noise) = (signal / count, noise / count);
+        Some(if noise > 0.0 { 10.0 * (signal / noise).log10() } else { f64::INFINITY })
     }
 
     /// How many samples of history the receiver holds.

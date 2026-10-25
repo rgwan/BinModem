@@ -2209,25 +2209,30 @@ impl Modem {
             let at = from.saturating_sub(base);
             let before = self.rx.fitted();
             let baseline = before.snr();
-            // Where the second TRN1u actually begins, by correlation: the hunt
-            // reports the reversal up to a period late and the far end's whole
-            // grid has moved by epsilon since the first fit, so the estimate is
-            // good to tens of symbols. A least-squares fit at the wrong
-            // alignment is a fit against the wrong sequence, and that is what
-            // kept this refit from ever happening on a real line.
-            // What the correlation said, for `V92_PHASE3_DIAG` only: the fit
-            // that follows keeps the signal to noise and not the pair.
+            // Where the second TRN1u actually begins. The hunt reports the
+            // reversal up to a period late and the far end's whole grid has
+            // moved by epsilon since the first fit, so the estimate is good to
+            // tens of symbols, and a least-squares fit at the wrong alignment
+            // is a fit against the wrong sequence -- which is what kept this
+            // refit from ever happening on a real line.
+            //
+            // What the correlation has to say is *that* TRN1u is here; what it
+            // cannot say is *where* to the symbol. `docs/80` measured two
+            // alignments two symbols apart scoring 0.7206 and 0.6734 -- a gap
+            // no 512-symbol correlation can call -- where the one the
+            // correlation preferred fitted 7 dB worse, because the window
+            // carrying the most of TRN1u's shape was not the window TRN1u began
+            // at. So the correlation shortlists and the fit chooses, in
+            // `align_trn1u_by_fit`: no offset, no new constant, and the figure
+            // that decides is the same least-squares fit the threshold below
+            // judges.
             let mut search: Option<(u64, f64)> = None;
-            let found = match self.rx.align_trn1u(at, REFIT_SEARCH, ALIGN_WINDOW) {
-                // The alignment is verified by the correlation, not by the fit:
-                // a two-point stream is two thirds of its power at 4000 Hz, and
-                // a telephone line has nothing there, so *no* fit of TRN1u
-                // reaches the figure a line with a flat top would give -- a
-                // real one measures 15 dB and a harness with a 3.4 kHz filter
-                // 13. What the refit has to get right is *when*, and the
-                // correlation says that to a fraction of a symbol.
-                Some((aligned, quality)) if quality > REFIT_QUALITY => {
-                    search = Some((aligned, quality));
+            let found = match self
+                .rx
+                .align_trn1u_by_fit(at, REFIT_SEARCH, ALIGN_WINDOW, REFIT_QUALITY, TRAIN_WINDOW)
+            {
+                Some((aligned, fit)) => {
+                    search = Some((aligned, fit));
                     // 9.5.1.1.10: "the digital modem shall keep a modulo 12 data
                     // frame interval count from the first symbol of TRN1u" --
                     // the *second* one, and this is the first the alignment of
@@ -2240,7 +2245,7 @@ impl Modem {
                     let taken = self.rx.train_verified(anchor, TRAIN_WINDOW);
                     if tracing() {
                         eprintln!(
-                            "V92TRACE: refit at {aligned}, quality {quality:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
+                            "V92TRACE: refit at {aligned}, fit {fit:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
                             self.rx.snr_db()
                         );
                     }
@@ -2248,11 +2253,45 @@ impl Modem {
                 }
                 _ => None,
             };
+            if self.diag.is_some()
+                && let Some((aligned, fit)) = search
+            {
+                // The refit's own figure against the fit in place, on the
+                // refit's own window: the two numbers the accept test compares
+                // are taken at different alignments, so this is the only form
+                // of "is the refit worse" that is a measurement of one thing.
+                let anchor = ((aligned as i64 + refit_offset()).max(0) as u64) as usize;
+                let (taps, back) = before.sections();
+                let kept = self.rx.score_of(taps, back, anchor, 0, TRAIN_WINDOW);
+                let now = self.rx.score_of(self.rx.taps(), self.rx.feedback(), anchor, 0, TRAIN_WINDOW);
+                if std::env::var_os("V92_SCORE_TRACE").is_some() {
+                    eprintln!("V92DIAG: score_of check: refit taps read {now:?} on the same window");
+                    // The fit's taps absorb an integer anchor error (a 48-tap
+                    // section is a delay line as much as an inverse), and the
+                    // first TRN1u's anchor came from a least-squares search that
+                    // cannot see one while this one came from the correlation,
+                    // which can. So the two filters are compared at their own
+                    // best anchor, not at one anchor for both.
+                    let best = |forward: &[f64], feedback: &[f64]| {
+                        (0..=40)
+                            .filter_map(|skip| self.rx.score_of(forward, feedback, anchor, skip, TRAIN_WINDOW))
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    };
+                    let a = best(taps, back);
+                    let b = best(self.rx.taps(), self.rx.feedback());
+                    eprintln!("V92DIAG: same window, own anchor: in place {a:.3} dB, refit {b:.3} dB");
+                }
+                self.diag_line(&format!(
+                    "refit at {aligned}: fit {fit:.3} dB, the fit in place {:.3} dB on the same \
+                     window (it read {baseline:.3} dB at the first TRN1u)",
+                    kept.unwrap_or(f64::NAN)
+                ));
+            }
             if self.diag.is_some() {
                 let line = match search {
-                    Some((aligned, quality)) => format!(
+                    Some((aligned, fit)) => format!(
                         "refit search around {at}: aligned {aligned} (expected {from}), \
-                         quality {quality:.3} over {REFIT_QUALITY}, fit {found:?}, \
+                         quality over {REFIT_QUALITY}, fit {fit:.3} dB, taken {found:?}, \
                          snr now {:.1} dB, was {baseline:.1}, slack {}",
                         self.rx.snr_db(),
                         refit_slack()
