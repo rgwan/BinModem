@@ -3253,88 +3253,6 @@ impl Receiver {
         let span = window.min(length - start);
         let lag = CHANNEL_DELAY.min(offset);
         let skip = start as i64 - lag as i64 - origin as i64;
-        // docs/137: the alignment curve of *this* fit, one residual per shift of
-        // `trn2u_from` in symbols. A switch, not a change: with the variable
-        // unset nothing below runs and the single fit underneath is exactly the
-        // one the call has always taken. With it set the curve is printed and
-        // `before` is restored, so the call's own outcome is unchanged.
-        if let Some(n) = std::env::var("V92_TRN2U_SWEEP").ok().and_then(|t| t.parse::<i64>().ok()) {
-            for shift in -n..=n {
-                let skip2 = skip - shift;
-                if skip2 < 0 || skip2 as usize + span > levels.len() {
-                    continue;
-                }
-                self.pending_levels = Some(levels.clone());
-                let snr = if self.fit_at(start, span, skip2 as u64, sections.0, sections.1) {
-                    Some(self.fitted().snr())
-                } else {
-                    None
-                };
-                eprintln!("V92TRN2USWEEP: shift {shift:+} skip {skip2} snr {snr:?}");
-                self.restore(&before);
-            }
-        }
-        // docs/137: `trn2u_from` is the timetable's number, and on a line whose
-        // converter is minimum phase it is 15 samples out (measured: 47.4 dB at
-        // -15, 0.95 dB here). The alignment is therefore *searched* in a window
-        // around it and the timetable's number is kept unless the search beats it
-        // by `TRN2U_SEARCH_MARGIN` -- a far end that arrives where we expect it
-        // still costs one extra fit and reads the same number.
-        let mut skip = skip;
-        if trn2u_search() {
-            // The scan is on a third of the window: the residual it is ranking is
-            // 40 dB deep and the curve is smooth over tens of symbols, so the
-            // search does not need the fit's own 1200 -- and the fits are the whole
-            // cost of it (docs/137: 269 ms at 1200, 92 ms at 400).
-            let scan_span = span.min(TRN2U_SEARCH_SPAN);
-            let mut best_shift = 0i64;
-            let mut best_snr = f64::NEG_INFINITY;
-            let mut scan = |this: &mut Self, shift: i64, best_snr: &mut f64| {
-                let at = skip - shift;
-                if at < 0 || at as usize + scan_span > levels.len() {
-                    return;
-                }
-                this.pending_levels = Some(levels.clone());
-                if this.fit_at(start, scan_span, at as u64, sections.0, sections.1) {
-                    let snr = this.fitted().snr();
-                    if snr > *best_snr {
-                        *best_snr = snr;
-                    }
-                }
-                this.restore(&before);
-            };
-            for step in -TRN2U_SEARCH_REACH..=TRN2U_SEARCH_REACH {
-                let shift = step * TRN2U_SEARCH_STEP;
-                let before_scan = best_snr;
-                scan(self, shift, &mut best_snr);
-                if best_snr > before_scan {
-                    best_shift = shift;
-                }
-            }
-            for shift in best_shift - TRN2U_SEARCH_STEP..=best_shift + TRN2U_SEARCH_STEP {
-                let before_scan = best_snr;
-                scan(self, shift, &mut best_snr);
-                if best_snr > before_scan {
-                    best_shift = shift;
-                }
-            }
-            // What the timetable's own number reads, so the margin is measured and
-            // not assumed: the same fit, at the alignment we did not choose.
-            let mut at_timetable = f64::NEG_INFINITY;
-            scan(self, 0, &mut at_timetable);
-            if best_snr > at_timetable + TRN2U_SEARCH_MARGIN {
-                skip -= best_shift;
-                if std::env::var_os("V92_REFIT_TRACE").is_some() {
-                    eprintln!(
-                        "V92TRACE: TRN2u alignment searched to {best_shift:+} symbols: {best_snr:.2} dB against {at_timetable:.2} dB at the timetable's own"
-                    );
-                }
-            } else if std::env::var_os("V92_REFIT_TRACE").is_some() {
-                eprintln!(
-                    "V92TRACE: TRN2u alignment kept at the timetable's own: {at_timetable:.2} dB, best {best_snr:.2} dB at {best_shift:+}"
-                );
-            }
-        }
         let mut best: Option<Fitted> = None;
         if skip >= 0 && skip as usize + span <= levels.len() {
             self.pending_levels = Some(levels);
@@ -4777,29 +4695,6 @@ mod tests {
 
 /// Coarse and fine steps of the aim search: a twentieth of a symbol, then a
 /// twentieth of that about the winner.
-/// The window the Phase 4 fit searches for TRN2u's first symbol in, in symbols
-/// either side of the timetable's number, and how far the search has to beat the
-/// timetable before the timetable is overruled (docs/137).
-const TRN2U_SEARCH_REACH: i64 = 32;
-const TRN2U_SEARCH_STEP: i64 = 4;
-const TRN2U_SEARCH_MARGIN: f64 = 3.0;
-/// How much of the window the search ranks its shifts on.
-const TRN2U_SEARCH_SPAN: usize = 400;
-
-/// Whether the Phase 4 fit searches for TRN2u's alignment (docs/137).
-///
-/// On by default: the assumption it replaces is that the difference between the
-/// two ends' symbol timelines is a constant this end already knows, and on a
-/// line whose rate converter is minimum phase it is neither (0.25 ms at DC,
-/// 7 ms at 3.9 kHz). `V92_TRN2U_SEARCH=0` restores the single fit at
-/// `trn2u_from` for a bisect.
-fn trn2u_search() -> bool {
-    !matches!(
-        std::env::var("V92_TRN2U_SEARCH").ok().as_deref(),
-        Some("0") | Some("off") | Some("none")
-    )
-}
-
 const FE_COARSE: usize = 20;
 /// How far the aim's own alignment search reaches, in symbols: the same reach
 /// `TRAIN_SEARCH` gives the fit that follows it.
