@@ -1363,6 +1363,24 @@ impl Receiver {
             return None;
         }
         let reference = reference_from(skip, span, self.reference_mode)?;
+        self.score_against(&reference, forward, feedback, at, rows)
+    }
+
+    /// [`Self::score_of`] with the reference already built: the whole of the
+    /// figure, so that a caller scoring two tap sets on one window over many
+    /// anchors generates the sequence once per anchor rather than twice.
+    fn score_against(
+        &self,
+        reference: &[f64],
+        forward: &[f64],
+        feedback: &[f64],
+        at: usize,
+        rows: usize,
+    ) -> Option<f64> {
+        let span = reference.len();
+        if span <= rows.max(1) + feedback.len() {
+            return None;
+        }
         let (mut signal, mut noise) = (0.0, 0.0);
         for n in rows..span {
             let mut model = 0.0;
@@ -1382,6 +1400,49 @@ impl Receiver {
         let count = (span - rows).max(1) as f64;
         let (signal, noise) = (signal / count, noise / count);
         Some(if noise > 0.0 { 10.0 * (signal / noise).log10() } else { f64::INFINITY })
+    }
+
+    /// What another set of taps and the ones in place read on **one** window,
+    /// each at its own best whole-symbol anchor: `(other, in place)`.
+    ///
+    /// This is the refit's accept test made into a measurement. `docs/81`: that
+    /// test compared the fit in place, taken on the **first** TRN1u, against
+    /// the refit's, taken on the **second**, and the line moves between them --
+    /// re-anchored by the reversal, sifted by epsilon, and by half a symbol of
+    /// fractional timing on a two-point stream, which is the worst case a
+    /// linear equaliser has. Scored here, both figures are one functional on
+    /// the same samples against the same sequence with only the taps
+    /// differing, which is what "is this filter worse" means. Nothing is
+    /// per-capture: the reference is the sequence this end generates and the
+    /// window is the one the caller is about to install.
+    ///
+    /// Each set gets its own anchor because a [`TRAIN_TAPS`] section is a delay
+    /// line as much as an inverse: a fit's taps absorb the whole-symbol part of
+    /// where its own window sat, so two filters designed a few symbols apart
+    /// are compared fairly only at the anchor each was designed at. The spread
+    /// searched is the section's own length, which is all the delay it can
+    /// express -- past that the comparison is between a filter and a delay
+    /// rather than between two filters.
+    #[must_use]
+    pub fn best_on_window(&self, other: (&[f64], &[f64]), at: usize, window: usize) -> Option<(f64, f64)> {
+        let rows = self.forward.len().saturating_sub(1);
+        let feedback = self.feedback.len();
+        let (mut other_best, mut placed_best) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for skip in 0..=rows {
+            let end = (at + window).min(self.history.len());
+            let span = end.checked_sub(at)?;
+            if span <= rows.max(1) + feedback + skip {
+                break;
+            }
+            let Some(reference) = reference_from(skip, span, self.reference_mode) else { break };
+            if let Some(db) = self.score_against(&reference, other.0, other.1, at, rows) {
+                other_best = other_best.max(db);
+            }
+            if let Some(db) = self.score_against(&reference, &self.forward, &self.feedback, at, rows) {
+                placed_best = placed_best.max(db);
+            }
+        }
+        (other_best.is_finite() && placed_best.is_finite()).then_some((other_best, placed_best))
     }
 
     /// How many samples of history the receiver holds.

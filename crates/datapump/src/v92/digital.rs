@@ -2243,48 +2243,57 @@ impl Modem {
                     self.design_at = self.trn2_from.map(|at| at + DESIGN_AFTER);
                     let anchor = (aligned as i64 + refit_offset()).max(0) as u64;
                     let taken = self.rx.train_verified(anchor, TRAIN_WINDOW);
+                    // The two numbers this test is made of, taken where the
+                    // refit will be installed: the taps in place and the ones
+                    // just fitted, same samples, same reference, each at its
+                    // own whole-symbol anchor. `docs/81` measured the old pair
+                    // as incomparable -- the incumbent's figure came from the
+                    // *first* TRN1u, the refit's from the second, and the line
+                    // moves between them by more than the whole tolerance.
+                    let judged = taken
+                        .then(|| self.rx.best_on_window(before.sections(), anchor as usize, TRAIN_WINDOW))
+                        .flatten();
                     if tracing() {
                         eprintln!(
                             "V92TRACE: refit at {aligned}, fit {fit:.3} -> {taken} at {:.1} dB (was {baseline:.1})",
                             self.rx.snr_db()
                         );
                     }
-                    taken.then(|| self.rx.snr_db())
+                    taken.then(|| (self.rx.snr_db(), judged))
                 }
                 _ => None,
             };
             if self.diag.is_some()
                 && let Some((aligned, fit)) = search
             {
-                // The refit's own figure against the fit in place, on the
-                // refit's own window: the two numbers the accept test compares
-                // are taken at different alignments, so this is the only form
-                // of "is the refit worse" that is a measurement of one thing.
-                let anchor = ((aligned as i64 + refit_offset()).max(0) as u64) as usize;
-                let (taps, back) = before.sections();
-                let kept = self.rx.score_of(taps, back, anchor, 0, TRAIN_WINDOW);
-                let now = self.rx.score_of(self.rx.taps(), self.rx.feedback(), anchor, 0, TRAIN_WINDOW);
+                // The pair the accept test was made of, printed as measured:
+                // the same window, the same reference, each tap set at its own
+                // whole-symbol anchor. The gap between them is the slack the
+                // rule would have needed to reject, so an always-accepting rule
+                // is visible here rather than inferred from the outcome.
+                let judged = match found {
+                    Some((_, judged)) => judged,
+                    None => None,
+                };
+                let (in_place, refit) = match judged {
+                    Some((a, b)) => (a, b),
+                    None => {
+                        let anchor = ((aligned as i64 + refit_offset()).max(0) as u64) as usize;
+                        let a = self.rx.score_of(before.sections().0, before.sections().1, anchor, 0, TRAIN_WINDOW);
+                        let b = self.rx.score_of(self.rx.taps(), self.rx.feedback(), anchor, 0, TRAIN_WINDOW);
+                        (a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))
+                    }
+                };
                 if std::env::var_os("V92_SCORE_TRACE").is_some() {
-                    eprintln!("V92DIAG: score_of check: refit taps read {now:?} on the same window");
-                    // The fit's taps absorb an integer anchor error (a 48-tap
-                    // section is a delay line as much as an inverse), and the
-                    // first TRN1u's anchor came from a least-squares search that
-                    // cannot see one while this one came from the correlation,
-                    // which can. So the two filters are compared at their own
-                    // best anchor, not at one anchor for both.
-                    let best = |forward: &[f64], feedback: &[f64]| {
-                        (0..=40)
-                            .filter_map(|skip| self.rx.score_of(forward, feedback, anchor, skip, TRAIN_WINDOW))
-                            .fold(f64::NEG_INFINITY, f64::max)
-                    };
-                    let a = best(taps, back);
-                    let b = best(self.rx.taps(), self.rx.feedback());
-                    eprintln!("V92DIAG: same window, own anchor: in place {a:.3} dB, refit {b:.3} dB");
+                    eprintln!("V92DIAG: same window, own anchor: in place {in_place:.3} dB, refit {refit:.3} dB");
                 }
                 self.diag_line(&format!(
-                    "refit at {aligned}: fit {fit:.3} dB, the fit in place {:.3} dB on the same \
-                     window (it read {baseline:.3} dB at the first TRN1u)",
-                    kept.unwrap_or(f64::NAN)
+                    "refit at {aligned}: fit {fit:.3} dB, on this window the taps in place read \
+                     {in_place:.3} dB and the refit {refit:.3} dB (the fit in place read \
+                     {baseline:.3} dB at the first TRN1u), so the refit leads it by {:.3} dB \
+                     against a tolerance of {} dB",
+                    refit - in_place,
+                    refit_slack()
                 ));
             }
             if self.diag.is_some() {
@@ -2308,10 +2317,18 @@ impl Modem {
             match found {
                 // And a fit that reads the line much worse than the one in place
                 // is not a refit: the taps would be worse for the CPt than what
-                // they replaced.
-                Some(snr) if snr > baseline - refit_slack() => {
+                // they replaced. "Much worse" is measured on one window, the one
+                // about to be installed, against the sequence this end
+                // generates, each tap set at its own whole-symbol anchor --
+                // `docs/81`'s finding was that the two figures the old test
+                // compared had been taken on two different TRN1u windows and so
+                // were not the same measurement at all.
+                Some((snr, Some((in_place, refit)))) if refit > in_place - refit_slack() => {
                     self.refit_from = None;
-                    self.note(format!("V.92: refit at the new phase, {snr:.1} dB"));
+                    self.note(format!(
+                        "V.92: refit at the new phase, {snr:.1} dB ({refit:.1} dB on the window, \
+                         against {in_place:.1} dB for the taps it replaces)"
+                    ));
                     // The reader and the CPt finder are left alone: a CPt is a
                     // whole frame with a CRC, so those that cross the refit are
                     // thrown out by it and the next repetition is read with the
