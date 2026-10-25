@@ -1178,10 +1178,11 @@ impl Receiver {
         reference: &[f64],
         at: usize,
         two_point: bool,
-    ) -> (f64, f64, f64) {
+    ) -> (f64, f64, f64, f64) {
         let rows = forward.len().saturating_sub(1);
         let span = reference.len();
         let (mut signal, mut noise, mut l1, mut scale, mut wrong, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut margin = f64::INFINITY;
         let four = four_point_levels();
         for n in rows..span {
             let mut model = 0.0;
@@ -1207,13 +1208,23 @@ impl Receiver {
             if (decided - reference[n]).abs() > 1e-6 {
                 wrong += 1.0;
             }
+            // How far the model is from the *decision boundaries* rather than
+            // from the points: the four levels are +-1/sqrt5 and +-3/sqrt5, so
+            // the boundaries sit at 0 and +-2/sqrt5. The residual to the
+            // nearest point cannot see a whole-level error at all -- a symbol
+            // decided to the wrong tier still lands on a point -- which is the
+            // blindness `tools/v92_eye_probe.py` names, and this is the figure
+            // that does not have it. Worst case over the window, not mean:
+            // one symbol on a boundary is the error that propagates.
+            let from_boundary = (model.abs()).min((model.abs() - 2.0 / 5f64.sqrt()).abs());
+            margin = margin.min(from_boundary);
             count += 1.0;
         }
         if count == 0.0 || noise <= 0.0 || scale <= 0.0 {
-            return (f64::NAN, f64::NAN, f64::NAN);
+            return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
         }
         let snr = 10.0 * ((signal / count) / (noise / count)).log10();
-        (snr, l1 / scale, wrong / count)
+        (snr, l1 / scale, wrong / count, if two_point { f64::NAN } else { margin })
     }
 
     /// One candidate delay on a window of known levels: fit the chain's own
@@ -1238,7 +1249,7 @@ impl Receiver {
         sections: (usize, usize),
         fit_len: usize,
         two_point: bool,
-    ) -> Option<(f64, f64, f64)> {
+    ) -> Option<(f64, f64, f64, f64)> {
         if fit_len < sections.0 + sections.1 || fit_len > span {
             return None;
         }
@@ -1254,14 +1265,14 @@ impl Receiver {
                 return None;
             }
         }
-        let (fit_snr, _, _) = probe.read_window(&probe.forward.clone(), &probe.feedback.clone(), &known[skip..skip + fit_len], at, two_point);
+        let (fit_snr, _, _, _) = probe.read_window(&probe.forward.clone(), &probe.feedback.clone(), &known[skip..skip + fit_len], at, two_point);
         if fit_len == span {
-            return Some((fit_snr, f64::NAN, f64::NAN));
+            return Some((fit_snr, f64::NAN, f64::NAN, f64::NAN));
         }
         let (forward, feedback) = (probe.forward.clone(), probe.feedback.clone());
-        let (held_snr, l1, wrong) =
+        let (held_snr, l1, wrong, margin) =
             probe.read_window(&forward, &feedback, &known[skip + fit_len..skip + span], at + fit_len, two_point);
-        Some((held_snr, l1, wrong))
+        Some((held_snr, l1, wrong, margin))
     }
 
     /// The aim's second measurement, on the four-point training sequence.
@@ -1305,7 +1316,7 @@ impl Receiver {
             if std::env::var_os("V92_FE_DEBUG").is_some() {
                 eprintln!("V92AIM4: d {d:.3} at {at} span {span} skip {skip} figure {:?}", figure);
             }
-            if let Some((_, l1, _)) = figure
+            if let Some((_, l1, _, _)) = figure
                 && best.map_or(true, |(_, b)| l1 < b)
             {
                 best = Some((d, l1));
@@ -1319,7 +1330,7 @@ impl Receiver {
                 if !(0.0..1.0).contains(&d) {
                     continue;
                 }
-                if let Some((_, l1, _)) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false)
+                if let Some((_, l1, _, _)) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false)
                     && refined.map_or(true, |(_, b)| l1 < b)
                 {
                     refined = Some((d, l1));
@@ -1384,7 +1395,7 @@ impl Receiver {
             if std::env::var_os("V92_FE_DEBUG").is_some() {
                 eprintln!("V92AIM1: d {d:.3} at {at} span {span} figure {:?}", figure.map(|f| f.0));
             }
-            if let Some((db, _, _)) = figure
+            if let Some((db, _, _, _)) = figure
                 && best.map_or(true, |(_, b)| db > b)
             {
                 best = Some((d, db));
@@ -1398,7 +1409,7 @@ impl Receiver {
                 if !(0.0..0.5).contains(&d) {
                     continue;
                 }
-                if let Some((db, _, _)) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true)
+                if let Some((db, _, _, _)) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true)
                     && refined.map_or(true, |(_, b)| db > b)
                 {
                     refined = Some((d, db));
@@ -1429,8 +1440,8 @@ impl Receiver {
             let d = k as f64 / FE_COARSE as f64;
             let conv = fracdelay::replay(&raw, d);
             let eye = eye_residual(&conv, at, span, self.reference_mode);
-            let (lin, _, _) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
-            let (linx, l1, wrong) = self.held_out(&raw, d, &known, at, span, 0, sections, split, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+            let (lin, _, _, _) = self.held_out(&raw, d, &known, at, span, 0, sections, span, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+            let (linx, l1, wrong, _) = self.held_out(&raw, d, &known, at, span, 0, sections, split, true).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
             eprintln!("V92FE2: d {d:.3} lin {lin:.4} linx {linx:.4} l1 {l1:.5} wrong {wrong:.5} eye {:.5}", eye.map_or(f64::NAN, |v| v));
         }
     }
@@ -1450,10 +1461,10 @@ impl Receiver {
         let split = span * 3 / 5;
         for k in 0..=FE_COARSE {
             let d = k as f64 / FE_COARSE as f64;
-            let (fit4, _, _) = self.held_out(&raw, d, &known, at, span, skip, sections, span, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
-            let (fit4x, l1, wrong) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
-            let (lin4x, _, _) = self.held_out(&raw, d, &known, at, span, skip, (TRAIN_TAPS, 0), split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN));
-            eprintln!("V92FE4: d {d:.3} fit4 {fit4:.4} fit4x {fit4x:.4} l1 {l1:.5} wrong {wrong:.5} lin4x {lin4x:.4}");
+            let (fit4, _, _, _) = self.held_out(&raw, d, &known, at, span, skip, sections, span, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+            let (fit4x, l1, wrong, margin) = self.held_out(&raw, d, &known, at, span, skip, sections, split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+            let (lin4x, _, _, _) = self.held_out(&raw, d, &known, at, span, skip, (TRAIN_TAPS, 0), split, false).unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+            eprintln!("V92FE4: d {d:.3} fit4 {fit4:.4} fit4x {fit4x:.4} l1 {l1:.5} wrong {wrong:.5} margin {margin:.5} lin4x {lin4x:.4}");
         }
     }
 
@@ -3788,7 +3799,7 @@ mod tests {
         let known = rx.trn2u_known(skip + span + 4).expect("no sequence");
         let sections = sections_in_use();
         let split = span * 3 / 5;
-        let (_, flat, _) = rx
+        let (_, flat, _, _) = rx
             .held_out(&raw, 0.0, &known, at, span, skip, sections, split, false)
             .expect("no figure at zero delay");
         let (delta, aimed) = rx.fe_aim_four(0, 1200).expect("the aim found nothing");
