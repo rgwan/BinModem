@@ -60,8 +60,8 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::rung::{Sigma, apply_ceiling, ceiling_rung, lc_for};
-use crate::v92::upchoice::{Choice, choose, pin};
+use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, lc_for};
+use crate::v92::upchoice::{choose, pin};
 use crate::v92::{FilterLimits, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
 /// The network's rate: one codeword per 125 microseconds (5/V.92).
@@ -2324,6 +2324,19 @@ pub struct Modem {
     upstream_delay: usize,
     /// Symbols of B1u still to be skipped for that delay.
     b1u_skip: usize,
+    /// The design the upstream rung is chosen from, held from the moment it is
+    /// built to the moment the measurement that chooses a rung exists.
+    ///
+    /// The design has to be made from the second TRN1u, while that stream is
+    /// still inside the receiver's history; the rung cannot be chosen until
+    /// TRN2u has been fitted, whose residual is the first decision-point
+    /// reading of the line (`Self::decide_upstream_rung`). So the design is
+    /// kept across that gap and the rung is chosen from it, rather than the
+    /// design being made twice or from a stale window.
+    upstream_plan: Option<Design>,
+    /// Whether a CPd has gone out on the line. A rung chosen after that cannot
+    /// be told to the far end, so the provisional one stands.
+    cpd_sent: bool,
     /// The same decoder on the other polarity, kept while B1u is being read
     /// both ways up: see [`Self::b1u_polarity`] and `decide_b1u_polarity`.
     b1u_probe: Option<Decoder>,
@@ -2513,6 +2526,8 @@ impl Modem {
             downstream_scrambler: Scrambler::new(Mode::Call),
             upstream_data: None,
             prefilter: prefilter_source(),
+            upstream_plan: None,
+            cpd_sent: false,
             upstream_scale: 1.0,
             upstream_delay: 0,
             b1u_skip: 0,
@@ -2751,6 +2766,12 @@ impl Modem {
                     "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB",
                     self.rx.snr_db()
                 ));
+                // The measurement that chooses the upstream rung exists from
+                // here: the receiver's own residual on a four-point stream with
+                // data mode's symbol rate, filter and power. See
+                // `decide_upstream_rung` for what the figure is and which way
+                // each step of its conversion errs.
+                self.decide_upstream_rung();
             } else {
                 self.upstream_drop_until = self.upstream_drop_until.min(self.now);
                 self.note("V.92: no phase 4 fit on TRN2u".into());
@@ -3437,6 +3458,7 @@ impl Modem {
                     bits.len()
                 ));
                 self.source.send(Out::Cpd, bits);
+                self.cpd_sent = true;
                 // 9.6.2.1.4: a CPd with its acknowledgement bit set is the
                 // other thing that lets the far end send E2u. See
                 // `arm_e2u_search`.
@@ -3766,94 +3788,87 @@ impl Modem {
         // section that is already on its final amplitude.
         self.upstream_scale = sent_scale;
         self.upstream_delay = designed.delay;
-        // The rate this end asks for, which has two inputs and it is the
-        // second that was missing. The analogue modem's Ja says which rungs it
-        // is willing to offer at all (Table 20); the *measurement* says which
-        // of those the line will carry, and that is a ceiling
-        // (`crate::v92::rung`). The candidates are the AND of the two:
+        // ---- The rung is not decided here ----
+        //
+        // The rate this end asks for has two inputs. The analogue modem's Ja
+        // says which rungs it will offer at all (Table 20); the *measurement*
+        // says which of those the line will carry, and that is a ceiling
+        // (`crate::v92::rung`):
         //
         //     mask = (Ja mask) AND (the rungs the measured residual permits)
         //
-        // A ceiling can only take a rung away. Nothing here raises one by
-        // assuming a better line than the one that was measured, which is what
-        // the retry this replaces did: it walked the ladder at a sigma from
-        // `rx.snr_db()` and divided the assumed noise by four each time a rung
-        // was refused, nine times over. Six decibels a rung out of a number
-        // that had not moved is not a measurement, it is a decision that the
-        // line must be better than it looked.
-        const SLOWEST: u32 = 1;
-        /// The rung that mask names, which is the ladder's slowest (drn 1).
+        // A ceiling can only take a rung away, and nothing raises one by
+        // assuming a better line than the one that was measured. What is wrong
+        // with the number that used to be used here is not its direction, it is
+        // that it is not a measurement of the line.
+        //
+        // **What was here, and why it was sixteen times too pessimistic.** The
+        // rung was chosen from `Receiver::snr_db()` as it stood after the Phase 3
+        // TRN1u fit, through `Sigma::from_design`. `read_window` defines that
+        // figure as
+        //
+        //     snr_db = 10 log10( mean(reference^2) / mean(error^2) )
+        //
+        // over the fit's own window, one value per symbol. TRN1u's reference is
+        // its two points at `+-LU` = `+-1` (`up_signals::LU`), so its mean square
+        // is exactly one, and the decibel figure *is* a per-symbol residual
+        // variance in the units the levels are in -- the units in which one
+        // half-cell is `G` and one index step is `2G`. Taken at face value, with
+        // no bandwidth factor anywhere and no fitted constant,
+        //
+        //     sigma = sqrt(10^(-snr/10)) / (2G)          index steps
+        //
+        // and at the 13.5 dB the second TRN1u fits at on this bench that is
+        // **0.975 index steps**. The same call's own B1u *levels* read 0.0887
+        // offline. The arithmetic was therefore not the defect; the *quantity*
+        // is. TRN1u is a two-point stream whose transitions this end's
+        // fractional-delay aim lands half a symbol off the network's instants, so
+        // its fit residual is dominated by uncancelled ISI and by sampling phase
+        // -- the receiver's own note is "19 dB against 166 dB on the instants" --
+        // and that residual is a property of TRN1u, not of the line: the same
+        // receiver reads 36.7 dB on the four-point TRN2u twenty seconds later.
+        // No bandwidth or matched-filter argument maps one onto the other,
+        // because what differs is not noise through another bandwidth, it is ISI
+        // the data mode does not have. So the figure is not converted. It is
+        // replaced.
+        //
+        // **What chooses the rung instead** is the same receiver's residual on a
+        // stream with data mode's character: TRN2u (8.7.6) is four points at
+        // unit mean square, the same symbol rate and the same transmit filter as
+        // B1u, and the Phase 4 receiver's fit against it reads the residual at
+        // the very output the slice will read. It exists 2400 symbols into
+        // TRN2u, and a CPd follows TRN2u in protocol order (9.6.1.1: SUVd,
+        // TRN2u/SUVu, then CPd), so the rung is chosen there, in
+        // `Self::decide_upstream_rung` -- the one place a rung is chosen on a
+        // measurement.
+        //
+        // Until then a CPd has to exist, because a line whose TRN2u this
+        // receiver cannot fit must still be told something. What "nothing
+        // measured yet" permits is the ladder's slowest, so that is the
+        // provisional CPd built here, through `pin` rather than `choose` for the
+        // reason the floor always was: `choose`'s spacing sanity rule is for a
+        // caller with no measurement, and it must not veto the one rung the call
+        // cannot do without.
         const SLOWEST_DRN: u8 = 1;
-        // The bench's stress arm, and nothing else. `V92_UP_RATE=48000` pins
-        // the rung naming that rate so that the *receive* path can be measured
-        // at a spacing the design would otherwise refuse. Unset -- which is
-        // every call a user makes -- the lines below are the only ones that
-        // run, and the mask is Ja's, narrowed by the measurement. An
-        // unparsable or off-ladder rate is a bench mistake and leaves the
-        // default alone rather than silently choosing something else.
+        let trellis = Trellis::Sixteen;
+        // The bench's stress arm, and nothing else. `V92_UP_RATE=48000` pins the
+        // rung naming that rate so that the *receive* path can be measured at a
+        // spacing the design would otherwise refuse. Unset -- which is every call
+        // a user makes -- nothing below runs, and the mask is Ja's, narrowed by
+        // the measurement. An unparsable or off-ladder rate is a bench mistake
+        // and leaves the default alone rather than silently choosing something
+        // else. A pinned rung consults no measurement, so it is built here and no
+        // measurement is waited for.
         let pinned = std::env::var("V92_UP_RATE").ok().and_then(|rate| {
             let rate = rate.trim().parse::<u32>().ok()?;
             (1..=crate::v92::UP_RATES as u8).rev().find(|&drn| crate::v92::up_rate(drn) == rate)
         });
-        let trellis = Trellis::Sixteen;
-        // The measurement, by name: `Receiver::snr_db`, the signal-to-residual
-        // ratio of the **Phase 3 TRN1u fit**. It is the only quantity of the
-        // line that exists after that fit and before CPd goes out -- nothing
-        // later in the call has happened yet -- and it is deliberately the only
-        // one: a second estimator invented inside the sample path is how the
-        // retry loop above got a number that was never a measurement.
-        //
-        // Which way its error goes decides which way the ceiling can be wrong,
-        // so the bound is named rather than assumed. TRN1u is a two-point
-        // stream with two thirds of its power at 4000 Hz, where a telephone
-        // line has a null, so the residual of a fit against it is mostly that
-        // null and not noise: it reads 13 dB on a line whose own SNR is 40. Too
-        // much residual for the same signal is a *floor* on the SNR, hence a
-        // ceiling on the assumed noise, hence an **upper bound on sigma** --
-        // the safe direction, because the ceiling falls as sigma rises, so an
-        // upper bound under-offers and can never invent a rung. That is what
-        // `Sigma::from_design` carries as `Bound::Upper`, and the cost is a
-        // rung refused that the line may have carried: bandwidth, not the call.
-        // (Were the quantity a *lower* bound it would be optimistic; the
-        // ceiling from it could then sit above the truth, and
-        // `rung::ceiling_rung` refuses to spend one anywhere but drn 1.)
-        let fit_snr_db = self.rx.snr_db();
-        let noise = 10f64.powf(-fit_snr_db / 10.0);
-        let ja = self.ja.upstream_rates().unwrap_or(0);
-        let rung = |designed: &crate::v92::design::Design| -> Option<(Choice, RateDecision)> {
-            let measured = Sigma::from_design(designed, noise);
-            let ceiling = ceiling_rung(measured, lc_for);
-            let allowed = match pinned {
-                Some(drn) => 1u32 << (drn - 1),
-                None => apply_ceiling(ja, measured, lc_for),
-            };
-            // A ceiling that leaves nothing does not license a rung below the
-            // ladder's slowest: 24 000 is what a measurement that permits
-            // nothing still gets, because the alternative is no call at all.
-            // Which of the two left it there is what the log carries.
-            let (mask, empty) = if allowed == 0 { (SLOWEST, true) } else { (allowed, false) };
-            let decision = RateDecision { measured, ceiling, mask, empty };
-            let found = match pinned {
-                Some(drn) => pin(designed, drn, trellis, noise),
-                // A ceiling that permits nothing has *already* decided the
-                // rung -- the slowest, because the alternative is no call --
-                // and the spacing sanity rule must not veto that decision from
-                // below. It would: at the fit's own noise it refuses even 24
-                // 000, which is the state the nine-times-and-a-quarter retry
-                // existed to escape. So the floor is built without it, and the
-                // log says the measurement, not the rule, put the call there.
-                None if empty => pin(designed, SLOWEST_DRN, trellis, noise),
-                None => choose(designed, noise, mask, trellis),
-            }?;
-            Some((found, decision))
-        };
-        let mut found = rung(&designed);
-        if found.is_none() && degraded.is_none() {
-            // Nothing the rate ladder will carry comes out of this design, so
-            // the far end would be told nothing at all. Ask it to run no
-            // filters instead: the line's ISI is then this receiver's to undo,
-            // and phase 4 at least begins. The rung does not move -- `ja` below
-            // is the slowest the analogue modem allows either way.
+        // A build that cannot make the slowest rung cannot make any of them, and
+        // a design that is legal in no field of Table 30 at all is answered with
+        // the identity rather than with silence (see `upstream_design`'s note).
+        let build_floor = |designed: &Design| pin(designed, SLOWEST_DRN, trellis, 0.0);
+        let mut floor = if let Some(drn) = pinned { pin(&designed, drn, trellis, 0.0) } else { build_floor(&designed) };
+        if floor.is_none() && degraded.is_none() {
             let residual = designed.residual_db();
             degraded = Some("no rung of the 6.1 ladder carries what the design leaves");
             designed = crate::v92::design::identity(&channel);
@@ -3862,48 +3877,160 @@ impl Modem {
             self.upstream_scale = 1.0;
             self.upstream_delay = designed.delay;
             eprintln!(
-                "V92TRACE: identity fallback: residual {residual:.1} dB, fit noise {:.2e}, ja {ja:#x}",
+                "V92TRACE: identity fallback: residual {residual:.1} dB, channel noise {:.2e}",
                 channel.noise
             );
-            found = rung(&designed);
+            floor = build_floor(&designed);
         }
         if let Some(reason) = degraded {
             self.note(format!("V.92: upstream design degraded to identity ({reason})"));
         }
-        let Some((mut choice, decision)) = found else {
+        let Some(mut choice) = floor else {
             eprintln!(
-                "V92TRACE: no upstream rung carries this line (fit noise {:.2e}, residual {:.1} dB, ja {ja:#x})",
-                channel.noise,
+                "V92TRACE: the ladder's slowest rung cannot be built from this design (residual {:.1} dB)",
                 designed.residual_db()
             );
             return None;
         };
-        // Diagnostic: force a four-point constellation, so that what the far
-        // end puts on the line can be counted in levels. A CPd it obeys and a
-        // CPd it ignores look nothing alike.
+        // Diagnostic: force a four-point constellation, so that what the far end
+        // puts on the line can be counted in levels. A CPd it obeys and a CPd it
+        // ignores look nothing alike.
         if std::env::var_os("V92_TINY").is_some() {
             choice.parameters.moduli = [4u8; UP_INTERVALS];
             choice.parameters.sets = vec![vec![1, 3, 5, 7]];
         }
         if tracing() {
             eprintln!(
-                "V92TRACE: upstream design assumed noise {noise:.2e}, scale {:.2}, residual {:.1} dB",
+                "V92TRACE: upstream design scale {:.2}, residual {:.1} dB; the rung waits for the four-point fit",
                 designed.scale,
                 designed.residual_db()
             );
         }
-        // The rate decision, in the numbers it was made on: the residual the
-        // Phase 3 fit measured, the ceiling that implies, the mask that came
-        // out of the AND, and the rung. A refusal is invisible without them.
+        if let Some(drn) = pinned {
+            self.note(format!(
+                "V.92: upstream rung pinned to drn {drn} at {} bit/s (V92_UP_RATE, no measurement consulted)",
+                choice.parameters.rate()
+            ));
+            return Some(choice.parameters);
+        }
+        self.upstream_plan = Some(designed);
+        self.note(format!(
+            "V.92: the rung waits for the four-point measurement -- nothing before TRN2u reads the \
+             line at the slice; CPd provisionally drn {} at {} bit/s",
+            choice.parameters.drn,
+            choice.parameters.rate()
+        ));
+        Some(choice.parameters)
+    }
+
+    /// The rung, chosen where it has an input: the Phase 4 receiver's residual on
+    /// TRN2u.
+    ///
+    /// # The conversion, and the assumption behind it
+    ///
+    /// `Receiver::snr_db()` after `train_on_trn2u` is `read_window`'s figure for
+    /// the window the Phase 4 receiver was fitted on: `10 log10(mean(reference^2)
+    /// / mean(error^2))`, one value per symbol, against Table 28's four points,
+    /// whose mean square is exactly one (`(1/5 + 9/5) / 2`). So
+    ///
+    /// ```text
+    /// sigma_abs    = sqrt(10^(-snr/10))        the levels' own units
+    /// sigma_steps  = sigma_abs / (2 G(8))      index steps on the LC = 8 grid
+    /// ```
+    ///
+    /// and the assumption is the one that makes that legitimate: the reference's
+    /// mean square is one, so the ratio is already a variance in the levels' own
+    /// units; `G` is 8.8.3's gain for a uniform set brought to mean square one;
+    /// and the residual is measured at the equaliser's output, one sample per
+    /// symbol, which is exactly where the slice will read it. No bandwidth, no
+    /// matched filter and no constant from anywhere else enter.
+    ///
+    /// **Which way each step errs.** The ratio-to-amplitude step and the `2G`
+    /// step are exact given those two conventions. The window is not, and it errs
+    /// one way only:
+    ///
+    /// 1. the fit is in-sample, so the residual it reads is *lower* than the
+    ///    residual on symbols the fit never saw -- low;
+    /// 2. the decision-feedback section is fed the *known* symbols throughout
+    ///    TRN2u, and one wrong decision feeding the next is exactly what a DFE
+    ///    does in data mode, so training never shows that propagation -- low;
+    /// 3. the far end's precoder is off during TRN2u (9.6.1.1 puts it in the
+    ///    data mode), so the ISI it does not cancel is invisible here and lands
+    ///    in data mode only -- low;
+    /// 4. TRN2u is at 21 s and B1u at 26 s, so the line may move in between, in
+    ///    either direction -- unmeasured, and the only step that is not one-way.
+    ///
+    /// Steps 1 to 3 are all one way, so this is a [`Bound::Lower`]: the
+    /// data-mode residual is **no smaller** than the number, and by how much is
+    /// measurable rather than argued -- on the c24-4 capture this reads 0.0674
+    /// index steps (36.7 dB) where the same call's B1u *levels* read 0.0887
+    /// (33.4 dB), a factor of 1.32 in sigma and 3.3 dB in the ratio. That is why
+    /// the bound is not [`Bound::Reading`] and certainly not `Upper`: a training
+    /// stream cannot see what only decisions produce.
+    ///
+    /// [`Bound::Lower`] is then spent the way `crate::v92::rung` says to spend
+    /// it -- at the slowest rung, because a lower bound cannot justify anything
+    /// faster -- and that is the honest outcome rather than a failure of the
+    /// criterion: the only residual that exists before CPd is one measured on
+    /// known symbols, so no pre-CPd measurement can license a rung the line has
+    /// not already been watched carrying. The number is *reported* either way,
+    /// so a call says what the line looked like and what it was allowed.
+    fn decide_upstream_rung(&mut self) {
+        let Some(designed) = self.upstream_plan.take() else { return };
+        if self.cpd_sent {
+            // A CPd has already gone out with the provisional rung. The far end
+            // has it, and telling it a different one on a repeat is a rate this
+            // end did not offer when it mattered.
+            self.note(
+                "V.92: the four-point measurement arrived after CPd went out; the provisional rung stands"
+                    .into(),
+            );
+            return;
+        }
+        let trellis = Trellis::Sixteen;
+        let snr_db = self.rx.snr_db();
+        let residual = 10f64.powf(-snr_db / 20.0);
+        let measured = Sigma::absolute(residual, Bound::Lower);
+        // `choose` and `pin` take the noise as a *power*, because their own
+        // sanity rule works in variances; the same reading supplies it.
+        let noise = 10f64.powf(-snr_db / 10.0);
+        let ja = self.ja.upstream_rates().unwrap_or(0);
+        let ceiling = ceiling_rung(measured, lc_for);
+        let allowed = apply_ceiling(ja, measured, lc_for);
+        // A ceiling that leaves nothing does not license a rung below the
+        // ladder's slowest: 24 000 is what a measurement that permits nothing
+        // still gets, because the alternative is no call at all. Which of the
+        // two left it there is what the log carries.
+        let (mask, empty) = if allowed == 0 { (1u32, true) } else { (allowed, false) };
+        let decision = RateDecision { measured, ceiling, mask, empty };
+        let found = if empty {
+            pin(&designed, 1, trellis, noise)
+        } else {
+            choose(&designed, noise, mask, trellis).or_else(|| pin(&designed, 1, trellis, noise))
+        };
+        let Some(choice) = found else {
+            self.note(
+                "V.92: no rung of the ladder could be built from the design this measurement was made \
+                 against; keeping the provisional rung"
+                    .into(),
+            );
+            return;
+        };
+        self.parameters = Some(choice.parameters.clone());
+        self.cpd = Some(Cpd::from(&choice.parameters));
+        // The decision, in the numbers it was made on: the residual the Phase 4
+        // fit measured, the ceiling that implies, the mask that came out of the
+        // AND, and the rung. A refusal is invisible without them.
         let ceiling = match decision.ceiling {
             Some(drn) => format!("drn {drn}"),
             None => "none".to_string(),
         };
         self.note(format!(
-            "V.92: upstream rate: sigma {:.4} index steps at LC {}, ceiling {}, mask {:#07x}, chose drn {} at {} bit/s",
+            "V.92: upstream rate: sigma {:.4} index steps at LC {} from the four-point fit at {snr_db:.1} dB \
+             ({:?}), ceiling {ceiling}, mask {:#07x}, chose drn {} at {} bit/s",
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
-            ceiling,
+            decision.measured.bound(),
             decision.mask,
             choice.parameters.drn,
             choice.parameters.rate()
@@ -3918,7 +4045,12 @@ impl Modem {
                 crate::v92::up_rate(1)
             ));
         }
-        Some(choice.parameters.clone())
+        if let Some(drn) = self.parameters.as_ref().map(|p| p.drn) {
+            self.note(format!(
+                "V.92: upstream rung settled: drn {drn}, {:.1} kbit/s (this is what CPd carries)",
+                f64::from(crate::v92::up_rate(drn)) / 1000.0
+            ));
+        }
     }
 
     /// 9.6.1.1.5-6: B1d out, and the receiver conditioned for B1u.
