@@ -1589,8 +1589,38 @@ impl Source {
 /// TRN2u, and maximises the four-point decision-feedback fit the data mode is
 /// read with. Keeping them separable is what makes "the mechanism is wrong"
 /// and "the criterion chooses badly" two measurements rather than one argument.
+/// How far to move the **far end's** transmitter phase away from what Jp would
+/// otherwise ask for: `V92_JP_OFFSET`, in symbols.
+///
+/// This is the only way to move the sampling instant that V.92 gives us, and it
+/// is why a captured `*.raw` cannot answer a phase question: the far end has
+/// already chosen its instant when the recording was made. Table 22 bits 18:33
+/// carry epsilon as `[0, 1)` of a symbol, so the offset is added modulo one and
+/// the same value is handed to `expect_step`, which is what our own receiver
+/// waits for.
+///
+/// Off by default and diagnostic only; a bench sweep sets it and reads the
+/// residual phase out of the meter below.
+fn jp_offset() -> f64 {
+    std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
+}
+
+/// Measure the line's phase and **report it** without installing anything:
+/// `V92_FE_AIM=meter`.
+///
+/// The converter's two measurements are the only phase instrument this receiver
+/// has, and until now they could only run when the delay line was in the path
+/// and being written to. Metering separates the two: the line exists (so the
+/// aimers have raw history to replay) but nothing is ever installed, so what
+/// comes out is the phase *the far end chose*, in symbols, which is the number
+/// `V92_JP_OFFSET` is swept against.
+fn fe_metering() -> bool {
+    matches!(std::env::var("V92_FE_AIM").ok().as_deref(), Some("meter") | Some("measure"))
+}
+
 fn fe_aim_wants(second: bool) -> bool {
     match std::env::var("V92_FE_AIM").ok().as_deref() {
+        Some("meter") | Some("measure") => false,
         Some("off") | Some("0") | Some("none") => false,
         Some("first") | Some("trn1u") => !second,
         Some("second") | Some("trn2u") => second,
@@ -2182,6 +2212,13 @@ impl Modem {
                     ));
                 }
             }
+            if self.rx.fe_enabled() && fe_metering() {
+                if let Some((delta, figure)) = self.rx.fe_aim_four(self.trn2u_from, fe_window(TRAIN_WINDOW)) {
+                    self.note(format!(
+                        "V.92: phase meter, TRN2u: {delta:.3} symbols (four-point residual {figure:.5})"
+                    ));
+                }
+            }
             if self.rx.fe_enabled() && std::env::var_os("V92_FE_DEBUG").is_some() {
                 self.rx.fe_report_four(self.trn2u_from, fe_window(TRAIN_WINDOW));
             }
@@ -2247,6 +2284,20 @@ impl Modem {
             // decodes the whole exchange, and a bit that asked for a
             // constellation this end was not reading left Phase 4 waiting for
             // an SUVu' that could not arrive.
+            // What the far end is actually asked for: epsilon as measured, plus
+            // the bench's offset. Both the wire field and our own expectation
+            // must carry the same number, because `expect_step` is what the
+            // receive hunt waits for (9.5.2.1.8).
+            let offset = jp_offset();
+            let epsilon = if offset == 0.0 {
+                epsilon
+            } else {
+                let wanted = epsilon::to_field(f64::from(epsilon) / 65536.0 + offset);
+                self.note(format!(
+                    "V.92: Jp epsilon {epsilon} -> {wanted} (bench offset {offset:+.4} symbols)"
+                ));
+                wanted
+            };
             let jp = Jp { epsilon, eight_in_training: false, eight_in_renegotiation: false };
             self.source.jp = jp.to_bits();
             // "shall finish the current Jd and then send Jp" (9.5.1.1.8). The
@@ -2315,6 +2366,15 @@ impl Modem {
                     self.rx.fe_install(delta);
                     self.note(format!(
                         "V.92: fractional delay {delta:.3} at TRN1u 2 (linear fit {figure:.2} dB)"
+                    ));
+                }
+            }
+            if self.rx.fe_enabled() && fe_metering() {
+                // Report only: the number is the far end's phase error, and the
+                // place to act on it is the next call's Jp, not this receiver.
+                if let Some((delta, figure)) = self.rx.fe_aim_linear(at as usize, REFIT_WINDOW) {
+                    self.note(format!(
+                        "V.92: phase meter, second TRN1u: {delta:.3} symbols (linear fit {figure:.2} dB)"
                     ));
                 }
             }
