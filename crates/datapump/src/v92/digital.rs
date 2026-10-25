@@ -3671,10 +3671,16 @@ impl Modem {
                     let _ = std::fs::write(std::path::Path::new(&path), text);
                 }
                 self.cpd = Some(Cpd::from(&parameters));
+                // The level set is named here, once per call, because it is the
+                // one thing about this CPd a batch has to be able to tell from
+                // the log: the two arms of an A/B differ in these points and in
+                // nothing else, so `levelset uniform` and `levelset code` are
+                // what separates them without an environment dump.
                 self.note(format!(
-                    "V.92: upstream drn {}, {:.1} kbit/s",
+                    "V.92: upstream drn {}, {:.1} kbit/s, levelset {}",
                     parameters.drn,
-                    f64::from(parameters.rate()) / 1000.0
+                    f64::from(parameters.rate()) / 1000.0,
+                    crate::v92::upchoice::levelset().name()
                 ));
                 self.parameters = Some(parameters);
             }
@@ -6017,9 +6023,20 @@ mod tests {
             limited: false,
             delay: 0,
         };
-        let parameters = crate::v92::upchoice::pin(&design, 1, Trellis::Sixteen, 1e-9)
-            .expect("drn 1 is pinnable")
-            .parameters;
+        // The code grid, named rather than read from `V92_LEVELSET`: these
+        // tests are about docs/114 R2a/R3/R4, whose `K` fit and level table are
+        // written against a design whose points are code values. The arm the
+        // default sends is the odd lattice, and the same fit against it is a
+        // different question (see `upchoice`'s switch).
+        let parameters = crate::v92::upchoice::pin_with(
+            &design,
+            1,
+            Trellis::Sixteen,
+            1e-9,
+            crate::v92::upchoice::LevelSet::Code,
+        )
+        .expect("drn 1 is pinnable")
+        .parameters;
         let mut modem = Modem::default();
         modem.parameters = Some(parameters);
         modem

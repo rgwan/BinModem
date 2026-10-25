@@ -103,16 +103,132 @@ pub const E2U_SYMBOLS: usize = UP_INTERVALS + if EXTEND_E2U { 1 } else { 0 };
 /// A uniform alphabet at 1, 3, ..., 2 LC - 1 has a mean square of
 /// ((2 LC)^2 - 1) / 3, and G is its reciprocal square root.
 ///
-/// This is the *odd lattice's* gain and is no longer what [`build`] sends: a
-/// design on the far end's code grid takes its gain from the code ladder's own
-/// mean square ([`codegrid::gain_for`]). It is kept because it is the reference
-/// the module comment above is written in and because a reader comparing the
-/// two designs needs both numbers side by side -- at 24 000 the odd lattice
-/// asks for G = 0.1085 and the code ladder for G = 6.17e-4, which are the same
-/// transmit power on two different sets of numbers.
+/// This is the *odd lattice's* gain, and the gain of the default level set
+/// ([`LevelSet::Uniform`]). A design on the far end's code grid takes its gain
+/// from the code ladder's own mean square ([`codegrid::gain_for`]), which is a
+/// different number for the same transmit power: at 24 000 the odd lattice asks
+/// for G = 0.1085 and the code ladder for G = 6.17e-4. Both are kept here
+/// because the selector between them is [`LEVELSET_VAR`], and a reader comparing
+/// the two arms needs both numbers side by side.
 pub fn gain_for(levels: usize) -> f64 {
     let span = 2.0 * levels as f64;
     (3.0 / (span * span - 1.0).max(1.0)).sqrt()
+}
+
+/// Which constellation level set [`build`] puts out: `V92_LEVELSET`.
+///
+/// `uniform` -- the odd lattice `a(eta) = 2 eta + 1` with [`gain_for`]'s gain --
+/// is the default, and is the set every call made before docs/114 R1 asked the
+/// far end for, field for field. `code` is docs/114 R1's far end G.711 code grid
+/// ([`codegrid::grid`]) with the set's own gain ([`codegrid::gain_for`]).
+///
+/// # Why it is a switch and not a default
+///
+/// The code grid's benefit is a *snapping* offset, and it is unproven: on the
+/// replay corpus there is no per-level systematic offset to remove (per-level
+/// means within 1.6 LSB of zero, 19-23 sigma away from the offsets the grid
+/// predicts), so "the code grid is better" is a hypothesis only a live A/B can
+/// settle. What the grid certainly costs is minimum gap, because a maximin code
+/// set inside the power ceiling is coarser than the odd lattice at the same
+/// power: 349 -> 256 LSB at 24 000 (-2.7 dB) and 43.6 -> 16 LSB at 48 000
+/// (-8.7 dB). So the default is the set the line has been shown to carry, and
+/// the bench compares the two arms out of one binary.
+///
+/// A variable of its own, and deliberately **not** `V92_CODE_GRID`: that one
+/// arms the one-per-call field dump (docs/114 R6), and a dump switch that moved
+/// the wire would make every observation of a call an intervention in it.
+pub const LEVELSET_VAR: &str = "V92_LEVELSET";
+
+/// The two level sets [`build`] can put out. See [`LEVELSET_VAR`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelSet {
+    /// `a(eta) = 2 eta + 1`: the odd lattice. The default.
+    Uniform,
+    /// The far end's own G.711 code values (docs/114 R1).
+    Code,
+}
+
+impl LevelSet {
+    /// The name the log carries, which is also the value `V92_LEVELSET` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            LevelSet::Uniform => "uniform",
+            LevelSet::Code => "code",
+        }
+    }
+
+    /// What a `V92_LEVELSET` value names, or `None` for a value this build does
+    /// not have. Unset and empty are `uniform`: the default is the default, not
+    /// a value the caller had to write down.
+    pub fn named(raw: Option<&str>) -> Option<Self> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("uniform") => Some(LevelSet::Uniform),
+            Some("code") => Some(LevelSet::Code),
+            Some(_) => None,
+        }
+    }
+
+    /// One constellation set's `levels` positive points.
+    ///
+    /// `uniform` cannot fail for any `levels` [`build`] admits; `code` can, and
+    /// does at 48 000, where the grid has no 64-point set with a usable gap
+    /// (docs/103 §3). That is a rung-specific refusal and not a clamp: [`build`]
+    /// returns `None` and the ladder steps down.
+    pub fn points(self, levels: usize) -> Option<Vec<u16>> {
+        match self {
+            LevelSet::Uniform => Some((0..levels).map(|index| (2 * index + 1) as u16).collect()),
+            LevelSet::Code => codegrid::grid(levels),
+        }
+    }
+
+    /// 8.8.3's gain for `points`: `ms(v G) = 1`.
+    ///
+    /// The odd lattice has a closed form -- a mean square of
+    /// `((2 LC)^2 - 1) / 3` -- and the code grid does not, so it is the
+    /// reciprocal square root of the set's own mean square. G is a function of
+    /// the set and not a knob: the clause that fixes it for one set fixes it for
+    /// the other (docs/114 R8).
+    pub fn gain(self, points: &[u16]) -> f64 {
+        match self {
+            LevelSet::Uniform => gain_for(points.len()),
+            LevelSet::Code => codegrid::gain_for(points),
+        }
+    }
+}
+
+/// `V92_LEVELSET`'s value for this call.
+pub fn levelset() -> LevelSet {
+    resolve(std::env::var(LEVELSET_VAR).ok().as_deref())
+}
+
+/// [`levelset`] for one value. An unrecognised value sends `uniform` -- a typo
+/// does not get to move the wire -- and the value it ignored is said out loud
+/// once per process, so a batch's log can tell a typo from an environment that
+/// never set the variable at all.
+pub fn resolve(raw: Option<&str>) -> LevelSet {
+    match LevelSet::named(raw) {
+        Some(set) => set,
+        None => {
+            report_ignored(raw.unwrap_or_default());
+            LevelSet::Uniform
+        }
+    }
+}
+
+/// Whether this call is the one that reports an unrecognised `V92_LEVELSET`.
+///
+/// Once per process: the value cannot differ between the rungs of one call, and
+/// a line per rung would bury the call's own notes. The note line carries the
+/// level set that actually went out ([`LevelSet::name`]), which is how a batch
+/// is classified; this is the explanation for a name that looks wrong.
+fn report_ignored(raw: &str) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!("{LEVELSET_VAR}: {raw:?} is not uniform or code; sending the odd lattice (uniform)");
+    true
 }
 
 /// What the choice settled on.
@@ -186,7 +302,22 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
 /// It cannot become a default by accident: neither caller searches at another
 /// rung on the strength of a better line assumed rather than measured.
 pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Choice> {
-    let parameters = build(design, drn, trellis)?;
+    pin_with(design, drn, trellis, noise, levelset())
+}
+
+/// [`pin`] with the level set named rather than read from the environment.
+///
+/// The two entry points differ in one argument and nothing else, which is the
+/// whole of the switch: `digital.rs` calls [`pin`], and a test that has to hold
+/// one arm still calls this.
+pub fn pin_with(
+    design: &Design,
+    drn: u8,
+    trellis: Trellis,
+    noise: f64,
+    levelset: LevelSet,
+) -> Option<Choice> {
+    let parameters = build_with(design, drn, trellis, levelset)?;
     parameters.fits().ok()?;
     let carried = design.scale * design.scale * noise.max(0.0);
     let sigma = (design.residual * design.residual + carried).sqrt();
@@ -197,7 +328,15 @@ pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Cho
 
 /// The parameters for one rung, with the moduli spread evenly over the twelve
 /// intervals and one constellation set shared by all six constellation frames.
+///
+/// The set comes from `V92_LEVELSET` ([`LEVELSET_VAR`]); everything else -- the
+/// moduli, the class arithmetic, the gain's clause -- is the same either way.
 fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
+    build_with(design, drn, trellis, levelset())
+}
+
+/// [`build`] with the level set named rather than read from the environment.
+fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) -> Option<Parameters> {
     let bits = up_bits(drn);
     // 6.4.1: K bits over twelve intervals, as evenly as they go. The spare bits
     // go to the intervals that come first, which is where the mixed radix
@@ -224,15 +363,22 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
     if levels > CONSTELLATION_POINTS {
         return None;
     }
-    // docs/114 R1: the points are the far end's own code values, not the odd
-    // lattice. `levels` is 6.4.2's LC, unchanged, so the class arithmetic and
-    // the moduli above are untouched; what changes is where the points sit.
-    let set = codegrid::grid(levels)?;
-    // 8.8.3 fixes G from the set's own mean square and from nothing else, so
-    // the change of shape moves G with it: the odd lattice's 0.1085 at LC = 8
-    // becomes the code ladder's 6.17e-4, and `ms(v G)` is 1 either way. G is
-    // not a grid knob and is not used as one (docs/114 R8).
-    let gain = codegrid::gain_for(&set);
+    // The points, from the level set this call is running. `levels` is 6.4.2's
+    // LC, unchanged, so the class arithmetic and the moduli above are the same
+    // for both sets: what differs is where the points sit.
+    //
+    // `uniform` is `a(eta) = 2 eta + 1`, the set every call before docs/114 R1
+    // asked for. `code` is docs/114 R1: the far end's own G.711 code values, on
+    // the ground that a codec can only emit codes, so a request at a code value
+    // makes its rounding a no-op and leaves a static per-point offset instead.
+    // That offset is what a live A/B has to settle, and it is why this is a
+    // switch with the old set as its default rather than a new truth.
+    let set = levelset.points(levels)?;
+    // 8.8.3 fixes G from the set's own mean square and from nothing else, so a
+    // change of shape moves G with it: the odd lattice's 0.1085 at LC = 8
+    // against the code ladder's 6.17e-4, with `ms(v G)` one either way. G is not
+    // a grid knob and is not used as one (docs/114 R8).
+    let gain = levelset.gain(&set);
     if gain > GAIN_LARGEST {
         // More power than CPd's field carries: the rung would go out quieter
         // than the design asked for and every level would be off by that much.
@@ -276,8 +422,10 @@ fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
         gain,
         moduli,
         filters: design.filters.clone(),
-        // One set of `levels` positive points on a spacing of two, shared by
-        // every constellation frame: the simple case of CPd's six.
+        // One set of `levels` positive points, shared by every constellation
+        // frame: the simple case of CPd's six. The spacing is two on the odd
+        // lattice and the codec's own on the grid, so nothing here may assume
+        // it -- `Parameters::step` reads the set.
         sets: vec![set],
         indices: [0; CONSTELLATION_FRAME],
     })
@@ -358,6 +506,107 @@ mod tests {
             assert!((gain * gain * power - 1.0).abs() < 1e-9, "{levels}: {} against 1", gain * gain * power);
             assert!(gain > 0.0 && gain <= GAIN_LARGEST, "{levels}: gain {gain}");
         }
+    }
+
+    /// The default level set is the odd lattice, by value: the eight points at
+    /// 24 000 are 1, 3, ..., 15, the gain is `gain_for(8)` exactly, and
+    /// `Parameters::step` is `2 G` as it was before the code grid existed.
+    ///
+    /// This is the half of the switch that has to be a *restoration* rather
+    /// than a new behaviour: a call made with `V92_LEVELSET` unset is the call
+    /// every earlier build made, and the numbers below are the ones this crate
+    /// sent then.
+    #[test]
+    fn the_default_level_set_is_the_odd_lattice_it_replaced() {
+        let design = design_for(1e-9);
+        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform).expect("drn 1 builds");
+        // LC = 8 at 24 000, and the points are the odd lattice itself.
+        assert_eq!(parameters.sets.len(), 1);
+        assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
+        // 8.8.3's closed form, to the bit: sqrt(3 / ((2 x 8)^2 - 1)).
+        assert_eq!(parameters.gain, (3.0f64 / 255.0).sqrt());
+        assert_eq!(parameters.gain, gain_for(8));
+        assert!((parameters.gain - 0.108_465_228_909_328_08).abs() < 1e-17, "gain {}", parameters.gain);
+        // Every other rung of the ladder, by value: LC = 16, 32 and 64 are the
+        // same lattice one octave up, and the gain follows the set.
+        for (drn, lc) in [(1u8, 8usize), (7, 16), (13, 32), (19, 64)] {
+            let parameters = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform)
+                .unwrap_or_else(|| panic!("drn {drn} is buildable on the odd lattice"));
+            let wanted: Vec<u16> = (0..lc).map(|index| (2 * index + 1) as u16).collect();
+            assert_eq!(parameters.sets[0], wanted, "drn {drn}: not the odd lattice");
+            assert_eq!(parameters.gain, gain_for(lc), "drn {drn}: gain");
+            // The spacing on the line: the lattice's gap is two, so `step` is
+            // `2 G` -- the number every pre-code-grid design was scored on.
+            assert!((parameters.step() - 2.0 * gain_for(lc)).abs() < 1e-15, "drn {drn}: step");
+        }
+        // And the two public entry points, unset environment and all, agree
+        // with it: `levelset()` is `uniform` when nothing says otherwise.
+        assert_eq!(levelset(), LevelSet::Uniform);
+        let pinned = pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform).expect("pinnable");
+        assert_eq!(pinned.parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
+    }
+
+    /// `code` is the far end's G.711 grid by value, and its gain is the set's
+    /// own mean square rather than the odd lattice's.
+    ///
+    /// The points are checked against `codegrid::value` of the code they claim
+    /// to be -- i.e. against G.711's own table, `_DEC` -- and not against a
+    /// list typed here. The minimum gap is checked against `codegrid::min_gap`,
+    /// because that is the quantity the grid costs (256 LSB at 24 000 against
+    /// the lattice's 349).
+    #[test]
+    fn the_code_level_set_is_the_far_end_s_g711_grid() {
+        let design = design_for(1e-9);
+        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Code).expect("drn 1 builds");
+        let grid = codegrid::grid(8).expect("the grid holds eight points");
+        assert_eq!(parameters.sets[0], grid, "not the grid the module builds");
+        // Every point is a code value: the µ-law decode of the code it is
+        // nearest to. That is what "emits `_DEC[code]` values" means.
+        for &point in &grid {
+            let code = codegrid::nearest_code(f64::from(point));
+            assert_eq!(codegrid::value(code), point, "code {code} decodes to {point}");
+        }
+        // 8.8.3 on the set's own mean square: 1/sqrt(ms), which at LC = 8 is
+        // the codec's scale and not the lattice's.
+        assert_eq!(parameters.gain, codegrid::gain_for(&grid));
+        assert!((parameters.gain - 6.172_48e-4).abs() < 1e-9, "gain {}", parameters.gain);
+        assert!((parameters.gain - gain_for(8)).abs() > 0.1, "the grid's gain is not the lattice's");
+        // The gap it costs: 256 LSB at 24 000, against the lattice's 349.
+        let gap = codegrid::min_gap(&grid);
+        assert!((gap - 256.0).abs() < 1.0, "gap {gap}");
+        assert!((parameters.step() - parameters.gain * gap).abs() < 1e-15, "step is not G x the set's gap");
+        // And what the gap costs on the line, against the lattice's `2 G`:
+        // 0.1580 against 0.2169, i.e. the -2.7 dB docs/114 quotes for 24 000.
+        // The lattice's own 349 LSB is not this arithmetic -- it is on the same
+        // set scaled to the codec's power, and it is the number the grid gives
+        // up (349 -> 256) rather than a step either end sends.
+        let loss = 20.0 * (parameters.step() / (2.0 * gain_for(8))).log10();
+        assert!((loss + 2.7).abs() < 0.1, "the grid costs {loss:.2} dB, not 2.7");
+    }
+
+    /// An unrecognised `V92_LEVELSET` sends the odd lattice and says so once.
+    ///
+    /// The typo does not get a vote on the wire; what it gets is one line, so
+    /// that a batch whose log says `levelset uniform` under `V92_LEVELSET=kode`
+    /// can be told from one that never set the variable.
+    #[test]
+    fn an_unrecognised_levelset_is_uniform_and_is_said_once() {
+        assert_eq!(LevelSet::named(None), Some(LevelSet::Uniform), "unset is the default");
+        assert_eq!(LevelSet::named(Some("")), Some(LevelSet::Uniform), "empty is the default");
+        assert_eq!(LevelSet::named(Some("uniform")), Some(LevelSet::Uniform));
+        assert_eq!(LevelSet::named(Some("code")), Some(LevelSet::Code));
+        assert_eq!(LevelSet::named(Some("uniform ")), Some(LevelSet::Uniform), "trailing space");
+        assert_eq!(LevelSet::named(Some("kode")), None, "not a level set this build has");
+        // The report is once per process, and the first value is the one it
+        // names: a rung-by-rung repeat would bury the call's own notes.
+        assert!(report_ignored("kode"), "the first unrecognised value is reported");
+        assert!(!report_ignored("kode"), "and the second is not");
+        assert!(!report_ignored("LEVELSET"), "nor a third");
+        // The value itself still resolves to the old set, by value.
+        assert_eq!(resolve(Some("kode")), LevelSet::Uniform);
+        let design = design_for(1e-9);
+        let parameters = build_with(&design, 1, Trellis::Sixteen, resolve(Some("kode"))).expect("drn 1");
+        assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15], "a typo moved the wire");
     }
 
     /// 8.8.3's other half: folding a scaled prefilter's `scale` into `G` is not

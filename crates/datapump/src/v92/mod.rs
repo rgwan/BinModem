@@ -553,10 +553,12 @@ impl Parameters {
     ///
     /// This is what a symbol error has to cross, and the quantity
     /// [`upchoice`](super::upchoice) scores `[6.4.2]`'s classes against. For the
-    /// odd lattice `a(eta) = 2 eta + 1` the smallest gap was two and this was
-    /// `2 G`; on the far end's code grid the gaps are the codec's own steps, so
-    /// it is `G` times the smallest of them ([`codegrid::min_gap`]). Zero for a
-    /// set with one point, which has no adjacent pair and no decision to make.
+    /// odd lattice `a(eta) = 2 eta + 1` the smallest gap is two, so this is
+    /// `2 G` -- the number every design before docs/114 R1 was scored on, and
+    /// the one `V92_LEVELSET=uniform` (the default) still gives. On the far
+    /// end's code grid the gaps are the codec's own steps, so it is `G` times
+    /// the smallest of them ([`codegrid::min_gap`]). Zero for a set with one
+    /// point, which has no adjacent pair and no decision to make.
     pub fn step(&self) -> f64 {
         let Some(set) = self.sets.first() else { return 0.0 };
         let gap = codegrid::min_gap(set);
