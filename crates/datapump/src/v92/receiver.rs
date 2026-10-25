@@ -2350,6 +2350,30 @@ impl Receiver {
     /// window's own power, because the step has to mean the same thing at any
     /// received level.
     fn track(&mut self, value: f64, decided: Option<f64>) {
+        // `V92_EQ=fixed` freezes the forward section at whatever training left
+        // it: no data-mode adaptation at all.
+        //
+        // This is not a tuning knob but the architecture V.92's own designers
+        // describe (`docs/90` §0): upstream is one symbol per 8 kHz sample, the
+        // CO's A/D puts every level on a quantisation code, and equalising at
+        // the receiver moves those levels off the codes -- "not compatible with
+        // computation of proper likelihoods" (Kim et al., TCOM 52(1) 2004,
+        // §II); US6594306 spec p.6 says the analog modem pre-equalises so that
+        // "the digital modem is not required to implement any equalization";
+        // Alagha §4.2.1 p.76 says the receiver cannot extract data from ISI at
+        // all. What the receiver may still do is track the *level* -- MICA's
+        // once-per-symbol integrator (`docs/90` §4.2) -- which
+        // `anchor_data_levels` below is.
+        //
+        // The falsifiable prediction this exists for is `docs/90` §3: with the
+        // data mode's adaptation off, 40000's off-lattice rate must fall. If it
+        // rises, the reading in `docs/90` §0 is wrong and this gate has to go.
+        static FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FIXED.get_or_init(|| {
+            matches!(std::env::var("V92_EQ").ok().as_deref(), Some("fixed") | Some("off"))
+        }) {
+            return;
+        }
         if self.tracking <= 0.0 || self.gain <= 0.0 || !matches!(self.slicer, Slicer::Levels(_)) {
             return;
         }
