@@ -2158,9 +2158,23 @@ impl Modem {
             // stream, so the fit below is entirely on converted samples.
             if self.rx.fe_enabled() && fe_aim_wants(true) {
                 let forced = std::env::var("V92_FE_DELTA").ok().and_then(|t| t.parse::<f64>().ok());
-                let aimed = forced
-                    .map(|d| (d, f64::NAN))
-                    .or_else(|| self.rx.fe_aim_four(self.trn2u_from, fe_window(TRAIN_WINDOW)));
+                // The aim's reference is Table 28's four points, and it is
+                // only the far end's sequence when this end asked for four
+                // (Jp bit 48, 8.7.6). Today `upstream_size` is fixed at four,
+                // so this is a guard against the day it is not: a four-point
+                // reference fitted against an eight-point line would give a
+                // plausible number for a phase that is not being measured.
+                let four = self.upstream_size == Trn2uSize::Four;
+                if !four {
+                    self.note("V.92: no aim at TRN2u: the reference is four points".into());
+                }
+                let aimed = forced.map(|d| (d, f64::NAN)).or_else(|| {
+                    if four {
+                        self.rx.fe_aim_four(self.trn2u_from, fe_window(TRAIN_WINDOW))
+                    } else {
+                        None
+                    }
+                });
                 if let Some((delta, figure)) = aimed {
                     self.rx.fe_install(delta);
                     self.note(format!(
