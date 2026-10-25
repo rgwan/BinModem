@@ -145,6 +145,15 @@ const SU_WITHIN: f64 = 5.1;
 /// follows it, with its half-symbol step behind us.
 const SU_AFTER_S_BAR: u64 = 36;
 
+/// 9.5.2.1.7's S-bar-u, in symbols and tenths: 24.5T. [`BLIND_SU`] counts from
+/// here, because a far end that never reverses never sends it either.
+const SU_BAR_TENTHS: u64 = 245;
+
+/// How far behind the onset the hunt's `Su` report is when it names a location:
+/// [`HELD_PERIODS`](crate::v92::receiver) periods of the six-symbol shape, give
+/// or take where in the period the anchor was taken.
+const SU_REPORT_LAG: u64 = 48;
+
 /// And how much of it is measured: sixteen periods of the six-symbol shape,
 /// 12 ms of Su. Long enough that the phase is steady to a few thousandths of a
 /// symbol, short enough that Jp is on the line well before the far end has any
@@ -1934,6 +1943,17 @@ impl Source {
 ///
 /// Off by default and diagnostic only; a bench sweep sets it and reads the
 /// residual phase out of the meter below.
+/// Whether [`BLIND_SU`] is armed: `V92_SU_BLIND=1`. Off unless asked for.
+fn blind_su() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("V92_SU_BLIND").ok().as_deref(),
+            Some("1") | Some("yes") | Some("on") | Some("true")
+        )
+    })
+}
+
 fn jp_offset() -> f64 {
     std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
 }
@@ -2015,6 +2035,10 @@ pub struct Modem {
     /// Where the Su that Jp's epsilon is measured on begins, in absolute
     /// symbols, once the S-bar-u reversal that opens it has been heard.
     su_from: Option<u64>,
+    /// Where the hunt last reported Su in the stage that is waiting for its
+    /// reversal. It is what [`BLIND_SU`]'s recovery counts from, and nothing
+    /// else reads it.
+    su_found: Option<u64>,
     /// Whether Jp has gone out. It waits for the measurement (9.5.1.1.8), so
     /// the stage alone does not say whether it has.
     jp_sent: bool,
@@ -2294,6 +2318,7 @@ impl Modem {
             cpt: None,
             trn_from: None,
             su_from: None,
+            su_found: None,
             jp_sent: false,
             refit_from: None,
             refit_tries: 0,
@@ -2941,12 +2966,68 @@ impl Modem {
             self.ja_deadline = None;
             self.fail("no Ja within 4.5 s and a round trip");
         }
+        // `V92_SU_BLIND=1`: a recovery arm for a far end whose Su is on the
+        // line and never turns over.
+        //
+        // 9.5.2.1.7 is a promise: Su for 144T, S-bar-u for 24.5T, then Su until
+        // Jp. A Conexant HSF on this bench keeps that promise's first clause
+        // and breaks the rest -- measured on three of its calls, its upstream
+        // is one unmodulated 1333.33 Hz tone from the start of Su to the point
+        // where it gives up, phase-constant to 0.07 degrees over 37000 symbols
+        // (`/dev/shm/reports/hsf-su.md`). There is no reversal to detect, so
+        // the digital modem's only conforming move is to wait out 9.5.1.2.2.
+        //
+        // This arm is **not conformance and must never be the default**. It
+        // exists to answer the next question in one bench call: given a Jp it
+        // was never asked for, does this far end go on to 9.5.2.1.8? If it
+        // does, the interworking fix is a named quirk in the phase 3 state
+        // machine; if it does not, no amount of receiver work reaches Phase 4
+        // on this far end and that is worth knowing before more of it is done.
+        //
+        // The arithmetic is self-consistent even without the step: epsilon is
+        // measured on the Su that is on the line, and it is that Su the far end
+        // lengthens by (24 + epsilon)T. Nothing here assumes the half symbol
+        // arrived, because on this far end it did not.
+        if blind_su()
+            && self.stage == Stage::AwaitSu
+            && let Some(found) = self.su_found
+            && self.now
+                >= found
+                    + crate::v92::SU_SYMBOLS as u64
+                    + SU_BAR_TENTHS / 10
+                    + 2 * crate::v92::up_signals::RU_PERIOD as u64
+        {
+            // Where 9.5.2.1.7's reversal should have been: 144T of Su after the
+            // onset the hunt's report is a few periods behind.
+            let at = found + crate::v92::SU_SYMBOLS as u64 - SU_REPORT_LAG;
+            self.note(format!(
+                "V.92: Su never reversed in {} periods; asking for Jp anyway (V92_SU_BLIND)",
+                (self.now - found) / crate::v92::up_signals::RU_PERIOD as u64
+            ));
+            self.su_found = None;
+            self.su_reversal(at);
+        }
         if let Some(at) = self.su_deadline
             && self.now > at
             && self.stage == Stage::AwaitSu
             && self.source.out() == Out::Jd
         {
             self.su_deadline = None;
+            // 9.5.1.2.2 gives 5100 ms from the start of TRN1d, and the three
+            // ways to spend them -- no Su, Su that never turned over, Su that
+            // turned over with a step this end did not expect -- are one line
+            // of log and three different fixes. The hunt is still holding the
+            // answer when the deadline arrives, so say it: a case that cost a
+            // capture and an afternoon to tell apart is a case the log can
+            // report for the price of one note (docs/97).
+            if let Some((kind, _, held, stray, step)) = self.rx.hunt_state() {
+                self.note(format!(
+                    "V.92: the hunt was still holding {kind} after {held} periods \
+                     ({stray} misses in a row, expecting a step of {step:.3})"
+                ));
+            } else {
+                self.note("V.92: the hunt was holding nothing at the deadline".into());
+            }
             self.fail("no Su within 5.1 s of TRN1d");
         }
     }
@@ -2971,6 +3052,7 @@ impl Modem {
             Heard::Su { at } => {
                 if self.stage == Stage::AwaitSu {
                     self.note(format!("V.92: Su at {at}"));
+                    self.su_found = Some(at);
                 }
             }
             Heard::SuReversal { at } => self.su_reversal(at),

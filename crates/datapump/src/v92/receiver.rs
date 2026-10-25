@@ -2022,6 +2022,56 @@ impl Receiver {
         self.history.len()
     }
 
+    /// What the two measurements [`Self::recognise`] decides on say about
+    /// `window` right now: the share that keeps the anchor, and the share that
+    /// says the sequence turned over at the step this end expects. `None`
+    /// before there is an anchor, because an anchor's polarity is the only zero
+    /// point either number is measured against.
+    ///
+    /// `Su` found and then no `S-bar-u` after it (9.5.1.1.6-9) has three causes
+    /// with three different fixes, and they read the same in a call's log:
+    ///
+    /// * the reversal was never on the line;
+    /// * it was on the line and under [`TURNED_MATCHED`];
+    /// * it was on the line with a step that is not the one this end expects,
+    ///   so `step` was the wrong number.
+    ///
+    /// Reading these numbers on a *capture* rather than on a call is the point
+    /// of the door: the Su window is inside the critical window, and on this
+    /// bench an instrument there takes the far end with it (`docs/93`).
+    /// What the hunt is holding and how it got there: which shape (an
+    /// acquired one or a turned-over one), the period it compares on, how many
+    /// periods in a row have matched it, how many have missed, and the step it
+    /// expects the far end to take at the next reversal. `None` between
+    /// sequences.
+    ///
+    /// [`Self::hunt_shares`] is only half the answer without this: the shares
+    /// are compared one period in six, and which six is the anchor's own.
+    #[must_use]
+    pub fn hunt_state(&self) -> Option<(&'static str, u64, u32, u32, f64)> {
+        let anchor = self.anchor?;
+        let kind = match anchor.kind {
+            Hunt::Searching => "searching",
+            Hunt::Ru => "Ru",
+            Hunt::RuTurned => "Ru turned",
+            Hunt::Su => "Su",
+            Hunt::SuTurned => "Su turned",
+        };
+        Some((kind, anchor.phase, anchor.held, anchor.stray, self.step))
+    }
+
+    #[must_use]
+    pub fn hunt_shares(&self, window: &[f64]) -> Option<(f64, f64)> {
+        let anchor = self.anchor?;
+        if window.len() < RU_PERIOD {
+            return None;
+        }
+        Some((
+            correlate(window, &anchor.template),
+            turned_share(window, &anchor.template, self.step),
+        ))
+    }
+
     /// Recognise Ru, Su and their reversals from the shape of the last window.
     ///
     /// The window is one period of six, which is what both sequences repeat
@@ -3361,6 +3411,52 @@ mod tests {
     }
 
     const RU_SYMBOLS_LOCAL: usize = 384;
+
+    /// The two numbers [`Receiver::hunt_shares`] hands out, pinned on the thing
+    /// this bench actually puts on the line.
+    ///
+    /// Su's zeros and its 4000 Hz two thirds do not survive the path the
+    /// analogue modem's audio takes to the digital one: an HSF on a 16 kHz
+    /// codec through the bridge's 16k-to-8k decimator arrives as its own
+    /// fundamental, a 1333.33 Hz tone, and so does the Agere's (measured, both
+    /// captures: every other bin of the six is 70 dB down). On a tone the two
+    /// numbers are pure geometry, which is what makes them worth asserting:
+    ///
+    /// * Su that never reverses reads `turned = -cos(30 degrees) = -0.866`,
+    ///   because the only other thing the test can be is the same tone
+    ///   inverted and half a symbol along -- and half a symbol of a six-symbol
+    ///   tone is 30 degrees, not 180.
+    /// * Su that does reverse at 9.5.2.1.7's 24.5T reads `turned = +1`, and
+    ///   only because the step the timetable predicted is the step that
+    ///   happened: negate a tone in place, or negate it a whole symbol out, and
+    ///   the same test reads -1 or +0.5.
+    #[test]
+    fn the_hunts_two_numbers_say_which_of_the_three_things_went_wrong() {
+        let tone = |x: f64| (std::f64::consts::TAU * x / RU_PERIOD as f64).sin();
+        let mut rx = Receiver::new();
+        rx.expect_su();
+        // `epsilon::step_direction` * 0.5, which is what Phase 3 sets: the
+        // analogue modem's grid moves half a symbol early at S-bar-u.
+        rx.expect_step(-0.5);
+        // A whole number of periods in, so the anchor taken from the first
+        // window is the same phase as this one.
+        let start = 60usize;
+        for n in 0..start {
+            rx.feed(tone(n as f64));
+        }
+        let steady: Vec<f64> = (start..start + RU_PERIOD).map(|n| tone(n as f64)).collect();
+        let (kept, turned) = rx.hunt_shares(&steady).expect("an anchor on a tone");
+        assert!(kept > 0.999, "a steady tone kept {kept}");
+        assert!((turned + 0.866).abs() < 0.005, "a steady tone turned {turned}");
+
+        // And the same tone, inverted, on the grid the 24.5T S-bar-u leaves.
+        let reversed: Vec<f64> = (start..start + RU_PERIOD)
+            .map(|n| -tone(n as f64 + 0.5))
+            .collect();
+        let (kept, turned) = rx.hunt_shares(&reversed).expect("an anchor on a tone");
+        assert!(kept < -0.8, "a reversed tone kept {kept}");
+        assert!(turned > 0.999, "a reversed tone turned {turned}");
+    }
 
     /// 9.5.2.1.7: Su for 144T, then S-bar-u for 24.5T -- which starts half a
     /// symbol late, so the S-bar-u is the Su's own inverse **a half symbol
