@@ -52,7 +52,34 @@ use super::UP_INTERVALS;
 /// on. A real analogue modem on a real line reaches the far end at about a
 /// quarter of full scale -- 0.06 of mean square on a good day -- so the hunt
 /// never fired at all and Phase 3 waited for a Ru that was on the line.
+///
+/// **This is the digital-silence floor and nothing else** (`docs/122`). It is
+/// in the line's own units -- a mean square -- so on its own it is a gate whose
+/// units are the amplitude, which is exactly what a level raise moves. The
+/// question "is this window a signal" is asked in [`AUDIBLE_SHARE`] as a ratio
+/// against the level measured on the same line; this number is left as the one
+/// case a ratio cannot answer, a line of exact zeros where there is no level to
+/// divide by.
 const AUDIBLE: f64 = 1e-4;
+
+/// How far below the level the line has been running a window may be before it
+/// stops being a signal: 30 dB.
+///
+/// The hunt's shape test is a normalised correlation, so it reads the same at
+/// any level; the question this answers is the one that *does* depend on level
+/// -- "is there anything here" -- and it is asked as a ratio, so that the answer
+/// does not move when the far end's transmit level does. The level it is a ratio
+/// against is [`Receiver::level_sq`], a mean square of the same samples, so both
+/// halves of the comparison are in the line's units and the quotient is not.
+const AUDIBLE_SHARE: f64 = 1e-3;
+
+/// Symbols between updates of [`Receiver::level_sq`].
+///
+/// One multiply-add per symbol and one division every sixty-four: the timer is
+/// what keeps a per-symbol division out of the sample path (`docs/97` §3 rule
+/// 2). The window is meant to be the line's level, which a call's own timetable
+/// moves on a scale of hundreds of symbols, not one.
+const LEVEL_SYMBOLS: u32 = 64;
 
 /// Ru's shape over one period: "+++---" (8.5.5).
 const RU_SHAPE: [f64; RU_PERIOD] = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0];
@@ -878,6 +905,14 @@ pub struct Receiver {
     /// The last `RU_PERIOD` samples' second moment, and the cross moment half
     /// a period back: what tells Ru from Su from silence.
     recent: VecDeque<f64>,
+    /// The line's own mean square, updated once every [`LEVEL_SYMBOLS`] symbols
+    /// from the samples themselves: the level every "is this a signal" gate in
+    /// the hunt is measured against, so that none of them carries the line's
+    /// units (`docs/122`).
+    level_sq: f64,
+    /// The sum of squares and the count behind the next [`Self::level_sq`].
+    level_sum: f64,
+    level_count: u32,
     products: VecDeque<(f64, f64)>,
     /// Which shape this end is waiting for, when the call's own order says so.
     ///
@@ -988,6 +1023,9 @@ impl Receiver {
             fe: fe_from_env(),
             events: VecDeque::new(),
             recent: VecDeque::new(),
+            level_sq: 0.0,
+            level_sum: 0.0,
+            level_count: 0,
             products: VecDeque::new(),
             expected: None,
             step: 0.0,
@@ -1031,6 +1069,14 @@ impl Receiver {
             Some(fe) => fe.push(level),
             None => level,
         };
+        // The line's own level, in the line's own units: one multiply-add per
+        // symbol and one division every [`LEVEL_SYMBOLS`] (see `level_sq`).
+        self.level_sum += level * level;
+        self.level_count += 1;
+        if self.level_count == LEVEL_SYMBOLS {
+            self.level_sq = self.level_sum / f64::from(LEVEL_SYMBOLS);
+            (self.level_sum, self.level_count) = (0.0, 0);
+        }
         self.history.push_back(level);
         if self.history.len() > HISTORY {
             self.history.pop_front();
@@ -2337,6 +2383,31 @@ impl Receiver {
         ))
     }
 
+    /// Whether this window is a signal at all -- asked **relative to the line**
+    /// and not to a fixed number.
+    ///
+    /// The hunt's decisions are shape decisions and its shape test is a
+    /// normalised correlation, so a level raise cannot move them; this is the
+    /// one gate in the hunt that used to carry the amplitude, and on a raised
+    /// line it was comparing a window against a constant measured at the old
+    /// one (`docs/122`). It is now the same question in the same units on both
+    /// sides -- this window's mean square against the mean square of what the
+    /// line has been carrying -- so the answer is a ratio and the far end's
+    /// transmit level cancels. [`AUDIBLE`] is kept for the one case a ratio
+    /// cannot express: a line of exact zeros, which has no level to be a
+    /// fraction of, and which is exactly what a digital network's silence is.
+    fn audible(&self, window: &[f64]) -> bool {
+        let power: f64 = window.iter().map(|x| x * x).sum();
+        if !power.is_finite() || power <= AUDIBLE {
+            return false;
+        }
+        // Thirty decibels under the line's own level is not a signal. Before
+        // `LEVEL_SYMBOLS` of line has been seen there is no level to divide by
+        // and the window stands on the floor alone.
+        let level = self.level_sq * RU_PERIOD as f64;
+        power > AUDIBLE_SHARE * level
+    }
+
     /// Recognise Ru, Su and their reversals from the shape of the last window.
     ///
     /// The window is one period of six, which is what both sequences repeat
@@ -2364,8 +2435,7 @@ impl Receiver {
             return false;
         }
         let window: Vec<f64> = self.recent.iter().copied().collect();
-        let power: f64 = window.iter().map(|x| x * x).sum();
-        if !power.is_finite() || power <= AUDIBLE {
+        if !self.audible(&window) {
             self.anchor = None;
             self.state = Hunt::Searching;
             return false;
@@ -3665,6 +3735,72 @@ mod tests {
     use super::*;
     use crate::v92::up_signals::{ru, su};
 
+    /// The hunt's answer is the same at every level, and it is the same
+    /// *index*: 9.5.2.1.7's Su, its half-symbol S-bar-u and the Su after it,
+    /// put on the line at half and twice the amplitude (`docs/122`).
+    ///
+    /// This is the gate that used to carry the line's units. The Su is the one
+    /// the timetable and the transmit filter leave: six symbols a period, two
+    /// of them at zero, then the reversal the S-bar-u steps half a symbol.
+    #[test]
+    fn the_hunt_reads_the_same_su_index_at_half_and_twice_the_level() {
+        let mut found = Vec::new();
+        for scale in [0.5, 1.0, 2.0] {
+            let mut rx = Receiver::new();
+            rx.expect_su();
+            rx.expect_step(0.5);
+            let mut events = Vec::new();
+            for n in 0..440u64 {
+                let bar = n >= 144;
+                rx.feed(scale * su(n, bar));
+                while let Some(event) = rx.heard() {
+                    if let Heard::Su { at } | Heard::SuReversal { at } = event {
+                        events.push((at, matches!(event, Heard::SuReversal { .. })));
+                    }
+                }
+            }
+            found.push((scale, events));
+        }
+        let (_, first) = &found[0];
+        assert!(!first.is_empty(), "nothing was heard even at half level");
+        assert!(first.iter().any(|(_, turned)| *turned), "no reversal: {first:?}");
+        for (scale, events) in &found[1..] {
+            assert_eq!(events, first, "the hunt moved with the level, {scale}: {events:?}");
+        }
+    }
+
+    /// And it does not fire on what is not there: a scramble, and noise, at
+    /// every level. The new gate is a ratio, so the null it has to keep is a
+    /// null at half and twice the amplitude as well.
+    #[test]
+    fn neither_scrambled_training_nor_noise_is_su_at_any_level() {
+        for scale in [0.5, 1.0, 2.0] {
+            let mut rx = Receiver::new();
+            rx.expect_su();
+            let mut training = crate::v92::up_signals::Trn1u::new();
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            for n in 0..1200u64 {
+                let level = if n < 600 {
+                    training.next_symbol()
+                } else {
+                    // A flat spectrum at the same rms, so that the test is of
+                    // the shape and not of the level.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if state >> 63 == 0 { 0.6 } else { -0.6 }
+                };
+                rx.feed(scale * 0.2 * level);
+                while let Some(event) = rx.heard() {
+                    assert!(
+                        !matches!(event, Heard::Su { .. } | Heard::SuReversal { .. }),
+                        "Su out of nothing at level {scale}: {event:?} at {n}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The measure the refit's boundary is made of separates 8.5.6's Su from
     /// 8.7.6's TRN1u without a reference sequence and without a sub-symbol
     /// phase: Su is one period of six, TRN1u is scrambled and repeats not at
@@ -4706,4 +4842,110 @@ fn eye_residual(conv: &[f64], at: usize, span: usize, mode: Mode) -> Option<f64>
         count += 1;
     }
     (count > 0).then(|| sum / count as f64)
+}
+
+/// The level-dependence probe for the shape hunt (`docs/122`).
+///
+/// Not a test: it needs a capture. It replays the **same** file through the
+/// receiver at several amplitude scales and prints, for every period the hunt
+/// looked at, the quantities the hunt actually gates on -- so that a gate whose
+/// units are the line's amplitude shows up as a column that changes with the
+/// scale while the dimensionless ones do not.
+///
+/// ```text
+/// V92_CAPTURE=/tmp/.../agr-tx.raw V92_SCALE=1 cargo test -p datapump --release \
+///     --lib v92::receiver::su_scale_probe -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod su_scale_probe {
+    use super::*;
+
+    fn capture(scale: f64) -> Option<Vec<f64>> {
+        let path = std::env::var_os("V92_CAPTURE")?;
+        let bytes = std::fs::read(&path).expect("the capture");
+        Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| scale * f64::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+                .collect(),
+        )
+    }
+
+    /// The acquire gate's own figure: the best normalised correlation over the
+    /// six phases, both Su templates and [`ACQUIRE_STEPS`] sub-symbol steps --
+    /// the number `recognise` compares against [`MATCHED`].
+    fn acquire_best(window: &[f64]) -> (f64, &'static str) {
+        let mut best = (0.0f64, "none");
+        for phase in 0..RU_PERIOD {
+            for (shape, kind) in
+                [(RU_SHAPE, "Ru"), (SU_SHAPE, "Su"), (SU_FILTERED, "Su filtered")]
+            {
+                let mut template = [0.0; RU_PERIOD];
+                for (i, slot) in template.iter_mut().enumerate() {
+                    *slot = shape[(i + phase) % RU_PERIOD];
+                }
+                let size = best_share(window, &template, ACQUIRE_STEPS).abs();
+                if size > best.0 {
+                    best = (size, kind);
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "needs V92_CAPTURE=<file.raw>"]
+    fn the_hunt_gates_on_shape_and_not_on_level() {
+        let Some(levels) = capture(
+            std::env::var("V92_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0),
+        ) else {
+            eprintln!("set V92_CAPTURE to a raw s16le file at 8000 Hz");
+            return;
+        };
+        let scale: f64 = std::env::var("V92_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let from: f64 = std::env::var("V92_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let to: f64 = std::env::var("V92_TO").ok().and_then(|s| s.parse().ok()).unwrap_or(1e9);
+        let mut rx = Receiver::new();
+        rx.expect_su();
+        let mut best = (0.0f64, 0usize, "none");
+        let mut events = 0u32;
+        for (n, &level) in levels.iter().enumerate() {
+            rx.feed(level);
+            while let Some(event) = rx.heard() {
+                if matches!(event, Heard::Su { .. } | Heard::SuReversal { .. }) {
+                    println!(
+                        "  scale {scale} EVENT {event:?} at sample {n} ({:.3} s)",
+                        n as f64 / 8000.0
+                    );
+                    events += 1;
+                }
+            }
+            if rx.recent.len() < RU_PERIOD {
+                continue;
+            }
+            let window: Vec<f64> = rx.recent.iter().copied().collect();
+            let (share, kind) = acquire_best(&window);
+            let rms = (window.iter().map(|x| x * x).sum::<f64>() / RU_PERIOD as f64).sqrt();
+            let held = rx.hunt_state();
+            let now = n as f64 / 8000.0;
+            if share > 0.80 && now >= from && now <= to {
+                println!(
+                    "  scale {scale} {now:7.3}s share {share:.4} {kind:12} window rms {rms:.5} \
+                     (power {:.2e}) hunt {:?}",
+                    rms * rms * RU_PERIOD as f64,
+                    held
+                );
+            }
+            if share > best.0 {
+                best = (share, n, kind);
+            }
+        }
+        println!(
+            "  scale {scale}: best acquire share {:.4} ({}) at sample {} ({:.3} s), Su events {events}",
+            best.0,
+            best.2,
+            best.1,
+            best.1 as f64 / 8000.0
+        );
+    }
 }
