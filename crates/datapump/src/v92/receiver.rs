@@ -39,6 +39,7 @@ use dsp::Complex;
 use super::up_signals::{self, RU_PERIOD};
 use crate::v32::Mode;
 
+use super::fracdelay::{self, FracDelay};
 use super::UP_INTERVALS;
 
 /// The mean square a window needs before any of its shape means anything.
@@ -808,6 +809,10 @@ pub struct Receiver {
     /// Every sample, for training, the epsilon estimator and the channel
     /// estimate. The oldest fall off the front.
     history: VecDeque<f64>,
+    /// The fixed fractional delay line ahead of the equaliser, when `V92_FE`
+    /// asks for it: `None` is the line this receiver has always been, and is
+    /// what every byte-identity check is made against.
+    fe: Option<FracDelay>,
     events: VecDeque<Heard>,
     /// The last `RU_PERIOD` samples' second moment, and the cross moment half
     /// a period back: what tells Ru from Su from silence.
@@ -917,6 +922,7 @@ impl Receiver {
         Self {
             reference_mode: Mode::Answer,
             history: VecDeque::with_capacity(HISTORY),
+            fe: fe_from_env(),
             events: VecDeque::new(),
             recent: VecDeque::new(),
             products: VecDeque::new(),
@@ -953,6 +959,14 @@ impl Receiver {
 
     /// One symbol, T spaced, in the levels' own units.
     pub fn feed(&mut self, level: f64) {
+        // The delay line is ahead of everything: the history, the hunt and the
+        // equaliser all see the converted stream, so that what is fitted and
+        // what is sliced are the same samples. With `V92_FE` unset there is no
+        // line and the `level` is the sample, unchanged.
+        let level = match self.fe.as_mut() {
+            Some(fe) => fe.push(level),
+            None => level,
+        };
         self.history.push_back(level);
         if self.history.len() > HISTORY {
             self.history.pop_front();
@@ -963,6 +977,110 @@ impl Receiver {
             self.equalise_and_slice(level);
         }
         self.count += 1;
+    }
+
+    /// Whether the fractional delay line is in the path.
+    #[must_use]
+    pub fn fe_enabled(&self) -> bool {
+        self.fe.is_some()
+    }
+
+    /// The delay the line is applying, in symbols.
+    #[must_use]
+    pub fn fe_delta(&self) -> Option<f64> {
+        self.fe.as_ref().map(FracDelay::delta)
+    }
+
+    /// Install a delay and hold it, as the fixed non-integer loop delay this
+    /// receiver assumes: estimated once, then never tracked.
+    pub fn fe_install(&mut self, delta: f64) {
+        if let Some(fe) = self.fe.as_mut() {
+            fe.install(delta);
+        }
+    }
+
+    /// The delay, in symbols, that best opens the eye on the TRN1u that begins
+    /// at history index `at`, and the residual it reads there.
+    ///
+    /// The figure is `docs/78`'s: the chain's own decision residual against the
+    /// sequence we know was sent, measured with the chain's own structure --
+    /// [`TRAIN_TAPS`] forward taps and [`DFE_FEEDBACK`] fed back from the *known*
+    /// symbols, never from our decisions. That structure is what gives the
+    /// measurement any sensitivity: a free, long fit absorbs a fraction of a
+    /// symbol almost completely -- one whole symbol moves it 0.2 per cent,
+    /// because it is free to interpolate -- while a causal forward section and
+    /// a feedback that only mops up behind the peak cannot.
+    ///
+    /// `docs/78` also measured what this criterion *cannot* do, and that is why
+    /// the result is returned with its residual rather than as an answer: it
+    /// cannot separate its own two branches (`f = -0.5` and `f = +0.245` differ
+    /// by 6 per cent, and which wins flips with the length of the interpolator
+    /// the criterion itself uses), and the three Agere rungs share one TRN1u, so
+    /// it cannot tell them apart. A caller that needs to know whether to
+    /// believe the figure has to look at the residual, not only the delay.
+    pub fn fe_aim(&self, at: usize, window: usize) -> Option<(f64, f64)> {
+        let fe = self.fe.as_ref()?;
+        let raw = fe.raw();
+        let span = window.min(raw.len().saturating_sub(at));
+        if span <= TRAIN_TAPS + DFE_FEEDBACK {
+            return None;
+        }
+        // The integer alignment first: `train_near` is what the caller is about
+        // to run, it searches for the window TRN1u actually begins at, and a
+        // reference generated a few symbols out reads as noise. One probe clone
+        // fixes it, and every candidate delay is then judged on the window the
+        // caller will really train on.
+        let mut probe = self.clone();
+        probe.fe = None;
+        if !probe.train_near(at as u64, FE_SEARCH) {
+            return None;
+        }
+        let at = probe.trained_at;
+        let span = window.min(raw.len().saturating_sub(at));
+        if span <= TRAIN_TAPS + DFE_FEEDBACK {
+            return None;
+        }
+        let mut best: Option<(f64, f64)> = None;
+        for k in 0..=FE_COARSE {
+            let d = k as f64 / FE_COARSE as f64;
+            let conv = fracdelay::replay(&raw, d);
+            let scored = eye_residual(&conv, at, span, self.reference_mode);
+            if std::env::var_os("V92_FE_DEBUG").is_some() {
+                eprintln!(
+                    "V92FEDBG: d {d:.3} r {:.5} raw {} at {at} span {span}",
+                    scored.map_or(f64::NAN, |v| v),
+                    raw.len()
+                );
+            }
+            if let Some(r) = scored
+                && best.map_or(true, |(_, b)| r < b)
+            {
+                best = Some((d, r));
+            }
+        }
+        // Refine about the coarse winner: `docs/77` measured an error of 0.05
+        // symbols as costing 0.9 dB, so a twentieth of a symbol is not fine
+        // enough to be the answer.
+        if let Some((d0, _)) = best {
+            let reach = 1.0 / FE_COARSE as f64;
+            let mut refined: Option<(f64, f64)> = None;
+            for k in 0..=FE_FINE {
+                let d = d0 - reach + 2.0 * reach * (k as f64 / FE_FINE as f64);
+                if !(0.0..1.0).contains(&d) {
+                    continue;
+                }
+                let conv = fracdelay::replay(&raw, d);
+                if let Some(r) = eye_residual(&conv, at, span, self.reference_mode)
+                    && refined.map_or(true, |(_, b)| r < b)
+                {
+                    refined = Some((d, r));
+                }
+            }
+            if let Some(r) = refined {
+                best = Some(r);
+            }
+        }
+        best
     }
 
     /// What the receiver has to say, one event at a time.
@@ -3410,4 +3528,123 @@ mod tests {
     }
 }
 
+/// Coarse and fine steps of the aim search: a twentieth of a symbol, then a
+/// twentieth of that about the winner.
+const FE_COARSE: usize = 20;
+/// How far the aim's own alignment search reaches, in symbols: the same reach
+/// `TRAIN_SEARCH` gives the fit that follows it.
+const FE_SEARCH: u64 = 64;
+const FE_FINE: usize = 10;
 
+/// `V92_FE`: the fixed fractional delay line ahead of the equaliser.
+///
+/// Off unless asked for, and absent by default, so that the receiver is
+/// byte-identical to the one every measurement before `docs/83` was made on.
+/// Reading the environment here rather than at some call site keeps the gate in
+/// one place: there is exactly one `Receiver`, and it either has a line or not.
+fn fe_from_env() -> Option<FracDelay> {
+    match std::env::var("V92_FE").ok().as_deref() {
+        Some("1") | Some("on") | Some("yes") => Some(FracDelay::new(HISTORY)),
+        _ => None,
+    }
+}
+
+/// The mean decision residual of the chain's own structure on known symbols.
+///
+/// `s` is the sequence we generated, `y` the samples the line delivered after
+/// the candidate delay. The window's own scale is divided out, because the far
+/// end's transmit level is its own business and a residual is only meaningful
+/// once both sides are in the same units.
+fn eye_residual(conv: &[f64], at: usize, span: usize, mode: Mode) -> Option<f64> {
+    let rows = TRAIN_TAPS;
+    let fb = DFE_FEEDBACK;
+    let span = span.min(conv.len().saturating_sub(at));
+    if span <= rows + fb {
+        return None;
+    }
+    // `reference` builds the sequence for a window that begins at `at`, which
+    // is TRN1u's first symbol: the same helper `dump_fit` aligns its own
+    // residual with, so this measures the thing that was measured offline.
+    let s = reference(at, at + span, mode)?;
+    // The mean absolute level, not the root mean square: a two-point stream is
+    // +/-A and A is the mean of |y|, while one transient in the window inflates
+    // an RMS enough to scale the whole window down and make every fit read as
+    // zero -- which is exactly how this measurement first came out flat at the
+    // mean of |s| and looked like a curve.
+    let scale = (0..span).map(|n| conv[at + n].abs()).sum::<f64>() / span as f64;
+    if !(scale > 0.0) {
+        return None;
+    }
+    let y: Vec<f64> = (0..span).map(|n| conv[at + n] / scale).collect();
+    let m = rows + fb;
+    let mut a = vec![vec![0.0f64; m + 1]; m];
+    let mut row = vec![0.0f64; m];
+    for n in rows..span {
+        for k in 0..rows {
+            row[k] = y[n - 1 - k];
+        }
+        for j in 1..=fb {
+            row[rows + j - 1] = s[n - j];
+        }
+        for p in 0..m {
+            let rp = row[p];
+            if rp == 0.0 {
+                continue;
+            }
+            for q in p..m {
+                a[p][q] += rp * row[q];
+            }
+            a[p][m] += rp * y[n];
+        }
+    }
+    // Symmetric: the upper triangle was filled, so mirror it before solving.
+    for p in 0..m {
+        for q in 0..p {
+            a[p][q] = a[q][p];
+        }
+    }
+    // Gaussian elimination with partial pivoting.
+    for col in 0..m {
+        let mut piv = col;
+        for r in col + 1..m {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, piv);
+        for r in col + 1..m {
+            let f = a[r][col] / a[col][col];
+            if f == 0.0 {
+                continue;
+            }
+            for q in col..=m {
+                a[r][q] -= f * a[col][q];
+            }
+        }
+    }
+    let mut w = vec![0.0f64; m];
+    for p in (0..m).rev() {
+        let mut acc = a[p][m];
+        for q in p + 1..m {
+            acc -= a[p][q] * w[q];
+        }
+        w[p] = acc / a[p][p];
+    }
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for n in rows..span {
+        let mut model = 0.0;
+        for k in 0..rows {
+            model += w[k] * y[n - 1 - k];
+        }
+        for j in 1..=fb {
+            model += w[rows + j - 1] * s[n - j];
+        }
+        sum += (model - s[n]).abs();
+        count += 1;
+    }
+    (count > 0).then(|| sum / count as f64)
+}

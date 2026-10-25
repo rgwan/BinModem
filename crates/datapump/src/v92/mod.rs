@@ -41,6 +41,7 @@ pub mod digital;
 pub mod down_source;
 pub mod epsilon;
 pub mod exchange;
+pub mod fracdelay;
 pub mod hold;
 pub mod memo;
 pub mod modulus;

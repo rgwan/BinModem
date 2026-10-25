@@ -2386,6 +2386,24 @@ impl Modem {
             // window starts.
             let base = self.rx.symbols() - self.rx.history_len() as u64;
             let at = from.saturating_sub(base);
+            // The fixed fractional delay line, if `V92_FE` asked for one, is
+            // aimed here and installed here: once, on the TRN1u about to be
+            // trained on, and then held. The phase it picks is `docs/78`'s eye
+            // optimum measured on our own sequence, and the refit at the second
+            // TRN1u re-fits the equaliser at that phase by the machinery that
+            // already exists -- which is what makes the gain real rather than
+            // absorbed: an equaliser is free to interpolate a fraction of a
+            // symbol, and `docs/78` measured one whole symbol as worth 0.2 per
+            // cent of residual, so installing a delay without re-fitting would
+            // buy nothing.
+            if self.rx.fe_enabled()
+                && let Some((delta, residual)) = self.rx.fe_aim(at as usize, TRAIN_WINDOW)
+            {
+                self.rx.fe_install(delta);
+                self.note(format!(
+                    "V.92: fractional delay {delta:.3} symbols (eye residual {residual:.4})"
+                ));
+            }
             if self.rx.train_near(at, TRAIN_SEARCH) {
                 self.stage = Stage::ReadJa;
                 self.note(format!("V.92: TRN1u trained at {:.1} dB", self.rx.snr_db()));
