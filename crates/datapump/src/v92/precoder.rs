@@ -69,68 +69,77 @@ pub const TIE_TO_SMALLER_INDEX: bool = true;
 /// The index offset the class of a 4D pair's *first* symbol carries, in
 /// indices.
 ///
-/// 6.4.2 prints "eta_k = Ki + z_k Mi" for k = 0, 1, 2, which puts Ki and the
-/// index it came from in the same residue class modulo Mi. A capture of an
-/// Agere SV92PP's B1u does not agree: read back through the classes as printed,
-/// only the low bit of every Ki comes out right, bits 1 and 2 are wrong in
-/// about a quarter of the frames, and B1u reads 83% ones where 8.7.1 says every
-/// one of its 48 data frames must. Reading positions 0 and 2 of each trellis
-/// frame as "eta_k = Ki + 2 + z_k Mi" instead makes B1u exactly all ones -- and
-/// the far end's whole idle stretch after it, some forty thousand bits.
+/// **It contradicts the clause.** 6.4.2 prints "eta_k = Ki + z_k Mi" for
+/// k = 0, 1, 2, so Ki is a member of its own class at those positions and the
+/// clause's own value is **0**. A capture of an Agere SV92PP's B1u does not
+/// agree: read back through the classes as printed (offset 0), only the low bit
+/// of every Ki comes out right, and B1u -- 8.7.1's 48 data frames of scrambled
+/// ones, 576 bits that must all read as ones -- reads chance. Reading positions
+/// 0 and 2 of each trellis frame as "eta_k = Ki + 3 + z_k Mi" instead makes B1u
+/// exactly all ones, and the far end's whole idle stretch after it, some forty
+/// thousand bits.
 ///
-/// That is a measurement, not a derivation: it is what this far end's
-/// transmitter does, and it is recorded here as a named constant rather than
-/// buried in the two places that use it, because the clause as printed says
-/// otherwise and a second capture may disagree. What it stands in for is most
-/// likely how a pair's first index is numbered when the constellation's levels
-/// arrive from a CPd of eight odd magnitudes; the offline enumeration that
-/// established it is `crates/datapump/examples/v92_b1u_search.rs`.
+/// That is a measurement, not a derivation. It was taken twice over, today, on
+/// the one clean 24 000 capture in the tree (`c24-4.agr-tx.raw`, replayed at
+/// 24 000 bit/s, equalised levels, Mi = 8, LC = 8, K = 36, the 361-symbol B1u
+/// score window), by two independently written offline decoders, and both want
+/// the same value:
 ///
-/// **It contradicts the clause, and removing it breaks interop.** 6.4.2 puts no
-/// case for k = 0 or k = 2: "eta_k = Ki + z_k Mi, z_k an integer" for k = 0, 1,
-/// 2, and z = 0 is an integer, so Ki is a member of its own class at those
-/// positions. This constant moves Ki two places along on half of them, which
-/// `ki_is_a_member_of_its_own_equivalence_class` fails on by design. Both were
-/// measured rather than argued:
+/// * **3**: B1u decodes 576/576 primed and 1080/1080 bits over all 30 frames of
+///   the window, and a 16-state trellis instrument reports **0 %** violations;
+/// * **0** (the clause as printed): the same trellis reports **94 %**
+///   violations;
+/// * **2** (what this constant said before today): 94 % violations too.
 ///
-/// * with the offset removed -- `Class::for_interval` and `index_to_ki` both
-///   reading the clause literally -- `/tmp/p0corr/ident.raw` and an Agere
-///   SV92PP capture (`agr-v90-interop/012503-mask3`) reach B1u in neither: no
-///   trace, no data mode. With it, both read 7128 and 2063 bytes, B1u 568 ones
-///   against 449.
-/// * `the_memories_are_zero_before_b1u` passes at 2 and fails at 0.
+/// The parity argument is the part that is structural rather than tuned, and it
+/// is why an even value cannot be right at all: the trellis takes Y0 from the
+/// 4-tuple parity eta0 + eta1 + eta2 + eta3, so shifting k = 0 and k = 2 by an
+/// even number of indices (6 linear levels in an odd-level set) flips nothing
+/// the code can see, while an odd shift changes the 4-tuple's parity. The same
+/// instrument accepts **every** odd offset at k = 0, 2 (1, 3, 5, 7 all give 0 %)
+/// and rejects **every** even one (0, 2, 4, 6 all give 94 %). Only 3 also makes
+/// B1u read as ones, which is what picks it out of the odd set -- so *any* even
+/// constant here is trellis-inconsistent on this far end, not merely mistuned.
 ///
-/// So the rotation is required by *our own far-end model and by a real Agere at
-/// once*, which is why encoder, decoder and tests all agreed while all three
-/// are at odds with the printed clause. What that points at next is not this
-/// mapping but the constellation we download: CPd carries six sets (LC1..LC6,
-/// Table 30) and a 4D symbol takes four positions from them, while this end
-/// sends one set for all twelve intervals and reads indices off it as if the
-/// four positions were interchangeable. A flattened set is the sort of thing
-/// that turns into a two-index rotation on exactly the pair-first positions.
-/// That is a question for the design path, not for this constant.
-pub const PAIR_FIRST_INDEX_OFFSET: i64 = 2;
+/// **It is not a per-call property in the evidence we have.** Two recordings of
+/// the same bench line (the capture, and the same capture through a different
+/// receiver front end) both want 3; nothing measured today needs a different
+/// value on a different call, and the run-time rotation that used to search
+/// `{2, 3, 1}` around this constant has been removed for that reason. What is
+/// *not* settled is how much of the 3 is the far end and how much is the
+/// channel: splitting it into an odd "far-end convention" plus an even
+/// "channel residual" accounts for the parity structure and for the +1 the
+/// codec's quantising step moves it by, but that split is a **hypothesis**, not
+/// a conclusion -- nothing measured today separates the two terms.
+/// `V92_PAIR_OFFSET` stays as an environment override for exactly that
+/// experiment.
+///
+/// **Removing it breaks interop.** With the offset at 0 -- `Class::for_interval`
+/// and `index_to_ki` both reading the clause literally -- `/tmp/p0corr/ident.raw`
+/// and an Agere SV92PP capture (`agr-v90-interop/012503-mask3`) reach B1u in
+/// neither: no trace, no data mode. 6.4.2 puts no case for k = 0 or k = 2, and
+/// `ki_is_a_member_of_its_own_equivalence_class` fails on this constant by
+/// design -- it is kept, `#[ignore]`d, so that the deviation is recorded rather
+/// than forgotten.
+pub const PAIR_FIRST_INDEX_OFFSET: i64 = 3;
 
 /// The offset in force this call; `i64::MIN` means "not read yet", so the
-/// environment or the constant decides on first use and `set_pair_first_index_offset`
-/// can move it afterwards.
+/// environment or the constant decides on first use.
 static OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 use std::sync::atomic::Ordering as StdOrdering;
 
-/// The offset in force: `PAIR_FIRST_INDEX_OFFSET` unless `V92_PAIR_OFFSET`
-/// overrides it, read once.
+/// The offset in force: [`PAIR_FIRST_INDEX_OFFSET`] unless `V92_PAIR_OFFSET`
+/// overrides it, read once and then held for the rest of the call.
 ///
-/// It is a knob because the constant above is a measurement of *one* far end,
-/// and the question "is this call's offset the one the constant names" cannot
-/// be answered by a constant: the decided indices of two calls that differ only
-/// by a codec's quantising step differ by exactly this offset on the pair-first
-/// positions (intervals 0 and 2, and only those -- measured with `V92_ETA_TRACE`
-/// on a capture and the same capture with the codec's error mixed in at 75 %:
-/// 77 % of trellis frames differ, by +1 on k = 0 and k = 2 and by nothing on
-/// k = 1 and k = 3). A wrong offset puts half the symbols one lattice step off,
-/// which slices *better* than a correct one and decides about half the bits
-/// wrongly -- so this is the mechanism behind the "two states" the residual
-/// measurements kept landing in.
+/// The override exists for one experiment and nothing else: the constant above
+/// is a measurement of one far end on one line, and how much of its odd value is
+/// the far end's convention and how much is a channel residual is still open
+/// (see the constant). Sweeping `V92_PAIR_OFFSET` over another channel is how
+/// that question gets answered -- including the parity prediction that only odd
+/// values can be trellis-consistent. **Nothing at run time moves it by itself:**
+/// the rotation that used to try `{2, 3, 1}` between candidate B1u boundaries
+/// was searching for the value the constant already names, and the measurement
+/// says the value does not vary from call to call the way that rotation assumed.
 pub fn pair_first_index_offset() -> i64 {
     let seen = OFFSET.load(StdOrdering::Relaxed);
     if seen != i64::MIN {
@@ -142,22 +151,6 @@ pub fn pair_first_index_offset() -> i64 {
         .unwrap_or(PAIR_FIRST_INDEX_OFFSET);
     OFFSET.store(start, StdOrdering::Relaxed);
     start
-}
-
-/// Move the offset for the rest of this call, and report what it was.
-///
-/// The constant above is one far end's measurement; a call can be one off, and
-/// then half the symbols sit a lattice step out and read *better* while deciding
-/// about half the bits wrongly (`docs/88` §9, measured: 304 of 576 against 539
-/// at the right offset). The only honest answer at run time is to try: B1u's
-/// candidate hunt already gives up and looks for another boundary when a
-/// candidate does not read as ones, so this lets it rotate the offset between
-/// attempts instead of blaming the boundary. Bounded by the caller.
-#[must_use]
-pub fn set_pair_first_index_offset(value: i64) -> i64 {
-    let previous = pair_first_index_offset();
-    OFFSET.store(value, StdOrdering::Relaxed);
-    previous
 }
 
 /// Whether `k` is the first index of its 4D pair. 6.4.3's inverse map takes
@@ -911,19 +904,21 @@ mod tests {
     /// **Ki is a member of its own equivalence class**. That is the clause read
     /// as an assertion, with no capture and no far end in it.
     ///
-    /// It is the test `PAIR_FIRST_INDEX_OFFSET` should never have survived.
-    /// The constant adds two indices on k = 0 and k = 2, which is exactly the
-    /// rotation that takes Ki = 0 to eta = 2 and Ki = 2 to eta = -4, i.e. it
-    /// moves the level table two places against Ki on half the intervals while
-    /// the clause requires "the indices are in the same order as the levels"
-    /// and puts no case for k = 0 or 2 at all -- only for k = 3.
+    /// It is the test `PAIR_FIRST_INDEX_OFFSET` fails by construction, and it
+    /// must: the constant adds three indices on k = 0 and k = 2 -- taking
+    /// Ki = 0 to eta = 3 and Ki = 2 to eta = -3 -- while the clause requires
+    /// "the indices are in the same order as the levels" and puts no case for
+    /// k = 0 or 2 at all, only for k = 3. Three is odd, which is the part the
+    /// trellis agrees with: Y0 is the 4-tuple parity, so only an odd shift at
+    /// the pair-first positions changes anything the code can see. The clause
+    /// as printed is still 0, and this test still says so.
     ///
-    /// It fails at the committed offset, and it is `#[ignore]`d rather than
-    /// deleted so that the deviation cannot be forgotten again: see
-    /// `V92_PAIR_OFFSET` and `pair_first_index_offset`. Run it with
+    /// It is `#[ignore]`d rather than deleted so that the deviation cannot be
+    /// forgotten: see `PAIR_FIRST_INDEX_OFFSET`, `V92_PAIR_OFFSET` and
+    /// `pair_first_index_offset`. Run it with
     /// `cargo test -p datapump --lib ki_is_a_member -- --ignored` and it names
-    /// the triples: (k, Ki, lowest member of E(Ki)) = (0, 0, 2), (0, 1, 3),
-    /// (0, 2, 4), (2, 0, 2), ... -- i.e. Ki = 0 sits on the *second* positive
+    /// the triples: (k, Ki, lowest member of E(Ki)) = (0, 0, 3), (0, 1, 4),
+    /// (0, 2, 5), (2, 0, 3), ... -- i.e. Ki = 0 sits on the *second* positive
     /// level instead of the first, and Ki = 2 wraps to the most negative one.
     #[test]
     #[ignore = "6.4.2's eta_k = Ki + z_k Mi is violated on k = 0, 2 by PAIR_FIRST_INDEX_OFFSET"]
@@ -1177,24 +1172,30 @@ mod tests {
         let first = run(&mut chain);
         // Worked through by hand for the first two. At n = 0 (k = 0, the first
         // symbol of a 4D pair) every memory is zero, so c(0) = 0 and the class
-        // is {1 + 2 + 4z} = {..., -5, -1, 3, 7, ...}: the member nearest zero
-        // is a(-1) = -1, so x(0) = -1 and v(0) = z2(0) x(0) = -1. At n = 1
-        // (k = 1, whose class is {1 + 4z} = {..., -7, -3, 1, 5, ...}) c(1) =
-        // 0.2 u(0) + 0.5 x(0) = -0.7, the member nearest 0.7 is a(1) = 3, so
-        // x(1) = 2.3 and v(1) = 2.3 + 0.3 x(0) + 0.1 v(0) = 1.9.
+        // is {1 + `PAIR_FIRST_INDEX_OFFSET` + 4z} = {..., -4, 0, 4, 8, ...} at
+        // the measured offset 3: the member nearest zero is a(0) = 1, so
+        // x(0) = 1 and v(0) = z2(0) x(0) = 1. At n = 1 (k = 1, whose class is
+        // {1 + 4z} = {..., -7, -3, 1, 5, ...}) c(1) = 0.2 u(0) + 0.5 x(0) =
+        // 0.7, the member nearest -0.7 is a(1) = 3, so x(1) = 3.7 and
+        // v(1) = 3.7 + 0.3 x(0) + 0.1 v(0) = 4.1.
+        //
+        // The vector pins the *memories*, which is what 8.7.1 is about, but the
+        // levels it pins are the class at k = 0 and k = 2, so it moves with
+        // `PAIR_FIRST_INDEX_OFFSET`: at the old constant 2 the first symbol was
+        // a(-1) = -1 and this vector began [-1.0, 1.9, ...].
         let pinned = [
-            -1.0,
-            1.8999999999999997,
-            1.88,
-            7.212999999999999,
-            6.2513,
-            4.5538799999999995,
-            1.477263,
-            6.356476300000001,
-            5.92455388,
-            4.604721013,
-            1.5843783513,
-            6.39732455388,
+            1.0,
+            4.1,
+            4.720000000000001,
+            9.307,
+            0.8307000000000004,
+            -2.255679999999999,
+            0.7100570000000004,
+            -7.1964943,
+            -0.02730568,
+            1.1203163069999995,
+            -0.45953086930000037,
+            4.58750394432,
         ];
         for (got, want) in first.iter().zip(pinned.iter()) {
             assert!((got - want).abs() < 1e-9, "the first twelve prefilter outputs after a reset: {first:?}");

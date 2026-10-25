@@ -3438,10 +3438,12 @@ impl Modem {
         // keeps the constant -- which is the behaviour it had.
         if let Some(decoder) = self.upstream_data.as_mut() {
             decoder.measure_rotation_from(self.b1u_skip + 1);
-            // Above 24 000 B1u's frames are read against 8.7.1's known content
-            // instead of against 6.4.1's chain, which is not the far end's
-            // there (`docs/74`). It stops with B1u: nothing after it is known,
-            // and the clause's chain is the only thing that can read it.
+            // Above 24 000 B1u's frames *can* be read against 8.7.1's known
+            // content instead of against 6.4.1's chain (`docs/74`), and it
+            // stops with B1u because nothing after it is known. It is off
+            // unless `V92_BY_CONTENT=1` asks for it: it is a workaround for a
+            // far end whose chain a payload cannot follow, and the chain is
+            // the default.
             decoder.read_by_content(true);
         }
         self.b1u_ones = [0; 2];
@@ -3853,35 +3855,12 @@ impl Modem {
              {other} the other), still hunting E2u"
         ));
         // A candidate that does not read as ones can be the wrong *boundary* or
-        // the wrong pair-first offset, and the two are indistinguishable from
-        // the count alone. The offset is one far end's measurement held in a
-        // constant (`docs/88` §9: today's Agere needs 3, the constant says 2,
-        // and the difference is 304 against 539 of 576), so instead of blaming
-        // the boundary every time, rotate the offset between attempts: three
-        // tries at most, each on the boundary the hunt finds next.
-        {
-            // Move to the next value *different from the one in force*, so the
-            // first failure actually changes something: the earlier form keyed
-            // the rotation off a counter that started at the constant's own
-            // value, so the first abandonment spent an attempt setting the
-            // offset to what it already was.
-            static SPENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            const TRIES: usize = 2;
-            let spent = SPENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if spent < TRIES {
-                let now = crate::v92::precoder::pair_first_index_offset();
-                let next = match now {
-                    2 => 3,
-                    3 => 1,
-                    _ => 2,
-                };
-                let was = crate::v92::precoder::set_pair_first_index_offset(next);
-                self.note(format!(
-                    "V.92: pair-first index offset {was} -> {next} for the next candidate (try {} of {TRIES})",
-                    spent + 1
-                ));
-            }
-        }
+        // the wrong pair-first offset. It is the boundary: the offset no longer
+        // moves here. It used to rotate `{2, 3, 1}` between attempts, which was
+        // a search for the value the constant already names, and the measurement
+        // behind the constant (`docs/88` §9, `PAIR_FIRST_INDEX_OFFSET`) says it
+        // does not vary from call to call. A candidate that does not read as
+        // ones is blamed on the boundary again, as it was before the rotation.
         self.upstream_data = None;
         self.b1u_probe = None;
         self.b1u_ones = [0; 2];

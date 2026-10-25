@@ -53,9 +53,10 @@ pub const SURVIVOR_DEPTH: usize = 40;
 ///   the decoder's own symbol count, from the first symbol of B1u on.
 /// * `rot=r0,r1,r2,r3` is the far end's class rotation, in the same convention
 ///   as `v92_b1u_class --offset`: the model's class is the observed one minus
-///   the table's entry, and the one this decoder already applies is `2,0,2,0`
-///   (`PAIR_FIRST_INDEX_OFFSET`). Only the difference from that one is applied,
-///   so the default path is untouched.
+///   the table's entry, and the one this decoder already applies is the pair
+///   offset at k = 0 and 2 and 0 at k = 1 and 3 (`PAIR_FIRST_INDEX_OFFSET`).
+///   Only the difference from that one is applied, so the default path is
+///   untouched.
 ///
 /// `V92_K3=levels=0,0,0,0.2;rot=6,6,6,7` is the shape the measurement found.
 /// Unset, off, or unparsable is no correction at all -- the level and the class
@@ -95,6 +96,14 @@ struct Correction {
     levels: [f64; TRELLIS_FRAME],
     /// The far end's class rotation, in `v92_b1u_class --offset`'s convention.
     rotation: Option<[i64; TRELLIS_FRAME]>,
+}
+
+/// `V92_BY_CONTENT=1`: read B1u's data frames against 8.7.1's known content
+/// instead of 6.4.1's chain, above 24 000 only. Unset, off, or anything but `1`
+/// leaves the spec chain in place, which is what every 24 000 number is taken
+/// with -- `by_content` cannot engage at that rung at all (`BITS_AT_THE_CONSTANT`).
+fn by_content_wanted() -> bool {
+    std::env::var("V92_BY_CONTENT").ok().as_deref() == Some("1")
 }
 
 /// `V92_ROT`: measure this call's class rotation off B1u, once, and use it in
@@ -486,10 +495,12 @@ pub struct Decoder {
     /// an array index and not an environment lookup.
     named_rotation: [Option<i64>; TRELLIS_FRAME],
     /// Whether a data frame's polarity is to be settled from B1u's known
-    /// content instead of from 6.4.1's chain. Only ever on above 24 000, and
-    /// only while B1u is being read: the far end's chain is not a function of
-    /// what it sends at those rungs (`docs/74`), and B1u's content is the one
-    /// thing a receiver knows symbol for symbol (8.7.1). The caller says when:
+    /// content instead of from 6.4.1's chain. **Off unless `V92_BY_CONTENT=1`
+    /// asks for it**, and then only above 24 000 and only while B1u is being
+    /// read: it is a workaround for a far end whose 6.4.1 chain a payload
+    /// cannot follow (`docs/74`), and it was on by default above 24 000 while
+    /// `PAIR_FIRST_INDEX_OFFSET` was wrong -- the branch it picks is a symptom
+    /// of that, not a fix for it. The caller says when:
     /// [`Self::read_by_content`].
     by_content: bool,
     /// Data frames read so far, so that `by_content` stops at the end of B1u:
@@ -593,8 +604,16 @@ impl Decoder {
     /// stop doing that. On only where the far end's 6.4.1 chain cannot be read
     /// out of what it sends -- above 24 000 (`docs/74`) -- and only for as long
     /// as the content is known, which is B1u and nothing after it.
+    ///
+    /// **Opt-in, by `V92_BY_CONTENT=1`.** Off is the plain spec chain: 8.7.1
+    /// zeroes the differential memory at B1u, so the decoder starts from
+    /// `d(-1) = 0` and 6.4.1's reflection tells it which way up each frame is.
+    /// Reading both sign candidates and keeping whichever comes out closer to
+    /// B1u's ones is what a wrong pair-first offset looks like from here -- a
+    /// correct offset leaves the chain nothing to choose -- so it is not the
+    /// default while the offset is the measured one.
     pub fn read_by_content(&mut self, on: bool) {
-        self.by_content = on && self.bits_per_frame > BITS_AT_THE_CONSTANT;
+        self.by_content = on && by_content_wanted() && self.bits_per_frame > BITS_AT_THE_CONSTANT;
     }
 
     /// Symbols fed since the first symbol of B1u.
