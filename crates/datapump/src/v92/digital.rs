@@ -307,8 +307,13 @@ pub struct B1uSearch {
     /// The symbol the run ended on: the first symbol carrying a non-zero bit
     /// after E2u's frame of scrambled zeros. B1u's frame 0 is at or before it.
     pub end: u64,
-    /// One level per symbol from `end + 1`, up to [`B1U_SYMBOLS`].
+    /// One level per symbol from `end + 1`, up to [`B1U_SYMBOLS`], with the
+    /// same symbols as they arrived beside them: the symbols past the winning
+    /// candidate's window are the first symbols of the *data* mode, and they
+    /// have to be handed to the decoder that carries the call rather than
+    /// dropped (`Modem::b1u_backlog`).
     levels: Vec<f64>,
+    symbols: Vec<Symbol>,
 }
 
 /// One candidate boundary's reading of B1u: the two decoders 8.7.1's known
@@ -426,6 +431,22 @@ fn best_b1u_reading(readings: &[B1uReading]) -> Option<usize> {
         }
     }
     best
+}
+
+/// The symbols the committed data decoder still has to be given, in time
+/// order: the ones between the end of B1u and the end of the collected window.
+///
+/// A candidate `back` symbols behind the run's end puts B1u's last symbol at
+/// `window - 1 - back`, so the window holds `back` symbols of the far end's
+/// *data* past it. The decoders are fed from B1u's frame 0 and stop at the end
+/// of the window (`last = B1U_SYMBOLS - 1 - back`), so a decoder fed only the
+/// window is fed `back` symbols short and starts the data mode `back` symbols
+/// into a data frame -- which is a call that reads B1u perfectly and delivers
+/// nothing. This is that `back`-symbol carry-over, and it is empty for the
+/// candidate at the run's end.
+fn b1u_backlog_symbols(search: &B1uSearch, back: usize) -> Vec<Symbol> {
+    let first = B1U_SYMBOLS.saturating_sub(back);
+    (first..B1U_SYMBOLS).filter_map(|index| search.symbols.get(index).copied()).collect()
 }
 
 /// The two decoders one candidate boundary is read with: B1u as it arrived and
@@ -2166,6 +2187,19 @@ pub struct Modem {
     /// every candidate in [`E2U_SYMBOLS`] can be scored against 8.7.1's known
     /// content before one of them is believed. See [`Self::begin_b1u`].
     b1u_search: Option<B1uSearch>,
+    /// Symbols already received that the committed data decoder has not been
+    /// given yet.
+    ///
+    /// A candidate `back` symbols behind the run's end puts the end of B1u
+    /// `back` symbols behind the end of the collected window, so the first
+    /// `back` symbols of the data mode are inside the window and are dropped
+    /// unless they are carried over: the run's end is 111 432 on one call and
+    /// 111 578 on the next, and at `back = 2` that is two symbols of the far
+    /// end's data. Nothing needs them -- they are data, not B1u -- but the
+    /// decoder that carries the call does: without them its stream starts two
+    /// symbols into a data frame, which is how a call that read B1u at 576 of
+    /// 576 connects and then delivers 9 820 bytes of nothing.
+    b1u_backlog: std::collections::VecDeque<Symbol>,
     /// Which way up the data mode is, +1 or -1, applied to the equaliser's
     /// output before the decoder sees it. See [`Self::b1u_scoring`].
     b1u_polarity: f64,
@@ -2314,6 +2348,7 @@ impl Modem {
             b1u_ones: [0; 2],
             b1u_scored: [0; 2],
             b1u_search: None,
+            b1u_backlog: std::collections::VecDeque::new(),
             b1u_polarity: 1.0,
             peak: 0.0,
             notes: Vec::new(),
@@ -3773,7 +3808,11 @@ impl Modem {
         // then read at every candidate boundary in it (`b1u_readings`). The
         // bits are B1u's, so they carry nothing: both decoders' output is
         // dropped once the reading is taken, whichever boundary wins.
-        self.b1u_search = Some(B1uSearch { end: self.now, levels: Vec::with_capacity(B1U_SYMBOLS) });
+        self.b1u_search = Some(B1uSearch {
+            end: self.now,
+            levels: Vec::with_capacity(B1U_SYMBOLS),
+            symbols: Vec::with_capacity(B1U_SYMBOLS),
+        });
         self.b1u_ones = [0; 2];
         self.b1u_scored = [0; 2];
         self.b1u_polarity = 1.0;
@@ -3858,38 +3897,19 @@ impl Modem {
             self.collect_b1u(symbol);
             return;
         }
-        // The polarity the measurement above found, then whatever diagnostic
-        // transform `V92_B1U_ADJ` asks for (see `adjust_b1u_level`). Done
-        // before the decoder is borrowed, because the transform keeps state.
-        if let Some(file) = b1u_levels_file()
-            && let Ok(mut file) = file.lock()
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{} {level:.9} data", self.now);
-        }
-        write_b1u_line(&symbol, self.now, "data");
-        let level = self.adjust_b1u_level(self.b1u_polarity * level);
-        if let Some(decoder) = self.upstream_data.as_mut() {
-            decoder.feed(level);
-            let bits = decoder.take_bits();
-            if let Some(file) = b1u_trace_file()
-                && let Ok(mut file) = file.lock()
-            {
-                use std::io::Write;
-                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
-                let _ = writeln!(file, "{} {level:.6} {} {text}", self.now, bits.len());
+        // The far end's data, from the symbol after B1u: the decoder that
+        // carries the call, on the polarity the measurement found.
+        //
+        // The symbols at the *front* of this queue come before the live ones:
+        // a boundary the search placed `back` symbols behind the run's end
+        // leaves the first `back` symbols of the data inside the window it
+        // collected (see [`Self::b1u_backlog`]).
+        if self.upstream_data.is_some() {
+            if let Some(pending) = self.b1u_backlog.pop_front() {
+                self.b1u_symbol(pending);
+                return;
             }
-            if let Some(file) = rx_bits_file()
-                && let Ok(mut file) = file.lock()
-            {
-                use std::io::Write;
-                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
-                let _ = writeln!(file, "{} {} {}", self.now, bits.len(), text);
-            }
-            if !bits.is_empty() {
-                self.upstream_bits += bits.len() as u64;
-                self.recovered.extend(bits);
-            }
+            self.b1u_symbol(symbol);
             return;
         }
         let Some(reader) = self.upstream.as_mut() else { return };
@@ -3994,6 +4014,50 @@ impl Modem {
         }
     }
 
+    /// One symbol of the far end's data mode, on the polarity the boundary
+    /// measurement found.
+    ///
+    /// The same path `V92_B1U_ADJ` and both bit traces have always been on; it
+    /// is a function so that the symbols a boundary search placed inside its
+    /// own window (`b1u_backlog`) and the live ones cannot be read differently.
+    fn b1u_symbol(&mut self, symbol: Symbol) {
+        let level = symbol.value;
+        // The polarity the measurement above found, then whatever diagnostic
+        // transform `V92_B1U_ADJ` asks for (see `adjust_b1u_level`). Done
+        // before the decoder is borrowed, because the transform keeps state.
+        if let Some(file) = b1u_levels_file()
+            && let Ok(mut file) = file.lock()
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{} {level:.9} data", self.now);
+        }
+        write_b1u_line(&symbol, self.now, "data");
+        let level = self.adjust_b1u_level(self.b1u_polarity * level);
+        if let Some(decoder) = self.upstream_data.as_mut() {
+            decoder.feed(level);
+            let bits = decoder.take_bits();
+            if let Some(file) = b1u_trace_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                let _ = writeln!(file, "{} {level:.6} {} {text}", self.now, bits.len());
+            }
+            if let Some(file) = rx_bits_file()
+                && let Ok(mut file) = file.lock()
+            {
+                use std::io::Write;
+                let text: String = bits.iter().map(|b| if *b { '1' } else { '0' }).collect();
+                let _ = writeln!(file, "{} {} {}", self.now, bits.len(), text);
+            }
+            if !bits.is_empty() {
+                self.upstream_bits += bits.len() as u64;
+                self.recovered.extend(bits);
+            }
+            return;
+        }
+    }
+
     /// `V92_B1U_ADJ`: what the data-mode level stream needs before it is a
     /// constellation at all. Empty is the only behaviour a call uses; `flip`
     /// negates, `dc` subtracts a running mean, and `shift:N` subtracts N lattice
@@ -4069,6 +4133,7 @@ impl Modem {
         let level = self.adjust_b1u_level(level);
         let Some(search) = self.b1u_search.as_mut() else { return };
         search.levels.push(level);
+        search.symbols.push(symbol);
         if search.levels.len() >= B1U_SYMBOLS {
             self.decide_b1u_boundary();
         }
@@ -4145,6 +4210,10 @@ impl Modem {
         self.b1u_ones = chosen.ones;
         self.b1u_scored = chosen.scored;
         self.b1u_skip = 0;
+        // The window ends `back` symbols after B1u does, and those symbols are
+        // the far end's data: the winning decoder is fed from the end of B1u,
+        // so they are next in its stream.
+        self.b1u_backlog = b1u_backlog_symbols(&search, back).into();
         self.note(format!(
             "V.92: B1u from symbol {origin}, {} bit/s, run end {} back {back}, scale {:.3}, taps {:?}",
             parameters.rate(),
@@ -5488,5 +5557,43 @@ mod tests {
             naive.best(),
             naive.scored()
         );
+    }
+    /// The symbols the committed decoder is fed after the window are the ones
+    /// between the end of B1u and the end of the window -- and none for the
+    /// candidate at the run's end.
+    ///
+    /// This is the bug the first bench batch with the search found: a call that
+    /// committed at `back = 2`, confirmed B1u at 576 of 576 and then delivered
+    /// 9 820 bytes of nothing, because its data decoder was fed from
+    /// `origin + 579` instead of `origin + 577`. Two symbols of a twelve-symbol
+    /// data frame is every bit of it.
+    #[test]
+    fn the_data_mode_picks_up_where_b1u_ends() {
+        let parameters = b1u_parameters();
+        let line = b1u_line();
+        let mut search = B1uSearch {
+            end: 1_000,
+            levels: Vec::new(),
+            symbols: Vec::new(),
+        };
+        for index in 0..B1U_SYMBOLS {
+            let symbol = Symbol {
+                index: index as u64,
+                raw: index as u64,
+                value: line[index + 1],
+                decided: None,
+                line: line[index + 1],
+                forward: 0.0,
+            };
+            search.symbols.push(symbol);
+            search.levels.push(symbol.value);
+        }
+        assert!(b1u_backlog_symbols(&search, 0).is_empty(), "the run's end leaves no data behind it");
+        let carried = b1u_backlog_symbols(&search, 2);
+        assert_eq!(carried.len(), 2, "a two-symbol overrun carries two symbols of data");
+        // Symbol `end + 1 + i` is entry `i`, and B1u's last symbol is entry
+        // `B1U_SYMBOLS - 1 - back` for a candidate `back` behind the run's end.
+        assert_eq!(carried[0].index, (B1U_SYMBOLS - 2) as u64);
+        assert_eq!(carried[1].index, (B1U_SYMBOLS - 1) as u64);
     }
 }
