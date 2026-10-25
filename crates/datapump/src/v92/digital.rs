@@ -157,36 +157,30 @@ const SU_BAR_TENTHS: u64 = 245;
 /// or take where in the period the anchor was taken.
 const SU_REPORT_LAG: u64 = 48;
 
-/// Periods a coherent `Su` has to be held, with no reversal and no break, before
-/// this end goes on without 9.5.2.1.7's `S-bar-u`.
+/// How far past the `Su` **onset** Phase 3 keeps to the far end's timetable
+/// before it goes on without 9.5.2.1.7's `S-bar-u` (docs/131).
 ///
-/// Derived from the lengths the Recommendation fixes, not tuned to the bench.
-/// 8.5.6's Su is **144 symbols**, and the period that repeats is six
-/// ([`RU_PERIOD`](crate::v92::up_signals::RU_PERIOD)), so a conforming far end's
-/// reversal arrives **24 periods** after Su starts; the S-bar-u it turns into is
-/// **24.5T** (9.5.2.1.7), one more period; the hunt holds an anchor through up
-/// to [`STRAY_PERIODS`](crate::v92::receiver)'s five periods of the change
-/// before it gives up on it, and it compares once a period at the anchor's own
-/// phase, so a reversal can be two periods late in being visible. 24 + 1 + 5 + 2
-/// = **32 periods** is therefore the first count at which a conforming far end's
-/// reversal is certain to have been seen, and the tolerance fires there and not
-/// before. Measured: this bench's Agere reverses nine periods after its Su is
-/// reported (54 symbols, `hsf-su.md` section 3), twenty-three periods inside
-/// this bound.
-const SU_TOLERANCE_PERIODS: u32 = 32;
-
-/// And how well the line has to have matched the anchor over that whole hold,
-/// **on average**.
+/// 9.5.2.1.6 and 9.5.2.1.7 make the far end's obligation a **timetable** --
+/// Su for 144T (8.5.6), `S-bar-u` for 24.5T, then Su again until Jp -- and the
+/// Recommendation puts **one** deadline on this end: 9.5.1.2.2's 5.1 s plus a
+/// round trip, for Su's *arrival*. There is none for *detecting* the
+/// `S-bar-u`, so waiting for an event a band-limited line cannot present is a
+/// wait the Recommendation never asked for; the schedule is the permission:
+/// 144T + 24.5T, plus the two periods the hunt's anchor may take to be sure of
+/// a step ([`STRAY_PERIODS`](crate::v92::receiver)), counted from the onset
+/// (`S0`, see `Modem::su_advance`) and not from the hunt's report of it.
 ///
-/// `kept` is the hunt's own correlation of each period against the anchor, and
-/// 0.90 is the gate at which a period counts as the same signal at all; asking
-/// for a mean of 0.95 over all thirty-two asks for a line steadier than that
-/// floor rather than merely at it. The mean and not the worst period, because a
-/// real line's Su dips a period now and then while going nowhere -- measured on
-/// this bench's HSF, 0.947 against 0.999 on the same tone -- and a tolerance a
-/// single period can veto is a tolerance for a synthetic line only. Measured:
-/// the HSF's Su holds at 0.999 over 6038 periods (`hsf-su.md` section 2).
-const SU_TOLERANCE_COHERENCE: f64 = 0.95;
+/// Measured: this bench's Agere reverses nine periods after its Su is reported
+/// (54 symbols, `hsf-su.md` section 3), well inside the schedule, so the
+/// detector confirms it there and this bound is never reached on a compliant
+/// peer. The HSF reverses at 144T on the `BRIDGE_ANTIALIAS=0` arm, but on the
+/// default `minphase` arm its decimator removes Su's 4 kHz component (-78 dB at
+/// 4.0 kHz) and there is no step on the line for any detector to see; the hunt
+/// itself is scale-invariant (docs/122), so "wait for the event" is the wrong
+/// criterion on every band-limited line and this is the right one (docs/131).
+const SU_TIMETABLE: u64 = crate::v92::SU_SYMBOLS as u64
+    + SU_BAR_TENTHS / 10
+    + 2 * crate::v92::up_signals::RU_PERIOD as u64;
 
 /// And how much of it is measured: sixteen periods of the six-symbol shape,
 /// 12 ms of Su. Long enough that the phase is steady to a few thousandths of a
@@ -2043,7 +2037,13 @@ impl Source {
 ///
 /// Off by default and diagnostic only; a bench sweep sets it and reads the
 /// residual phase out of the meter below.
-/// Whether [`BLIND_SU`] is armed: `V92_SU_BLIND=1`. Off unless asked for.
+/// Whether `V92_SU_BLIND=1` armed the go-now override: off unless asked for.
+///
+/// It used to be the product's way past a far end that never reverses. It is
+/// now only an **override** on top of Phase 3's timetable (docs/131): with it
+/// set, the Su stage is left the moment the hunt reports Su instead of on the
+/// schedule, which is what a bench arm wants when it is asking what a far end
+/// does with a Jp it never waited for.
 fn blind_su() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2054,14 +2054,12 @@ fn blind_su() -> bool {
     })
 }
 
-/// Whether the `Su` tolerance is armed: on unless `V92_SU_TOLERANCE=off`.
+/// Whether Phase 3's timetable is armed: on unless `V92_SU_TOLERANCE=off`.
 ///
-/// This is a **product decision and not a diagnostic**: 9.5.2.1.7's second
-/// clause is missing from a far end this product has to interoperate with
-/// (measured, `hsf-su.md`), and waiting out 9.5.1.2.2 instead is not
-/// interoperation. It is not a widening of the detector -- the reversal test is
-/// untouched and runs first -- it is a bounded, logged tolerance for a `Su` that
-/// has held coherently for longer than a conforming one can ([`SU_TOLERANCE_PERIODS`]).
+/// The name is the old switch's: the timetable replaced the coherence gate that
+/// used to sit behind it (`docs/131`), and `off` is still the way back -- with
+/// it off, the Su stage is left only by 9.5.2.1.7's reversal or by 9.5.1.2.2,
+/// which is what this end did before either.
 fn su_tolerance() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2192,9 +2190,16 @@ pub struct Modem {
     /// symbols, once the S-bar-u reversal that opens it has been heard.
     su_from: Option<u64>,
     /// Where the hunt last reported Su in the stage that is waiting for its
-    /// reversal. It is what [`BLIND_SU`]'s recovery counts from, and nothing
-    /// else reads it.
+    /// reversal. It is [`SU_TIMETABLE`]'s anchor -- `S0` is this less
+    /// [`SU_REPORT_LAG`] -- and nothing in the decode reads it.
     su_found: Option<u64>,
+    /// Where the hunt reported the Su-to-S-bar-u reversal, once it has. Only
+    /// recorded here: it confirms the timetable and re-anchors the epsilon
+    /// window, and it is not what lets the stage advance (docs/131).
+    su_seen: Option<u64>,
+    /// The last `held`/`coherence` the hunt reported for a Su this end is
+    /// waiting on: evidence for the log line, and a permission for nothing.
+    su_evidence: Option<(u32, f64)>,
     /// Whether Jp has gone out. It waits for the measurement (9.5.1.1.8), so
     /// the stage alone does not say whether it has.
     jp_sent: bool,
@@ -2529,6 +2534,8 @@ impl Modem {
             trn_from: None,
             su_from: None,
             su_found: None,
+            su_seen: None,
+            su_evidence: None,
             jp_sent: false,
             refit_from: None,
             refit_tries: 0,
@@ -3262,65 +3269,48 @@ impl Modem {
             self.ja_deadline = None;
             self.fail("no Ja within 4.5 s and a round trip");
         }
-        // `V92_SU_BLIND=1`: a recovery arm for a far end whose Su is on the
-        // line and never turns over.
+        // Phase 3 keeps to a **timetable**, not to an event (docs/131).
         //
-        // 9.5.2.1.7 is a promise: Su for 144T, S-bar-u for 24.5T, then Su until
-        // Jp. A Conexant HSF on this bench keeps that promise's first clause
-        // and breaks the rest -- measured on three of its calls, its upstream
-        // is one unmodulated 1333.33 Hz tone from the start of Su to the point
-        // where it gives up, phase-constant to 0.07 degrees over 37000 symbols
-        // (`/dev/shm/reports/hsf-su.md`). There is no reversal to detect, so
-        // the digital modem's only conforming move is to wait out 9.5.1.2.2.
+        // 9.5.2.1.6/.7 make the far end's obligation a schedule: Su for 144T,
+        // its 24.5T S-bar-u, then Su again until Jp. The Recommendation's one
+        // deadline here is 9.5.1.2.2's 5.1 s plus a round trip for Su to
+        // *arrive*, kept below and untouched; it asks for nothing to be
+        // detected. And on a band-limited line there is nothing to detect --
+        // this bench's HSF reverses at 144T on the antialias-off arm and is one
+        // unmodulated tone on the default `minphase` arm, because its
+        // decimator removes Su's 4 kHz component. The hunt is right and
+        // scale-invariant (docs/122); the criterion was wrong.
         //
-        // It is no longer the way this product gets on with such a far end: the
-        // tolerance below is on by default and reaches the same place with
-        // evidence behind it. What is left here is the **override** -- a bench
-        // arm that says "go now, ask nothing" -- so that a session can ask what
-        // a far end does with a Jp on its own terms without the tolerance's
-        // thirty-two periods in the way. It is off unless asked for, and
-        // `V92_SU_TOLERANCE=off` takes the tolerance out entirely, which is the
-        // way back to the old behaviour on both counts.
-        if self.stage == Stage::AwaitSu
-            && let Some(found) = self.su_found
-        {
-            if blind_su()
-                && self.now
-                    >= found
-                        + crate::v92::SU_SYMBOLS as u64
-                        + SU_BAR_TENTHS / 10
-                        + 2 * crate::v92::up_signals::RU_PERIOD as u64
-            {
-                self.proceed_as_if_reversed(
-                    found,
-                    format!(
-                        "V.92: Su never reversed in {} periods; asking for Jp anyway (V92_SU_BLIND)",
-                        (self.now - found) / crate::v92::up_signals::RU_PERIOD as u64
-                    ),
-                );
-            } else if su_tolerance()
-                && let Some((held, coherence)) = self.rx.su_held()
-                && held >= SU_TOLERANCE_PERIODS
-                && coherence >= SU_TOLERANCE_COHERENCE
-            {
-                // A `Su` that has held the anchor, period after period, for
-                // longer than 8.5.6 and 9.5.2.1.7 can account for, without ever
-                // turning over. The reversal test is untouched and ran first:
-                // had there been a S-bar-u, the hunt would have reported it and
-                // this stage would long since have left AwaitSu, so reaching
-                // here *is* the measurement that it did not.
-                //
-                // What it does is what the blind arm does, to the symbol, since
-                // the position of the reversal Jp's epsilon is measured after is
-                // 9.5.2.1.7's and not the far end's, and it says which tolerance
-                // it used, how long the Su had been held and how well the line
-                // matched it.
-                self.proceed_as_if_reversed(
-                    found,
-                    format!(
-                        "V.92: Su held {held} periods with no reversal, coherent at {coherence:.3};                          completing Su by tolerance (V92_SU_TOLERANCE, 9.5.2.1.7)"
-                    ),
-                );
+        // So the schedule advances the stage, from `S0` = the onset the hunt
+        // reported minus its own lag, and `held`/`coherence` are evidence that
+        // gets logged and permission for nothing. The reversal detector is
+        // untouched and runs first: when it does fire it confirms the
+        // schedule, re-anchors everything downstream on where it actually
+        // landed, and its epsilon window opens on the Su *after* it
+        // (9.5.1.1.9), as before.
+        if let Some(found) = self.su_found {
+            let s0 = found.saturating_sub(SU_REPORT_LAG);
+            if self.su_seen.is_some() {
+                self.su_advance(found);
+            } else if self.stage == Stage::AwaitSu {
+                // Evidence, once a timer tick: reported rather than
+                // consulted. The longest hold seen and not the latest reading,
+                // because the hunt re-anchors the moment it calls the turn and
+                // would report the new anchor's zero from then on.
+                if let Some(held) = self.rx.su_held() {
+                    let longer = match self.su_evidence {
+                        Some((best, _)) => held.0 >= best,
+                        None => true,
+                    };
+                    if longer {
+                        self.su_evidence = Some(held);
+                    }
+                }
+                if blind_su() {
+                    self.su_advance(found);
+                } else if su_tolerance() && self.now >= s0 + SU_TIMETABLE {
+                    self.su_advance(found);
+                }
             }
         }
         if let Some(at) = self.su_deadline
@@ -3405,21 +3395,54 @@ impl Modem {
     }
 
     /// Go on as if 9.5.2.1.7's `S-bar-u` had arrived, at the position it would
-    /// have taken, naming the tolerance that justified it.
+    /// have taken.
     ///
-    /// Two callers need this -- the `V92_SU_BLIND` override and the tolerance
-    /// for a far end whose Su never reverses -- and they must not differ in
-    /// *where* they put the reversal: Jp's epsilon is measured on the Su that
-    /// follows it (9.5.2.1.7) and the far end's answer is (24 + epsilon)T after
-    /// that (9.5.2.1.8), so the position is the one place the two can agree to
-    /// disagree, and it is computed here once.
-    fn proceed_as_if_reversed(&mut self, found: u64, why: String) {
-        // Where 9.5.2.1.7's reversal should have been: 144T of Su after the
-        // onset, and the hunt's report is a few periods behind the onset.
+    /// [9.5.2.1.7] fixes *where* it goes: Jp's epsilon is measured on the Su
+    /// that follows the reversal, and the far end's answer is (24 + epsilon)T
+    /// after that ([9.5.2.1.8]), so the position is 144T after the onset and
+    /// not wherever this end happened to notice anything -- which is why the
+    /// timetable and the detector agree to the symbol when the detector does
+    /// fire.
+    fn proceed_as_if_reversed(&mut self, found: u64) {
         let at = found + crate::v92::SU_SYMBOLS as u64 - SU_REPORT_LAG;
-        self.note(why);
-        self.su_found = None;
         self.su_reversal(at);
+    }
+
+    /// The one line Phase 3 gives to account for its Su, and the advance the
+    /// timetable owes this end once it is due (docs/131).
+    ///
+    /// Called from [`Self::timers`] and never from the symbol path: what it
+    /// reports about the line -- `held`, `coherence`, the reversal symbol -- is
+    /// evidence for the log, and none of it decides anything.
+    fn su_advance(&mut self, found: u64) {
+        let s0 = found.saturating_sub(SU_REPORT_LAG);
+        let scheduled = s0 + crate::v92::SU_SYMBOLS as u64;
+        let seen = self.su_seen.take();
+        self.su_found = None;
+        let evidence = match self.su_evidence.take() {
+            Some((held, coherence)) => {
+                format!("Su held {held} periods, coherent at {coherence:.3}")
+            }
+            None => "Su held for no whole period".to_string(),
+        };
+        let reversal = match seen {
+            Some(at) => format!(
+                "reversal seen at {at} (S0+{}T, {:+}T off the schedule)",
+                at.saturating_sub(s0),
+                at as i64 - scheduled as i64
+            ),
+            None => "reversal absent".to_string(),
+        };
+        let advance = match seen {
+            Some(_) => "advanced on the reversal".to_string(),
+            None => format!("advanced on timetable at S0+{SU_TIMETABLE}T"),
+        };
+        self.note(format!(
+            "phase 3: Su at S0 {s0}; {reversal}; {evidence}; {advance}; epsilon window open"
+        ));
+        if seen.is_none() {
+            self.proceed_as_if_reversed(found);
+        }
     }
 
     fn begin_training(&mut self, reversal: u64) {
@@ -3435,6 +3458,9 @@ impl Modem {
         // transmitter half a symbol the way `epsilon` says it steps it.
         self.rx.expect_step(epsilon::step_direction() * 0.5);
         self.rx.restart_hunt();
+        self.su_found = None;
+        self.su_seen = None;
+        self.su_evidence = None;
         self.note(format!("V.92: TRN1u expected from symbol {from}"));
     }
 
@@ -5135,6 +5161,14 @@ impl Modem {
                 // the 24.5T S-bar-u -- and keeps measuring, because that run's
                 // phase is the one that already carries the half symbol. Jp
                 // goes out as soon as the measurement is in (see `timers`).
+                //
+                // The arithmetic of the detector is not this stage's to
+                // change (docs/131). What the report is for now is to confirm
+                // the timetable -- `su_advance` logs where it landed against
+                // the schedule -- and to re-anchor the epsilon window on the
+                // Su that follows it, which is why `su_from` is taken from
+                // `at` and not from the schedule.
+                self.su_seen = Some(at);
                 self.stage = Stage::AwaitSuBar;
                 self.su_from = Some(at + SU_AFTER_S_BAR);
                 self.note(format!("V.92: Su reversed at {at}, measuring the next run"));
@@ -5966,6 +6000,12 @@ mod tests {
         /// measured on this bench: the Agere reverses 54 symbols after its Su is
         /// reported, the HSF sends one unmodulated tone for 4.63 s.
         reverses: bool,
+        /// Symbols of `Su` before its `S-bar-u`: 9.5.2.1.7's 144T on a
+        /// conforming far end, and whatever a late one is scripted with.
+        bar1_at: u64,
+        /// Whether this far end sends `Su` at all. A far end that sends none is
+        /// 9.5.1.2.2's case and nothing else's.
+        su: bool,
     }
 
     impl Script {
@@ -5982,7 +6022,26 @@ mod tests {
                 sender.push(&cp.to_bits_in(Layout::V92, UP_INTERVALS));
                 sender
             });
-            Self { trn, ja: Some(ja), cp, second_trn: Trn1u::new(), reverses: true }
+            Self {
+                trn,
+                ja: Some(ja),
+                cp,
+                second_trn: Trn1u::new(),
+                reverses: true,
+                bar1_at: crate::v92::SU_SYMBOLS as u64,
+                su: true,
+            }
+        }
+
+        /// The same, turning over `late` symbols after `Su` starts instead of at
+        /// 9.5.2.1.7's 144T.
+        fn reversing_at(late: u64, wanted: &Descriptor, rates: u32, cp: Option<Cp>) -> Self {
+            Self { bar1_at: late, ..Self::new(wanted, rates, cp) }
+        }
+
+        /// A far end that never sends `Su` at all: 9.5.1.2.2's third case.
+        fn without_su(wanted: &Descriptor, rates: u32) -> Self {
+            Self { su: false, ..Self::new(wanted, rates, None) }
         }
 
         /// The same call from a far end that breaks 9.5.2.1.7's second clause:
@@ -6015,7 +6074,10 @@ mod tests {
             }
             // Su 144T, S-bar-u 24T, Su again (which is where Jp is heard),
             // the (24 + epsilon)T S-bar-u that answers it, TRN1u, CPt, E1u.
-            let bar1 = SU_START + 144;
+            if !self.su {
+                return 0.0;
+            }
+            let bar1 = SU_START + self.bar1_at;
             let su2 = bar1 + 24;
             let bar2 = su2 + 400;
             let trn2 = bar2 + 40;
@@ -6056,11 +6118,41 @@ mod tests {
 
     fn run(script: &mut Script, symbols: u64) -> Modem {
         let mut modem = Modem::new(settings());
-        for n in 0..symbols {
-            let level = script.next(n);
-            modem.step(level * 8000.0);
-        }
+        let mut n = 0;
+        drive(&mut modem, script, &mut n, symbols);
         modem
+    }
+
+    /// Carry an existing modem on along the same script, so that what a stage
+    /// looked like part-way through can be asserted without running it twice.
+    fn drive(modem: &mut Modem, script: &mut Script, n: &mut u64, symbols: u64) {
+        for _ in 0..symbols {
+            let level = script.next(*n);
+            modem.step(level * 8000.0);
+            *n += 1;
+        }
+    }
+
+    /// The reversal symbol a phase 3 line reports, from the log.
+    fn reversal_at(notes: &str) -> u64 {
+        let tag = "reversal seen at ";
+        let i = notes.find(tag).unwrap_or_else(|| panic!("no reversal in: {notes}")) + tag.len();
+        notes[i..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no symbol after `{tag}`: {notes}"))
+    }
+
+    /// The phase 3 line, of which there is exactly one per call.
+    fn phase3_line(notes: &str) -> String {
+        let count = notes.matches("phase 3:").count();
+        assert_eq!(count, 1, "expected exactly one phase 3 line, found {count}: {notes}");
+        notes
+            .lines()
+            .find(|line| line.contains("phase 3:"))
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// Phase 3 runs from Ru to R-bar-i and into Phase 4 over a clean line: Ja
@@ -6272,59 +6364,156 @@ mod tests {
         assert_ne!(up_table(LevelSet::Code, &code.sets[0], 1.0 + code_k), code.sets[0].clone());
     }
 
-    /// A far end whose `Su` never turns over -- 9.5.2.1.7's second clause
-    /// missing, measured on this bench's HSF -- is carried out of `AwaitSu` by
-    /// the **tolerance**, and the tolerance says so: its name, the periods the
-    /// hunt held the Su for, and the coherence it held it at.
+    /// docs/131 case (a): a **compliant** far end -- `Su` 144T, its 24.5T
+    /// `S-bar-u`, `Su` again -- is confirmed by the reversal detector, and the
+    /// detector's report is what the timetable is checked against. No timetable
+    /// event is raised, and the epsilon window opens on the `Su` **after** the
+    /// reversal (9.5.1.1.9), wherever the detector put it.
     #[test]
-    fn a_su_that_never_reverses_is_completed_by_tolerance_and_logged() {
+    fn a_compliant_peer_confirms_the_timetable_with_no_event() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let mut script = Script::new(&Descriptor::none(), 0x7ffff, Some(cp));
+        let mut modem = Modem::new(settings());
+        let mut n = 0u64;
+        // Past the reversal and into the run whose phase Jp is measured on,
+        // but not so far that Jp has gone out and the window been cleared.
+        drive(&mut modem, &mut script, &mut n, SU_START + 144 + 90);
+        let notes = modem.clone().take_notes().join("\n");
+        let line = phase3_line(&notes);
+        assert!(line.contains("reversal seen at"), "{line}");
+        assert!(!line.contains("reversal absent"), "a reversing peer raised an event: {line}");
+        assert!(!line.contains("advanced on timetable"), "a timetable event fired: {line}");
+        assert!(line.contains("advanced on the reversal"), "{line}");
+        // The window is 9.5.1.1.9's: the Su after the S-bar-u the hunt found,
+        // and not the schedule's 144T.
+        let at = reversal_at(&notes);
+        assert_eq!(modem.su_from, Some(at + SU_AFTER_S_BAR), "epsilon window moved: {line}");
+        // And the call completes: Jp with the epsilon off that window, then
+        // Phase 4.
+        drive(&mut modem, &mut script, &mut n, 400 + 40 + 2400 + 1600);
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("Jp with epsilon"), "no Jp off the window: {notes}");
+        assert_eq!(phase3_line(&notes).matches("reversal seen at").count(), 1, "{notes}");
+        assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes}", modem.phase());
+    }
+
+    /// docs/131 case (b): the **HSF signature** -- one unmodulated tone from
+    /// the start of `Su` to the point where it gives up, no `S-bar-u` anywhere
+    /// -- is carried out of `AwaitSu` by the timetable itself, at `S0` + 144T +
+    /// 24.5T + two periods, with exactly one event logged, and Jp's epsilon is
+    /// still measured on the Su after where the reversal would have been.
+    #[test]
+    fn a_su_that_never_reverses_is_carried_by_the_timetable_and_logged_once() {
         let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
         let mut script = Script::without_reversal(&Descriptor::none(), 0x7ffff, Some(cp));
         let modem = run(&mut script, SU_START + 144 + 24 + 400 + 40 + 2400 + 1600);
         let notes = modem.clone().take_notes().join("\n");
-        assert!(notes.contains("V92_SU_TOLERANCE"), "no tolerance event: {notes}");
+        let line = phase3_line(&notes);
+        assert!(line.contains("reversal absent"), "{line}");
         assert!(
-            notes.contains(&format!("Su held {SU_TOLERANCE_PERIODS} periods")),
-            "the event has to say how many periods it held: {notes}"
+            line.contains(&format!("advanced on timetable at S0+{SU_TIMETABLE}T")),
+            "the timetable has to say where it landed: {line}"
         );
-        // A tone this clean is the best case the coherence can read, and it is
-        // reported as measured rather than as a gate.
-        assert!(notes.contains("coherent at 1.000"), "{notes}");
-        // It is the tolerance and not the bench arm that carried the call.
-        assert!(!notes.contains("V92_SU_BLIND"), "{notes}");
-        // And it carried the call out of `AwaitSu`: Jp went out, and Phase 3 is
-        // waiting for the far end's answer to it.
+        // 144 + 24.5 + two periods, counted in symbols from the onset; the
+        // count is the Recommendation's, not a tuned one.
+        assert_eq!(SU_TIMETABLE, 144 + 24 + 2 * 6, "{SU_TIMETABLE}");
+        // Evidence, reported and not consulted: a tone this clean is the best
+        // case the coherence can read.
+        assert!(line.contains("Su held "), "the evidence is not reported: {line}");
+        assert!(line.contains("coherent at "), "{line}");
+        // The epsilon is still measured, on the Su after the scheduled
+        // reversal, and Jp goes out with it.
         assert!(notes.contains("Jp with epsilon"), "no Jp: {notes}");
-        assert_eq!(modem.stage, Stage::AwaitSuBar, "phase {} notes {notes}", modem.phase());
-        // The script stops its tone at the point a real far end does, and this
-        // end reads that stop as 9.5.2.1.8's second S-bar-u only when the step
-        // it was told to expect is not zero -- on this bench's HSF the Jp carried
-        // epsilon 47690, a third of a symbol, and the stop is what the hunt
-        // reported as the reversal. A perfectly clean synthetic line measures an
-        // epsilon of zero, so the stage it would take next is not this script's
-        // to exercise; what this test is for is the tolerance's own event and
-        // the Jp it produces.
+        // It is the timetable and not an override that carried the call.
+        assert!(!notes.contains("V92_SU_BLIND") && !notes.contains("V92_SU_TOLERANCE"), "{notes}");
     }
 
-    /// And a far end that **does** turn over at 9.5.2.1.7's 144T is never
-    /// touched by it. This is the assertion the product's interoperation rests
-    /// on: the Agere on this bench reverses (54 symbols after its Su is
-    /// reported), the reversal test is untouched, and the tolerance needs
-    /// thirty-two periods -- twelve more than a conforming far end takes -- so
-    /// its stage is left long before the count could be reached.
+    /// docs/131 case (c): a far end that sends **no Su at all** is still
+    /// 9.5.1.2.2's, unchanged -- the deadline is 5.1 s plus a round trip after
+    /// the start of TRN1d, the call retrains there, and the timetable never
+    /// runs because there is nothing to anchor it to.
     #[test]
-    fn a_su_that_reverses_never_reaches_the_tolerance() {
-        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
-        let mut script = Script::new(&Descriptor::none(), 0x7ffff, Some(cp));
-        let modem = run(&mut script, SU_START + 144 + 24 + 400 + 40 + 2400 + 1600);
+    fn no_su_at_all_still_retrains_at_the_recommendation_s_deadline() {
+        let mut settings = settings();
+        // A round trip that shows up in the deadline rather than rounding out
+        // of it: 5.25 s at 8 kHz is a whole number of symbols.
+        settings.round_trip = 0.15;
+        let habits = settings.habits;
+        let mut script = Script::without_su(&Descriptor::none(), 0x7ffff);
+        let mut modem = Modem::new(settings);
+        let mut n = 0u64;
+        // Up to the read of Ja, which is where the deadline is armed: one
+        // symbol at a time, so that `now` is the symbol it was armed on.
+        while modem.su_deadline.is_none() && n < SU_START {
+            drive(&mut modem, &mut script, &mut n, 1);
+        }
         let notes = modem.clone().take_notes().join("\n");
-        assert!(notes.contains("Su reversed at"), "the reversal was not seen: {notes}");
-        assert!(
-            !notes.contains("V92_SU_TOLERANCE") && !notes.contains("Su held"),
-            "the tolerance fired on a Su that reverses: {notes}"
+        assert!(notes.contains("Ja read"), "no Ja: {notes}");
+        let deadline = modem.su_deadline.expect("a deadline from Ja");
+        let trn1d_start =
+            modem.now + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64;
+        assert_eq!(
+            deadline - trn1d_start,
+            (habits.trn1d * FS) as u64 + ((SU_WITHIN + 0.15) * FS) as u64,
+            "the deadline is not 5.1 s plus a round trip of TRN1d's start"
         );
-        assert!(modem.cpt().is_some(), "{notes}");
+        let trn1d_end = trn1d_start + (habits.trn1d * FS) as u64;
+        assert_eq!(deadline - trn1d_end, ((SU_WITHIN + 0.15) * FS) as u64);
+        // And it is where the call goes: no Su, no timetable, a retrain.
+        let left = deadline - modem.now + 8;
+        drive(&mut modem, &mut script, &mut n, left);
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("no Su within 5.1 s of TRN1d"), "{notes}");
+        assert!(!notes.contains("phase 3:"), "a timetable ran with no Su: {notes}");
+        assert!(matches!(modem.status, Status::Failed(_)), "{notes}");
+        assert!(habits.trn1d * FS >= TRN1D_MINIMUM as f64, "TRN1d is at least 2040T");
+        let _ = trn1d_end;
+    }
+
+    /// docs/131 case (d): a **late** reversal is taken where it is. The
+    /// detector runs first, re-anchors everything downstream on the symbol it
+    /// actually found, the deviation from the schedule is recorded, and the
+    /// epsilon window opens on the Su after *that* -- the measurement never
+    /// moves to suit the schedule.
+    ///
+    /// How late is measured and not assumed: the hunt reports a reversal about a
+    /// period after it happens on this script, and the timetable allows two
+    /// periods for that, so 168T (24T late) is still the detector's and 170T is
+    /// not. The second half of this test pins that boundary; there the timetable
+    /// carries the stage, which is the right answer for a far end 26T off its
+    /// own timetable.
+    #[test]
+    fn a_late_reversal_re_anchors_and_the_schedule_is_noted() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let mut script = Script::reversing_at(168, &Descriptor::none(), 0x7ffff, Some(cp));
+        let mut modem = Modem::new(settings());
+        let mut n = 0u64;
+        drive(&mut modem, &mut script, &mut n, SU_START + 168 + 90);
+        let notes = modem.clone().take_notes().join("\n");
+        let line = phase3_line(&notes);
+        assert!(line.contains("reversal seen at"), "{line}");
+        assert!(!line.contains("reversal absent"), "the timetable pre-empted it: {line}");
+        assert!(line.contains("off the schedule"), "no deviation noted: {line}");
+        assert!(!line.contains("+0T off the schedule"), "deviation vanished: {line}");
+        // Where it landed, and that the window followed it there.
+        let at = reversal_at(&notes);
+        assert!(at > SU_START + 144, "the script's reversal was not late: {line}");
+        assert_eq!(modem.su_from, Some(at + SU_AFTER_S_BAR), "window moved: {line}");
+        drive(&mut modem, &mut script, &mut n, 400 + 40 + 2400 + 1600);
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("Jp with epsilon"), "no Jp after a late reversal: {notes}");
         assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes}", modem.phase());
+
+        // Past the margin the timetable is what carries the stage, and what the
+        // far end was doing meanwhile is reported as evidence.
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let mut script = Script::reversing_at(170, &Descriptor::none(), 0x7ffff, Some(cp));
+        let modem = run(&mut script, SU_START + 170 + 24 + 400 + 40 + 2400 + 1600);
+        let notes = modem.clone().take_notes().join("\n");
+        let line = phase3_line(&notes);
+        assert!(line.contains("reversal absent"), "170T was still detected: {line}");
+        assert!(line.contains(&format!("advanced on timetable at S0+{SU_TIMETABLE}T")), "{line}");
+        assert!(line.contains("Su held "), "the hold is not reported: {line}");
     }
 
     /// 9.5.1.2.2: Su within 5100 ms of the start of TRN1d, however long TRN1d
