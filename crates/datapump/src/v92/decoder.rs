@@ -1081,6 +1081,18 @@ impl Decoder {
         (1..=UP_RATES as u8).find(|&drn| up_bits(drn) == self.bits_per_frame).unwrap_or(0)
     }
 
+    /// The twelve moduli 6.4.1 is being decoded with, interval 0 first.
+    ///
+    /// This is the decoder's own copy of the array, and the only reason it is
+    /// public is the lock next to `Cpd::from`: `docs/270` sec 1.2's claim that
+    /// these cannot drift from the declaration is a property of *construction*
+    /// (one `Parameters`, two consumers), and a property of construction is
+    /// worth one assertion that fails if a future reader ever hands the decoder
+    /// a second source for them (`docs/272` sec 3).
+    pub fn moduli(&self) -> [u8; UP_INTERVALS] {
+        *self.moduli.values()
+    }
+
     /// Measure this call's class rotation off B1u, from the `first` symbol of
     /// B1u that this decoder is about to be fed.
     ///

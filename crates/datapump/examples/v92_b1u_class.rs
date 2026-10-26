@@ -66,6 +66,15 @@ fn main() {
     let mut gain = 0.108_465_229_f64;
     let mut bits = 36_u32;
     let mut moduli = [8_u8; UP_INTERVALS];
+    // The declared set's LC: 6.4.2 runs the indices `-N/2 <= eta < N/2` with
+    // `N = 2 LC`, so the range is `LC` and not any modulus. 8 is the odd
+    // lattice of 16 points, which is every rung up to `drn 2`.
+    let mut lc = 8_usize;
+    // `--legacy`: score every interval in `max(moduli)` and the range at
+    // `max(moduli)` too, which is what this tool did before `docs/272` sec 1.2
+    // found the defect. Kept only to re-read an old table against the new one;
+    // it is the wrong question, not a second convention.
+    let mut legacy = false;
     let mut start: Option<usize> = None;
     let mut offset: Option<[i64; TRELLIS_FRAME]> = None;
     let mut decode = false;
@@ -131,6 +140,8 @@ fn main() {
                 );
                 return;
             }
+            "--lc" => lc = args.next().expect("--lc").parse().expect("lc"),
+            "--legacy" => legacy = true,
             "--levels" => {
                 let text = args.next().expect("--levels");
                 let values: Vec<f64> = text.split(',').map(|v| v.trim().parse().expect("level")).collect();
@@ -146,10 +157,18 @@ fn main() {
         );
         std::process::exit(2);
     };
-    // 6.4.2's class map has period Mi, and every rung this bench pins spreads
-    // one modulus over the twelve intervals, so the period is Mi itself: 8 at
-    // 24 000 and 16 at 32 000.
-    let classes = usize::from(*moduli.iter().max().expect("twelve moduli"));
+    // **6.4.2's class map has period Mi, per interval, and the index range is
+    // the declared set's `LC`.** One radix for all twelve intervals
+    // (`max(moduli)`) is what `docs/272` sec 1.2 found: at `drn 2` an `Mi = 16`
+    // interval and an `Mi = 8` one sit at the same trellis position, so a
+    // one-step rotation reads 15 in radix 16 and 7 in radix 8, `Mi/2` apart,
+    // and the `Mi = 8` class's free second member prints as a second `+-8`.
+    // Neither exists in each interval's own radix. `classes` is now the set's
+    // `LC` -- the index range and the histogram width -- and every symbol
+    // carries its own `Mi` for the class itself.
+    let classes = lc;
+    let widest = usize::from(*moduli.iter().max().expect("twelve moduli"));
+    println!("LC {lc} (index range {} .. {}), Mi per interval {moduli:?} (widest {widest}, what every table below `docs/272` was scored in)", -(lc as i32), lc as i32 - 1);
     let levels = match levels(&path) {
         Ok(levels) if !levels.is_empty() => levels,
         Ok(_) => {
@@ -178,7 +197,12 @@ fn main() {
     }
     // What the capture did: the class each level falls into, under the decoder's
     // own convention for turning an index into one.
-    let observed = observed_classes(&levels, gain, &level_table, classes);
+    let radices = if legacy { [u8::try_from(widest.max(1)).unwrap_or(16); UP_INTERVALS] } else { moduli };
+    let classes = if legacy { widest } else { lc };
+    if legacy {
+        println!("--legacy: one radix for all twelve intervals, the defect `docs/272` sec 1.2 names");
+    }
+    let observed = observed_classes(&levels, gain, &level_table, &radices, classes);
 
     println!("{} scored symbols from {path}: gain {gain:.9}, K {bits}, Mi {classes}", observed.len());
 
@@ -776,9 +800,16 @@ fn level_of(eta: i32) -> f64 {
 
 /// What the classes are measured against: the CPd's own set, read the way 6.4.2
 /// prints it -- "the indices are in the same order as the levels".
-fn observed_classes(levels: &[f64], gain: f64, table: &[f64; TRELLIS_FRAME], classes: usize) -> Vec<Observed> {
-    // 6.4.2 runs the indices -N/2 <= eta < N/2, which for N = 2 Mi is -Mi ..
-    // Mi - 1: -8 .. 7 at 24 000 and -16 .. 15 at 32 000.
+fn observed_classes(
+    levels: &[f64],
+    gain: f64,
+    table: &[f64; TRELLIS_FRAME],
+    moduli: &[u8; UP_INTERVALS],
+    classes: usize,
+) -> Vec<Observed> {
+    // 6.4.2 runs the indices -N/2 <= eta < N/2 with N = 2 LC, which is
+    // -LC .. LC - 1: -8 .. 7 on a 16-point set. It is the set's LC and not
+    // `max(Mi)` -- at `drn 2` those are 8 and 16.
     let (lowest, highest) = (-(classes as i32), classes as i32 - 1);
     levels
         .iter()
@@ -792,7 +823,13 @@ fn observed_classes(levels: &[f64], gain: f64, table: &[f64; TRELLIS_FRAME], cla
             let eta = (lowest..=highest)
                 .min_by(|&a, &b| (target - level_of(a)).abs().total_cmp(&(target - level_of(b)).abs()))
                 .unwrap_or(0);
-            Observed { n, eta, residual: (target - level_of(eta)).abs(), classes }
+            Observed {
+                n,
+                eta,
+                residual: (target - level_of(eta)).abs(),
+                classes,
+                modulus: usize::from(moduli[n % UP_INTERVALS]),
+            }
         })
         .collect()
 }
@@ -802,8 +839,11 @@ struct Observed {
     n: usize,
     eta: i32,
     residual: f64,
-    /// The period of the class map this capture was taken at, Mi.
+    /// The set's LC: the width of the index range and of every histogram.
     classes: usize,
+    /// **This symbol's own interval's Mi** -- the period of the class map at
+    /// the position it is in, which is the only radix its class can be read in.
+    modulus: usize,
 }
 
 impl Observed {
@@ -822,10 +862,11 @@ impl Observed {
     /// comes off the bottom first. Either way the answer is invariant to z,
     /// which is the point: it is invariant to the free bit.
     fn class(&self, start: usize) -> usize {
+        let radix = self.modulus.max(1) as i32;
         if self.k(start) == TRELLIS_FRAME - 1 {
-            (((self.eta - self.eta.rem_euclid(2)) / 2).rem_euclid(self.classes as i32)) as usize
+            (((self.eta - self.eta.rem_euclid(2)) / 2).rem_euclid(radix)) as usize
         } else {
-            (self.eta.rem_euclid(self.classes as i32)) as usize
+            (self.eta.rem_euclid(radix)) as usize
         }
     }
 }
@@ -903,7 +944,7 @@ fn frame_bits(
         // one, so the boundary is `(start + n) mod twelve`.
         let index = start + symbol.n;
         let k = symbol.k(start);
-        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
+        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.modulus.max(1) as i64) as u8;
         if index % UP_INTERVALS == UP_INTERVALS - 1
             && let Ok(frame) = decoder.decode(&labels, &moduli, bits)
         {
@@ -940,7 +981,7 @@ fn decode_classes(
         // frame closes on `(start + n) mod twelve`.
         let index = start + symbol.n;
         let k = symbol.k(start);
-        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.classes as i64) as u8;
+        labels[index % UP_INTERVALS] = (symbol.class(start) as i64 - offset[k]).rem_euclid(symbol.modulus.max(1) as i64) as u8;
         if index % UP_INTERVALS == UP_INTERVALS - 1
             && let Ok(frame) = decoder.decode(&labels, &moduli, bits)
         {

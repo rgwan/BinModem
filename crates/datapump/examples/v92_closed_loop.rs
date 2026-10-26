@@ -30,6 +30,7 @@ use datapump::v90::ucode::{self, Law, UCODES};
 use datapump::v92::decoder::Decoder;
 use datapump::v92::design::{self, Channel};
 use datapump::v92::farend::{self, FarEndParams};
+use datapump::v92::precoder::Constellation;
 use datapump::v92::receiver::Receiver;
 use datapump::v92::rung::{self, Reading};
 use datapump::v92::up_signals::Trn1u;
@@ -496,6 +497,123 @@ fn b1u(parameters: &Parameters, codewords: &[i32], at: usize, lu: f64, k: Option
     (ones, bits, rotation)
 }
 
+/// `docs/272`'s **residual**, measured where that ticket names it: how far the
+/// level the receiver was handed sits from the level the index it decided names,
+/// in **index steps of the declared set**, together with the share of symbols
+/// that sit outside the set altogether.
+///
+/// The set is read off the `Parameters`, not assumed: `a(eta) = 2 eta + 1` is
+/// the odd lattice, so one index step is two units and the residual is
+/// `|x - a(eta)| / 2`. That is the same normalisation `docs/270` and `docs/272`
+/// read the bench's `score` streams in (`a(eta) = +/-(2k+1)`, `rung.rs`'s
+/// `REFERENCE_LC = 8` grid), which is why the numbers here are comparable with
+/// the 0.114 and 0.051 those tickets quote instead of being a second unit.
+///
+/// The decision is the decoder's own -- the trellis's, when the trellis decides
+/// -- and not a fresh nearest-point search, because the residual a payload cares
+/// about is the one left *after* the receiver has chosen.
+#[derive(Default, Clone, Copy)]
+struct Residual {
+    /// Symbols of B1u's window the decision covered.
+    n: u64,
+    /// Sum of the squared residual, index steps.
+    sum_sq: f64,
+    /// Sum of the signed residual: a pure gain error is a bias, not a spread.
+    sum: f64,
+    /// Symbols whose level lies outside the declared set (`|x| > a(highest)`).
+    outside: u64,
+    /// `a(highest)`, the outermost level the set holds, in the same units.
+    edge: f64,
+}
+
+impl Residual {
+    fn measure(
+        parameters: &Parameters,
+        codewords: &[i32],
+        at: usize,
+        lu: f64,
+        k: Option<f64>,
+    ) -> Self {
+        let set = Constellation::new(&parameters.sets[0]);
+        let edge = set.level(set.highest()).unwrap_or(0.0);
+        // The decoder's own units: it divides the wire level by G before it
+        // slices it against the declared set (`Decoder::feed`), so the level this
+        // measurement is written against is `code / lu / G` -- the same
+        // `level / gain` `docs/272` scored the bench's `score` streams with.
+        let fed: Vec<f64> =
+            codewords.iter().skip(at).take(UP_INTERVALS * 48).map(|&c| f64::from(c) / lu).collect();
+        let mut decoder = Decoder::new(parameters);
+        if let Some(k) = k {
+            decoder.slice_at(k);
+        }
+        decoder.keep_decisions(true);
+        for &x in &fed {
+            decoder.feed(x);
+        }
+        let mut r = Self { edge, ..Self::default() };
+        for (index, etas) in decoder.take_decisions_indexed() {
+            for (position, &eta) in etas.iter().enumerate() {
+                let symbol = index as usize * 4 + position;
+                let Some(&wire) = fed.get(symbol) else { continue };
+                // `Decoder::feed` divides the wire level by G before it slices
+                // it against the declared set, so the level this measurement is
+                // written against is `wire / gain` -- the same `level / gain`
+                // `docs/272` scored the bench's `score` streams with.
+                let x = wire / parameters.gain;
+                // The set's own level for the index the decision named. A symbol
+                // it cannot name is not scored rather than scored as zero.
+                let Some(point) = set.level(eta) else { continue };
+                // One index step, measured on the set itself: half the
+                // spacing between the two indices either side. It is 2 on the
+                // odd lattice, which is the normalisation `docs/272` used, and
+                // it is the local code gap on the code set, where a fixed 2
+                // would be a different unit at every chord.
+                let below = set.level((eta - 1).max(set.lowest()));
+                let above = set.level((eta + 1).min(set.highest()));
+                let step = match (below, above) {
+                    (Some(lo), Some(hi)) if hi > lo && eta > set.lowest() && eta < set.highest() => {
+                        0.5 * (hi - lo)
+                    }
+                    _ => 1.0,
+                };
+                let error = (x - point) / step;
+                r.n += 1;
+                r.sum += error;
+                r.sum_sq += error * error;
+                if x.abs() > edge + 1e-9 {
+                    r.outside += 1;
+                }
+            }
+        }
+        r
+    }
+
+    /// The residual in index steps, root mean square.
+    fn rms(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        (self.sum_sq / self.n as f64).sqrt()
+    }
+
+    /// The signed mean, index steps: the part of the residual one gain number
+    /// explains.
+    fn bias(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        self.sum / self.n as f64
+    }
+
+    /// The share of symbols outside the declared set, in percent.
+    fn outside_pct(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        100.0 * self.outside as f64 / self.n as f64
+    }
+}
+
 /// The **code (bin) error rate**: the fraction of B1u's symbols whose decided
 /// code differs from the code that was sent, per chord and weighted by each
 /// chord's population (`docs/253` §2).
@@ -679,12 +797,20 @@ fn main() {
                     &observed[..ideal_trn.len()],
                     0..8,
                 );
-                let correction = e.correction(s.lu, s.lu);
+                // `docs/276`: TRN1u is one amplitude, so the wire carries one
+                // code and the reading is that code's reconstruction level. The
+                // correction is the identity inside the code grid's own
+                // resolution -- otherwise a far end commanded at a level the
+                // codec cannot name (900, exactly between 876 and 924) is
+                // "corrected" 2.74 % up into a level error that was not there.
+                let resolution = farend::quantiser_resolution(s.law, &observed, &ideal_trn);
+                let correction = e.correction_within(s.lu, s.lu, resolution);
                 println!(
-                    "  estimate drn={drn} delay={:+.4} level={:.1} tap={:+.4} nmse={:.5} -> \
+                    "  estimate drn={drn} delay={:+.4} level={:.1} res={:.1} tap={:+.4} nmse={:.5} -> \
                      params delay={:+.4} level={:.1} eq=[{}]",
                     e.delay,
                     e.level,
+                    resolution,
                     e.tap,
                     e.nmse,
                     correction.delay,
@@ -792,6 +918,30 @@ fn main() {
         let (ones, bits, rotation) = b1u(&parameters, &codewords, b1u_at, s.lu, k);
         let pct = if bits > 0 { 100.0 * ones as f64 / bits as f64 } else { 0.0 };
         let bins = Bins::measure(&parameters, &b1u_etas, &codewords, b1u_at, s.lu, k, &ladder, s.law);
+        let resid = Residual::measure(&parameters, &codewords, b1u_at, s.lu, k);
+        // Two numbers, and only the second one licences a rung (`docs/277`
+        // sec 1): `licence` is `rung::threshold`, the gap-priced criterion the
+        // tree's ceiling is built on, and `screen` is the mean-square form,
+        // which is 2.7x looser at `drn 2` and licensed a rung the bench watched
+        // fail when `docs/274` sec 2.2 compared against it. It is printed
+        // anyway, labelled, so that a table can be read in either form and the
+        // difference is visible in the harness's own output.
+        let licence = rung::threshold(drn);
+        let screen = rung::sigma_max(rung.lc);
+        println!(
+            "  RESIDUAL drn={drn} lc={} n={} sigma={:.4} bias={:+.4} out={} ({:.2}%) \
+             edge={:.0} licence=threshold({licence:.4}) over={:.2}x \
+             screen=sigma_max({screen:.4},not consulted) farlev={:.2}",
+            rung.lc,
+            resid.n,
+            resid.rms(),
+            resid.bias(),
+            resid.outside,
+            resid.outside_pct(),
+            resid.edge,
+            if licence > 0.0 { resid.rms() / licence } else { f64::INFINITY },
+            used.level_lsb * far,
+        );
         let crossing = stats.crossing(&ladder, &rx, s.law, gap);
         let landing = Landing::scan(s.law, &ladder, &continuous);
         println!(

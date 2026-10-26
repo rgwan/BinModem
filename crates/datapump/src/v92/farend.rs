@@ -324,6 +324,79 @@ impl Estimate {
             eq: EqTaps::inverse_of(self.tap),
         }
     }
+
+    /// The same correction, with the estimator's own resolution as the
+    /// deadband: a reading that agrees with the target to within
+    /// [`quantiser_resolution`] is *not* a level error, and the level is left
+    /// exactly where it is.
+    ///
+    /// `docs/276`: TRN1u is a single-amplitude sequence, so the far end puts one
+    /// code on the wire and the estimator reads that code's reconstruction
+    /// level. The code is the level, to within its own decision cell: a far end
+    /// commanded at 900 LSB transmits 900, the G.711 code nearest to it is 876,
+    /// and the reading is 876.0 with a *zero* fit error. Dividing the target by
+    /// that reading commands 924.66, which is 2.67 % high -- a correction
+    /// manufactured by the code grid, not measured on the line. This predicate
+    /// is what makes the correction the identity there.
+    #[must_use]
+    pub fn correction_within(
+        &self,
+        current_level_lsb: f64,
+        target_lsb: f64,
+        resolution: f64,
+    ) -> FarEndParams {
+        if (self.level - target_lsb).abs() <= resolution {
+            return FarEndParams {
+                delay: -self.delay,
+                level_lsb: current_level_lsb,
+                eq: EqTaps::inverse_of(self.tap),
+            };
+        }
+        self.correction(current_level_lsb, target_lsb)
+    }
+}
+
+/// How well a level can be read off a stream of G.711 reconstruction levels, in
+/// the units of [`Estimate::level`]: for each symbol, the distance from the
+/// level it carried to the **farther** edge of the decision cell that code
+/// owns, divided by the ideal symbol's own amplitude, and the largest over the
+/// sequence.
+///
+/// The cell edges are the midpoints to the neighbouring codes, which is the
+/// rule `ucode::nearest` applies, so this is the code grid's own number and not
+/// a tolerance somebody chose. It is `0.0` when the stream is not on the code
+/// grid at all (an analogue capture), which is the right answer: such a stream
+/// carries no quantisation limit from this codec.
+#[must_use]
+pub fn quantiser_resolution(law: crate::v90::ucode::Law, observed: &[f64], ideal: &[f64]) -> f64 {
+    use crate::v90::ucode::{UCODES, linear, nearest};
+    let n = observed.len().min(ideal.len());
+    let mut worst: f64 = 0.0;
+    for i in 0..n {
+        let amplitude = ideal[i].abs();
+        if amplitude == 0.0 || observed[i] == 0.0 {
+            continue;
+        }
+        let value = observed[i].abs().round() as i32;
+        let (code, _) = nearest(law, value.min(32767));
+        let here = f64::from(linear(law, code));
+        let below = if code == 0 {
+            f64::from(linear(law, 0))
+        } else {
+            f64::from(linear(law, code - 1))
+        };
+        let above = if usize::from(code) + 1 >= UCODES {
+            f64::from(linear(law, UCODES as u8 - 1))
+        } else {
+            f64::from(linear(law, code + 1))
+        };
+        let half = ((here - below) / 2.0).max((above - here) / 2.0);
+        let step = half / amplitude;
+        if step > worst {
+            worst = step;
+        }
+    }
+    worst
 }
 
 /// The integer lag a far end's transmit stream arrives at, for callers that
@@ -642,5 +715,100 @@ mod tests {
         assert_eq!(filters.fits(&smallest), Ok(()));
         assert_eq!(smallest.total, 192);
         assert_eq!(smallest.most, 128);
+    }
+
+    /// `docs/276`: a far end at exactly the commanded level must read
+    /// `gain = 1.000`, and the reading must say how close it can get.
+    ///
+    /// The stream is TRN1u's: one amplitude, two signs, which is what the
+    /// estimator is actually given on the line. Through the G.711 quantiser the
+    /// wire carries one code, so the estimator reads that code's reconstruction
+    /// level -- 900 LSB commanded lands on the chord-2/3 boundary and comes back
+    /// as 876.0, 2.67 % low, with a *zero* fit error. The fix is not to move the
+    /// reading (876 is the level the code says, and the code is all the line
+    /// carries); it is to state the reading's resolution and to make the
+    /// correction the identity inside it. That is what is checked here, over the
+    /// whole range a far end can be commanded to.
+    #[test]
+    fn a_far_end_on_its_command_reads_gain_one_within_the_code_grid() {
+        use crate::v90::ucode::{self, Law};
+        let quantise = |lsb: f64| -> f64 {
+            let full = lsb.clamp(-32768.0, 32767.0).round() as i32;
+            let (code, negative) = ucode::nearest(Law::Mu, full.abs().min(32767));
+            let level = f64::from(ucode::linear(Law::Mu, code).abs());
+            if negative || full < 0 { -level } else { level }
+        };
+        // TRN1u: 5.1's scrambled ones, i.e. +-1, as the harness builds it.
+        let ideal: Vec<f64> = (0..512).map(|i| if i % 3 == 0 { 1.0 } else { -1.0 }).collect();
+
+        // The commanded level the bench runs at, and the two ways it can land.
+        let mut worst = 0.0f64;
+        let mut worst_at = 0.0f64;
+        for lu in (300..=3000).step_by(37) {
+            let lu = f64::from(lu);
+            let observed: Vec<f64> = ideal.iter().map(|&x| quantise(x * lu)).collect();
+            let e = estimate(&ideal, &observed, 0..8);
+            let resolution = quantiser_resolution(Law::Mu, &observed, &ideal);
+            // The reading is the level the wire carried -- the code's own level.
+            assert!(resolution > 0.0, "a code stream has a resolution at {lu}");
+            // The instrument's stated accuracy is the grid's own half-cell, and
+            // the error never exceeds it.
+            let error = (e.level / lu - 1.0).abs();
+            assert!(
+                error <= resolution / lu + 1e-12,
+                "at lu {lu} the reading {} is off by {error} beyond its stated {resolution}",
+                e.level
+            );
+            // And inside that accuracy the correction is the identity: gain 1.000.
+            let corrected = e.correction_within(lu, lu, resolution);
+            if error <= resolution / lu {
+                assert_eq!(corrected.level_lsb, lu, "correction moved a level at {lu}");
+            }
+            if error > worst {
+                worst = error;
+                worst_at = lu;
+            }
+        }
+        // The number `docs/274` read as a bias, at the harness's own operating
+        // level: 24 LSB of the G.711 grid, 2.67 % of 900 -- a reading that is
+        // exactly on a code and exactly between two codes at once.
+        let code900: Vec<f64> = ideal.iter().map(|&x| quantise(x * 900.0)).collect();
+        let e900 = estimate(&ideal, &code900, 0..8);
+        assert!((e900.level - 876.0).abs() < 1e-6, "the reading at 900 is {}", e900.level);
+        assert!(e900.nmse < 1e-18, "a single-code stream fits to rounding: {}", e900.nmse);
+        assert!((quantiser_resolution(Law::Mu, &code900, &ideal) - 24.0).abs() < 1e-9);
+        assert!(((900.0 - e900.level) / 900.0 - 24.0 / 900.0).abs() < 1e-12);
+        assert_eq!(e900.correction_within(900.0, 900.0, 24.0).level_lsb, 900.0);
+        // Without the deadband it is the 2.74 % overshoot the ticket saw.
+        assert!((e900.correction(900.0, 900.0).level_lsb - 924.657_534_246_575_3).abs() < 1e-9);
+        // The worst point of the whole range is not 900: it is the chord-1/2
+        // boundary at 412 LSB, where one half-cell is 3.9 % of the level.
+        let _ = worst_at;
+        assert!(worst < 0.039, "worst relative reading error {worst}");
+
+        // Where the commanded level *is* a code level the reading is exact.
+        for lu in [396.0, 588.0, 876.0, 924.0, 1180.0] {
+            let observed: Vec<f64> = ideal.iter().map(|&x| quantise(x * lu)).collect();
+            let e = estimate(&ideal, &observed, 0..8);
+            assert!((e.level / lu - 1.0).abs() < 1e-12, "lu {lu} reads {} not gain 1", e.level);
+        }
+
+        // What this costs: `docs/266`'s bench reading of +2.2 % is 20 LSB at
+        // 900, and the resolution there is 32 LSB, so the instrument cannot
+        // report that far end as anything but 924 either -- the reading moves by
+        // a whole code for a 2.2 % change. That is the accuracy it must be
+        // trusted to, and it is why the correction is gated on the resolution
+        // and not on the reading.
+        let commanded = 900.0;
+        let measured = commanded * 1.022;
+        let observed: Vec<f64> = ideal.iter().map(|&x| quantise(x * measured)).collect();
+        let e = estimate(&ideal, &observed, 0..8);
+        let resolution = quantiser_resolution(Law::Mu, &observed, &ideal);
+        assert!((e.level - 924.0).abs() < 1e-6, "a +2.2 % far end at 900 reads {}", e.level);
+        assert!(
+            (measured - commanded).abs() <= resolution,
+            "+2.2 % inside the {resolution} LSB the grid resolves at 900"
+        );
+        assert_eq!(e.correction_within(commanded, commanded, resolution).level_lsb, commanded);
     }
 }
