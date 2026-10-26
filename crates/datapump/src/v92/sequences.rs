@@ -1243,6 +1243,131 @@ mod tests {
         }
     }
 
+    /// Every field this end emits satisfies Table 30, at every rung of the
+    /// ladder, checked as the table states it rather than as `check` happens to
+    /// implement it.
+    ///
+    /// `Cpd::check` is one home for these rules and this test does not replace
+    /// it: what it adds is the *field* view -- each value against the range the
+    /// printed bit-positions give it -- so that an edit which keeps `check`
+    /// happy but writes, say, an 8-point training constellation or a trellis
+    /// code 3 (reserved) fails here. It walks drn 1..=19 on both level sets,
+    /// builds the CPd the design would send, and holds it to:
+    ///
+    /// * bits 22:26 `drn` 0..=19 (0 is cleardown; we send 1..=19), 6.1;
+    /// * bits 27:28 trellis 0..=2 -- "3 is reserved" (`v92.txt:1811-1815`);
+    /// * bit 29 the E2u extension, a flag, and 0 everywhere here (8.7.2);
+    /// * bit 33 acknowledge, a flag, and 0 unless the exchange set it;
+    /// * bits 35:50 `4G`, "4 x G > 0" in Q0.16, so never zero and inside the
+    ///   sixteen bits;
+    /// * bits 52:152 the twelve moduli, each a non-zero byte and `2^K <= prod`
+    ///   (6.4.1, `v92.txt:416-446`);
+    /// * bits 154:213 the four section lengths, each inside `Lmax` and their sum
+    ///   inside `Ltot`, with a section present only if INFO1a bits 12:13 offered
+    ///   it (`v92.txt:1186-1197`);
+    /// * every coefficient inside its printed Q format: `z1`, `z2` signed Q0.15
+    ///   in [-1, 1), `p1`, `p2` signed Q1.14 in [-2, 2);
+    /// * the constellation sets: at most six, "shall not contain the zero
+    ///   point", "shall not exceed 128" points, ascending, index 0..=5, and each
+    ///   interval's `N >= Mi`, `N >= 2 Mi` where k = 3 (6.4.2, `v92.txt:447-458`).
+    #[test]
+    fn table_30_constraints_hold_for_every_field_this_end_emits() {
+        use crate::v92::upchoice::{LevelSet, pin_with};
+
+        let limits = FilterLimits::from_info1a(3, 3, 3);
+        let mut seen = 0;
+        let mut channel = vec![0.0f64; 16];
+        channel[0] = 1.0;
+        for k in 1..16 {
+            channel[k] = 0.2 / k as f64;
+        }
+        let norm = channel.iter().map(|t| t * t).sum::<f64>().sqrt();
+        channel.iter_mut().for_each(|t| *t /= norm);
+        let design = crate::v92::design::design(
+            &crate::v92::design::Channel { taps: channel, noise: 0.0, signal: 1.0 },
+            &limits,
+        )
+        .expect("designable");
+        for levelset in [LevelSet::Uniform, LevelSet::Code] {
+            for drn in 1..=UP_RATES as u8 {
+                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset) else {
+                    continue;
+                };
+                let parameters = choice.parameters;
+                seen += 1;
+                let cpd = Cpd::from(&parameters);
+                let where_ = format!("{} drn {drn}", levelset.name());
+                // The three parts the first CPd of a training must carry.
+                assert!(cpd.complete(), "{where_}: a part is missing");
+                // Bits 22:26.
+                assert!((1..=19).contains(&cpd.drn), "{where_}: drn {}", cpd.drn);
+                // Bits 27:28: code 3 is reserved.
+                assert!(cpd.trellis.code() <= 2, "{where_}: trellis code {}", cpd.trellis.code());
+                // Bit 29 and bit 33 are flags, and 29 is 0 (8.7.2).
+                assert!(!cpd.extend_e2u, "{where_}: CPd bit 29 is set");
+                assert!(!cpd.ack, "{where_}: a CPd that has not been acked says so");
+                // Bits 35:50: "4 x G > 0".
+                assert!(cpd.gain4 > 0, "{where_}: 4G is zero, which Table 30 forbids");
+                // Bits 52:152: twelve moduli, each a non-zero byte, K bits over
+                // their product.
+                let moduli = cpd.moduli.expect("moduli");
+                for (i, &modulus) in moduli.iter().enumerate() {
+                    assert!(modulus >= 2, "{where_}: interval {i} has modulus {modulus}");
+                }
+                assert!(
+                    (1u128 << parameters.bits()) <= parameters.product(),
+                    "{where_}: K = {} bits do not fit the moduli's product",
+                    parameters.bits()
+                );
+                // Bits 154:213: the section lengths, against INFO1a bits 12:17.
+                let filters = cpd.filters.clone().expect("filters");
+                assert!(filters.fits(&limits).is_ok(), "{where_}: {:?}", filters.fits(&limits));
+                assert_eq!(filters.z1.len(), filters.z1.len().min(usize::from(limits.most)));
+                assert!(!filters.z2.is_empty(), "{where_}: a CPd with no prefilter");
+                // The coefficients, each inside its printed format.
+                let inside = |value: f64, largest: f64| value.abs() < largest;
+                for &coefficient in filters.z1.iter().chain(&filters.z2) {
+                    assert!(inside(coefficient, 1.0), "{where_}: z = {coefficient} does not fit Q0.15");
+                }
+                for &coefficient in filters.p1.iter().chain(&filters.p2) {
+                    assert!(inside(coefficient, 2.0), "{where_}: p = {coefficient} does not fit Q1.14");
+                }
+                // The constellation sets.
+                let sets = cpd.sets.clone().expect("sets");
+                assert!(sets.points.len() <= crate::v92::CONSTELLATION_SETS, "{where_}: too many sets");
+                for points in &sets.points {
+                    assert!(!points.is_empty(), "{where_}: an empty set");
+                    assert!(points.len() <= crate::v92::CONSTELLATION_POINTS, "{where_}: {} points", points.len());
+                    assert_ne!(points[0], 0, "{where_}: the set contains the zero point");
+                    assert!(
+                        points.windows(2).all(|pair| pair[0] < pair[1]),
+                        "{where_}: the set is not ascending"
+                    );
+                }
+                for &index in &sets.index {
+                    assert!(usize::from(index) < crate::v92::CONSTELLATION_SETS, "{where_}: index {index}");
+                }
+                for i in 0..UP_INTERVALS {
+                    // The constellation index is per constellation frame
+                    // (i mod 6, Figure 1), the interval index is per symbol.
+                    let n = 2 * sets.points[usize::from(sets.index[i % CONSTELLATION_FRAME])].len();
+                    let step = usize::from(moduli[i]) * if i % 4 == 3 { 2 } else { 1 };
+                    assert!(n >= step, "{where_}: interval {i} has N {n} for a class step of {step}");
+                }
+                // And the one home for all of it agrees.
+                cpd.check(&limits, parameters.bits()).unwrap_or_else(|error| panic!("{where_}: {error}"));
+                // The bits Table 30 fixes at zero -- 30:32 and 50 "reserved
+                // for the ITU", 34 "start bit: 0" -- read straight out of the
+                // framed sequence, whose bit `b` is the table's bit `b`.
+                let bits = cpd.to_bits(12);
+                for (name, at) in [("30:32", 30usize), ("34", 34), ("50", 50)] {
+                    assert!(!bits[at], "{where_}: bit {name} is not zero");
+                }
+            }
+        }
+        assert!(seen >= 30, "only {seen} parameter sets were checked");
+    }
+
     /// 8.6.2 and Table 21: bit 47 is "the Jd/Jp identifier: 0 = Jd", where
     /// V.90's Table 13 had a constellation flag. The two vectors are P3S 5.2's.
     #[test]
