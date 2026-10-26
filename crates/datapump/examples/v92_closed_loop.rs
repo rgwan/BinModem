@@ -797,12 +797,20 @@ fn main() {
                     &observed[..ideal_trn.len()],
                     0..8,
                 );
-                let correction = e.correction(s.lu, s.lu);
+                // `docs/276`: TRN1u is one amplitude, so the wire carries one
+                // code and the reading is that code's reconstruction level. The
+                // correction is the identity inside the code grid's own
+                // resolution -- otherwise a far end commanded at a level the
+                // codec cannot name (900, exactly between 876 and 924) is
+                // "corrected" 2.74 % up into a level error that was not there.
+                let resolution = farend::quantiser_resolution(s.law, &observed, &ideal_trn);
+                let correction = e.correction_within(s.lu, s.lu, resolution);
                 println!(
-                    "  estimate drn={drn} delay={:+.4} level={:.1} tap={:+.4} nmse={:.5} -> \
+                    "  estimate drn={drn} delay={:+.4} level={:.1} res={:.1} tap={:+.4} nmse={:.5} -> \
                      params delay={:+.4} level={:.1} eq=[{}]",
                     e.delay,
                     e.level,
+                    resolution,
                     e.tap,
                     e.nmse,
                     correction.delay,
