@@ -11571,7 +11571,13 @@ mod conformance_221 {
         ("E2 Jd-prime", "v90.txt:1503-1507", "deleted from V.92 8.6; V.90 always sends it after Jd"),
         ("E3 Jp/Jp-prime", "v92.txt:1391-1435", "no V.90 downstream counterpart exists"),
         ("E4 SCR", "v92.txt:1436-1444", "V.92-only downstream signal; V.90's SCR is the analogue modem's (v90.txt:1411-1415)"),
-        ("E5 Rf", "v92.txt:1957-1962", "V.92-only, 12-symbol, FPE only"),
+        // E5 is the one exception whose signal *does* have a transmit path in
+        // this tree (`Out::Rf`/`Out::RfBar`): it stays excluded from the diff
+        // because V.90 has no `Rf` (v92.txt:1957) to diff it against, and it is
+        // pinned instead by
+        // `c_8_8_4_rf_is_the_loudest_codeword_of_the_data_mode_constellation_as_passed_in_cpu`.
+        ("E5 Rf", "v92.txt:1957-1962", "V.92-only: 8.8.4 defines it, V.90 has no Rf at all, so there is no V.90 stream to diff; pinned by c_8_8_4_rf_* instead"),
+
         ("E6 CPd/SUVd", "v92.txt:1763-1843, 1964-1998", "V.92-only; they replace V.90's MP (v90.txt:1746-1830)"),
         ("E7 Ed transmitted during Fast Parameter Exchange", "v92.txt:1758-1762", "FPE puts Ed on the preceding data mode modulation; the diff covers the training framing only"),
         ("E8 Ri/R-bar-i placement and Ucode 0 silence", "v92.txt:2557-2562, 2971-2975", "Ri is at the end of Phase 3 and the silence is V.92-only; Ri's *symbols* are diffed, its *position* cannot be"),
@@ -12138,5 +12144,80 @@ mod conformance_221_properties {
         source.change(Out::Rd);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.next()));
         assert!(result.is_err(), "a codeword meaning nothing went out quietly");
+    }
+
+    /// 8.8.4 (`v92.txt:1957-1962`) [quoted]: "*Rf is transmitted by ... repeating
+    /// the 12-symbol sequence containing the PCM codewords with the sign pattern
+    /// `+ + - - + + - - + + - -` where the left-most sign is transmitted
+    /// first*", "*R f consists of 2 repetitions of the 12-symbol sequence
+    /// containing the same PCM codewords with the sign pattern
+    /// `- - + + - - + + - - + +`*", and "*The PCM codewords used are the
+    /// highest power PCM codeword from the data mode constellation of each data
+    /// frame interval as passed in CPu*".
+    ///
+    /// `docs/221` could not write this test: `Rf` had no transmit path in that
+    /// tree, which is why `docs/221` left `Rf` to "whoever implements it". It
+    /// now has one (`Out::Rf`/`Out::RfBar`,
+    /// `digital.rs`, and the arm that emits it), so the exclusion keeps it out
+    /// of the **diff** -- V.90 has no `Rf` to diff it against, `v92.txt:1957` --
+    /// and this property test pins it against the three mistakes this end can
+    /// still make: a codeword that is not the loudest of the CPu in force, a
+    /// pattern read off an em dash instead of the line, or a bar that repeats
+    /// rather than inverts.
+    ///
+    /// The codewords are read through `renegotiation_points`, i.e. from the
+    /// mapping `B1d`'s encoder is sliced from, not from a vector this test
+    /// made up: two CPu shapes, so the property is the table's.
+    #[test]
+    fn c_8_8_4_rf_is_the_loudest_codeword_of_the_data_mode_constellation_as_passed_in_cpu() {
+        let law = Law::Mu;
+        // [quoted] v92.txt:1957-1958 and 1958-1960, left-most sign first:
+        // `+ + - - + + - - + + - -`, and R-bar-f's `- - + + - - + + - - + +`.
+        let rf_12 = [true, true, false, false, true, true, false, false, true, true, false, false];
+        let bar_12 = rf_12.map(|sign| !sign);
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let mut modem = in_data_mode(cpu_of(&sets, intervals));
+            let (data, training) = modem.renegotiation_points();
+            // "the highest power PCM codeword ... as passed in CPu": one an
+            // interval, resolved off the constellation mask the CPu carried.
+            let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let loudest = *set.points().first().expect("a set with points");
+                assert_eq!(data[i], loudest, "interval {i}: Rf's codeword is not CPu's loudest");
+                assert!(set.points().contains(&data[i]), "interval {i}: Rf's codeword is not in CPu");
+            }
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rf);
+            let mut rf = Vec::new();
+            let mut bar = Vec::new();
+            for _ in 0..(R_FRAMES + R_BAR_FRAMES) * INTERVALS {
+                let level = modem.source.next();
+                match modem.source.out() {
+                    Out::Rf => rf.push(level),
+                    Out::RfBar => bar.push(level),
+                    other => panic!("Rf ran into {other:?} before R-bar-f was over"),
+                }
+            }
+            assert_eq!(rf.len(), R_FRAMES * INTERVALS, "Rf is 384T (9.9.1.2.2)");
+            assert_eq!(bar.len(), R_BAR_FRAMES * INTERVALS, "R-bar-f is 24T (9.9.1.2.2)");
+            for (i, level) in rf.iter().enumerate() {
+                let want = ucode::level(law, data[i % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "Rf symbol {i} is not CPu interval {}'s loudest codeword", i % DOWN_INTERVALS);
+                assert_eq!(*level > 0.0, rf_12[i % 12], "Rf symbol {i} left 8.8.4's sign pattern");
+            }
+            for (i, level) in bar.iter().enumerate() {
+                let want = ucode::level(law, data[i % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "R-bar-f symbol {i} is not the same PCM codewords");
+                assert_eq!(
+                    *level > 0.0,
+                    bar_12[i % 12],
+                    "R-bar-f symbol {i} is not 2 repetitions of the inverted 12"
+                );
+            }
+        }
     }
 }
