@@ -74,6 +74,29 @@ const INTERVALS: usize = 6;
 const SD_FRAMES: usize = 64;
 const SD_BAR_FRAMES: usize = 8;
 
+/// 9.5.1.1.3's wait between reading `Ja` and putting `Sd` on the line, in
+/// seconds: "After receiving a DIL descriptor of Ja, the digital modem **may
+/// wait for up to 500 ms** and shall then transmit signal Sd for 384T and
+/// signal S-d for 48T" (`v92.txt:2535-2536`; the same words are at
+/// `v92.txt:2519-2520` in the copy docs/206 quoted from).
+///
+/// It is a *permission* and not an obligation: the digital modem may use any
+/// part of it, and this end used none of it until the wait became a number
+/// ([`Habits::sd_after_ja`]). The point of the clause is that `Sd` need not be
+/// jammed into the tail of the far end's `Ja` -- the analogue modem terminates
+/// `Ja` only after detecting the `Sd`-to-`S-bar-d` transition (9.5.2.1.3), so
+/// how close our `Sd` starts to its `Ja` decides what the far end's own
+/// detector has to work with.
+///
+/// The wait is spent in whole frames of [`INTERVALS`] codewords, so that the
+/// signal which follows still begins on a frame boundary: see the silence
+/// branch of `Source::next_level` and the reason it must (`Source::next`).
+pub const SD_AFTER_JA_WITHIN: f64 = 0.5;
+
+/// One frame of the wait, in milliseconds: [`INTERVALS`] codewords at [`FS`]
+/// codewords a second, i.e. 0.75 ms.
+pub const SD_FRAME_MS: f64 = INTERVALS as f64 * 1000.0 / FS;
+
 /// R-bar-i: "4 repetitions of the 6-symbol sequence" (V.90 8.6.4).
 const R_BAR_FRAMES: usize = 4;
 
@@ -1255,17 +1278,85 @@ pub struct Habits {
     /// TRN1d, in seconds: "at least 2040T", and Jd "within 4000 ms of
     /// starting TRN1d" (9.5.1.1.4).
     pub trn1d: f64,
+    /// How much of 9.5.1.1.3's window this end uses between reading `Ja` and
+    /// putting `Sd` on the line, in seconds: 0 to [`SD_AFTER_JA_WITHIN`].
+    ///
+    /// **0 is the behaviour every call on this bench had before the number
+    /// existed** -- `Sd` starts at the first frame boundary after `Ja` is read
+    /// -- so the default changes nothing until a value is chosen. What it is
+    /// for is the arrangement of our own transmission in time, which the clause
+    /// explicitly leaves to the digital modem; see [`Self::sd_after_ja_frames`]
+    /// for the frame grid the wait is kept on.
+    pub sd_after_ja: f64,
     /// Jd's bits 49:50, "the maximum spectral shaping look-ahead".
     pub lookahead: u8,
 }
 
 impl Habits {
     /// Short TRN1d, for the tests and for the second end of our own call.
-    pub const PROMPT: Self = Self { trn1d: 0.3, lookahead: 1 };
+    pub const PROMPT: Self = Self { trn1d: 0.3, sd_after_ja: 0.0, lookahead: 1 };
 
     /// What a live server sends: the analogue modem's equaliser wants the
-    /// time, and the clause's own ceiling is four seconds.
-    pub const LIVE: Self = Self { trn1d: 3.6, lookahead: 1 };
+    /// time, and the clause's own ceiling is four seconds. None of 9.5.1.1.3's
+    /// 500 ms is used, which is what this end has always done.
+    pub const LIVE: Self = Self { trn1d: 3.6, sd_after_ja: 0.0, lookahead: 1 };
+
+    /// The live server's habits, with 9.5.1.1.3's wait an operator setting
+    /// rather than a constant: `BINMODEM_V92_SD_AFTER_JA_MS` if it is set,
+    /// [`Self::LIVE`] (zero) otherwise.
+    ///
+    /// The clause gives a window, not a value -- "may wait for up to 500 ms"
+    /// (`v92.txt:2535-2536`) -- so how much of it to use is a policy number and
+    /// tuning it must not mean patching a constant. `docs/209` gave TRN1d's
+    /// length the same shape for the same reason. Out-of-window and
+    /// off-the-grid values are the clamp's business, not the operator's
+    /// ([`Self::sd_after_ja_frames`]).
+    #[must_use]
+    pub fn live() -> Self {
+        let mut habits = Self::LIVE;
+        if let Ok(text) = std::env::var("BINMODEM_V92_SD_AFTER_JA_MS")
+            && let Ok(ms) = text.trim().parse::<f64>()
+            && ms.is_finite()
+        {
+            habits.sd_after_ja = ms / 1000.0;
+        }
+        habits
+    }
+
+    /// 9.5.1.1.3's wait as this end will spend it: **clamped into the clause's
+    /// window and snapped to the frame grid**, in frames of [`INTERVALS`]
+    /// codewords.
+    ///
+    /// The grid is not a convenience. Silence occupies frame intervals like
+    /// anything else and a signal that starts mid-frame rotates the six-symbol
+    /// pattern of everything measured against the frame count (`Source::next`
+    /// records what that cost: an Agere SV92PP answered a rotated `Ri` with two
+    /// seconds of nothing and then a retrain). A wait of a whole number of
+    /// frames leaves the residue exactly where it was and moves only the
+    /// placement.
+    ///
+    /// Clamped, so that no setting can send the wait out of conformance: the
+    /// largest whole frame inside 500 ms is 666 frames = 499.5 ms, since 667
+    /// frames is 500.25 ms and past the clause.
+    #[must_use]
+    pub fn sd_after_ja_frames(&self) -> usize {
+        let ms = self.sd_after_ja * 1000.0;
+        let ms = if ms.is_finite() { ms.clamp(0.0, SD_AFTER_JA_WITHIN * 1000.0) } else { 0.0 };
+        let frames = (ms / SD_FRAME_MS).round();
+        (frames as usize).min(Self::sd_after_ja_frames_most())
+    }
+
+    /// The most frames 9.5.1.1.3's window holds.
+    #[must_use]
+    pub fn sd_after_ja_frames_most() -> usize {
+        (SD_AFTER_JA_WITHIN * FS / INTERVALS as f64).floor() as usize
+    }
+
+    /// The wait in codewords, which is what the source counts in.
+    #[must_use]
+    pub fn sd_after_ja_symbols(&self) -> usize {
+        self.sd_after_ja_frames() * INTERVALS
+    }
 }
 
 impl Default for Habits {
@@ -1415,6 +1506,9 @@ pub struct Source {
     /// Codewords since the first symbol of Sd, for the frame boundaries.
     symbol: u64,
     pending: Option<Out>,
+    /// Codewords of silence still to go out before `pending` may start. It is
+    /// 9.5.1.1.3's wait and nothing else; zero everywhere but after `Ja`.
+    hold: usize,
     bits: VecDeque<bool>,
     jd: Vec<bool>,
     jp: Vec<bool>,
@@ -1452,6 +1546,7 @@ impl Source {
             count: 0,
             symbol: 0,
             pending: None,
+            hold: 0,
             bits: VecDeque::new(),
             jd: settings.jd_bits(),
             jp: Jp::default().to_bits(),
@@ -1699,6 +1794,23 @@ impl Source {
     /// Ask for `out` at the next place the signal now on the line can end.
     pub fn change(&mut self, out: Out) {
         self.pending = Some(out);
+        self.hold = 0;
+    }
+
+    /// Ask for `out` after `symbols` more codewords of silence: 9.5.1.1.3's
+    /// "may wait for up to 500 ms and shall then transmit signal Sd"
+    /// (`v92.txt:2535-2536`).
+    ///
+    /// `symbols` is a whole number of frames ([`Habits::sd_after_ja_symbols`]
+    /// guarantees it), so the wait only moves *when* `Sd` starts and leaves the
+    /// frame grid -- and with it the six-symbol pattern every frame-counted
+    /// signal is measured against -- exactly where it was. The wait is counted
+    /// only while silence is on the line: it belongs to the gap after `Ja`, and
+    /// a hand-over that finds some other signal in flight has nothing to wait
+    /// in.
+    pub fn change_after(&mut self, out: Out, symbols: usize) {
+        self.pending = Some(out);
+        self.hold = if self.out == Out::Silence { symbols } else { 0 };
     }
 
     /// One codeword out.
@@ -1720,6 +1832,14 @@ impl Source {
         loop {
             match self.out {
                 Out::Silence => {
+                    // 9.5.1.1.3's wait, spent as silence on the frame grid: the
+                    // pending signal starts at the first frame boundary at or
+                    // after the hold runs out, so it is still whole frames
+                    // (`Source::next`'s rotation) and only its placement moved.
+                    if self.hold > 0 {
+                        self.hold -= 1;
+                        return 0.0;
+                    }
                     if self.at_frame_boundary()
                         && let Some(next) = self.pending.take()
                     {
@@ -5264,7 +5384,16 @@ impl Modem {
         ));
         let no_dil = descriptor.is_empty();
         self.descriptor = Some(descriptor);
-        self.source.change(Out::Sd);
+        // 9.5.1.1.3's wait: how much of the clause's 500 ms this end uses, on
+        // the frame grid so the following signal still begins on a boundary.
+        let wait = self.settings.habits.sd_after_ja_symbols() as u64;
+        if wait > 0 {
+            self.note(format!(
+                "V.92: waiting {}T (9.5.1.1.3) before Sd",
+                wait
+            ));
+        }
+        self.source.change_after(Out::Sd, wait as usize);
         self.stage = Stage::AwaitSu;
         // DR2 runs from TRN1d's start, and everything between here and there
         // has to come off the deadline: Sd is 384T, S-bar-d 48T, and TRN1d is
@@ -5274,14 +5403,24 @@ impl Modem {
         // 9.5.2.1.6 allows it before Su is cut off, and the call retrains
         // instead of connecting. That is what an Agere SV92PP on an 8 kHz
         // line did: it waited, and this end had already gone back to tone A.
+        // `now` is the sample `Ja` was read on and every term below is a
+        // duration this end spends before TRN1d starts: the 9.5.1.1.3 wait,
+        // Sd, S-bar-d, and then TRN1d itself. The wait is a term here for the
+        // same reason Sd and S-bar-d are: leave it out and the deadline is
+        // armed `wait` symbols early, which for a 500 ms wait is the whole of
+        // what the clause allows Su to be late by.
         let trn1d = (self.settings.habits.trn1d * FS) as u64;
         self.su_deadline = Some(
             self.now
+                + wait
                 + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
                 + trn1d
                 + ((SU_WITHIN + self.settings.round_trip) * FS) as u64,
         );
         if no_dil && !ZERO_DIL_USES_SCR {
+            // No Sd goes out on this path at all, so there is nothing for
+            // 9.5.1.1.3's wait to precede and it is not spent: the deadline
+            // above carries it, which can only make the deadline later.
             self.source.change(Out::Ri);
         }
         self.rx.restart_hunt();
@@ -7184,4 +7323,159 @@ mod conformance_158 {
         // sixteen-bit CRC, so the CRC occupies 42 to 57.
         assert!(flipped[1..].iter().all(|at| (42..58).contains(at)), "{flipped:?}");
     }
+    /// 9.5.1.1.3: "the digital modem **may wait for up to 500 ms** and shall
+    /// then transmit signal Sd for 384T and signal S-d for 48T"
+    /// (`v92.txt:2535-2536`). The wait is a setting, clamped into the clause's
+    /// window and snapped to the frame grid; what follows it is untouched.
+    #[test]
+    fn sd_after_ja_is_clamped_into_the_clause_and_snapped_to_the_frame_grid() {
+        // The window, from the clause's own two numbers: at most 500 ms, and
+        // never negative.
+        for asked in [-1.0, 0.0, 3.0, 6.0, 48.0, 54.0, 250.0, 499.0, 500.0, 501.0, 1000.0] {
+            let habits = Habits { sd_after_ja: asked / 1000.0, ..Habits::LIVE };
+            let frames = habits.sd_after_ja_frames();
+            let ms = habits.sd_after_ja_symbols() as f64 * 1000.0 / FS;
+            assert_eq!(
+                habits.sd_after_ja_symbols(),
+                frames * INTERVALS,
+                "{asked} ms: the wait is not a whole number of frames"
+            );
+            assert!(
+                (0.0..=SD_AFTER_JA_WITHIN * 1000.0).contains(&ms),
+                "{asked} ms: the wait {ms} ms is outside 9.5.1.1.3's window"
+            );
+            assert!(
+                frames <= Habits::sd_after_ja_frames_most(),
+                "{asked} ms: more frames than the window holds"
+            );
+        }
+        // The window's two ends, and the largest whole frame inside it.
+        assert_eq!(Habits::sd_after_ja_frames_most(), 666);
+        assert!((Habits::sd_after_ja_frames_most() as f64 * SD_FRAME_MS) <= 500.0);
+        assert!((Habits::sd_after_ja_frames_most() as f64 + 1.0) * SD_FRAME_MS > 500.0);
+        assert_eq!(Habits { sd_after_ja: -1.0, ..Habits::LIVE }.sd_after_ja_frames(), 0);
+        assert_eq!(Habits { sd_after_ja: 0.0, ..Habits::LIVE }.sd_after_ja_frames(), 0);
+        assert_eq!(Habits { sd_after_ja: 0.054, ..Habits::LIVE }.sd_after_ja_frames(), 72);
+        assert_eq!(Habits { sd_after_ja: 1000.0, ..Habits::LIVE }.sd_after_ja_frames(), 666);
+        // A request that is not on the grid is **snapped**, not accepted as
+        // it stands and not rounded silently into something off-grid.
+        for (asked, frames) in [(250.0, 333), (499.0, 665), (500.0, 666), (1.0, 1)] {
+            let habits = Habits { sd_after_ja: asked / 1000.0, ..Habits::LIVE };
+            assert_eq!(habits.sd_after_ja_frames(), frames, "{asked} ms");
+            let ms = habits.sd_after_ja_symbols() as f64 / FS * 1000.0;
+            assert_ne!(ms, asked, "{asked} ms is off the grid and was not snapped");
+            assert_eq!(ms, frames as f64 * SD_FRAME_MS);
+        }
+        // And the default reproduces the behaviour every call had before this
+        // existed: no wait at all.
+        assert_eq!(Habits::LIVE.sd_after_ja_frames(), 0);
+        assert_eq!(Habits::PROMPT.sd_after_ja_frames(), 0);
+        assert_eq!(Habits::default().sd_after_ja_symbols(), 0);
+    }
+
+    /// The wait goes on the line **before** Sd and nowhere else: the source is
+    /// silent for exactly the waiting frames, Sd is exactly 384T, S-bar-d
+    /// exactly 48T, and TRN1d starts on the codeword immediately after it.
+    ///
+    /// And it is a *shift*: the same Ja read with a wait of W frames puts Sd's
+    /// first symbol exactly `W * INTERVALS` later than with no wait, so what the
+    /// wait moves is the placement and not the frame grid (the residue mod
+    /// `INTERVALS` is identical, which is the whole point -- see `Source::next`).
+    #[test]
+    fn the_wait_delays_sd_by_whole_frames_and_leaves_every_length_alone() {
+        let mut settings = settings();
+        settings.habits = Habits { trn1d: 0.3, sd_after_ja: 0.054, ..Habits::LIVE };
+        let wait = settings.habits.sd_after_ja_symbols();
+        assert_eq!(wait, 432, "54 ms is 72 frames of six");
+
+        // Ja read at symbol 2, i.e. four codewords into a frame: the residue a
+        // real Ja ends on is not zero, and the wait must not move it.
+        let mut with_wait = Modem::new(settings.clone());
+        for _ in 0..2 {
+            with_wait.source.next();
+        }
+        with_wait.heard_ja(asked_dil());
+        let total = 2 * INTERVALS + wait + SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS + 6;
+        let stream = labelled(&mut with_wait.source, total);
+        let first_sd = stream
+            .iter()
+            .position(|(out, _)| *out == Out::Sd)
+            .expect("Sd never reached the line");
+        // The stream starts two codewords into a frame, so the frame boundary
+        // is an absolute property: index + 2.
+        let sd_at = first_sd + 2;
+        assert_eq!(sd_at % INTERVALS, 0, "Sd did not start on a frame boundary");
+        assert_eq!(
+            &stream[..first_sd],
+            &vec![(Out::Silence, 0.0); first_sd][..],
+            "something other than silence went out before Sd"
+        );
+        assert_eq!(only(&stream, Out::Sd).len(), 384, "9.5.1.1.3: Sd is 384T");
+        assert_eq!(only(&stream, Out::SdBar).len(), 48, "9.5.1.1.3: S-bar-d is 48T");
+        assert_eq!(
+            stream[first_sd + 432].0,
+            Out::Trn1d,
+            "TRN1d does not start on the codeword after S-bar-d"
+        );
+
+        // The control: the same Ja, no wait.
+        let mut bare = settings.clone();
+        bare.habits.sd_after_ja = 0.0;
+        let mut no_wait = Modem::new(bare);
+        for _ in 0..2 {
+            no_wait.source.next();
+        }
+        no_wait.heard_ja(asked_dil());
+        let stream = labelled(&mut no_wait.source, total);
+        let first_sd_now = stream
+            .iter()
+            .position(|(out, _)| *out == Out::Sd)
+            .expect("Sd never reached the line");
+        assert_eq!(
+            first_sd - first_sd_now,
+            wait,
+            "the wait did not move Sd by exactly its own whole frames"
+        );
+        assert_eq!(
+            sd_at % INTERVALS,
+            (first_sd_now + 2) % INTERVALS,
+            "the frame residue moved"
+        );
+    }
+
+    /// The 5.1 s deadline is what carries the whole of Phase 3's preamble from
+    /// the sample Ja was read on, so 9.5.1.1.3's wait is one of its terms.
+    #[test]
+    fn the_su_deadline_carries_the_sd_wait_too() {
+        let mut settings = settings();
+        settings.habits = Habits { trn1d: 3.6, sd_after_ja: 0.5, ..Habits::LIVE };
+        let habits = settings.habits;
+        let wait = habits.sd_after_ja_symbols() as u64;
+        assert!(wait > 0);
+        let mut modem = Modem::new(settings);
+        let ja_read = 8000u64;
+        modem.now = ja_read;
+        modem.heard_ja(asked_dil());
+        let deadline = modem.su_deadline.expect("a deadline from Ja");
+        assert_eq!(
+            deadline,
+            ja_read
+                + wait
+                + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
+                + (habits.trn1d * FS) as u64
+                + (SU_WITHIN * FS) as u64,
+            "the deadline does not carry 9.5.1.1.3's wait"
+        );
+        // Which leaves the 5.1 s where 9.5.1.2.2 puts it -- after TRN1d's own
+        // length from TRN1d's start, exactly as it was before the wait existed,
+        // so the wait moved the deadline by its own length and nothing else.
+        let trn1d_start = ja_read
+            + wait
+            + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64;
+        assert_eq!(
+            deadline - trn1d_start,
+            (habits.trn1d * FS) as u64 + (SU_WITHIN * FS) as u64
+        );
+    }
+
 }
