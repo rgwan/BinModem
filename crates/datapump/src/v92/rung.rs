@@ -78,7 +78,15 @@
 //!
 //! ## Trellis coding: not claimed
 //!
-//! Both ends run a convolutional code over the 4D symbol (6.5), so the *real*
+//! Both ends run a convolutional code over the 4D symbol -- 6.4.4 for V.92's
+//! own encoder ("the convolutional encoders from ITU-T V.34 shall be used ...
+//! except that the 2T delays are replaced by 4T delays", v92.txt:478-482),
+//! 6.4.3 for the `2 y(k) + 1` index domain it runs in (v92.txt:470-474), and
+//! Table 30 bits 27:28 for the digital receiver's requirement on the far end
+//! (v92.txt:1810-1814). **This note used to cite "(6.5)", and V.92 has no
+//! clause 6.5**: the text goes from 6.4.4 straight to "7 Interchange circuits"
+//! (v92.txt:487), so the code's citation is 6.4.3-6.4.4 (docs/246 sec 3.2).
+//! So the *real*
 //! symbol error rate at a given spacing is better than `2 Q(1/(2 sigma))` --
 //! typically by a dB figure that is quoted second-hand in every modem design
 //! note. That figure is not used here and must not be: a threshold that moves
@@ -295,6 +303,95 @@ pub fn lc_for(drn: u8) -> usize {
 // The ceiling
 // ---------------------------------------------------------------------------
 
+/// The largest interval modulus a rung's twelve intervals ask for: how many
+/// positive points the *worst* interval of 6.4.1's even-ish spread needs.
+///
+/// `lc_for` answers "how many points is the set", which is the same number only
+/// when `K/12` is exact -- the four rungs this bench has run (36/48/60/72 bits,
+/// three to six a interval, LC 8/16/32/64). One rung further up the ladder, 6.4.1
+/// gives the first `K % 12` intervals one bit more, and a 32-point interval
+/// needs a code-grid gap of 64 LSB where an 8-point one has 320. Pricing
+/// 25 333 at LC = 8 is how a model that says 0.0939 licenses a rung the bench
+/// watched fail ([`threshold`], `docs/240` sec 3c).
+#[must_use]
+pub fn points(drn: u8) -> usize {
+    if !(1..=UP_RATES as u8).contains(&drn) {
+        return 0;
+    }
+    let bits = up_bits(drn);
+    let each = bits / UP_INTERVALS as u32;
+    let spare = bits % UP_INTERVALS as u32;
+    let mut widest = 1usize;
+    for i in 0..UP_INTERVALS {
+        let width = each + u32::from((i as u32) < spare);
+        widest = widest.max(1usize << width);
+    }
+    widest
+}
+
+/// One index step of the LC = 8 grid in the codec's LSB: `2 G` at
+/// [`REFERENCE_LC`], times [`codegrid::TARGET_RMS`] (`docs/241` sec 0: 349 LSB).
+///
+/// This is the denominator `docs/240` sec 3c's gap correction is taken against,
+/// and it is the clause's own number: `[8.8.3]` fixes `G`, and the far end's
+/// power identity fixes what one unit of it is in LSB.
+#[must_use]
+pub fn index_step_lsb() -> f64 {
+    2.0 * super::upchoice::gain_for(REFERENCE_LC) * crate::v92::codegrid::TARGET_RMS
+}
+
+/// The residual, in index steps of the LC = 8 grid, that a rung actually needs:
+/// [`SIGMA_MAX`] scaled by the smallest gap a maximin set of [`points`] codes
+/// can hold, over one index step.
+///
+/// ```text
+/// drn   rate   points  gap(LSB)  threshold
+///   1  24000      8      320      0.0861
+///   2  25333     16      128      0.0344
+///   7  32000     16      128      0.0344
+///  13  40000     32       64      0.0172
+///  19  48000     64       16      0.0043
+/// ```
+///
+/// `sigma_max(lc)` answers a different question -- what the *mean square* of a
+/// `lc`-point set buys -- and for a rung whose set is carried by an interval one
+/// bit wider than `K/12` it is nearly three times too generous. A decision taken
+/// against a gap has to clear half of it, so the gap is the number the criterion
+/// is denominated in, and this is the only threshold [`ceiling_rung`] compares
+/// with. It is *tighter* than `sigma_max` everywhere except the LC = 8 rung the
+/// bench has measured, which is the conservative direction (`docs/240` sec 3c).
+#[must_use]
+pub fn threshold(drn: u8) -> f64 {
+    let points = points(drn);
+    if points < 2 {
+        return 0.0;
+    }
+    gap_lsb(points).map_or(0.0, |gap| SIGMA_MAX * gap / index_step_lsb())
+}
+
+/// The smallest gap a *maximin* set of `points` positive µ-law codes holds, in
+/// the codec's LSB, at the power `[8.8.3]` sets (`docs/116` sec 7, re-derived in
+/// `docs/240` sec 3c's gap column).
+///
+/// Taken from that column rather than searched here, because the search this
+/// crate has ([`crate::v92::codegrid::grid`]) is greedy from the bottom and
+/// finds 256 LSB at eight points where a maximin set holds 320 -- a 20 % tighter
+/// reading of the same rung, which is a modelling difference and not a
+/// measurement. The four counts the ladder's twelve intervals actually ask for
+/// (8, 16, 32, 64 -- 6.4.1's `2^(K/12)` with the spare bits on the first
+/// intervals) are the ones tabulated; anything else is searched.
+#[must_use]
+pub fn gap_lsb(points: usize) -> Option<f64> {
+    let tabulated = match points {
+        8 => Some(320.0),
+        16 => Some(128.0),
+        32 => Some(64.0),
+        64 => Some(16.0),
+        _ => None,
+    };
+    tabulated.or_else(|| crate::v92::codegrid::grid(points).map(|set| crate::v92::codegrid::min_gap(&set)))
+}
+
 /// The largest measurement, in index steps of the **LC = 8 grid**, that a rung
 /// whose set is `lc` points can carry.
 ///
@@ -443,11 +540,19 @@ impl Sigma {
 /// faster than that; a measurement that already refuses the slowest rung refuses
 /// everything.
 #[must_use]
-pub fn ceiling_rung(measured: Sigma, lc_of: impl Fn(u8) -> usize) -> Option<u8> {
-    if measured.bound == Bound::Lower {
-        return (measured.steps <= sigma_max(lc_of(1))).then_some(1);
-    }
-    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= sigma_max(lc_of(drn)))
+pub fn ceiling_rung(measured: Sigma) -> Option<u8> {
+    // **Scan and decide, for every bound.** The scan used to be skipped for a
+    // `Bound::Lower`: the number was spent at drn 1 without asking any rung its
+    // own question, so a measurement that carried 25 333 by 2.5x could not say
+    // so, and the log carried a ceiling that was a constant rather than a
+    // reading. What makes the scan safe is not the bound but the threshold: it
+    // is the *gap*-corrected requirement (`docs/240` sec 3c), which for every
+    // rung above drn 1 is two to twenty times tighter than `sigma_max` would be,
+    // and it is refused the moment the measurement does not clear it. So this is
+    // not "allow more": at today's 0.0690 every rung above drn 1 is still
+    // refused, and the refusal is now a number in the log rather than a
+    // short-circuit (see `digital::decide_upstream_rung`).
+    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold(drn))
 }
 
 /// The mask of rungs at or below `ceiling`, in the layout of Table 20's Ja mask:
@@ -472,9 +577,502 @@ pub fn ceiling_mask(ceiling: Option<u8>) -> u32 {
 /// apply_ceiling(ja, m) & ja == apply_ceiling(ja, m)
 /// ```
 #[must_use]
-pub fn apply_ceiling(ja: u32, measured: Sigma, lc_of: impl Fn(u8) -> usize) -> u32 {
+pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
     let allowed = if ja == 0 { JA_MASK_ALL } else { ja };
-    allowed & ceiling_mask(ceiling_rung(measured, lc_of))
+    allowed & ceiling_mask(ceiling_rung(measured))
+}
+
+// ---------------------------------------------------------------------------
+// The cap: the highest rung the bench has carried data on
+// ---------------------------------------------------------------------------
+
+/// The highest rung the bench has been shown to **carry data**, and the cap the
+/// live rung decision is held to whatever the instruments below say.
+///
+/// This is a **measurement, not a design limit.** `docs/266` sec 4 took the
+/// ladder live on an Agere at 33 333: the level granted `drn 8`, `CPd drn 8, ack
+/// true` went out, and the far end's `B1u` did not read as `B1u` -- **443/800**
+/// and **429/800** ones on the two directions -- so there was no `E2u` within
+/// 2 s, the call fell back to `V.90`, and there was no `ATI11` to read. Forced
+/// `drn 8` reproduced it bit-identically with the ladder out of the path, and
+/// forced `drn 2` = 25 333 fails the same way (**333/608**, **314/608**). The
+/// one call that carried payload at all -- **2000/2000, mismatched 0** -- was
+/// `drn 1` = 24 000. That is the whole of the working evidence: 24 000 and
+/// nothing above it.
+///
+/// `docs/269` sec 0.2 and sec 3 say why, and say that it is not solved: above
+/// `drn 1` the twelve intervals' moduli are not all equal (K % 12 != 0), the
+/// engine's per-interval modulus assignment is the only structural difference
+/// between the rung that works and the rung that does not, and the transmitter
+/// model reproduces `drn 1` and does not reproduce `drn 2`. `drn 7` -- the other
+/// rung with no spare bit, so the other rung with twelve equal moduli -- fails
+/// too, which is why this cap is *not* "the rungs with no spare bit are fine".
+///
+/// **Do not raise this without a bench call that carries payload at the rung it
+/// raises to.** A tree that cannot carry data must not be merged as if it could,
+/// and the instruments below (`admit`, its tolerance table) are the instrument,
+/// not the licence: they measure the **level**, and the level is not what fails
+/// here. `docs/271` sec 1 is the record of this cap and of the test that holds
+/// it.
+pub const MEASURED_WORKING_MAX_DRN: u8 = 1;
+
+/// The mask [`MEASURED_WORKING_MAX_DRN`] permits: bit k for drn k + 1, every
+/// rung at or below the cap.
+#[must_use]
+pub fn measured_mask() -> u32 {
+    if MEASURED_WORKING_MAX_DRN >= UP_RATES as u8 {
+        JA_MASK_ALL
+    } else {
+        (1u32 << MEASURED_WORKING_MAX_DRN) - 1
+    }
+}
+
+/// What the live rung decision may spend: what the instruments granted, cut to
+/// [`measured_mask`].
+///
+/// Two properties the caller relies on, and both are tested rather than stated:
+///
+/// * no bit above the cap survives, for **every** input mask -- so `choose`,
+///   which can only return a rung whose bit is set in the mask it is handed
+///   (`upchoice.rs:262-265`), cannot carry a rung above the cap;
+/// * `0` can come back, and `0` means "every rung" to `choose`
+///   (`upchoice.rs:261`), so a caller must treat it as a refusal rather than
+///   hand it on -- which the live path already does by pinning `drn 1` on an
+///   empty mask (`digital.rs:6094-6099`).
+#[must_use]
+pub fn cap_to_measured(granted: u32) -> u32 {
+    granted & measured_mask()
+}
+
+/// The highest rung a mask carries, or `None` when it carries nothing.
+#[must_use]
+pub fn highest_rung(mask: u32) -> Option<u8> {
+    (1..=UP_RATES as u8)
+        .rev()
+        .find(|drn| mask & (1 << (drn - 1)) != 0)
+}
+
+/// The line the live log carries for the cap: what the instruments granted, what
+/// the cap leaves, and the measurement that fixes it.
+///
+/// It is printed on **every** ladder decision, including the ones in which
+/// nothing is taken away, so that a call's log states the cap rather than
+/// implying it only by the absence of a higher rung. The `LADDER` lines printed
+/// beside it are untouched: they still print, per rung, what each instrument
+/// says and what it *would* have granted -- this line is what says that grant is
+/// not what the call gets.
+#[must_use]
+pub fn cap_line(granted: u32) -> String {
+    let capped = cap_to_measured(granted);
+    let would = match highest_rung(granted) {
+        Some(drn) => format!("drn {drn} ({})", up_rate(drn)),
+        None => "nothing".to_string(),
+    };
+    let got = match highest_rung(capped) {
+        Some(drn) => format!("drn {drn} ({})", up_rate(drn)),
+        None => "nothing -- drn 1 is pinned".to_string(),
+    };
+    let taken = granted.count_ones() - capped.count_ones();
+    let head = format!(
+        "V.92: capped: MEASURED_WORKING_MAX_DRN = {MEASURED_WORKING_MAX_DRN} takes the live rung from {would} to {got} ({taken} rung(s) removed); "
+    );
+    let why = format!(
+        "the instruments above granted mask {granted:#07x} and granted it on the level, which is not what fails here: "
+    );
+    head + &why
+        + "the bench carries payload at 24 000 and at no rung above it, 33 333 and 25 333 both die at B1u (docs/266 sec 4), "
+        + "and the per-interval modulus assignment above drn 1 is unexplained, drn 7 included (docs/269 sec 3). "
+        + "Do not raise the cap without a bench call that carries payload at the rung it raises to"
+}
+
+// ---------------------------------------------------------------------------
+// The instrument a rung's decision binds on
+// ---------------------------------------------------------------------------
+
+/// Which measured statistic a rung's decision is taken against.
+///
+/// `docs/250` sec 4 and `docs/253` sec 2 are the measurement: the per-chord
+/// **half-step crossing** reads exactly 0.0000 % across a sweep in which `B1u`
+/// loses 41 points, because the event it counts is a displacement of half a
+/// chord's step -- 4 to 128 LSB -- while the event that actually happens at a
+/// 64-point set is a move of **8 LSB** to the adjacent code (3 to 16 times
+/// smaller). The **code (bin) error rate** -- the fraction of B1u symbols whose
+/// *decided index* differs from the sent one -- fires at the right size, and it
+/// is the same quantity the standard's target error probability is about.
+///
+/// Below [`FIRST_BIN_DRN`] the design's gap is 128 ... 320 LSB, 8 ... 20 times
+/// the codec's own step, the two statistics agree (both read zero), and the
+/// crossing is the sharper one because it resolves a fraction of a step rather
+/// than a whole code. Above it the gap has fallen to 64 ... 16 LSB, the crossing
+/// is saturated, and the bin rate is the only instrument with resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instrument {
+    /// The population-weighted per-chord rate of symbols that moved past half
+    /// of their chord's own step.
+    Crossing,
+    /// The rate of B1u symbols whose decided index differs from the sent index.
+    Bin,
+    /// No rate was measured: the rung was decided on the level precondition
+    /// alone, which is the only thing there is to read before `CPd` goes out.
+    /// A grant under this instrument says exactly that and nothing about a
+    /// symbol error rate -- `docs/264` sec 2.
+    Level,
+}
+
+/// The first rung at which the bin error rate binds: `drn 9`, where LC is 32 and
+/// the design's gap is 64 LSB -- four times the 16 LSB step of the chord where
+/// the innermost points sit (`docs/253` sec 2's table).
+pub const FIRST_BIN_DRN: u8 = 9;
+
+impl Instrument {
+    /// The instrument a rung's decision binds on.
+    #[must_use]
+    pub fn for_rung(drn: u8) -> Instrument {
+        if drn >= FIRST_BIN_DRN { Instrument::Bin } else { Instrument::Crossing }
+    }
+
+    /// The name the log carries.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Instrument::Crossing => "crossing",
+            Instrument::Bin => "bin",
+            Instrument::Level => "level",
+        }
+    }
+}
+
+/// One rung's level tolerance, two-sided and asymmetric, **measured** rather
+/// than derived: how far the far end's level may sit from `1/G` before that
+/// rung's bin error rate leaves zero.
+///
+/// This replaces `0.5 x min_gap` (`docs/253`'s choice, the decision's own
+/// half-gap), which `docs/261` sec 4 measured and found **3.1x too tight** at
+/// the top of the ladder: at `drn 15 ... 19` it asks for 8 LSB = 0.49 % where a
+/// far end 1.5 % off still reads bin 0.00 %, and from +0.5 % to +1.7 % it alone
+/// floored the ladder at `drn 14` while every bin rate on `drn 9 ... 19` read
+/// zero. A precondition that refuses rungs the instrument the ladder is built on
+/// calls clean is not a precondition, it is a second, unreconciled criterion.
+///
+/// # The numbers, and what they are
+///
+/// `docs/261` sec 4 swept the far end's level error δ on the closed loop from
+/// −3 % to +3 % on a 0.1 % grid at every rung and recorded the **first δ at
+/// which a bin error appears**. The value below is the last δ that reads
+/// 0.00 % -- one grid step inside the crossing, because the crossing itself is
+/// where the measurement says the rung *fails*:
+///
+/// | rungs | + side (first error -> allowed) | − side (first error -> allowed) |
+/// |---|---|---|
+/// | 1, 2 | > +3 % (the sweep's edge) | > −3 % (the sweep's edge) |
+/// | 3 … 8 | +2.6 % → **+2.5 %** | −2.5 % → **−2.4 %** |
+/// | 9 … 18 | +1.8 % → **+1.7 %** | −2.0 % → **−1.9 %** |
+/// | 19 | +1.8 % → **+1.7 %** | −1.5 % → **−1.4 %** |
+///
+/// * `drn 1, 2` are **bounded only by the sweep**: no level error in ±3 % moves
+///   a code at all, and 3 % is as far as the measurement goes. Granting beyond
+///   it would be a claim nothing measured, so the edge is the tolerance. **[our
+///   choice, on `docs/261` sec 2's "0.00 % from −3 % to +3 %"]**
+/// * `drn 3 … 8`'s positive crossing is **+2.6 %** (sec 2's finer grid), not the
+///   `> +3 %` of sec 4's coarser column; the finer number is the one used.
+///   **[verified, `docs/261` sec 2 and sec 3's +2.6 % row]**
+/// * `drn 9 … 18` takes the **tightest** crossing of the group (1.8 % at
+///   `drn 9 … 14, 17, 19`; 1.9 % at `drn 15, 16, 18`), so the group's allowed
+///   value is 1.7 % for every rung in it. One grid step of conservatism, spent
+///   so that the table has no rung whose grant depends on a 0.1 % distinction
+///   the sweep cannot resolve. **[our choice]**
+/// * `drn 19`'s **negative** side is the tightest number on the ladder (−1.5 %,
+///   24 LSB): going down lands the point in the next chord *below*, whose step
+///   is half. **[verified]**
+///
+/// # Why the shape is asymmetric
+///
+/// `docs/261` sec 4.2: a level error moves every design point by `δ a(η)` LSB
+/// and the far end's codec then rounds it to the nearest code. Going up the
+/// µ-law lattice the next chord's step is **double**, so a round-up moves the
+/// code more often than a round-down of the same size; going down it is half.
+/// The measurement shows exactly that -- the positive side binds at `drn 9 …
+/// 18`, the negative side at `drn 19` -- so one number either side would
+/// either refuse a level the measurement grants or grant one it refuses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tolerance {
+    /// How far **above** `1/G` the far end may sit, as a fraction of `1/G`.
+    pub plus: f64,
+    /// How far **below**, as a positive fraction of `1/G`.
+    pub minus: f64,
+}
+
+/// The measured tolerance of one rung, as fractions of `1/G` ([`Tolerance`]).
+#[must_use]
+pub fn tolerance(drn: u8) -> Tolerance {
+    match drn {
+        0..=2 => Tolerance { plus: 0.030, minus: 0.030 },
+        3..=8 => Tolerance { plus: 0.025, minus: 0.024 },
+        19 => Tolerance { plus: 0.017, minus: 0.014 },
+        _ => Tolerance { plus: 0.017, minus: 0.019 },
+    }
+}
+
+/// One measured ladder reading: the rung it was taken on, the far end's level,
+/// the `G` our own CPd names, and both rates.
+///
+/// The two rates are *measured*, not modelled: the bin rate pairs each decided
+/// index with the index that was sent (`Decoder::take_decisions_indexed`), so a
+/// dropped frame cannot shift the pairing, and the crossing is taken over the
+/// same B1u window. The population is carried because a rate over 361 symbols
+/// and a rate over 2 448 are not the same evidence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reading {
+    /// The rung the reading was measured on, `drn 1 ... 19`.
+    pub drn: u8,
+    /// That rung's LC.
+    pub lc: usize,
+    /// The smallest gap between neighbours inside a chord of the rung's own set,
+    /// in LSB, taken from the set itself -- the code grid the far end's codec
+    /// rounds to -- and not from a tabulated maximin, and not from 349.
+    pub min_gap_lsb: f64,
+    /// The level the far end actually transmitted at, LSB.
+    pub level_lsb: f64,
+    /// The `G` the CPd we sent names (bits 35:50).
+    pub gain: f64,
+    /// Symbols whose decided index differed from the sent one, over the window.
+    pub bin: f64,
+    /// Symbols that crossed half their chord's own step, over the same window.
+    pub crossing: f64,
+    /// How many symbols the two rates were measured over.
+    pub symbols: u64,
+}
+
+impl Reading {
+    /// The rate the rung's instrument reads.
+    #[must_use]
+    pub fn rate(&self, instrument: Instrument) -> f64 {
+        match instrument {
+            Instrument::Crossing => self.crossing,
+            // The level-only instrument has no rate of its own; a caller that
+            // asks for one gets the binding rate's, which is the one it would
+            // have been decided on had a window existed.
+            Instrument::Bin | Instrument::Level => self.bin,
+        }
+    }
+
+    /// The finest non-zero rate this window can report: one symbol, over the
+    /// population. A zero bin count does not prove a rate of zero, it proves a
+    /// rate below this number, and a grant has to say so.
+    #[must_use]
+    pub fn resolution(&self) -> f64 {
+        if self.symbols == 0 { f64::INFINITY } else { 1.0 / self.symbols as f64 }
+    }
+
+    /// The level the far end must be at for the design's own numbers to arrive
+    /// as the levels they are: `1/G` (`docs/253` sec 1.2, 8.8.3).
+    #[must_use]
+    pub fn wanted_level(&self) -> f64 {
+        1.0 / self.gain
+    }
+
+    /// How far off `1/G` this rung's level may be: the tolerance **measured**
+    /// on this rung (`docs/261` sec 4, [`tolerance`]), two-sided and asymmetric.
+    #[must_use]
+    pub fn tolerance(&self) -> Tolerance {
+        tolerance(self.drn)
+    }
+
+    /// The far end's level error against `1/G`, as a signed fraction of `1/G`:
+    /// positive is high.
+    #[must_use]
+    pub fn level_delta(&self) -> f64 {
+        (self.level_lsb - self.wanted_level()) / self.wanted_level()
+    }
+
+    /// Whether the far end's level is `1/G` within what the measurement gives
+    /// this rung. Two-sided and asymmetric: the high and the low side are
+    /// different numbers, because the µ-law lattice is not symmetric about a
+    /// design point (`docs/261` sec 4.2).
+    #[must_use]
+    pub fn level_ok(&self) -> bool {
+        let delta = self.level_delta();
+        let tolerance = self.tolerance();
+        delta <= tolerance.plus && -delta <= tolerance.minus
+    }
+
+    /// The one-line log the ladder writes: which instrument bound, the rates it
+    /// read, the resolution of that measurement, and the level precondition.
+    ///
+    /// Both rates are printed even when only one binds, because the low rungs
+    /// read both and the switch is a statement about which one is *consulted*.
+    #[must_use]
+    pub fn line(&self, verdict: Verdict) -> String {
+        let tolerance = self.tolerance();
+        let wanted = self.wanted_level();
+        // `n/a` and not a zero: a rate nobody measured is not a clean rate, and
+        // the line has to be readable as that.
+        let (instrument, rate, resolution) = match verdict {
+            Verdict::Granted { instrument: Instrument::Level, .. }
+            | Verdict::Level { .. } => ("level".to_owned(), "n/a".to_owned(), "n/a".to_owned()),
+            _ => {
+                let instrument = verdict.instrument().unwrap_or(Instrument::for_rung(self.drn));
+                (
+                    instrument.name().to_owned(),
+                    format!("{:.4e}", self.rate(instrument)),
+                    format!("{:.2e}", self.resolution()),
+                )
+            }
+        };
+        let why = match verdict {
+            Verdict::Level { delta, plus, minus, .. } => {
+                let side = if delta > plus { "high" } else { "low" };
+                format!(
+                    "REFUSE(level {:+.2}% {side}: +{:.1}%/-{:.1}% allowed)",
+                    delta * 100.0,
+                    plus * 100.0,
+                    minus * 100.0
+                )
+            }
+            Verdict::Rate { rate, target, .. } => {
+                format!("REFUSE(rate {rate:.4e} > {:e})", target)
+            }
+            Verdict::Granted { instrument: Instrument::Level, .. } => {
+                "GRANT(level only: no rate window yet)".to_owned()
+            }
+            Verdict::Granted { .. } => "GRANT".to_owned(),
+        };
+        format!(
+            "LADDER drn={} lc={} instrument={instrument} rate={rate} bin={:.4e} crossing={} \
+             target={:.1e} symbols={} resolution={resolution} level={:.1} 1/G={wanted:.1} \
+             delta={:+.2}% tol=+{:.1} LSB/-{:.1} LSB gap={:.0} -> {why}",
+            self.drn,
+            self.lc,
+            self.bin,
+            if self.crossing.is_finite() { format!("{:.4e}", self.crossing) } else { "n/a".to_owned() },
+            TARGET,
+            self.symbols,
+            self.level_lsb,
+            self.level_delta() * 100.0,
+            tolerance.plus * wanted,
+            tolerance.minus * wanted,
+            self.min_gap_lsb,
+        )
+    }
+}
+
+/// What the ladder decided for one rung, and why.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verdict {
+    /// The binding rate is at or under the target: the rung is granted, *on the
+    /// far end being at `1/G`*, which the line beside it states.
+    Granted {
+        instrument: Instrument,
+        rate: f64,
+        target: f64,
+    },
+    /// The binding rate is over the target.
+    Rate {
+        instrument: Instrument,
+        rate: f64,
+        target: f64,
+    },
+    /// The level is not `1/G` within the tolerance **measured** for this rung
+    /// ([`tolerance`]): the reading describes a far end this end did not ask
+    /// for, so its rate is not evidence about the bench's far end either way.
+    /// The refusal carries the number that refused it -- the signed `delta` and
+    /// the two allowances -- so an honest refusal is readable as one.
+    Level {
+        level_lsb: f64,
+        wanted: f64,
+        delta: f64,
+        plus: f64,
+        minus: f64,
+    },
+}
+
+impl Verdict {
+    /// Whether the rung is granted.
+    #[must_use]
+    pub fn granted(&self) -> bool {
+        matches!(self, Verdict::Granted { .. })
+    }
+
+    /// The instrument that bound, when a rate was the reason.
+    #[must_use]
+    pub fn instrument(&self) -> Option<Instrument> {
+        match self {
+            Verdict::Granted { instrument, .. } | Verdict::Rate { instrument, .. } => Some(*instrument),
+            Verdict::Level { .. } => None,
+        }
+    }
+}
+
+/// Decide one rung from one measured reading.
+///
+/// Two conditions, in this order:
+///
+/// 1. **the level is `1/G`** within [`Reading::tolerance`], the tolerance
+///    `docs/261` sec 4 **measured** per rung, two-sided and asymmetric. This is
+///    the precondition the grant cannot check from our side: we send `G` in CPd
+///    bits 35:50 and the far end is supposed to obey it (8.8.3), but whether it
+///    did is a property of the far end. A reading taken at any other level is
+///    refused whatever its rate, because it is not a reading of the far end the
+///    grant would be about -- `docs/253` sec 3 is the case that matters (at
+///    2 100 LSB, 29 % high, `drn 19` reads 9.62 % bin and 92.8 % `B1u`).
+/// 2. **the binding rate is at or under [`TARGET`]**, the standard's per-symbol
+///    error probability before the trellis. Which rate binds is
+///    [`Instrument::for_rung`]'s answer: the crossing below [`FIRST_BIN_DRN`],
+///    the bin error rate at and above it. Two-sided: over the target is a
+///    refusal, at or under it a grant.
+///
+/// **The low rungs keep the crossing *and* the bin rate.** A crossing measures a
+/// displacement of half the chord's own step; a symbol that moves one *code* --
+/// which at `drn 1` is 8 to 128 LSB, inside a 256 LSB gap -- is a bin error that
+/// no crossing can see. So below [`FIRST_BIN_DRN`] the bin rate is a second,
+/// necessary check and the instrument that binds is the one whose rate is the
+/// larger; above it the crossing is *not consulted at all*, because there it is
+/// saturated (it reads zero while the bin rate is 9 %) and carries no
+/// information. The decision's own line quotes whichever rate fired and both
+/// numbers are printed beside it.
+///
+/// **What a grant is worth is its resolution.** [`TARGET`] is `1e-7`; the B1u
+/// window is 416 symbols, which cannot see a rate below `2.4e-3`. So a grant
+/// with no errors means "no error in this window", which is `1/symbols` and not
+/// `TARGET` -- [`Reading::resolution`] is printed beside every decision for that
+/// reason.
+#[must_use]
+pub fn admit(reading: &Reading) -> Verdict {
+    if !reading.level_ok() {
+        let tolerance = reading.tolerance();
+        return Verdict::Level {
+            level_lsb: reading.level_lsb,
+            wanted: reading.wanted_level(),
+            delta: reading.level_delta(),
+            plus: tolerance.plus,
+            minus: tolerance.minus,
+        };
+    }
+    // No rate window yet: before `CPd` there is no `B1u` to read, so the only
+    // measurement there is is the level, and the grant says so rather than
+    // reporting a zero it did not take (`docs/264` sec 2).
+    if reading.symbols == 0 {
+        return Verdict::Granted { instrument: Instrument::Level, rate: f64::NAN, target: TARGET };
+    }
+    let named = Instrument::for_rung(reading.drn);
+    let (instrument, rate) = match named {
+        // At and above the switch the crossing is saturated and is not read.
+        Instrument::Bin | Instrument::Level => (Instrument::Bin, reading.bin),
+        // A crossing nobody measured is not a crossing of zero: where the live
+        // receive path has the bin rate and not the per-chord level stream
+        // (`docs/264` sec 3), the bin rate is what is read and the line says
+        // `crossing=n/a`.
+        Instrument::Crossing if !reading.crossing.is_finite() => (Instrument::Bin, reading.bin),
+        // Below it both are read, and the larger is the one that binds: a bin
+        // error inside an oversized gap is an error the crossing cannot see.
+        Instrument::Crossing if reading.bin > reading.crossing => (Instrument::Bin, reading.bin),
+        Instrument::Crossing => (Instrument::Crossing, reading.crossing),
+    };
+    if rate <= TARGET {
+        Verdict::Granted { instrument, rate, target: TARGET }
+    } else {
+        Verdict::Rate { instrument, rate, target: TARGET }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +1303,7 @@ mod tests {
         for step in 0..=240 {
             let steps = 10f64.powf(-4.0 + 4.0 * f64::from(step) / 120.0);
             let measured = Sigma::absolute(2.0 * gain_for(REFERENCE_LC) * steps, Bound::Reading);
-            let ceiling = ceiling_rung(measured, lc_for).unwrap_or(0);
+            let ceiling = ceiling_rung(measured).unwrap_or(0);
             assert!(
                 ceiling <= previous,
                 "the ceiling rose from {previous} to {ceiling} at sigma {steps:e}"
@@ -717,27 +1315,38 @@ mod tests {
         assert_eq!(seen.last(), Some(&0), "a dirty enough one must permit nothing");
     }
 
-    /// Each rung's boundary is where `SIGMA_MAX` and its own `G` put it: a
-    /// measurement just inside the bound carries the rung, and one just outside
-    /// does not.
+    /// Each rung's boundary is where its own **gap-corrected** threshold puts
+    /// it: a measurement just inside carries the rung, one just outside does
+    /// not. The number is `SIGMA_MAX` scaled by the smallest gap of a maximin
+    /// code set of [`points`] points (`docs/240` sec 3c), not `sigma_max(lc)`:
+    /// 25 333 is carried by a 16-point interval and 0.0939 would be a model of a
+    /// set the rung does not have.
     #[test]
-    fn each_rung_s_boundary_is_where_the_target_puts_it() {
-        for (drn, lc) in [(1u8, 8usize), (7, 16), (13, 32), (19, 64)] {
-            let inside = Sigma::reading(sigma_max(lc) * 0.999, REFERENCE_LC);
-            let outside = Sigma::reading(sigma_max(lc) * 1.001, REFERENCE_LC);
-            let permitted = ceiling_rung(inside, lc_for).expect("a rung");
+    fn each_rung_s_boundary_is_where_its_own_threshold_puts_it() {
+        for (drn, lc) in [(1u8, 8usize), (2, 16), (7, 16), (13, 32), (19, 64)] {
+            let bound = threshold(drn);
+            assert!(bound > 0.0, "drn {drn} has no threshold");
+            let inside = Sigma::reading(bound * 0.999, REFERENCE_LC);
+            let outside = Sigma::reading(bound * 1.001, REFERENCE_LC);
+            let permitted = ceiling_rung(inside).expect("a rung");
             assert!(permitted >= drn, "drn {drn} was refused at 0.1 % inside its bound: {permitted}");
-            let refused = ceiling_rung(outside, lc_for);
+            let refused = ceiling_rung(outside);
             assert!(
                 refused.is_none_or(|ceiling| ceiling < drn),
                 "drn {drn} was still permitted at 0.1 % outside its bound: {refused:?}"
             );
-            // And the predicted error at the boundary is the target, on that
-            // rung's own grid.
-            let at_boundary = Sigma::reading(sigma_max(lc), REFERENCE_LC).error(lc);
+            // The predicted error at the boundary is at or under the target on
+            // the rung's own worst interval, and the gap correction only ever
+            // tightens the mean-square model -- which is the direction the
+            // threshold exists to be wrong in.
+            let at_boundary = Sigma::reading(bound, REFERENCE_LC).error(points(drn));
             assert!(
-                (at_boundary / TARGET - 1.0).abs() < 0.02,
+                at_boundary <= TARGET * 1.001,
                 "drn {drn}: {at_boundary:e} at its boundary against a target of {TARGET:e}"
+            );
+            assert!(
+                bound <= sigma_max(points(drn)),
+                "drn {drn}: threshold {bound:.4} is looser than the mean-square model"
             );
         }
     }
@@ -748,12 +1357,12 @@ mod tests {
     #[test]
     fn the_24_000_measurement_carries_24_000_and_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_24, 8);
-        let ceiling = ceiling_rung(measured, lc_for).expect("the measured arm carries a rung");
+        let ceiling = ceiling_rung(measured).expect("the measured arm carries a rung");
         assert!(ceiling >= 1, "24 000 was refused");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_24} index-step residual");
         // The two rungs, explicitly, through the mask: drn 1 survives, drn 7
         // does not, and no rung above 7 does either.
-        let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+        let mask = apply_ceiling(JA_MASK_ALL, measured);
         assert_eq!(mask & (1 << 0), 1 << 0, "24 000 was masked out");
         assert_eq!(mask & (1 << 6), 0, "32 000 survived the ceiling");
         assert_eq!(mask & !((1 << 7) - 1), 0, "a rung above 32 000 survived");
@@ -765,7 +1374,7 @@ mod tests {
     #[test]
     fn the_32_000_measurement_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_32, 16);
-        let ceiling = ceiling_rung(measured, lc_for).expect("the fallback is still a rung");
+        let ceiling = ceiling_rung(measured).expect("the fallback is still a rung");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_32} index-step residual");
         assert!(ceiling >= 1, "the measurement refuses even 24 000, which the call went on to use");
         // On the reference grid the same absolute residual is half as many
@@ -782,15 +1391,28 @@ mod tests {
         for step in 0..40 {
             let steps = 0.005 * f64::from(step);
             let measured = Sigma::reading(steps, REFERENCE_LC);
-            let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+            let mask = apply_ceiling(JA_MASK_ALL, measured);
             for drn in 1..=UP_RATES as u8 {
                 let permitted = mask & (1 << (drn - 1)) != 0;
-                let error = measured.error(lc_for(drn));
+                // The rung's own worst interval, which is what the scan prices.
+                let error = measured.error(points(drn));
+                let budget = threshold(drn);
+                // The permission *is* the scan's comparison, and it is at least
+                // as strict as the error probability -- the gap correction only
+                // tightens -- so a permitted rung never misses the target and a
+                // refused one is refused on a number that is not looser than
+                // the model.
                 assert_eq!(
                     permitted,
-                    error <= TARGET * 1.001,
-                    "drn {drn} at sigma {steps}: permitted {permitted} with a predicted {error:e}"
+                    steps <= budget,
+                    "drn {drn} at sigma {steps}: permitted {permitted} against {budget:.4}"
                 );
+                if permitted {
+                    assert!(
+                        error <= TARGET * 1.001,
+                        "drn {drn} at sigma {steps} was permitted with a predicted {error:e}"
+                    );
+                }
             }
         }
     }
@@ -808,9 +1430,9 @@ mod tests {
                 for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
                     let measured = Sigma { bound, ..Sigma::reading(steps, REFERENCE_LC) };
                     let allowed = if mask == 0 { JA_MASK_ALL } else { mask };
-                    let out = apply_ceiling(mask, measured, lc_for);
+                    let out = apply_ceiling(mask, measured);
                     assert_eq!(out & !allowed, 0, "mask {mask:#b} at sigma {steps} grew to {out:#b}");
-                    assert!(out & !ceiling_mask(ceiling_rung(measured, lc_for)) == 0);
+                    assert!(out & !ceiling_mask(ceiling_rung(measured)) == 0);
                     if out & !mask != 0 {
                         // Only possible through the zero-means-every-rung rule.
                         assert_eq!(mask, 0);
@@ -825,19 +1447,58 @@ mod tests {
         assert!(rose > 0, "the zero-mask case was not exercised");
     }
 
-    /// A lower bound on the residual is optimistic, so it is spent at the
-    /// slowest rung: it can never justify anything faster, and a lower bound
-    /// that already refuses 24 000 refuses everything.
+    /// **The rule the scan exists for, both ways.**
+    ///
+    /// Above a rung's threshold that rung is *refused* and the granted `drn` is
+    /// what it was before the scan existed -- today's 0.0690 measures drn 1 and
+    /// nothing higher, and the ladder must not move on it. Below the threshold
+    /// the rung rises to the highest one whose threshold the measurement meets,
+    /// which is the scan doing what the short-circuit could not do at all.
     #[test]
-    fn a_lower_bound_only_reaches_the_slowest_rung() {
-        let clean = Sigma::lower(1e-6, 8);
-        assert_eq!(ceiling_rung(clean, lc_for), Some(1), "a lower bound justified more than the slowest rung");
-        let dirty = Sigma::lower(1.0, 8);
-        assert_eq!(ceiling_rung(dirty, lc_for), None);
-        // The same numbers read as a reading or as an upper bound go all the
-        // way up the ladder, which is the difference the bound makes.
-        assert_eq!(ceiling_rung(Sigma::reading(1e-6, 8), lc_for), Some(UP_RATES as u8));
-        assert_eq!(ceiling_rung(Sigma::absolute(0.0, Bound::Upper), lc_for), Some(UP_RATES as u8));
+    fn the_scan_refuses_above_a_threshold_and_grants_below_it() {
+        // The ticket's two-sided rule, named after it: `drn 2` = 25 333 has a
+        // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
+        let above = Sigma::lower(0.0690, REFERENCE_LC);
+        assert_eq!(ceiling_rung(above), Some(1), "0.0690 was allowed past drn 1");
+        assert!(0.0690 > threshold(2), "the threshold the refutation rests on moved");
+        println!("drn 2 threshold {} at 0.0690 -> {:?}", threshold(2), ceiling_rung(above));
+
+        // Just inside it, drn 2 is carried -- and so is every rung at or under
+        // the same threshold, which is the highest rung the measurement meets.
+        let below = Sigma::lower(0.0344 * 0.999, REFERENCE_LC);
+        let granted = ceiling_rung(below).expect("0.0339 must carry a rung");
+        assert!(granted >= 2, "drn 2 was refused at 0.0339: {granted}");
+        let expected = (1..=UP_RATES as u8).rev().find(|&drn| 0.0344 * 0.999 <= threshold(drn));
+        assert_eq!(Some(granted), expected, "the scan did not take the highest rung met");
+        println!("0.0339 -> drn {granted} ({})", up_rate(granted));
+
+        // A bound does not change the scan any more: the same number is the same
+        // rung whether it is called a reading or a lower bound. What the bound
+        // still does is travel in the log (`docs/242` sec 4).
+        for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
+            let measured = Sigma { bound, ..Sigma::reading(0.0344 * 0.999, REFERENCE_LC) };
+            assert_eq!(ceiling_rung(measured), Some(granted), "{bound:?} read differently");
+        }
+        let dirty = Sigma::lower(1.0, REFERENCE_LC);
+        assert_eq!(ceiling_rung(dirty), None, "a measurement that refuses 24 000 must refuse all");
+    }
+
+    /// The thresholds reproduce `docs/240` sec 3c's verified column, which is
+    /// what stops a later reader from rounding the rung above 24 000 back to the
+    /// mean-square model.
+    #[test]
+    fn the_thresholds_are_the_gap_corrected_ones() {
+        for (drn, want) in [(1u8, 0.0861), (2, 0.0344), (7, 0.0344), (13, 0.0172), (19, 0.0043)] {
+            let got = threshold(drn);
+            assert!((got - want).abs() < 5e-4, "drn {drn}: {got:.4} against {want}");
+        }
+        // 349 LSB is one index step at LC 8 (`docs/241` sec 0).
+        assert!((index_step_lsb() - 349.0).abs() < 1.0, "{}", index_step_lsb());
+        // 25 333's worst interval is 16 points, and an 8-point reading of the
+        // same rung would be 2.7x too generous.
+        assert_eq!(points(2), 16, "25 333's widest interval");
+        assert_eq!(points(1), 8);
+        assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the mean-square model is not tighter");
     }
 
     /// The wiring's own input: a design and a noise figure give an *upper* bound
@@ -858,7 +1519,7 @@ mod tests {
         let mut previous = u8::MAX;
         for exp in (0..12).rev() {
             let noise = 10f64.powi(-exp);
-            let ceiling = ceiling_rung(Sigma::from_design(&design, noise), lc_for).unwrap_or(0);
+            let ceiling = ceiling_rung(Sigma::from_design(&design, noise)).unwrap_or(0);
             assert!(ceiling <= previous, "noise {noise:e} gave {ceiling} after {previous}");
             previous = ceiling;
         }
@@ -878,8 +1539,8 @@ mod tests {
         for (text, lc, recorded) in [TWENTY_FOUR, THIRTY_TWO] {
             let measured = sigma_from_stream(text, lc).expect("a score run");
             assert_eq!(measured.bound(), Bound::Reading);
-            let ceiling = ceiling_rung(measured, lc_for).expect("the slowest rung survives both");
-            let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+            let ceiling = ceiling_rung(measured).expect("the slowest rung survives both");
+            let mask = apply_ceiling(JA_MASK_ALL, measured);
             println!(
                 "recorded at drn {recorded} (LC {lc}): sigma {:.4} index steps, {:.4} on the LC = 8 grid, \
                  ceiling drn {ceiling}, mask {mask:#b}",
@@ -908,6 +1569,309 @@ mod tests {
         assert!((3.0..3.3).contains(&ratio), "{ratio}");
     }
 
+    /// One reading, with the level named and the gain the reciprocal of the
+    /// level the design's points are meant to arrive at (`1/G`).
+    fn reading(drn: u8, level_lsb: f64, bin: f64, crossing: f64, symbols: u64) -> Reading {
+        let lc = lc_for(drn);
+        Reading {
+            drn,
+            lc,
+            min_gap_lsb: crate::v92::codegrid::min_gap(
+                &crate::v92::codegrid::grid(points(drn)).expect("the builder's set"),
+            ),
+            level_lsb,
+            gain: 1.0 / ideal_level(drn),
+            bin,
+            crossing,
+            symbols,
+        }
+    }
+
+    /// The level at which the design's own codes arrive as the levels they are,
+    /// to the figures `docs/253` sec 1.2 computed. Written out rather than
+    /// derived from `gain_for` so the test is against a181's reported numbers.
+    fn ideal_level(drn: u8) -> f64 {
+        match lc_for(drn) {
+            8 => 1620.1,
+            16 => 1640.3,
+            32 => 1607.1,
+            _ => 1627.0,
+        }
+    }
+
+    /// The instrument switch: the crossing binds at `drn 1 ... 8`, the bin error
+    /// rate from `drn 9`. `drn 9` is where the design's gap has come down to
+    /// 64 LSB and the failing decision is the adjacent code, which the crossing
+    /// -- a displacement of half a chord's step -- cannot resolve.
+    #[test]
+    fn the_bin_error_rate_binds_from_drn_9_and_the_crossing_below_it() {
+        for drn in 1..=UP_RATES as u8 {
+            let want = if drn >= FIRST_BIN_DRN { Instrument::Bin } else { Instrument::Crossing };
+            assert_eq!(Instrument::for_rung(drn), want, "drn {drn}");
+        }
+        assert_eq!(Instrument::for_rung(8), Instrument::Crossing);
+        assert_eq!(Instrument::for_rung(9), Instrument::Bin);
+        // The two names are what the log prints, so they are pinned.
+        assert_eq!(Instrument::Crossing.name(), "crossing");
+        assert_eq!(Instrument::Bin.name(), "bin");
+    }
+
+    /// The switch is a decision and not a decoration. `docs/253` sec 2's own
+    /// case -- a clean crossing and a 0.2 % bin rate -- is refused at `drn 9`
+    /// on the bin rate. And the crossing is *not consulted* above `drn 8`: the
+    /// same crossing rate that refuses at `drn 8` is granted at `drn 9` when the
+    /// bin rate is clean, because there the crossing is saturated.
+    #[test]
+    fn the_bin_rate_binds_at_drn_9_and_the_crossing_is_not_read_above_it() {
+        let nine = reading(9, ideal_level(9), 2e-3, 0.0, 2_448);
+        match admit(&nine) {
+            Verdict::Rate { instrument, rate, target } => {
+                assert_eq!(instrument, Instrument::Bin);
+                assert_eq!(rate, 2e-3);
+                assert_eq!(target, TARGET);
+            }
+            other => panic!("drn 9 at 0.2 % bin: {other:?}"),
+        }
+        // The same reading one rung lower: the bin rate still refuses, because
+        // the low rungs keep the bin rate as a second, necessary check.
+        let eight = reading(8, ideal_level(8), 2e-3, 0.0, 2_448);
+        assert_eq!(admit(&eight).instrument(), Some(Instrument::Bin));
+        assert!(!admit(&eight).granted());
+        // A crossing over the target with a clean bin rate is the switch's two
+        // sides: refused at 8, granted at 9.
+        let eight_cross = reading(8, ideal_level(8), 0.0, 2e-3, 2_448);
+        assert!(matches!(
+            admit(&eight_cross),
+            Verdict::Rate { instrument: Instrument::Crossing, .. }
+        ));
+        let nine_cross = reading(9, ideal_level(9), 0.0, 2e-3, 2_448);
+        assert!(admit(&nine_cross).granted(), "the crossing is not read at drn 9");
+        assert_eq!(admit(&nine_cross).instrument(), Some(Instrument::Bin));
+    }
+
+    /// Two-sided, at the boundary: a rate exactly at the target grants, one part
+    /// in `10^9` over it refuses. The comparison is the rate against the
+    /// standard's target and nothing else.
+    #[test]
+    fn the_rate_is_compared_with_the_target_on_both_sides() {
+        let at = reading(19, ideal_level(19), TARGET, 0.0, 2_448);
+        assert!(admit(&at).granted(), "at the target");
+        let over = reading(19, ideal_level(19), TARGET * 1.000_000_001, 0.0, 2_448);
+        assert!(!admit(&over).granted(), "over the target");
+        assert!(matches!(admit(&over), Verdict::Rate { instrument: Instrument::Bin, .. }));
+        // And the low-rung instrument is two-sided the same way.
+        let low_at = reading(1, ideal_level(1), 0.0, TARGET, 1_224);
+        assert!(admit(&low_at).granted());
+        let low_over = reading(1, ideal_level(1), 0.0, TARGET * 2.0, 1_224);
+        assert_eq!(admit(&low_over).instrument(), Some(Instrument::Crossing));
+        assert!(!admit(&low_over).granted());
+    }
+
+    /// The discriminator this ticket creates: `drn 19` is refused when the far
+    /// end's level is not `1/G`, **even when its rate is clean**, because the
+    /// reading then describes a far end we did not ask for. `docs/253` sec 3's
+    /// `--lu 2100` is that case: 29 % high, and its own 9.62 % bin rate is a
+    /// second, independent refusal.
+    #[test]
+    fn drn_19_is_refused_when_the_far_end_is_not_at_one_over_g() {
+        let at = reading(19, 1_627.0, 0.0, 0.0, 2_448);
+        assert!(admit(&at).granted(), "1/G at a clean rate: {at:?}");
+        let high = reading(19, 2_100.0, 0.0, 0.0, 2_448);
+        match admit(&high) {
+            Verdict::Level { level_lsb, wanted, delta, plus, minus } => {
+                assert_eq!(level_lsb, 2_100.0);
+                assert!((wanted - 1_627.0).abs() < 0.05, "wanted {wanted}");
+                assert!((delta - 0.2907).abs() < 1e-3, "delta {delta}");
+                assert!((plus - 0.017).abs() < 1e-12, "the measured + side: {plus}");
+                assert!((minus - 0.014).abs() < 1e-12, "the measured - side: {minus}");
+            }
+            other => panic!("2100 LSB is not 1/G: {other:?}"),
+        }
+        // And the refusal is not a rate result: the level is checked first, so a
+        // clean reading at the wrong level cannot be reported as a grant.
+        assert_eq!(admit(&high).instrument(), None);
+        // The tolerance is the *measured* one, and it is no longer the design's
+        // half-gap: 0.5 x 16 LSB was 8 LSB, the measurement gives 27.7 LSB up.
+        assert!((at.tolerance().plus - 0.017).abs() < 1e-12, "{:?}", at.tolerance());
+        assert!((at.tolerance().plus * at.wanted_level() - 27.66).abs() < 0.02);
+        assert!(at.tolerance().plus * at.wanted_level() > 3.0 * 8.0, "the old rule was 3.1x too tight");
+        assert!((reading(1, 1_620.1, 0.0, 0.0, 1_224).tolerance().plus - 0.030).abs() < 1e-12);
+    }
+
+    /// **The two-sided test the replacement has to pass**, in `docs/261` sec 4's
+    /// own units: at every rung, the level the measurement calls *fatal* is
+    /// refused and the level it calls *fine* is granted.
+    ///
+    /// Fatal is the crossing minus nothing -- the first δ at which a bin error
+    /// appears; fine is one grid step (0.1 %) inside it, which is the level the
+    /// whole table of §2 reads 0.00 % at.
+    #[test]
+    fn the_measured_tolerance_refuses_what_is_fatal_and_grants_what_is_fine() {
+        // (rung, first error high, first error low, fine high, fine low)
+        let rows = [
+            // 1 and 2 have no fatal δ inside the sweep, so their row's fatal
+            // value is the tolerance itself and the *fine* check is the whole
+            // test: nothing in ±3 % moves a code at all.
+            (3, 0.026, 0.025, 0.025, 0.024),
+            (8, 0.026, 0.025, 0.025, 0.024),
+            (9, 0.018, 0.020, 0.017, 0.019),
+            (15, 0.019, 0.020, 0.017, 0.019),
+            (18, 0.019, 0.020, 0.017, 0.019),
+            (19, 0.018, 0.015, 0.017, 0.014),
+        ];
+        for (drn, fatal_high, fatal_low, fine_high, fine_low) in rows {
+            let wanted = ideal_level(drn);
+            let at = |delta: f64| reading(drn, wanted * (1.0 + delta), 0.0, 0.0, 416);
+            // Fine: granted, at a clean rate.
+            // 0.1 % of slack so that a value *at* the tolerance is not decided
+            // by the last bit of a float: the table is a grid, not an equality.
+            assert!(admit(&at(fine_high * 0.999)).granted(), "drn {drn}: +{fine_high} refused");
+            assert!(admit(&at(-fine_low * 0.999)).granted(), "drn {drn}: -{fine_low} refused");
+            // Fatal: refused on the level, with the number.
+            for delta in [fatal_high, -fatal_low] {
+                let verdict = admit(&at(delta));
+                assert!(!verdict.granted(), "drn {drn}: {delta} granted");
+                assert!(matches!(verdict, Verdict::Level { .. }), "drn {drn}: {delta} refused on {:?}", verdict.instrument());
+            }
+        }
+        // `drn 1` and `drn 2` are granted the whole swept range and no more:
+        // granting past it would be a claim the measurement does not make.
+        for drn in [1u8, 2] {
+            let wanted = ideal_level(drn);
+            assert!(admit(&reading(drn, wanted * 1.029, 0.0, 0.0, 416)).granted(), "drn {drn} at +2.9 %");
+            assert!(admit(&reading(drn, wanted * 0.971, 0.0, 0.0, 416)).granted(), "drn {drn} at -2.9 %");
+            assert!(!admit(&reading(drn, wanted * 1.035, 0.0, 0.0, 416)).granted(), "drn {drn} past the sweep");
+        }
+        // And the asymmetry is real, not decoration: drn 19's low side is
+        // tighter than its high side, drn 9's high side is tighter than its low.
+        assert!(tolerance(19).minus < tolerance(19).plus);
+        assert!(tolerance(9).plus < tolerance(9).minus);
+    }
+
+    /// **The decision this ticket exists for.** At the far end's measured 2.2 %
+    /// the level precondition grants `drn 1 ... 8` and refuses `drn 9 ... 19`,
+    /// so the highest rung the ladder grants is `drn 8` = 33 333 bit/s -- with
+    /// no rate window at all, which is what a `CPd` has to be decided on
+    /// (`docs/261` sec 3, `docs/264` sec 1).
+    #[test]
+    fn at_the_measured_two_point_two_per_cent_the_ladder_grants_drn_8() {
+        let mut highest = None;
+        let mut line = String::new();
+        for drn in 1..=UP_RATES as u8 {
+            let wanted = ideal_level(drn);
+            let reading = reading(drn, wanted * 1.022, 0.0, 0.0, 0);
+            if admit(&reading).granted() {
+                highest = Some(drn);
+                line = reading.line(admit(&reading));
+            }
+        }
+        assert_eq!(highest, Some(8), "2.2 % must buy drn 8 and no more");
+        assert_eq!(up_rate(8), 33_333);
+        // The grant is honest about *what* it was taken on.
+        assert!(line.contains("instrument=level"), "{line}");
+        assert!(line.contains("rate=n/a"), "{line}");
+        assert!(line.contains("delta=+2.20%"), "{line}");
+        assert!(line.contains("GRANT(level only"), "{line}");
+        // And the first refusal says which number refused it.
+        let refused = reading(9, ideal_level(9) * 1.022, 0.0, 0.0, 0);
+        let text = refused.line(admit(&refused));
+        assert!(text.contains("REFUSE(level +2.20% high"), "{text}");
+        assert!(text.contains("+1.7%/-1.9% allowed"), "{text}");
+        // 1.7 % buys the top rung, which is the other side of the same test:
+        // the old 0.5 x gap rule floored this at drn 14 (docs/261 sec 3).
+        assert!(admit(&reading(19, ideal_level(19) * 1.017, 0.0, 0.0, 0)).granted());
+        assert!(admit(&reading(15, ideal_level(15) * 1.017, 0.0, 0.0, 0)).granted());
+    }
+
+    /// **The cap this ticket exists for.** Every instrument at its most
+    /// generous -- the level exactly on the design's own `1/G`, and no `B1u`
+    /// index errors over a window long enough to resolve [`TARGET`] -- grants
+    /// all nineteen rungs, and the live decision still grants `drn 1` and
+    /// nothing above it: no bit above [`MEASURED_WORKING_MAX_DRN`] survives
+    /// `cap_to_measured` for **any** mask, and `choose` can only return a rung
+    /// whose bit is set in the mask it is handed (`upchoice.rs:262-265`).
+    ///
+    /// The instruments are kept and still say what they say; what the cap takes
+    /// away is the licence to *spend* their grant above what the bench has
+    /// carried data on (`docs/266` sec 4, `docs/269` sec 3).
+    #[test]
+    fn the_granted_rung_never_exceeds_the_measured_maximum() {
+        // The instruments, at their most generous.
+        let mut granted = 0u32;
+        for drn in 1..=UP_RATES as u8 {
+            let reading = reading(drn, ideal_level(drn), 0.0, 0.0, 2_448);
+            let verdict = admit(&reading);
+            assert!(
+                verdict.granted(),
+                "drn {drn} at the design's own level: {}",
+                reading.line(verdict)
+            );
+            granted |= 1 << (drn - 1);
+        }
+        assert_eq!(granted, JA_MASK_ALL, "every instrument grants every rung");
+        assert_eq!(highest_rung(granted), Some(UP_RATES as u8));
+        // The cap, on the same grant.
+        assert_eq!(MEASURED_WORKING_MAX_DRN, 1);
+        assert_eq!(measured_mask(), 1);
+        assert_eq!(cap_to_measured(granted), 1);
+        assert_eq!(highest_rung(cap_to_measured(granted)), Some(1));
+        // And not for one mask but for every mask there is.
+        let ceiling = (1u32 << MEASURED_WORKING_MAX_DRN) - 1;
+        for mask in 0..(1u32 << UP_RATES) {
+            assert_eq!(
+                cap_to_measured(mask) & !ceiling,
+                0,
+                "mask {mask:#07x} carried a rung above the cap"
+            );
+        }
+        // The cap is visible in the log, and it names the grant it overrides.
+        let line = cap_line(granted);
+        for wanted in [
+            "capped",
+            "MEASURED_WORKING_MAX_DRN = 1",
+            "from drn 19",
+            "to drn 1",
+            "18 rung(s) removed",
+            "mask 0x7ffff",
+            "docs/266",
+            "docs/269",
+            "Do not raise the cap",
+        ] {
+            assert!(line.contains(wanted), "{line} does not carry {wanted}");
+        }
+        // A mask at or below the cap loses nothing, and the line still prints --
+        // a call's log states the cap rather than implying it.
+        assert_eq!(cap_to_measured(1), 1);
+        assert!(cap_line(1).contains("0 rung(s) removed"), "{}", cap_line(1));
+        // And nothing granted stays nothing: the cap does not invent a rung.
+        assert_eq!(cap_to_measured(0), 0);
+        assert_eq!(highest_rung(0), None);
+    }
+
+    /// A grant's honesty is its resolution: the target is `1e-7` and a 2 448
+    /// symbol window cannot see below `4.1e-4`, so "no errors" is evidence of a
+    /// rate under `1/symbols` and not of the target. The line prints both, and
+    /// the line names the instrument and the level precondition.
+    #[test]
+    fn a_grant_states_its_resolution_and_which_instrument_bound() {
+        let clean = reading(19, 1_627.0, 0.0, 0.0, 2_448);
+        let verdict = admit(&clean);
+        assert!(verdict.granted());
+        assert!(clean.resolution() > TARGET, "{} is coarser than {TARGET:e}", clean.resolution());
+        assert!((clean.resolution() - 1.0 / 2_448.0).abs() < 1e-12);
+        let line = clean.line(verdict);
+        for wanted in ["instrument=bin", "rate=0.0000e0", "symbols=2448", "resolution=4.08e-4", "1/G=1627.0", "GRANT"] {
+            assert!(line.contains(wanted), "{line} does not carry {wanted}");
+        }
+        let refused = reading(19, 2_100.0, 0.0, 0.0, 2_448);
+        assert!(refused.line(admit(&refused)).contains("REFUSE"));
+        // A rate the instrument cannot resolve is not a grant: one error in the
+        // window is `4.1e-4`, four thousand times the target.
+        let one = reading(19, 1_627.0, 1.0 / 2_448.0, 0.0, 2_448);
+        assert!(!admit(&one).granted());
+        assert!(matches!(admit(&one), Verdict::Rate { instrument: Instrument::Bin, .. }));
+    }
+
     /// A stream with no `score` lines, or one that is not a level stream at all,
     /// measures nothing rather than measuring zero.
     #[test]
@@ -920,7 +1884,7 @@ mod tests {
         let clean = format!("1 {g:.17} score\n2 {:.17} score\n3 {:.17} score\n", -3.0 * g, 5.0 * g);
         let clean = sigma_from_stream(&clean, REFERENCE_LC).expect("a score run");
         assert!(clean.steps() < 1e-12, "{}", clean.steps());
-        assert_eq!(ceiling_rung(clean, lc_for), Some(UP_RATES as u8));
+        assert_eq!(ceiling_rung(clean), Some(UP_RATES as u8));
         // And the mode is what selects the window: the same levels as `data` are
         // not a measurement.
         assert!(sigma_from_stream("1 0.5 data\n", 8).is_none());

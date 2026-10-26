@@ -599,3 +599,55 @@ fn when_one_end_hangs_up_the_other_notices() {
         assert!(said.contains("NO CARRIER"), "host hangs up {host_hangs_up}: {said:?}");
     }
 }
+
+/// V.42 8.7.2 through a retrain: a call put down while the line is being
+/// rebuilt still announces itself with a DISC.
+///
+/// The DISC cannot go out until phase 4 has given the transmitter a bit
+/// stream back, so the release waits for that instead of concluding on the
+/// first sample. It used to conclude at once -- "DISC timeout after 0 retries;
+/// 0 DISC sent" -- and bring the carrier down with the frame still queued,
+/// which left the far end with a carrier that stopped: the one outcome the
+/// DISC exists to prevent, reported as a timeout that never happened.
+#[test]
+fn a_hang_up_during_a_retrain_still_sends_the_disc() {
+    let mut pair = connected_pair();
+    assert_eq!(pair.caller.compression_name(), Some("V.44"), "V.42 was not up");
+    // The far end retrains (V.90 9.5.1), and the terminal is put down in the
+    // middle of it: the data mode is gone, so nothing on the line can carry a
+    // DISC at that instant.
+    pair.caller.ask_for_retrain();
+    pair.run(0.4);
+    assert!(
+        pair.caller.retraining(),
+        "the caller never saw the retrain: phase {}",
+        pair.caller.line_phase()
+    );
+    pair.caller.hang_up();
+    pair.caller_said.extend(pair.caller.take_dte());
+    let said = String::from_utf8_lossy(&pair.caller_said).into_owned();
+    assert!(said.contains("OK"), "the terminal was not answered at once: {said:?}");
+    // The carrier is still up: the DISC is queued and waiting for the line.
+    assert_ne!(pair.caller.state(), State::Command, "the carrier went with the line down");
+
+    let waited = run_until(&mut pair, 40.0, |p| p.caller.state() == State::Command);
+    // One UA's worth of line after the end, so the far end has read its own
+    // answer before it is asked what it made of the call.
+    pair.run(0.25);
+    let notes = pair.caller.take_line_notes().join(" | ");
+    let what = format!(
+        "after {waited:.2} s the caller is {:?}, notes {notes:?}, the far end's excuse {:?}",
+        pair.caller.state(),
+        pair.host.ended_because()
+    );
+    assert_eq!(pair.caller.state(), State::Command, "{what}");
+    // A DISC went out: at least one, and never the report of a goodbye that
+    // was never attempted.
+    assert!(notes.contains("hang-up: DISC"), "{what}");
+    assert!(!notes.contains("0 DISC sent"), "{what}");
+    assert!(!notes.contains("0 retries"), "{what}");
+    // Which is the whole point: the far end read a goodbye, not a carrier
+    // that stopped. A far end left without one reports a fault -- V.42 has no
+    // other way to tell a hang-up from a cut line.
+    assert_eq!(pair.host.ended_because(), Some(Ended::PeerCleared), "{what}");
+}

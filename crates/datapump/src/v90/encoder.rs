@@ -96,6 +96,24 @@ impl Mapping {
         })
     }
 
+    /// The highest-power Ucode that every one of the six constellations has.
+    ///
+    /// One derivation, in the object that owns the level table, so that nothing
+    /// needing "a point legal in all six intervals" can hand-derive one and
+    /// drift from [`Mapping::sets`]. `Constellation::points()` is sorted
+    /// loudest first (`v90.txt:654-656`, "label 0 ... largest"), so the first
+    /// member of `sets[0]` that all six hold is the loudest common one -- the
+    /// maximum over the intersection by [`super::ucode::linear`], which is what
+    /// `docs/221`'s test asserts independently.
+    ///
+    /// `None` when the six sets are disjoint, which 5.4.3's inequality should
+    /// already have refused.
+    #[must_use]
+    pub fn common_loudest(&self) -> Option<u8> {
+        let rest = &self.sets[1..];
+        self.sets[0].points().iter().copied().find(|&u| rest.iter().all(|s| s.points().contains(&u)))
+    }
+
     /// The moduli these constellations give (5.4.3: "Mi is equal to the number
     /// of members in the PCM code sets").
     pub fn moduli(&self) -> Moduli {

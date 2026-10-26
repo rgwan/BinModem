@@ -1251,3 +1251,93 @@ mod tests {
         assert_eq!(got[..], sent[..got.len()]);
     }
 }
+
+/// A test-only handle on the V.90 **transmit path**, for the differential
+/// harness of `docs/221`.
+///
+/// The harness's whole claim is "the V.92 transmitter emits what the V.90
+/// transmitter emits for the same signal", and that claim is only worth
+/// anything if it is made against the V.90 transmitter itself rather than
+/// against a re-derivation of it. [`Source`] is private to this module, so the
+/// harness could not reach it; this exposes exactly the setters a test needs
+/// and nothing else. Not compiled into the modem.
+#[cfg(test)]
+pub(crate) mod probe {
+    use super::*;
+
+    pub(crate) struct Tx(Source);
+
+    impl Tx {
+        pub(crate) fn new(law: Law, uinfo: u8, trn1d: f64) -> Self {
+            Self(Source::new(law, uinfo, Jd::default(), trn1d))
+        }
+
+        /// CPt, read as `heard_cp` reads it (`v90/digital.rs:1090`).
+        pub(crate) fn set_cpt(&mut self, cp: &Cp) -> bool {
+            match Mapping::from_cp(cp) {
+                Some(m) => {
+                    self.0.training = Some(m);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// CP, read as `heard_cp` reads it (`v90/digital.rs:1104-1110`), with
+        /// `Rd`'s twelve codewords out of it exactly as `begin_renegotiation`
+        /// derives them (`v90/digital.rs:826`).
+        pub(crate) fn set_cpu(&mut self, cp: &Cp) -> bool {
+            match Mapping::from_cp(cp) {
+                Some(m) => {
+                    self.0.data_mode = Some(m);
+                    self.arm_rd(cp);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// `Rd`'s codewords only: "the highest power PCM codeword from the
+        /// data mode constellation of each data frame interval" (8.6.4).
+        pub(crate) fn arm_rd(&mut self, cp: &Cp) {
+            self.0.r_codes = std::array::from_fn(|i| cp.points(i).last().copied().unwrap_or(0));
+        }
+
+        /// A DIL descriptor, as `heard_ja` installs one (`v90/digital.rs:1062`).
+        pub(crate) fn set_dil(&mut self, d: &Descriptor) {
+            self.0.dil = d.symbols().collect();
+            let mut end = 0;
+            self.0.dil_ends =
+                d.ucodes.iter().map(|&u| { end += d.segment_length(u); end }).collect();
+        }
+
+        /// Start a named signal now, as the call would ask for it.
+        pub(crate) fn change(&mut self, signal: &str) -> bool {
+            let out = match signal {
+                "Sd" => Out::Sd,
+                "Trn1d" => Out::Trn1d,
+                "Dil" => Out::Dil,
+                "Ri" => Out::Ri,
+                "RiBar" => Out::RiBar,
+                "Rd" => Out::Rd,
+                "RdBar" => Out::RdBar,
+                "Trn2d" => Out::Trn2d,
+                "Ed" => Out::Ed,
+                "B1d" => Out::B1d,
+                _ => return false,
+            };
+            match self.0.out {
+                // Off silence the call starts the signal at once; asking for
+                // it and then taking a symbol would eat that symbol.
+                Out::Silence => self.0.start(out),
+                _ => self.0.change(out),
+            }
+            true
+        }
+
+        /// `n` symbols off the line.
+        pub(crate) fn symbols(&mut self, n: usize) -> Vec<f64> {
+            (0..n).map(|_| self.0.next()).collect()
+        }
+    }
+}

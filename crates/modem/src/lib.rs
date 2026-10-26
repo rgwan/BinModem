@@ -1007,6 +1007,13 @@ enum Disc {
     Acked,
     /// N400 DISC commands went unanswered: it will not know.
     Timeout,
+    /// The line went before the first DISC could be put on it.
+    ///
+    /// Not a timeout, and not [`Self::NotConnected`] either: V.42 was up and
+    /// the DISC was queued, but nothing ever carried it. A retrain holding
+    /// the data mode down while the call is put down is how this happens, and
+    /// "0 retries" there is a claim about an attempt that was never made.
+    Unsent,
     /// V.42 was not up, so there was nothing to announce it with.
     NotConnected,
     /// The far end's own DISC, answered with a UA before the carrier went.
@@ -1154,14 +1161,6 @@ impl Modem {
             self.drop_call();
             return;
         }
-        // A retrain takes the line away for seconds and freezes T401 with it
-        // (see `Self::tick`), so waiting on the release through one would
-        // wait for ever. The far end is being told the same thing by the
-        // line's own silence.
-        let retraining = self
-            .pump
-            .as_ref()
-            .is_some_and(|p| matches!(p.status(), Progress::Retraining));
         let Some(ec) = self.ec.as_ref() else {
             // No stack to ask: whatever happened, no DISC was acknowledged.
             self.note_hang_up(Disc::Timeout, 0, pending.symbols);
@@ -1170,7 +1169,25 @@ impl Modem {
             return;
         };
         let (outcome, attempts) = match ec.release() {
-            Some(ec::stack::Release::Asking { attempts }) if !retraining => return,
+            // A release is waited on, retrain or no retrain. It used to be
+            // abandoned the moment a retrain was under way -- "a retrain takes
+            // the line away for seconds and freezes T401 with it" -- and the
+            // carrier went with the DISC still queued: the far end was then
+            // left with a carrier that stopped, which is the one outcome the
+            // DISC exists to prevent, and the log said "0 retries" about an
+            // attempt that was never made.
+            //
+            // Nothing on a retrain makes this unbounded. A release ends on the
+            // UA or the DM that answers the DISC (8.7.2), on N400 of them
+            // going unanswered (8.7.3), or -- while a retrain holds the data
+            // mode down -- on the retrain ending, one way or the other: a
+            // pump that comes back to data mode hands the stack a bit stream
+            // and the queued DISC goes out then, and a retrain that fails
+            // reports `Failed` and ends the call (see `Self::watch_for_retrain`
+            // and `Self::carry_data`). A call that has genuinely re-established
+            // data mode can therefore hang up cleanly, which is the whole of
+            // what 8.7.2 asks of it.
+            Some(ec::stack::Release::Asking { .. }) => return,
             Some(ec::stack::Release::Acked { attempts }) => (Disc::Acked, attempts),
             // Nothing answered it, or the line went away underneath the wait
             // (a retrain freezes T401, so the wait cannot outlast one). Either
@@ -1178,7 +1195,7 @@ impl Modem {
             // many were tried.
             Some(ec::stack::Release::Asking { attempts })
             | Some(ec::stack::Release::Unanswered { attempts }) => (Disc::Timeout, attempts),
-            None => (Disc::Timeout, 0),
+            None => (Disc::Unsent, 0),
         };
         self.note_hang_up(outcome, attempts, pending.symbols);
         self.drop_call();
@@ -1269,6 +1286,7 @@ impl Modem {
             let what = match report.outcome {
                 Disc::Acked => "DISC acked".to_owned(),
                 Disc::Timeout => format!("DISC timeout after {} retries", report.attempts),
+                Disc::Unsent => "the line went before the first DISC could go out".to_owned(),
                 Disc::NotConnected => "not connected: no DISC".to_owned(),
                 Disc::PeerCleared => "peer DISC: UA answered, reason peer clear".to_owned(),
             };
@@ -1931,6 +1949,34 @@ impl Modem {
         // reason on its own.
         let wants_ec = (self.want_error_control || self.role == Role::Answering)
             && !matches!(self.pump, Some(Pump::Bell103(_)));
+        // 9.8: a rate renegotiation takes the data mode down and puts it back
+        // up again. If the terminal has not been told the call is up yet --
+        // the first data mode's CONNECT is still held while V.42's detection
+        // phase runs -- then the data mode that stack was negotiating over no
+        // longer exists: the line carries `SUVd`/`CPd` until 9.6.1.1.5's
+        // `B1d`, the detection phase can only fail, and the CONNECT it was
+        // holding would be released for a call that is mid-exchange. Withdraw
+        // both. 9.6.1.1.5 puts `Status::Connected` back when the renegotiation
+        // ends, and the arm below builds the stack and announces then.
+        //
+        // A call that was already connected before the renegotiation has no
+        // `announce` left to withdraw and is untouched, which is what 9.8 asks
+        // for: that call stays up throughout.
+        if self.announce.is_some()
+            && matches!(self.pump.as_ref().map(Pump::status), Some(Progress::Retraining))
+        {
+            if std::env::var_os("V92_EC_TRACE").is_some() {
+                eprintln!(
+                    "V92EC withdrawn at {:.2}s: a renegotiation took the data mode down \
+                     before the call was announced",
+                    self.call_samples as f64 / self.fs
+                );
+            }
+            self.announce = None;
+            self.ec = None;
+            self.recovered.clear();
+            return;
+        }
         // Announced but no stack yet: the CONNECT went out before the pump
         // reported connected, and returning here would skip the arm below that
         // builds the error-control stack. A V.92 call does exactly that -- its
@@ -2953,9 +2999,12 @@ impl Modem {
     fn hang_up_outcome(&self) -> (Disc, u32) {
         match self.ec.as_ref().and_then(Stack::release) {
             Some(ec::stack::Release::Acked { attempts }) => (Disc::Acked, attempts),
+            // Nothing was sent, so nothing was left unanswered: the line went
+            // while the first DISC was still queued.
+            Some(ec::stack::Release::Asking { attempts: 0 }) => (Disc::Unsent, 0),
             Some(ec::stack::Release::Asking { attempts })
             | Some(ec::stack::Release::Unanswered { attempts }) => (Disc::Timeout, attempts),
-            None => (Disc::Timeout, 0),
+            None => (Disc::Unsent, 0),
         }
     }
 

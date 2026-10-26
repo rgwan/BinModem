@@ -262,14 +262,45 @@ pub fn design(channel: &Channel, limits: &FilterLimits) -> Result<Design, &'stat
     // untouched.
     response.iter_mut().for_each(|value| *value /= unit);
     let mut z2: Vec<f64> = inverse.iter().map(|value| value / unit).collect();
-    // z2 is Q0.15, [-1, 1). A channel whose inverse needs more than that is
-    // answered by scaling the whole prefilter down and telling the rate
-    // choice, which folds the scale into G.
+    // 8.8.3 fixes `G` from what the *prefilter outputs*, and 6.4.2's `v(n)` is
+    // the section this CPd declares: for a data frame whose symbols are the
+    // level set, `ms(v) = ms(a) * sum z2^2`. A section of unit energy is
+    // therefore the one `G = 1/sqrt(ms(a))` is the gain for, and it is the
+    // section this design now puts out -- the whole section is normalised, not
+    // just the main tap.
+    //
+    // Nothing downstream moves with it: `p1` and `z1` are ratios of the
+    // response to itself (they were taken after `response` was divided by its
+    // main tap), `residual` is in units of that tap, and `delay` is where the
+    // tap sits. What the normalisation decides is only the amplitude the far
+    // end's `v` has, which is exactly the amplitude `G` is defined against --
+    // so a gain computed from `sent_prefilter_energy` (see `upchoice`) is the
+    // clause's `G` for the section actually sent, and `E[(G v)^2] = 1`.
+    let energy = z2.iter().map(|tap| tap * tap).sum::<f64>().sqrt();
+    if !(energy > 0.0) || !energy.is_finite() {
+        return Err("the prefilter has no energy to normalise against");
+    }
+    z2.iter_mut().for_each(|value| *value /= energy);
+    // Q0.15 is [-1, 1) and the field is the one thing a level cannot pay for.
+    // A section whose *peak* unit-energy tap will not fit is scaled down again
+    // -- a deep null wants taps larger than the field holds -- and that residue
+    // is `scale`: the rate choice sees the power it costs, and `G` picks it up
+    // (`upchoice::build_with` divides by the energy that was sent). The
+    // pure-delay case never reaches here; `collapse_pure_delay` sends `[1]`.
+    //
+    // `scale` is what the receiver has to normalise by: the ideal section has a
+    // unit main tap, so with the whole section divided by `energy/ the
+    // amplitude that arrives is `1/scale` of the levels. That number keeps the
+    // meaning it had before this normalisation -- the rate choice's noise term
+    // (`design.scale * design.scale * noise`) and the chain tests both read it
+    // as "what arrives, over what the levels are" -- and it is now the honest
+    // total divisor rather than only the Q0.15 part of it.
     let largest = z2.iter().fold(0.0f64, |a, &tap| a.max(tap.abs()));
-    let mut scale = 1.0;
-    if largest >= 0.99 {
-        scale = largest / 0.99;
-        z2.iter_mut().for_each(|value| *value /= scale);
+    let mut scale = energy;
+    if largest > TAP_HEADROOM {
+        let over = largest / TAP_HEADROOM;
+        scale *= over;
+        z2.iter_mut().for_each(|value| *value /= over);
     }
     let mut filters = Filters { z2, ..Filters::default() };
 
@@ -1076,6 +1107,8 @@ pub fn from_reading(reading: &Reading, limits: &FilterLimits) -> Result<(Design,
         least = least.min(tone.z_db);
     }
 
+    // No `p2`: this is a zero-phase FIR shaper and there is no pole to place.
+    // See `Filters::p2` and `docs/252` §2 -- `LP2 = 0` is declared, not left out.
     let filters = Filters { z1: Vec::new(), p1: Vec::new(), z2: taps, p2: Vec::new() };
     filters.fits(limits)?;
     let predicted = Predicted {

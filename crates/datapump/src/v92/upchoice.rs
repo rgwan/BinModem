@@ -374,43 +374,44 @@ fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) ->
     // That offset is what a live A/B has to settle, and it is why this is a
     // switch with the old set as its default rather than a new truth.
     let set = levelset.points(levels)?;
-    // 8.8.3 fixes G from the set's own mean square and from nothing else, so a
-    // change of shape moves G with it: the odd lattice's 0.1085 at LC = 8
-    // against the code ladder's 6.17e-4, with `ms(v G)` one either way. G is not
-    // a grid knob and is not used as one (docs/114 R8).
-    let gain = levelset.gain(&set);
-    if gain > GAIN_LARGEST {
-        // More power than CPd's field carries: the rung would go out quieter
-        // than the design asked for and every level would be off by that much.
-        // Refused rather than clamped.
-        return None;
-    }
     // 8.8.3: "The digital modem shall design the modulation parameters assuming
     // that, when the prefilter output multiplied by G has a mean-square value
-    // of 1, the analogue modem will transmit at the desired power." Read that
-    // as an equation and it fixes G: `ms(v G) = 1`, with `v` this design's own
-    // prefilter output. For a unit prefilter that is what `gain_for` already
-    // returns -- an eight-point set's mean square is eighty-five, and G is
-    // 1/sqrt(85) to nine figures.
+    // of 1, the analogue modem will transmit at the desired power." Read as an
+    // equation, that is `E[(G v)^2] = 1`, and `v` is 6.4.2's prefilter output --
+    // *the section this CPd declares*, not the unit section it would be
+    // convenient to have declared. For a data frame on the level set,
     //
-    // A design whose prefilter had to be scaled down to fit Q0.15 breaks it.
-    // The section is `scale` times smaller than the inverse it stands for, so
-    // keeping `ms(v G) = 1` needs G `scale` times *larger*, and on this harness
-    // `scale` is 12.586 (see `design()`'s `RIDGE`) against a field that carries
-    // 4G <= 0xFFFF, i.e. G <= 0.25. Twelve and a half times 0.1085 is 1.36.
+    //     ms(v) = ms(a) * sum z2(k)^2
     //
-    // So `V92_GAIN_SCALE=fold` cannot produce a legal CPd here, and the honest
-    // thing is to say so rather than to send a gain the far end will read as a
-    // different power. Folded, it is refused; unfolded, `G` describes a unit
-    // prefilter, which is exactly what `V92_PRE=none` tells the far end to run.
-    // Sending a real `z2` at this rate needs `design()` to produce a `scale` of
-    // about one, which is the transmit-power constraint the design has not got.
-    let design_gain = gain * design.scale.max(f64::MIN_POSITIVE);
-    let fold = std::env::var("V92_GAIN_SCALE").ok().as_deref() == Some("fold");
-    if fold && design_gain * crate::v92::GAIN_SCALE > f64::from(u16::MAX) {
+    // so the clause's gain is `1/sqrt(ms(a) sum z2^2)`: the set's own mean
+    // square, from `LevelSet::gain`, divided by the L2 norm of the `z2` that
+    // goes on the wire. Both halves are named quantities, and the second is
+    // [`crate::v92::sent_prefilter_energy`], which squares the Q0.15 *codes*
+    // rather than the design's floats -- the far end runs the codes.
+    //
+    // This replaces a `G` that was `1/sqrt(ms(a))` unconditionally -- the gain
+    // for a unit prefilter -- beside a `z2` that was not unit. That pairing
+    // satisfied `E[(G v)^2] = 1` only for a section of unit energy: a design
+    // scaled down to fit Q0.15 came out `scale^2` low in power, i.e. the far
+    // end transmitted `scale^2` quiet, and `docs/249` §3.2 is that finding.
+    // `fold` used to be an environment variable because the folded gain could
+    // not fit `4G <= 0xFFFF` at the old `scale`; that `scale` was the defect, so
+    // the fold is now unconditional and the field's own limit is the refusal.
+    let unit_gain = levelset.gain(&set);
+    let energy = crate::v92::sent_prefilter_energy(&design.filters.z2);
+    if !(energy > 0.0) || !energy.is_finite() {
+        // A section of no energy has no `v` to put a gain on: nothing about
+        // its power can be named, and a CPd full of zeros is not a prefilter.
         return None;
     }
-    let gain = if fold { design_gain } else { gain };
+    let gain = unit_gain / energy.sqrt();
+    if gain > GAIN_LARGEST {
+        // The gain this section needs does not fit bits 35:50. Refused rather
+        // than clamped: a clamped gain puts a quieter analogue modem on the
+        // wire than `E[(G v)^2] = 1` describes, which is the very mismatch this
+        // arithmetic exists to remove.
+        return None;
+    }
     if !(gain > 0.0) || gain * crate::v92::GAIN_SCALE < 1.0 {
         // A gain the field would round to nothing is not a gain.
         return None;
@@ -528,10 +529,16 @@ mod tests {
         // LC = 8 at 24 000, and the points are the odd lattice itself.
         assert_eq!(parameters.sets.len(), 1);
         assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
-        // 8.8.3's closed form, to the bit: sqrt(3 / ((2 x 8)^2 - 1)).
-        assert_eq!(parameters.gain, (3.0f64 / 255.0).sqrt());
-        assert_eq!(parameters.gain, gain_for(8));
-        assert!((parameters.gain - 0.108_465_228_909_328_08).abs() < 1e-17, "gain {}", parameters.gain);
+        // 8.8.3's closed form, sqrt(3 / ((2 x 8)^2 - 1)), over the energy of the
+        // section that is sent. The design normalises `z2` to unit energy, so
+        // the divisor is one to the last code (`sent_prefilter_energy` squares
+        // the Q0.15 words, not the floats) -- the gain is the closed form to
+        // 1e-5 relative, and that residue is the field's rounding, not a design
+        // difference.
+        let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
+        assert!((energy - 1.0).abs() < 1e-4, "the sent section's energy is {energy}, not 1");
+        assert_eq!(parameters.gain, gain_for(8) / energy.sqrt());
+        assert!((parameters.gain - 0.108_465_228_909_328_08).abs() < 2e-5, "gain {}", parameters.gain);
         // Every other rung of the ladder, by value: LC = 16, 32 and 64 are the
         // same lattice one octave up, and the gain follows the set.
         for (drn, lc) in [(1u8, 8usize), (7, 16), (13, 32), (19, 64)] {
@@ -539,10 +546,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("drn {drn} is buildable on the odd lattice"));
             let wanted: Vec<u16> = (0..lc).map(|index| (2 * index + 1) as u16).collect();
             assert_eq!(parameters.sets[0], wanted, "drn {drn}: not the odd lattice");
-            assert_eq!(parameters.gain, gain_for(lc), "drn {drn}: gain");
+            // The set's gain over the sent section's energy, which is one here.
+            let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
+            assert_eq!(parameters.gain, gain_for(lc) / energy.sqrt(), "drn {drn}: gain");
             // The spacing on the line: the lattice's gap is two, so `step` is
             // `2 G` -- the number every pre-code-grid design was scored on.
-            assert!((parameters.step() - 2.0 * gain_for(lc)).abs() < 1e-15, "drn {drn}: step");
+            assert!(
+                (parameters.step() - 2.0 * parameters.gain).abs() < 1e-15,
+                "drn {drn}: step"
+            );
+            assert!((parameters.step() - 2.0 * gain_for(lc)).abs() < 1e-4, "drn {drn}: step");
         }
         // And the two public entry points, unset environment and all, agree
         // with it: `levelset()` is `uniform` when nothing says otherwise.
@@ -572,9 +585,17 @@ mod tests {
             assert_eq!(codegrid::value(code), point, "code {code} decodes to {point}");
         }
         // 8.8.3 on the set's own mean square: 1/sqrt(ms), which at LC = 8 is
-        // the codec's scale and not the lattice's.
-        assert_eq!(parameters.gain, codegrid::gain_for(&grid));
-        assert!((parameters.gain - 6.172_48e-4).abs() < 1e-9, "gain {}", parameters.gain);
+        // the codec's scale and not the lattice's. Divided by the sent
+        // section's energy, which is one to the last Q0.15 code here.
+        assert_eq!(parameters.gain, codegrid::gain_for(&grid) / crate::v92::sent_prefilter_energy(&parameters.filters.z2).sqrt());
+        assert!(
+            (parameters.gain - codegrid::gain_for(&grid) / crate::v92::sent_prefilter_energy(&parameters.filters.z2).sqrt())
+                .abs()
+                < 1e-12,
+            "gain {}",
+            parameters.gain
+        );
+        assert!((parameters.gain - 6.172_48e-4).abs() < 1e-8, "gain {}", parameters.gain);
         assert!((parameters.gain - gain_for(8)).abs() > 0.1, "the grid's gain is not the lattice's");
         // The gap it costs: 256 LSB at 24 000, against the lattice's 349.
         let gap = codegrid::min_gap(&grid);
@@ -614,30 +635,253 @@ mod tests {
         assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15], "a typo moved the wire");
     }
 
-    /// 8.8.3's other half: folding a scaled prefilter's `scale` into `G` is not
-    /// a choice the field leaves open.
+    /// 8.8.3 on the wire: `E[(G v)^2] = 1` for the filters this CPd declares.
     ///
-    /// The assumption is `ms(v G) = 1`, so a prefilter whose section had to be
-    /// scaled down to fit Q0.15 needs `G` scaled up by the same number. Past
-    /// `4G <= 0xFFFF` there is no legal CPd that says it, and the rung has to
-    /// be refused rather than sent with a gain the far end would read as a
-    /// different transmit power.
+    /// The measurement is not the formula read back. It plays a white data
+    /// frame through 6.4.2's `v(n) = sum x(n-kappa) z2(kappa)` -- the Q0.15
+    /// codes, since those are what the far end runs -- multiplies by the `G` the
+    /// far end reads out of bits 35:50 after its own rounding, and takes the
+    /// mean square. One for both design paths: [`design`], the least-squares
+    /// inverse, and [`from_reading`], which is what a call actually designs from.
+    ///
+    /// The failure it is aimed at is `docs/249` §3.2's: `G = 1/sqrt(ms(a))` for
+    /// *every* section, so a section the design had to scale down came out
+    /// `scale^2` quiet and the far end transmitted `scale^2` low. The emulation
+    /// at the end of this test is that pairing, and it must not measure 1.
     #[test]
-    fn a_scaled_prefilter_cannot_be_folded_into_the_gain() {
-        let design = design_for(0.0);
-        // What a legal field carries, and what this design needs to satisfy
-        // `ms(v G) = 1` if its prefilter is sent at the amplitude Q0.15 holds.
-        let plain = build(&design, 5, Trellis::Sixteen).expect("a rung");
-        let needed = plain.gain * design.scale;
-        assert!(plain.gain * crate::v92::GAIN_SCALE <= f64::from(u16::MAX), "an unfolded gain must fit");
-        if needed * crate::v92::GAIN_SCALE > f64::from(u16::MAX) {
-            // The one thing an unfolded CPd must be able to say is the truth:
-            // `G` describes a unit prefilter, which is what `V92_PRE=none`
-            // tells the far end to run.
-            let power: f64 = plain.sets.iter().flatten().map(|&p| f64::from(p) * f64::from(p)).sum::<f64>()
-                / plain.sets.iter().map(Vec::len).sum::<usize>() as f64;
-            assert!((plain.gain * plain.gain * power - 1.0).abs() < 1e-6);
+    fn the_gain_sent_belongs_to_the_filter_sent_and_names_a181s_operating_point() {
+        let set_gain = |parameters: &Parameters| parameters.levelset.gain(&parameters.sets[0]);
+        for (label, design) in [
+            ("least squares", design_for(0.0)),
+            ("the reading", reading_design()),
+        ] {
+            for drn in [1u8, 5, 11, 15, UP_RATES as u8] {
+                let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                    continue;
+                };
+                // What the far end runs and what it multiplies by: the codes and
+                // the field, not the floats and the parameter.
+                let gain = crate::v92::gain_from_4g(crate::v92::four_g_from_gain(parameters.gain));
+                let measured = mean_square_out(gain, &parameters.sets[0], &parameters.filters.z2);
+                assert!(
+                    (measured - 1.0).abs() < 0.05,
+                    "{label}, drn {drn}: ms(G v) is {measured:.4}, not 1 (G {gain:.6}, sum z2^2 {:.4})",
+                    crate::v92::sent_prefilter_energy(&parameters.filters.z2),
+                );
+                // And `G` is that set's gain over that section's energy, which is
+                // the provenance the doc names.
+                let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2).sqrt();
+                // Within the field's own step: bits 35:50 carry 4G in Q0.16, so
+                // `G` is the computed value to half of 2^-18.
+                assert!(
+                    (gain - set_gain(&parameters) / energy).abs() <= 0.5 / crate::v92::GAIN_SCALE + 1e-12,
+                    "{label}, drn {drn}: G is {} not {} -- the set's gain over the sent section's energy",
+                    gain,
+                    set_gain(&parameters) / energy,
+                );
+            }
         }
+
+        // `docs/254` §2: the level a far end must transmit at is `1/G`, and the `G`
+        // this API emits names a number **0.03 ... 0.08 LSB below** `docs/253`
+        // §1.2's computed `1620.1 / 1640.3 / 1607.1 / 1627.0`. The whole of the
+        // difference is one Q0.15 code: `1.0` is not representable in a signed
+        // Q0.15 word (its largest value is `32767/32768`), so the sent section's
+        // energy comes out just under one -- 0.999976 for this test's 16-tap
+        // channel, 0.999939 for the harness's identity section -- and the emitted
+        // gain is that much larger than `1/sqrt(ms(a))`. a181's numbers are the
+        // *design's* -- the clause's gain for a section of exactly unit energy --
+        // and these are the *wire's*. Both are right about different objects, and
+        // the difference is at most 0.08 LSB, 1 % of the half gap at LC = 64,
+        // which is why it cannot move a decision.
+        let design = design_for(0.0);
+        for (drn, a181) in [(1u8, 1620.1), (7, 1640.3), (13, 1607.1), (19, 1627.0)] {
+            let parameters = pin_with(&design, drn, Trellis::Sixteen, 0.0, LevelSet::Code)
+                .expect("the code grid builds every rung")
+                .parameters;
+            let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
+            assert!(
+                energy <= 1.0 && energy > 1.0 - 1e-4,
+                "drn {drn}: the sent section's energy is {energy}, not unit to a Q0.15 code",
+            );
+            // The design's number, recomputed from the set a181 used.
+            let computed = 1.0 / codegrid::gain_for(&parameters.sets[0]);
+            assert!((computed - a181).abs() < 0.05, "drn {drn}: {computed} against a181's {a181}");
+            // The wire's number: what the emitted `G` names.
+            let measured = 1.0 / parameters.gain;
+            assert!(
+                (measured - computed).abs() < 0.1,
+                "drn {drn}: the emitted 1/G is {measured}, a181 computed {computed}",
+            );
+            assert!(measured < computed, "drn {drn}: the sent section is one code short of unit");
+        }
+
+        // The pairing that shipped on f8ac825: the unit prefilter's gain beside a
+        // section the design had scaled down. Measured with the same instrument,
+        // it is `1/scale^2` -- at the design's own `scale` of 12.586 that is
+        // 1/158, i.e. 22 dB of transmit power missing from the far end.
+        let design = design_for(0.0);
+        let shipped = build_with(&design, 5, Trellis::Sixteen, LevelSet::Uniform).expect("a rung");
+        let mut shrunk = shipped.clone();
+        for tap in &mut shrunk.filters.z2 {
+            *tap /= 2.5;
+        }
+        let old_gain = crate::v92::gain_from_4g(crate::v92::four_g_from_gain(set_gain(&shipped)));
+        let old = mean_square_out(old_gain, &shipped.sets[0], &shrunk.filters.z2);
+        assert!(
+            (old - 1.0 / 6.25).abs() < 0.05,
+            "the old pairing measured {old:.4}, not 1/scale^2 = 0.16",
+        );
+        // The fix is the gain, not the filter: the same shrunk section with the
+        // gain this module now computes for it -- the set's gain over the energy
+        // actually sent, i.e. 2.5 times larger, which this example needs past
+        // `4G <= 0xFFFF` and so past what `build_with` would emit -- is exactly
+        // 1 again.
+        let fixed = mean_square_out(set_gain(&shipped) * 2.5, &shipped.sets[0], &shrunk.filters.z2);
+        assert!((fixed - 1.0).abs() < 0.05, "the corrected gain measured {fixed:.4}");
+    }
+
+    /// The two bits this end leaves at their default are named, with the clause
+    /// that makes the default legal and the consequence of it.
+    ///
+    /// * `CPd` bit 29 (`v92.txt:1818-1821`): "Extend the length of the E2u
+    ///   sequence: 0 = don't extend; 1 = extend by 1 symbol." 8.7.2
+    ///   (`v92.txt:1470-1471`) makes E2u "a data frame of scrambled,
+    ///   differentially encoded zeroes ... extended by a single symbol if bit 29
+    ///   of CPd is set". The extension is a lever for the *digital* modem's
+    ///   E2u-to-B1u boundary search: it lengthens the descrambled zero run by
+    ///   one symbol. This end's search is a candidate-set measurement over the
+    ///   run rather than a count (`digital::E2U_SYMBOLS`), so the extra symbol
+    ///   buys nothing here; leaving it 0 is compliant, and the same bit "shall
+    ///   be set to zero during rate renegotiation and fast parameter exchange"
+    ///   anyway. Consequence of the default: E2u is 12 symbols, not 13, and the
+    ///   receiver's window must stay 12 -- one constant, `EXTEND_E2U`, so the
+    ///   bit and the count cannot disagree.
+    /// * `Jp` bits 48 and 49 (Table 22, `v92.txt:1420-1424`; 8.7.6,
+    ///   `v92.txt:1717`): 0 = 4-point upstream training constellation, 1 =
+    ///   8-point. Consequence of the default: CPu, E2u, SUVu and TRN2u are
+    ///   4-point at every rung and in both procedures. That is what this end's
+    ///   receiver is built to read (Tables 28/29), so it is correct and not
+    ///   merely permitted.
+    #[test]
+    fn the_e2u_extension_and_the_training_constellation_are_left_at_the_default_with_a_reason() {
+        // CPd bit 29: 0, and the receiver's window agrees with it.
+        assert!(!EXTEND_E2U, "CPd bit 29 asks the far end to lengthen E2u by a symbol");
+        assert_eq!(E2U_SYMBOLS, UP_INTERVALS, "E2u is one data frame: 8.7.2's twelve symbols");
+        // Jp bits 48 and 49: 0, in both procedures.
+        let jp = crate::v92::sequences::Jp { epsilon: 0x8000, eight_in_training: false, eight_in_renegotiation: false };
+        let bits = jp.to_bits();
+        assert!(!bits[48], "Jp bit 48 asks for 8-point training constellations");
+        assert!(!bits[49], "Jp bit 49 asks for 8-point constellations in a renegotiation");
+        // And the parser agrees, so the pin survives a round trip.
+        let back = crate::v92::sequences::Jp::from_bits(&bits).expect("a Jp comes back");
+        assert_eq!(back, jp);
+        // The rungs never move either bit: a CPd built from any rung carries 0.
+        let design = design_for(0.0);
+        for drn in 1..=UP_RATES as u8 {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                continue;
+            };
+            assert!(!parameters.extend_e2u, "drn {drn}: CPd bit 29 was set");
+        }
+    }
+
+    /// `p2` is absent by decision, and the decision has a clause and a bound.
+    ///
+    /// 6.4.2 (`v92.txt:463-466`) prints `v(n) = sum x(n-kappa) z2(kappa) +
+    /// sum v(n-kappa) p2(kappa)`, so `LP2 > 0` is a recursive prefilter and
+    /// `LP2 = 0` an FIR one. Both designers here produce an FIR section, so
+    /// every CPd this end emits declares `LP2 = 0` -- Table 30's "p2(1) :
+    /// p2(LP2) (if LP2 > 0)" makes that a legal length rather than a gap -- and
+    /// nothing may put a `p2` on the wire without a designer behind it. The
+    /// bound on the field, should one ever exist, is INFO1a bits 12:17: the
+    /// section must have been offered (bits 12:13, codes 2 and 3 name `p2`) and
+    /// `LP2` counts in `Ltot <= 192/256/320/384` and `Lmax <= 128/192/256/320`.
+    #[test]
+    fn a_prefilter_without_a_feedback_section_is_declared_not_omitted() {
+        let design = design_for(0.0);
+        for drn in 1..=UP_RATES as u8 {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                continue;
+            };
+            assert!(parameters.filters.p2.is_empty(), "drn {drn}: an undesigned p2 reached the wire");
+        }
+        let reading = reading_design();
+        assert!(reading.filters.p2.is_empty(), "the reading's shaper is FIR");
+        // The bound the field would be held to: a p2 the far end did not offer
+        // is refused before the wire, and one that fits is only refused by the
+        // lengths INFO1a announced.
+        let offered = FilterLimits::from_info1a(0, 0, 0); // p1 and z2 only
+        let mut with_p2 = Filters { z2: vec![1.0], p2: vec![0.25], ..Filters::default() };
+        assert!(with_p2.fits(&offered).is_err(), "a p2 nobody offered was accepted");
+        with_p2.p2.truncate(1);
+        assert!(with_p2.fits(&plan()).is_ok(), "a single p2 is inside Ltot and Lmax");
+        // The section would also change `v`: a pole on the prefilter's own
+        // output is a different `v`, hence a different 8.8.3 gain. That is why
+        // the absence is a decision and not a default -- see the module docs of
+        // `Filters::p2`.
+        let mut state = 0.0f64;
+        for _ in 0..32 {
+            state = 1.0 + 0.25 * state;
+        }
+        assert!(state > 1.3, "a p2 of 0.25 raises the section's steady-state output to {state}");
+    }
+
+    /// A design from the L1/L2 probing of a G.712-like loop: the path a call
+    /// actually takes (`Prefilter::Reading` is the default).
+    fn reading_design() -> Design {
+        use crate::v34::probe::{Reading, Tone};
+        let reading = Reading {
+            tones: crate::v34::probe::TONES
+                .iter()
+                .map(|&(frequency, _)| Tone {
+                    frequency,
+                    gain_db: -20.0 - 8.0 * (frequency - 150.0) / 3600.0,
+                    snr_db: 40.0,
+                })
+                .collect(),
+            frequency_offset: Some(0.0),
+        };
+        crate::v92::design::from_reading(&reading, &plan()).expect("a loop is designable").0
+    }
+
+    /// `E[(G v)^2]` for a white data frame on `set` through a section `z2`, with
+    /// `z2` and `G` taken as the sixteen-bit fields carry them.
+    ///
+    /// White in the sense 6.4.2's design assumption uses: every point of the set
+    /// equally often, in an order no modulator would produce but whose mean
+    /// square converges on the set's own. The frame is long enough (4096
+    /// symbols) that the sampling error is under 2 per cent, which is the
+    /// tolerance the callers use.
+    fn mean_square_out(gain: f64, set: &[u16], z2: &[f64]) -> f64 {
+        use crate::v92::{PREFILTER_FRACTION, PREFILTER_WIDTH, signed_q, to_signed_q};
+        let codes: Vec<f64> = z2
+            .iter()
+            .map(|&tap| signed_q(to_signed_q(tap, PREFILTER_WIDTH, PREFILTER_FRACTION), PREFILTER_WIDTH, PREFILTER_FRACTION))
+            .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut v = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Both signs: a CPd lists positive points on a spacing of two and
+            // 6.4.2's `a(eta)` is the whole two-sided set, so a frame that only
+            // ever sent +1, +3, ... would carry a DC of 8 that no `z2` with
+            // `sum z2 != 0` would leave alone.
+            let sign = if (state >> 40) & 1 == 0 { 1.0 } else { -1.0 };
+            v.push(sign * f64::from(set[(state >> 33) as usize % set.len()]));
+        }
+        let mut out = vec![0.0; v.len()];
+        for n in 0..v.len() {
+            for (k, &code) in codes.iter().enumerate() {
+                if n >= k {
+                    out[n] += code * v[n - k];
+                }
+            }
+        }
+        let tail = &out[codes.len().max(1)..];
+        tail.iter().map(|value| (gain * value) * (gain * value)).sum::<f64>() / tail.len() as f64
     }
 
     /// 8.7.2's extension bit and the receiver's count of E2u are one number.

@@ -778,7 +778,9 @@ impl Digital {
             // so it goes where that design is computed.
             let probing = p2.reading().cloned();
             let mut settings = pcm::Settings::new(self.law, &asked, p2.round_trip().unwrap_or(0.0), wide);
-            settings.habits = pcm::Habits::LIVE;
+            // `live()` and not `LIVE`: TRN1d's length and 9.5.1.1.3's wait are
+            // operator settings, and the clause's window is applied inside.
+            settings.habits = pcm::Habits::live();
             settings.probing = probing;
             self.v92 = Some(pcm::Modem::new(settings));
         }

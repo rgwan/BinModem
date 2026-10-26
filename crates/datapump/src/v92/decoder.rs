@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use crate::v32::{Mode, Scrambler};
 use crate::v34::trellis::{self, Code};
 
+use super::codegrid;
 use super::modulus::{self, FrameBits, Moduli12};
 use super::precoder::{
     Constellation, code_for, index_to_ki, index_to_ki_class, inverse_map, label_of, opens_a_pair,
@@ -833,9 +834,17 @@ pub struct Decoder {
     /// instrument has asked for them ([`Self::keep_decisions`]). Empty by
     /// default: the bit stream is what the modem wants and the indices are what
     /// a *measurement* wants, and only one of the two belongs in a call.
-    decisions: Vec<[i32; TRELLIS_FRAME]>,
+    decisions: Vec<(u64, [i32; TRELLIS_FRAME])>,
     /// Whether the above is being filled.
     keeping: bool,
+    /// The design's own constellation sets, kept un-scaled so that a decision
+    /// table at one `k` can be rebuilt from the design rather than from another
+    /// table (`docs/114` R4).
+    design: Vec<Vec<u16>>,
+    /// The scale `k` the decision table is built at, per `[8.7.3]`'s CPu mask
+    /// ([`codegrid::estimate_from_mask`]) or the far end's own level. One --
+    /// the design's own codes -- until [`Self::slice_at`] is told otherwise.
+    scale: f64,
 }
 
 impl Decoder {
@@ -884,6 +893,8 @@ impl Decoder {
             pushed: 0,
             decisions: Vec::new(),
             keeping: false,
+            design: parameters.sets.clone(),
+            scale: 1.0,
             named_rotation: correction()
                 .and_then(|fix| fix.rotation)
                 .map_or([None; TRELLIS_FRAME], |table| table.map(Some)),
@@ -985,6 +996,39 @@ impl Decoder {
         }
     }
 
+    /// Slice against the table the far end actually emits, `round(k a(eta))`,
+    /// instead of the design's own `a(eta)` (`docs/114` R4).
+    ///
+    /// `k` is the scale between the design's codes and the levels on the wire:
+    /// one when the far end transmits the design's own code values -- which is
+    /// what a code-grid design asks for and what a code-transparent far end
+    /// does -- and something else when the far end is at its own level, when
+    /// `[8.7.3]`'s CPu mask is where `k` is measured ([`codegrid::estimate_from_mask`]).
+    ///
+    /// It is a scale on the *decisions* and not on the design: the levels rise
+    /// with the index at any `k > 0`, so every distance moves with the
+    /// thresholds and a `k` away from one costs spacing rather than adding a
+    /// constant. What it is not is free: the design's gap is the finest thing
+    /// the rung has, and a table left at one while the wire is at `k` decides
+    /// the neighbouring code whenever `|k - 1| a(eta)` passes half a gap --
+    /// which at LC = 64 is 8 LSB (`docs/253`).
+    pub fn slice_at(&mut self, k: f64) {
+        if !(k.is_finite() && k > 0.0) {
+            return;
+        }
+        self.scale = k;
+        self.params.sets = if (k - 1.0).abs() < f64::EPSILON {
+            self.design.clone()
+        } else {
+            self.design.iter().map(|set| codegrid::scaled(set, k)).collect()
+        };
+    }
+
+    /// The `k` the table is built at; one until [`Self::slice_at`] moves it.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
     /// Symbols fed since the first symbol of B1u.
     pub fn symbols(&self) -> u64 {
         self.n
@@ -1016,6 +1060,14 @@ impl Decoder {
     /// The frames decided since the last call, oldest first, each with the four
     /// indices the decision named.
     pub fn take_decisions(&mut self) -> Vec<[i32; TRELLIS_FRAME]> {
+        std::mem::take(&mut self.decisions).into_iter().map(|(_, etas)| etas).collect()
+    }
+
+    /// The same frames, each with the trellis frame it is: `index` 0 is B1u's
+    /// first four symbols (8.7.1). A measurement that has to line a decision up
+    /// with what the far end sent needs the index and not the position in the
+    /// list, because a frame the slice drops takes its place with it.
+    pub fn take_decisions_indexed(&mut self) -> Vec<(u64, [i32; TRELLIS_FRAME])> {
         std::mem::take(&mut self.decisions)
     }
 
@@ -1171,7 +1223,7 @@ impl Decoder {
         let Some((index, etas)) = decided else { return };
         self.decided += 1;
         if self.keeping {
-            self.decisions.push(etas);
+            self.decisions.push((index, etas));
         }
         trace_etas(self, index, etas);
         // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
@@ -1534,6 +1586,73 @@ mod tests {
             assert!(skipped.is_some(), "{trellis:?}: the streams do not line up");
             assert_eq!(errors, 0, "{trellis:?}: {errors} bits wrong through the viterbi");
         }
+    }
+
+    /// The decision table has to be built at the far end's `k`, and the rung
+    /// that proves it is the finest one (docs/253).
+    ///
+    /// A far end whose levels are `k` times the design's codes cannot be sliced
+    /// against the design's own codes: the levels rise with the index at any
+    /// `k > 0`, so the nearest design point to `k a(eta)` is the neighbour as
+    /// soon as `|k - 1| a(eta)` passes half a gap. At LC = 64 that is 8 LSB, so
+    /// two per cent of scale cost codes across the whole upper half of the set.
+    /// [`Decoder::slice_at`] moves the table with the levels and the same stream
+    /// comes back whole, which is `docs/114` R4 in one assertion and the reason
+    /// `codegrid::scaled` is on the decision path.
+    #[test]
+    fn a_stream_at_k_needs_the_table_at_k() {
+        let mut parameters = parameters(19, Trellis::Sixteen);
+        parameters.sets = vec![codegrid::grid(64).expect("a 64-point code set")];
+        parameters.moduli = [64u8; UP_INTERVALS];
+        parameters.levelset = crate::v92::LevelSet::Code;
+        let point = |eta: i32| -> f64 {
+            let set = &parameters.sets[0];
+            let index = if eta >= 0 { eta as usize } else { (-eta - 1) as usize };
+            let value = f64::from(set[index]);
+            if eta >= 0 { value } else { -value }
+        };
+        let mut encoder = UpEncoder::new(&parameters).expect("feasible");
+        let sent = encoder.b1u();
+        let k = 1.02;
+        let wrong = |decoder: &mut Decoder| -> usize {
+            decoder.keep_decisions(true);
+            let mut wrong = 0;
+            for symbol in &sent {
+                decoder.feed(symbol.u * k);
+                for (index, etas) in decoder.take_decisions_indexed() {
+                    for (position, &eta) in etas.iter().enumerate() {
+                        let at = index as usize * TRELLIS_FRAME + position;
+                        if at < sent.len() && eta != sent[at].eta {
+                            wrong += 1;
+                        }
+                    }
+                    let _ = point;
+                }
+            }
+            wrong
+        };
+        // Where the threshold is, measured on this set and this stream: 1.01
+        // costs nothing and 1.02 costs 7.9 % of the codes, because the first
+        // point the shift carries past half its own gap is the 428 LSB one
+        // (gap 32) and `0.02 x 428 = 8.6` is past 16. The 64-point grid's
+        // finest steps are its lowest ones -- 24, 24, 24, 32 LSB at 24 ... 148
+        // LSB -- so a scale error bites at small `a` first and everywhere
+        // above it after that.
+        let mut near_one = Decoder::with_trellis(&parameters, TrellisMode::Slice);
+        near_one.slice_at(1.01);
+        assert_eq!(wrong(&mut near_one), 0, "1 % of scale is inside this set's gaps");
+        let mut at_one = Decoder::with_trellis(&parameters, TrellisMode::Slice);
+        assert_eq!(at_one.scale(), 1.0);
+        let design = wrong(&mut at_one);
+        assert_eq!(design, 33, "a stream at 1.02 must not slice right at k = 1: 33 of 416");
+        let mut at_k = Decoder::with_trellis(&parameters, TrellisMode::Slice);
+        at_k.slice_at(k);
+        assert!((at_k.scale() - k).abs() < 1e-12);
+        assert_eq!(wrong(&mut at_k), 0, "the table at k must slice its own stream");
+        // ... and back, so that a scale is a property of the table and not a
+        // history: the same decoder told k = 1 again is the design's decoder.
+        at_k.slice_at(1.0);
+        assert_eq!(at_k.params.sets, parameters.sets, "k = 1 is the design itself");
     }
 
     /// `V92_ROT`'s measurement, pinned on lines that have no capture in them.

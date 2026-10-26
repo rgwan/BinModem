@@ -60,7 +60,7 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, lc_for};
+use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung};
 use crate::v92::upchoice::{choose, pin};
 use crate::v92::{FilterLimits, LevelSet, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
@@ -74,8 +74,482 @@ const INTERVALS: usize = 6;
 const SD_FRAMES: usize = 64;
 const SD_BAR_FRAMES: usize = 8;
 
+/// 9.5.1.1.3's wait between reading `Ja` and putting `Sd` on the line, in
+/// seconds: "After receiving a DIL descriptor of Ja, the digital modem **may
+/// wait for up to 500 ms** and shall then transmit signal Sd for 384T and
+/// signal S-d for 48T" (`v92.txt:2535-2536`; the same words are at
+/// `v92.txt:2519-2520` in the copy docs/206 quoted from).
+///
+/// It is a *permission* and not an obligation: the digital modem may use any
+/// part of it, and this end used none of it until the wait became a number
+/// ([`Habits::sd_after_ja`]). The point of the clause is that `Sd` need not be
+/// jammed into the tail of the far end's `Ja` -- the analogue modem terminates
+/// `Ja` only after detecting the `Sd`-to-`S-bar-d` transition (9.5.2.1.3), so
+/// how close our `Sd` starts to its `Ja` decides what the far end's own
+/// detector has to work with.
+///
+/// The wait is spent in whole frames of [`INTERVALS`] codewords, so that the
+/// signal which follows still begins on a frame boundary: see the silence
+/// branch of `Source::next_level` and the reason it must (`Source::next`).
+pub const SD_AFTER_JA_WITHIN: f64 = 0.5;
+
+/// One frame of the wait, in milliseconds: [`INTERVALS`] codewords at [`FS`]
+/// codewords a second, i.e. 0.75 ms.
+pub const SD_FRAME_MS: f64 = INTERVALS as f64 * 1000.0 / FS;
+
 /// R-bar-i: "4 repetitions of the 6-symbol sequence" (V.90 8.6.4).
 const R_BAR_FRAMES: usize = 4;
+
+/// `R-bar` in symbols: "R for 384T followed by R-bar for 24T" (9.8.1.1.1,
+/// 9.8.1.1.4) is four repetitions of six.
+const R_BAR_SYMBOLS: usize = R_BAR_FRAMES * INTERVALS;
+
+/// How many symbols off the phase `Ru` locked on say the far end has turned
+/// `Ru` into `R-bar-u`.
+///
+/// **[inferred]**, and the one number the fiducial below rests on: 8.5.5's
+/// `R-bar-u` is `{-LU x3, +LU x3}`, so the first *three* symbols after the
+/// transition disagree with `Ru`'s phase and no later symbol does. Waiting for
+/// a whole period would put `Rd` on the line at the end of the 24T rather than
+/// near its start.
+const RU_BAR_DEVIATIONS: usize = 3;
+
+/// Where the far end's renegotiation `TRN2u` begins, in symbols after this end
+/// sees the `Ru`-to-`R-bar-u` transition.
+///
+/// 9.8.2.1.1 puts `Ru` at 384T and `R-bar-u` at 24T, and 9.8.2.2.3 (responding)
+/// and 9.8.2.1.2 (initiating) put `TRN2u` straight after `R-bar-u`'s 24T. This
+/// end's detector fires on the [`RU_BAR_DEVIATIONS`]-th disagreeing symbol, so
+/// `R-bar-u` has `24 - 3` symbols left to run when it does, and the far end's
+/// `TRN2u` starts here.
+///
+/// It is a **fiducial and not a guess**: the reader for the far end's `SUVu` is
+/// built on this symbol, and one symbol either way would leave its descrambler
+/// on the wrong phase and the `SUVu` unreadable -- the same silent failure the
+/// downstream frame grid has (`Source::next`).
+///
+/// **[inferred]** from 9.8.2.1.1/9.8.2.2.3 plus [`RU_BAR_DEVIATIONS`]; no
+/// signal is involved that 8.5.5 and 8.7.6 do not define.
+pub const TRN2U_AFTER_RU_BAR: u64 = (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64;
+
+/// Whether this end asks for 9.8.1.1.3's silent period in its own `SUVd`.
+///
+/// **[our choice]**, and the clause leaves it open twice over: 9.8.1.1.2 enters
+/// the silent-period branch only "if bit 32 is set in **either** `SUVd` or
+/// `SUVu`", and 9.8.1.1.5 has the digital modem "wait to receive another
+/// `SUVu`" when the bit is clear. `false` is Figure 15's shape -- "Rate
+/// renegotiation with no silence initiated by the digital modem": `SUVd`,
+/// `SUVd`, `CPd` -- which reaches the `CPd` without a handshake whose only
+/// purpose is a retrain of `Rt` this end does not need, since what is changing
+/// is the far end's upstream and not this end's downstream. The far end can
+/// still take this end into the branch by setting bit 32 in its own `SUVu`, and
+/// that path *is* implemented and tested; the alternative reading is `true`,
+/// which puts 9.8.1.1.3's `SUVd'`, `Ed`, silence and `Rt` on every
+/// renegotiation, as Figures 16 and 17 draw.
+const RENEG_REQUEST_SILENCE: bool = false;
+
+/// Rd and Rt, in frames: "transmit signal Rd for 384T and then R-bar-d for
+/// 24T" (9.8.1.1.1, 9.8.1.2.2), and the same pair for Rt (9.8.1.1.4, .5).
+///
+/// 384T is 64 data frame intervals of [`INTERVALS`] codewords, the length
+/// 8.4.4/V.90 already gives Sd; 24T is [`R_BAR_FRAMES`] repetitions of the
+/// six-symbol pattern, which is exactly the 24T 9.8.1.1.1 asks for. Neither is
+/// a free parameter of this end's: they are counted out of the clause.
+const R_FRAMES: usize = 64;
+
+/// The number of data frame *intervals* a downstream data frame carries, which
+/// is what V.90 8.6.4 counts Rd's codewords over ("the data mode constellation
+/// of each data frame interval"). V.92 leaves it at twelve (6.4).
+const DOWN_INTERVALS: usize = 12;
+
+/// The period of `Rf`'s sign pattern, in symbols.
+///
+/// 8.8.4 (`v92.txt:1957-1959`): "**Rf** is transmitted by repeating the
+/// 12-symbol sequence containing the PCM codewords with the sign pattern
+/// `+ + - - + + - - + + - -`", and "**R-bar-f** consists of 2 repetitions of
+/// the 12-symbol sequence ... with the sign pattern
+/// `- - + + - - + + - - + +`". Both are `+ + - -` repeated, so the pattern's
+/// period is four symbols and its phase is fixed by "the left-most sign is
+/// transmitted first": the first two symbols of `Rf` are positive and the next
+/// two negative. (Read off the source line, not from memory: an earlier ticket
+/// nearly shipped `- - - + + -` for V.90's `R-bar`, a PDF hyphenation
+/// artefact of the em dashes.)
+const RF_SIGN_PERIOD: usize = 4;
+
+/// TRN2d in a rate renegotiation: "shall then transmit TRN2d for **up to**
+/// 16008T" (9.8.1.1.2).
+///
+/// "Up to" is a ceiling and not a target: 16008T is 2668 data frame intervals,
+/// and a digital modem that sent exactly that on every renegotiation would
+/// spend a third of a second per rung. What the ceiling bounds is how long the
+/// far end may be kept in TRN2d before SUVd starts; this end cuts TRN2d at the
+/// first frame boundary at or after [`Source::trn2d_symbols`], and the test
+/// pins that the emitted run is within the ceiling.
+const TRN2D_MOST: usize = 16008;
+
+/// What 8.5.5 says a run of `Ru` looks like, as a sign pattern: "repeating the
+/// 6-symbol sequence {+LU, +LU, +LU, -LU, -LU, -LU}".
+///
+/// One period, as `true` for positive. `Ru`'s bar is the negation, which is the
+/// same array read inverted.
+const RU_PERIOD: [bool; 6] = [true, true, true, false, false, false];
+
+/// How many periods of `Ru` this end wants to see before it believes the far
+/// end is renegotiating.
+///
+/// **[our choice]**, and the one threshold in the detector. 9.8.2.1.1 gives the
+/// far end 384T of `Ru` to spend, so a detector may take as long as it likes
+/// inside that; four periods is 24 of those 384 symbols. The bound in the other
+/// direction is false positives: a data mode symbol is a legal point of the
+/// data constellation, so a *six*-symbol match on signs alone happens by
+/// chance one time in sixty-four, and this end would answer a lucky stretch of
+/// data with `Rd`. Four periods on signs *and* constant magnitude is what
+/// 8.5.5's "the same structure used while transmitting 2 point TRN1u signal"
+/// buys -- a two-point signal holds |level| fixed for all six symbols, which
+/// the differential encoder in data mode does not.
+const RU_LOCK_PERIODS: usize = 4;
+
+/// How far the six magnitudes of one period may drift and still be the same
+/// two-point signal, as a fraction of the louder one.
+///
+/// **[our choice]**. A two-point signal is exact in the ideal; this is the
+/// slack a real line's noise and this end's own AGC need. Wide enough that a
+/// `Ru` read through a noisy line still locks, narrow enough that a data mode
+/// symbol -- whose intervals differ in magnitude by far more than this -- does
+/// not.
+const RU_MAGNITUDE_SLACK: f64 = 0.35;
+
+/// How much of a window the period-six component must account for before the
+/// far end is taken to be sending `Ru`, as the amplitude of the six-symbol
+/// component over the window's rms. **`[our choice]`**, and it is the one
+/// threshold that reads 8.5.5 off the line instead of off the clause's ideal
+/// waveform.
+///
+/// **Why a second reading of 8.5.5 is needed at all.** `RU_MAGNITUDE_SLACK`
+/// above asks for six *equal* magnitudes, which is what 8.5.5's
+/// `{+LU, +LU, +LU, -LU, -LU, -LU}` is at the modulator's input. What the Far
+/// end actually puts on the line is that sequence as a period-six wave, and the
+/// wave comes back through the far end's own transmit path. Measured on
+/// `/home/hikari/runs-214/164250-sd108ab170-r214/agr-tx.raw`, the far end's
+/// `Ru` at record sample 192 090 is **three** magnitudes, not one --
+/// 4 683 / 4 650 / 33 -- because the only component of a 1 333.33 Hz
+/// ({fs}/6) period-six wave left below Nyquist is the fundamental: the
+/// measured 6-symbol pattern is a pure 5 389-amplitude sine at a constant
+/// -30.4 deg for 46.5 ms, third harmonic 0.3 against a fundamental of 5 388.8.
+/// A detector that insists on six equal magnitudes can therefore never fire on
+/// this far end, which is why `docs/224`'s `Ru detected` was never printed.
+///
+/// The two forms bracket the threshold: a raw `{+ + + - - -}` square wave has a
+/// six-symbol component of 4/pi = 1.27 times its rms, the fundamental-only form
+/// has sqrt(2) = 1.414, and data mode levels -- measured over the same file,
+/// three separate data stretches, every third symbol -- reach 0.831 at
+/// [`RU_TONE_SYMBOLS`] and no more. The threshold sits 1.3 times above the
+/// third and 1.15 times below the first.
+const RU_TONE_DOMINANCE: f64 = 1.10;
+
+/// Symbols of history the period-six reading is taken over.
+///
+/// **[our choice]** 48, eight periods of 8.5.5's six. It is the shortest window
+/// that separates the two populations by a clear margin, and it is bounded from
+/// below by a race that is measured and not hypothetical: 9.6.1.1.2's
+/// data-mode-loss detector (`DATA_MODE_LOSS_FRAMES` of twelve symbols) calls
+/// `Ru` "a symbol outside the constellation CPd declared" and fires 96 symbols
+/// in -- `runs-223/181911-ab170-fpe-v92` did exactly that at 25.000 and sent
+/// `Ri` at a far end that was asking for a rate renegotiation. Forty-eight
+/// symbols is 6 ms of 8.5.5's 384T, half the loss detector's own latency, and
+/// leaves 336 for `R-bar-u` and the frame boundary `Rd` waits for.
+///
+/// The false-positive bound at this length: over three data stretches of the
+/// same recording the six-symbol component reaches 0.831. At 24 symbols it
+/// reaches 0.987 and at 96 it falls to 0.561 -- 48 is where the loss-detector
+/// race and that spread cross.
+const RU_TONE_SYMBOLS: usize = 48;
+
+/// 9.8.1.2.1's receiver conditioning, as a small state machine.
+///
+/// "After detecting `Ru`, the digital modem shall clamp circuit 104 to binary
+/// one and **condition its receiver to detect the `Ru`-to-`R-bar-u`
+/// transition**" (9.8.1.2.1). Two states, because the clause asks for two
+/// things in order: `Ru` seen, then the transition away from it.
+///
+/// The detector is a **side channel**. It is fed the same received levels the
+/// B1u decoder is fed and it returns nothing to that decoder, so a call with no
+/// renegotiation in it puts exactly the same symbols through exactly the same
+/// arithmetic it did before this existed. `no_ru_in_data_mode_never_fires_the_
+/// responder` pins that.
+#[derive(Debug, Clone)]
+pub struct RuDetector {
+    /// The signs of the last four `Ru` periods, one bit a symbol, oldest in the
+    /// most significant position: 1 positive.
+    ///
+    /// A shift register and not a six-symbol window, because [`RU_PERIOD`] has
+    /// period six and a window slid one symbol at a time only equals it on one
+    /// of every six symbols. Matching it *at whichever phase the far end
+    /// started on* is what [`RU_SHIFTED`] is for.
+    signs: u32,
+    /// The magnitudes of the last [`RU_PERIOD`] symbols, for the two-point
+    /// test.
+    magnitudes: [f64; 6],
+    /// Symbols seen since the last reset, saturating at 24.
+    filled: usize,
+    /// 9.8.1.2.1's conditioning is in force: `Ru` has been detected, and what
+    /// is wanted now is the `Ru`-to-`R-bar-u` transition.
+    locked: bool,
+    /// The phase of the six-symbol cycle `Ru` locked on, 0..6.
+    phase: usize,
+    /// Consecutive symbols since then that disagree with that phase.
+    deviations: usize,
+    /// The last [`RU_TONE_SYMBOLS`] levels, oldest at [`Self::filled`]'s ring
+    /// position. Used only for 8.5.5's period-six reading.
+    recent: [f64; RU_TONE_SYMBOLS],
+    /// Where the next level goes in [`Self::recent`].
+    at: usize,
+    /// The six-symbol component's phase when the period-six reading locked.
+    tone_phase: Option<f64>,
+    /// Symbols the period-six reading has held the far end to `Ru` for.
+    tone_run: usize,
+    /// The period-six reading has already reported the end of `Ru`, once.
+    tone_fired: bool,
+    /// Symbols fed, saturating at [`RU_TONE_SYMBOLS`]: the ring is only a
+    /// window once it has been filled once.
+    seen: usize,
+}
+
+impl Default for RuDetector {
+    fn default() -> Self {
+        Self {
+            signs: 0,
+            magnitudes: [0.0; 6],
+            filled: 0,
+            locked: false,
+            phase: 0,
+            deviations: 0,
+            recent: [0.0; RU_TONE_SYMBOLS],
+            at: 0,
+            tone_phase: None,
+            tone_run: 0,
+            tone_fired: false,
+            seen: 0,
+        }
+    }
+}
+
+/// The 24 symbols of four `Ru` periods, oldest symbol in the top bit.
+const RU_LOCKED: u32 = 0b111_000_111_000_111_000_111_000;
+
+/// Every one of the six phases [`RU_LOCKED`] can legitimately start on.
+///
+/// "the 6-symbol sequence {+LU, +LU, +LU, -LU, -LU, -LU}" (8.5.5) is a *cyclic*
+/// sequence -- the far end begins it at a data frame boundary, which is not a
+/// boundary of this end's slicing -- so a receiver that only recognised one
+/// phase would miss five renegotiations in six.
+/// One `Ru` period, oldest symbol in bit 5, and its six phases.
+///
+/// The transition of 9.8.1.2.2 is detected on *one* period and not on four:
+/// 9.8.2.1.1 gives the far end 24T of `R-bar-u`, which is four periods, and a
+/// receiver that needed all four would put `Rd` on the line at the last symbol
+/// of it rather than at its start.
+const RU_ONE: u32 = 0b111_000;
+const RU_ONE_SHIFTED: [u32; 6] = [
+    RU_ONE,
+    (RU_ONE << 1 | RU_ONE >> 5) & 0x3F,
+    (RU_ONE << 2 | RU_ONE >> 4) & 0x3F,
+    (RU_ONE << 3 | RU_ONE >> 3) & 0x3F,
+    (RU_ONE << 4 | RU_ONE >> 2) & 0x3F,
+    (RU_ONE << 5 | RU_ONE >> 1) & 0x3F,
+];
+
+const RU_SHIFTED: [u32; 6] = [
+    RU_LOCKED,
+    ((RU_LOCKED << 1) | (RU_LOCKED >> 23)) & 0xFF_FFFF,
+    ((RU_LOCKED << 2) | (RU_LOCKED >> 22)) & 0xFF_FFFF,
+    ((RU_LOCKED << 3) | (RU_LOCKED >> 21)) & 0xFF_FFFF,
+    ((RU_LOCKED << 4) | (RU_LOCKED >> 20)) & 0xFF_FFFF,
+    ((RU_LOCKED << 5) | (RU_LOCKED >> 19)) & 0xFF_FFFF,
+];
+
+impl RuDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether 9.8.1.2.1's conditioning is in force.
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Forget everything: no `Ru` is in progress.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// One received data mode symbol, as the level the slicer saw.
+    ///
+    /// `Ru` is "the same structure used while transmitting 2 point TRN1u
+    /// signal" (8.5.5), so it is read off level rather than off bits: the B1u
+    /// decoder is slicing these same symbols against the data constellation,
+    /// and a two-point signal is not a legal codeword sequence of that
+    /// constellation in general. Nothing here touches that decoder.
+    pub fn feed(&mut self, level: f64) -> RuEvent {
+        let magnitude = level.abs();
+        self.signs = ((self.signs << 1) | u32::from(level >= 0.0)) & 0xFF_FFFF;
+        self.magnitudes.rotate_left(1);
+        self.magnitudes[5] = magnitude;
+        self.filled = (self.filled + 1).min(24);
+        self.recent[self.at] = level;
+        self.at = (self.at + 1) % RU_TONE_SYMBOLS;
+        self.seen = (self.seen + 1).min(RU_TONE_SYMBOLS);
+        // 8.5.5's period-six structure, read as the wave the far end actually
+        // sends it as. Checked first because it is the reading that survives
+        // the far end's transmit path (`RU_TONE_DOMINANCE`), while the
+        // two-point magnitude test below is the reading that survives an ideal
+        // modulator. A `Ru` satisfies whichever of the two its transmitter
+        // leaves intact; a data mode symbol satisfies neither.
+        if self.seen >= RU_TONE_SYMBOLS && !self.tone_fired {
+            match self.period_six() {
+                RuEvent::None => {}
+                event => return event,
+            }
+        }
+        if self.filled < 24 {
+            return RuEvent::None;
+        }
+        // 8.5.5's two-point structure, one period at a time: all six magnitudes
+        // of a period within a fraction of each other. A data mode symbol has
+        // the intervals of its own constellation, which are not.
+        let (loud, quiet) = self
+            .magnitudes
+            .iter()
+            .fold((0.0_f64, f64::MAX), |(hi, lo), &m| (hi.max(m), lo.min(m)));
+        if quiet <= 0.0 || (loud - quiet) / loud > RU_MAGNITUDE_SLACK {
+            return RuEvent::None;
+        }
+        let ru = RU_SHIFTED.contains(&self.signs);
+        if self.locked {
+            // 9.8.1.2.1's conditioning: the transition *away* from `Ru` is
+            // what 9.8.1.2.2 releases `Rd` on, and it is only a transition
+            // because `Ru` came first -- which is what `locked` records.
+            //
+            // The **phase** is what makes it a transition. 8.5.5's pattern is
+            // three positives then three negatives, so its negation is the
+            // same cyclic sequence started three symbols later: `{+ + + - - -}`
+            // read from offset 3 *is* `{- - - + + +}`. A receiver that only
+            // compared patterns would therefore see no difference at all
+            // between `Ru` and `R-bar-u`, which is exactly why 9.8.1.2.1
+            // conditions the receiver rather than merely watching for a
+            // sequence. What is tracked here is the phase `Ru` locked on; a
+            // symbol that disagrees with it is the far end flipping over.
+            let want = (RU_SHIFTED[self.phase] >> 23) & 1;
+            self.phase = (self.phase + 1) % 6;
+            if u32::from(level >= 0.0) == want {
+                self.deviations = 0;
+            } else {
+                self.deviations += 1;
+                // Three symbols off the locked phase is half a period and is
+                // not noise: `R-bar-u` is 24T, so waiting for a whole period
+                // would put `Rd` on the line at the end of it rather than at
+                // its start.
+                if self.deviations >= RU_BAR_DEVIATIONS {
+                    return RuEvent::RuToRuBar;
+                }
+            }
+            return RuEvent::None;
+        }
+        if ru {
+            self.locked = true;
+            // The phase `Ru` locked on, so that the transition can be read
+            // against it.
+            self.phase = RU_SHIFTED.iter().position(|&p| p == self.signs).unwrap_or(0);
+            self.deviations = 0;
+            return RuEvent::RuDetected;
+        }
+        RuEvent::None
+    }
+
+    /// 8.5.5's `Ru` read as a period-six wave: the amplitude and phase of the
+    /// six-symbol component over [`RU_TONE_SYMBOLS`] symbols, against the
+    /// window's rms.
+    ///
+    /// "Signal `Ru` is transmitted by repeating the 6-symbol sequence
+    /// {+LU, +LU, +LU, -LU, -LU, -LU}" (`v92.txt:1325`) is a statement about
+    /// period, not about harmonics, and the detector may hold the far end to
+    /// what the clause guarantees: one period is six symbols, so the wave has
+    /// exactly one component below the Nyquist of a symbol rate of one symbol a
+    /// sample. At 8 000 symbols a second that component is at 1 333.33 Hz, and
+    /// that is what the bench's far end puts on the line (`RU_TONE_DOMINANCE`).
+    ///
+    /// The transition of 9.8.1.2.1 is read the same way. `R-bar-u` is the
+    /// negation, which for a single component is a 180-degree step of its
+    /// phase -- and, measured, this far end does not send one at all (`docs/224`
+    /// [verified]: phase constant to 0.3 degree over its 384T of `Ru`, then
+    /// data). So the end of `Ru` is taken as the transition too, because a far
+    /// end that spends its 384T and goes back to data has made the same
+    /// statement in the only way its transmitter makes it.
+    fn period_six(&mut self) -> RuEvent {
+        let n = RU_TONE_SYMBOLS as f64;
+        let (mut re, mut im, mut power) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for k in 0..RU_TONE_SYMBOLS {
+            let v = self.recent[(self.at + k) % RU_TONE_SYMBOLS];
+            let theta = -2.0 * std::f64::consts::PI * k as f64 / RU_PERIOD.len() as f64;
+            re += v * theta.cos();
+            im += v * theta.sin();
+            power += v * v;
+        }
+        let rms = (power / n).sqrt();
+        if rms <= 0.0 {
+            return RuEvent::None;
+        }
+        let amplitude = 2.0 * (re * re + im * im).sqrt() / n;
+        let phase = im.atan2(re);
+        if amplitude / rms >= RU_TONE_DOMINANCE {
+            if self.tone_phase.is_none() {
+                self.tone_phase = Some(phase);
+                self.tone_run = 0;
+                if !self.locked {
+                    self.locked = true;
+                    self.phase = 0;
+                    self.deviations = 0;
+                    return RuEvent::RuDetected;
+                }
+                return RuEvent::None;
+            }
+            self.tone_run += 1;
+            let turned = (phase - self.tone_phase.unwrap_or(phase)).abs();
+            let turned = turned.min(2.0 * std::f64::consts::PI - turned);
+            if turned > 2.0 * std::f64::consts::PI / 3.0 {
+                self.tone_fired = true;
+                self.tone_phase = None;
+                return RuEvent::RuToRuBar;
+            }
+            return RuEvent::None;
+        }
+        // The six-symbol component is gone. If it held for a period at least,
+        // the far end has left `Ru` without inverting it: 9.8.1.2.2's
+        // transition, in the only form this far end sends it.
+        if self.tone_phase.is_some() {
+            let held = self.tone_run;
+            self.tone_phase = None;
+            if held >= RU_PERIOD.len() {
+                self.tone_fired = true;
+                return RuEvent::RuToRuBar;
+            }
+        }
+        RuEvent::None
+    }
+}
+
+/// What a run of received symbols says about rate renegotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuEvent {
+    /// Nothing yet: this symbol neither completed `Ru` nor left it.
+    None,
+    /// 9.8.1.2.1: `Ru` detected, the receiver conditioned, circuit 104 clamped.
+    RuDetected,
+    /// 9.8.1.2.2: the `Ru`-to-`R-bar-u` transition, which is what releases
+    /// `Rd`.
+    RuToRuBar,
+}
+
 
 /// TRN2d: "at least 2040T" (9.6.1.1), and this end sends more than that.
 ///
@@ -652,6 +1126,13 @@ fn b1u_decoders(parameters: &Parameters, skip: usize) -> (Decoder, Decoder) {
     // polarity turns out inverted therefore keeps the constant -- which is the
     // behaviour it had.
     straight.measure_rotation_from(skip + 1);
+    // `docs/264` sec 3: keep the window's decided indices. This is a *record*
+    // of the decisions the decoder has already taken -- `keep_decisions` pushes
+    // them after `decide` has returned -- so it cannot move a decision, and it
+    // is drained once, by `B1uBins::measure`, at the boundary. The decoder that
+    // goes on into data mode has it switched off again there, because the
+    // alternative is a Vec that grows for the length of the call.
+    straight.keep_decisions(true);
     // Above 24 000 B1u's frames *can* be read against 8.7.1's known content
     // instead of against 6.4.1's chain (`docs/74`), and it stops with B1u
     // because nothing after it is known. It is off unless `V92_BY_CONTENT=1`
@@ -1255,17 +1736,85 @@ pub struct Habits {
     /// TRN1d, in seconds: "at least 2040T", and Jd "within 4000 ms of
     /// starting TRN1d" (9.5.1.1.4).
     pub trn1d: f64,
+    /// How much of 9.5.1.1.3's window this end uses between reading `Ja` and
+    /// putting `Sd` on the line, in seconds: 0 to [`SD_AFTER_JA_WITHIN`].
+    ///
+    /// **0 is the behaviour every call on this bench had before the number
+    /// existed** -- `Sd` starts at the first frame boundary after `Ja` is read
+    /// -- so the default changes nothing until a value is chosen. What it is
+    /// for is the arrangement of our own transmission in time, which the clause
+    /// explicitly leaves to the digital modem; see [`Self::sd_after_ja_frames`]
+    /// for the frame grid the wait is kept on.
+    pub sd_after_ja: f64,
     /// Jd's bits 49:50, "the maximum spectral shaping look-ahead".
     pub lookahead: u8,
 }
 
 impl Habits {
     /// Short TRN1d, for the tests and for the second end of our own call.
-    pub const PROMPT: Self = Self { trn1d: 0.3, lookahead: 1 };
+    pub const PROMPT: Self = Self { trn1d: 0.3, sd_after_ja: 0.0, lookahead: 1 };
 
     /// What a live server sends: the analogue modem's equaliser wants the
-    /// time, and the clause's own ceiling is four seconds.
-    pub const LIVE: Self = Self { trn1d: 3.6, lookahead: 1 };
+    /// time, and the clause's own ceiling is four seconds. None of 9.5.1.1.3's
+    /// 500 ms is used, which is what this end has always done.
+    pub const LIVE: Self = Self { trn1d: 3.6, sd_after_ja: 0.0, lookahead: 1 };
+
+    /// The live server's habits, with 9.5.1.1.3's wait an operator setting
+    /// rather than a constant: `BINMODEM_V92_SD_AFTER_JA_MS` if it is set,
+    /// [`Self::LIVE`] (zero) otherwise.
+    ///
+    /// The clause gives a window, not a value -- "may wait for up to 500 ms"
+    /// (`v92.txt:2535-2536`) -- so how much of it to use is a policy number and
+    /// tuning it must not mean patching a constant. `docs/209` gave TRN1d's
+    /// length the same shape for the same reason. Out-of-window and
+    /// off-the-grid values are the clamp's business, not the operator's
+    /// ([`Self::sd_after_ja_frames`]).
+    #[must_use]
+    pub fn live() -> Self {
+        let mut habits = Self::LIVE;
+        if let Ok(text) = std::env::var("BINMODEM_V92_SD_AFTER_JA_MS")
+            && let Ok(ms) = text.trim().parse::<f64>()
+            && ms.is_finite()
+        {
+            habits.sd_after_ja = ms / 1000.0;
+        }
+        habits
+    }
+
+    /// 9.5.1.1.3's wait as this end will spend it: **clamped into the clause's
+    /// window and snapped to the frame grid**, in frames of [`INTERVALS`]
+    /// codewords.
+    ///
+    /// The grid is not a convenience. Silence occupies frame intervals like
+    /// anything else and a signal that starts mid-frame rotates the six-symbol
+    /// pattern of everything measured against the frame count (`Source::next`
+    /// records what that cost: an Agere SV92PP answered a rotated `Ri` with two
+    /// seconds of nothing and then a retrain). A wait of a whole number of
+    /// frames leaves the residue exactly where it was and moves only the
+    /// placement.
+    ///
+    /// Clamped, so that no setting can send the wait out of conformance: the
+    /// largest whole frame inside 500 ms is 666 frames = 499.5 ms, since 667
+    /// frames is 500.25 ms and past the clause.
+    #[must_use]
+    pub fn sd_after_ja_frames(&self) -> usize {
+        let ms = self.sd_after_ja * 1000.0;
+        let ms = if ms.is_finite() { ms.clamp(0.0, SD_AFTER_JA_WITHIN * 1000.0) } else { 0.0 };
+        let frames = (ms / SD_FRAME_MS).round();
+        (frames as usize).min(Self::sd_after_ja_frames_most())
+    }
+
+    /// The most frames 9.5.1.1.3's window holds.
+    #[must_use]
+    pub fn sd_after_ja_frames_most() -> usize {
+        (SD_AFTER_JA_WITHIN * FS / INTERVALS as f64).floor() as usize
+    }
+
+    /// The wait in codewords, which is what the source counts in.
+    #[must_use]
+    pub fn sd_after_ja_symbols(&self) -> usize {
+        self.sd_after_ja_frames() * INTERVALS
+    }
 }
 
 impl Default for Habits {
@@ -1364,6 +1913,32 @@ pub enum Out {
     Ri,
     /// R-bar-i, 24T.
     RiBar,
+    /// Rd, 384T: signal R on the *data mode* constellation of each data frame
+    /// interval, "as passed in CP" (V.90 8.6.4, reached from 8.8.4/V.92;
+    /// 9.8.1.1.1, 9.8.1.2.2).
+    Rd,
+    /// R-bar-d, 24T: "4 repetitions of the 6-symbol sequence ... with the sign
+    /// pattern - - - + + +" -- the same codewords, the pattern inverted
+    /// (V.90 8.6.4).
+    RdBar,
+    /// Rt, 384T: signal R on the *training* constellation of each data frame
+    /// interval, "as passed in CPt" (V.90 8.6.4; 9.8.1.1.4, 9.8.1.1.5).
+    ///
+    /// Not the same signal as [`Out::Rd`]: a different constellation, and the
+    /// one place 9.8 can silently send the wrong level.
+    Rt,
+    /// R-bar-t, 24T.
+    RtBar,
+    /// Rf, 384T: 8.8.4's repeated 12-symbol sequence "with the sign pattern
+    /// + + - - + + - - + + - -", each symbol "the highest power PCM codeword
+    /// from the data mode constellation of each data frame interval as passed
+    /// in CPu" (`v92.txt:1957-1962`) -- 9.9.1.2.2's answer to a fast
+    /// parameter exchange.
+    Rf,
+    /// R-bar-f, 24T: "2 repetitions of the 12-symbol sequence ... with the
+    /// sign pattern - - + + - - + + - - + +" (8.8.4, `v92.txt:1959-1961`):
+    /// the same codewords, the pattern inverted.
+    RfBar,
     /// TRN2d, from the start of Phase 4 (9.6.1.1).
     Trn2d,
     /// SUVd and SUVd-bar: the short information sequence, repeated, while the
@@ -1415,6 +1990,12 @@ pub struct Source {
     /// Codewords since the first symbol of Sd, for the frame boundaries.
     symbol: u64,
     pending: Option<Out>,
+    /// Whether the `Ri` on the line is [`Source::ri_opener`]'s and counts its
+    /// own 384T out, rather than waiting for an `E1u` that will not come.
+    ri_timed: bool,
+    /// Codewords of silence still to go out before `pending` may start. It is
+    /// 9.5.1.1.3's wait and nothing else; zero everywhere but after `Ja`.
+    hold: usize,
     bits: VecDeque<bool>,
     jd: Vec<bool>,
     jp: Vec<bool>,
@@ -1432,6 +2013,10 @@ pub struct Source {
     last: Vec<bool>,
     /// B1d's codewords, already mapped: one octet a symbol (V.90 8.6.1).
     codes: VecDeque<u8>,
+    /// The last codeword B1d put on the line, and its sign: what the
+    /// queue-empty arm repeats rather than emitting a level that is not a data
+    /// symbol at all (`docs/221`). Cleared whenever a signal starts.
+    last_code: Option<(u8, bool)>,
     /// How long TRN2d lasts: "at least 2040T" (9.6.1.1.1).
     trn2d_symbols: usize,
     /// Set when a Phase 4 sequence has run out of bits: see
@@ -1441,6 +2026,41 @@ pub struct Source {
     /// has been read, which is the only thing that says what constellation
     /// Phase 4 goes out on (V.90 8.6.5).
     phase4: Option<Down4>,
+    /// 8.8.5: the coder a fast parameter exchange's `SUVd`, `CPd` and `Ed` go
+    /// out on -- "**During Fast Parameter Exchange it is transmitted using the
+    /// preceding data mode modulation**" (`v92.txt:1963-1966`). Built from
+    /// **CPu**, the constellation `B1d` was going out on, and not from `CPt`:
+    /// a far end in a fast parameter exchange has stayed in the data mode
+    /// modulation (9.9 has no `TRN2d` in it), so `CPt`'s coder is the wrong one.
+    data4: Option<Down4>,
+    /// [`Source::data4`] is the coder in force: a fast parameter exchange is
+    /// the procedure in flight rather than 9.8's rate renegotiation.
+    fpe: bool,
+    /// 9.8's two R signals, already resolved to one codeword per downstream
+    /// data frame interval: `Rd` out of the data mode constellation CPd named
+    /// and `Rt` out of the training constellation CPt named (V.90 8.6.4).
+    ///
+    /// Resolved once, at [`Source::arm_renegotiation`], rather than per symbol:
+    /// the two constellations are the whole difference between the signals and
+    /// a per-symbol lookup is where they would get mixed up.
+    reneg: Option<RenegPoints>,
+}
+
+/// The two R signals of 9.8, one codeword a data frame interval.
+///
+/// V.90 8.6.4 keeps them apart on purpose: "**Rd** denotes signal R using the
+/// highest power PCM codeword from the **data mode** constellation of each data
+/// frame interval as passed in **CP**", while "**Rt** denotes signal R using the
+/// highest power PCM codeword from the **training** constellation of each data
+/// frame interval as passed in **CPt**". Two different constellations, two
+/// different codewords, and 9.8.1.2.2 asks for `Rd` while 9.8.1.1.4 and
+/// 9.8.1.1.5 ask for `Rt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenegPoints {
+    /// Twelve codewords, interval 0 to 11, from CPd's data mode sets.
+    pub rd: [u8; DOWN_INTERVALS],
+    /// Twelve codewords, interval 0 to 11, from CPt's training sets.
+    pub rt: [u8; DOWN_INTERVALS],
 }
 
 impl Source {
@@ -1452,6 +2072,7 @@ impl Source {
             count: 0,
             symbol: 0,
             pending: None,
+            hold: 0,
             bits: VecDeque::new(),
             jd: settings.jd_bits(),
             jp: Jp::default().to_bits(),
@@ -1462,9 +2083,14 @@ impl Source {
             trn1d_symbols: (settings.habits.trn1d * FS) as usize,
             last: Vec::new(),
             codes: VecDeque::new(),
+            last_code: None,
             trn2d_symbols: TRN2D_LEAST,
             finished: None,
             phase4: None,
+            data4: None,
+            fpe: false,
+            reneg: None,
+            ri_timed: false,
         }
     }
 
@@ -1518,6 +2144,33 @@ impl Source {
     ///
     /// False when CPt's rate does not fit its own constellations, which is the
     /// one thing 5.4.3 forbids and which leaves Phase 4 with nothing to send.
+    /// 8.8.5's **Fast Parameter Exchange** coder: `SUVd`, `CPd` and `Ed` are
+    /// "transmitted using the preceding data mode modulation" (`v92.txt:1963-1966`),
+    /// so they go out through `CPu`'s encoder and not `CPt`'s.
+    ///
+    /// Built afresh, which is also 9.9.1.2.3's "initialize the scrambler,
+    /// differential encoder and spectral shaping filter memory to zero"
+    /// (`v92.txt:3083-3085`) applied to the coder that is actually used: a new
+    /// `Encoder` is `Differential::new()` and `Shaper::new()`
+    /// (`crates/datapump/src/v90/encoder.rs:154-162`), and there is no reset
+    /// anywhere else (`encoder.rs:129-133`). The scrambler is `Source`'s own,
+    /// used by [`Source::phase4_codeword`] for the sequences' bits, and it is
+    /// zeroed here for the same clause.
+    pub fn begin_fpe(&mut self, cpu: &Cp) -> bool {
+        let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu) else { return false };
+        self.fpe = true;
+        self.data4 = Some(Down4 { coder: Encoder::new(mapping, self.law), samples: VecDeque::new() });
+        self.scrambler.reset();
+        true
+    }
+
+    /// Back to data mode: the fast parameter exchange is over and `CPt`'s coder
+    /// is the corresponding one again for whatever 9.6.1.1 does next.
+    pub fn end_fpe(&mut self) {
+        self.fpe = false;
+        self.data4 = None;
+    }
+
     pub fn set_cpt(&mut self, cpt: &Cp) -> bool {
         let Some(mapping) = CodeMapping::from_cp(cpt) else { return false };
         self.phase4 = Some(Down4 {
@@ -1559,7 +2212,8 @@ impl Source {
 
     /// Whether the coder still has codewords queued for the sequence in flight.
     fn phase4_queued(&self) -> bool {
-        self.phase4.as_ref().is_some_and(|p| !p.samples.is_empty())
+        let coder = if self.fpe { self.data4.as_ref() } else { self.phase4.as_ref() };
+        coder.is_some_and(|p| !p.samples.is_empty())
     }
 
     /// The next codeword of a Phase 4 signal, mapping another data frame
@@ -1573,7 +2227,11 @@ impl Source {
     /// `None` only when no CPt has been installed -- Phase 4 cannot be signalled
     /// without one, and the caller falls back to what it did before.
     fn phase4_codeword(&mut self, ones: bool) -> Option<(u8, bool)> {
-        let mut phase4 = self.phase4.take()?;
+        // 8.8.5: the same coder, whichever constellation is the "corresponding"
+        // one for the procedure in flight -- `CPt`'s during Training and Rate
+        // Renegotiation, **the preceding data mode's during Fast Parameter
+        // Exchange** (`v92.txt:1963-1966`).
+        let mut phase4 = if self.fpe { self.data4.take()? } else { self.phase4.take()? };
         let codeword = loop {
             if let Some(sample) = phase4.samples.pop_front() {
                 break sample;
@@ -1603,7 +2261,11 @@ impl Source {
                 }
             }
         };
-        self.phase4 = Some(phase4);
+        if self.fpe {
+            self.data4 = Some(phase4);
+        } else {
+            self.phase4 = Some(phase4);
+        }
         Some(codeword)
     }
 
@@ -1642,6 +2304,122 @@ impl Source {
         ucode::level(self.law, ucode) * if positive { 1.0 } else { -1.0 }
     }
 
+    /// Give 9.8's two R signals their codewords, out of the constellations
+    /// V.90 8.6.4 sends them out on.
+    ///
+    /// `data` is the highest-power codeword of each downstream data frame
+    /// interval as **CPd** passed it; `training` is the same out of **CPt**.
+    /// The caller resolves both because it is the caller that holds CPd and
+    /// CPt; what this keeps is the pair, so that no later symbol can pick the
+    /// wrong one.
+    pub fn arm_renegotiation(&mut self, data: [u8; DOWN_INTERVALS], training: [u8; DOWN_INTERVALS]) {
+        self.reneg = Some(RenegPoints {
+            rd: data,
+            rt: training,
+        });
+    }
+
+    /// 9.5.1.1.12's `Ri` for 384T followed by `R-bar-i` for 24T, with the bar
+    /// counted out here rather than by an `E1u`.
+    ///
+    /// In Phase 3 the bar is the far end's to ask for: `E1u` ends the `CPt`
+    /// series and this end answers `R-bar-i` (`cpt_bit`), which is why nothing
+    /// in the `Ri` arm ever counted 384T. Off the re-entry there is no `CPt`
+    /// and no `E1u` -- the far end has simply stopped sending data -- so the
+    /// clause's own lengths are the only thing left to run the signal for, and
+    /// they are `Ri` for 384T and `R-bar-i` for 24T (`docs/216` §3).
+    pub fn ri_opener(&mut self) {
+        self.ri_timed = true;
+        self.change(Out::Ri);
+    }
+
+    /// 9.8.1.1.2's "up to 16008T": how long TRN2d may run before the `SUVd`
+    /// the clause puts after it goes out.
+    ///
+    /// The bound is a **countdown**, not a check: the `TRN2d` arm takes a
+    /// pending change only at a frame boundary at or after this many symbols,
+    /// so asking for `SUVd` while TRN2d is on the line cuts it at exactly this
+    /// count instead of letting it run on. Without it the arm's exit condition
+    /// (`count >= trn2d_symbols && at_frame_boundary && pending`) never fires in
+    /// a renegotiation and the far end never sees an `SUVd` -- `docs/214` §6's
+    /// first gap.
+    ///
+    /// 16008T is 2668 whole data frame intervals, so the cut lands on the frame
+    /// boundary the `SUVd` after it must start on.
+    pub fn bound_trn2d(&mut self, symbols: usize) {
+        self.trn2d_symbols = symbols;
+    }
+
+    /// How long TRN2d is being held for, in symbols.
+    #[must_use]
+    pub fn trn2d_bound(&self) -> usize {
+        self.trn2d_symbols
+    }
+
+    /// Whether the signal waiting to go out may only begin on a data frame
+    /// boundary.
+    ///
+    /// "The rate renegotiation procedure ... shall be initiated only on the
+    /// boundary of a data frame. Similarly, a modem shall only respond to a
+    /// rate renegotiation on the boundary of a data frame" (`v92.txt:2839`),
+    /// and 9.8.1.1.1 and 9.8.1.2.2 each repeat it of `Rd` itself: "The signal
+    /// Rd shall begin on the boundary of a data frame".
+    ///
+    /// Only the 9.8 signals are named. Everything else in this end's Phase 4
+    /// takes its place on whatever symbol the signal before it ran out on, and
+    /// changing that would be a change to every call, not to this one -- see
+    /// [`Source::next`] for the bug that made the frame grid load-bearing.
+    fn pending_needs_frame_boundary(&self) -> bool {
+        matches!(
+            self.pending,
+            // `Ri` is here for `docs/216`'s re-entry and nothing else: out of
+            // data mode the `B1d` arm is where a queued signal waits, and
+            // every frame-counted signal after `Ri` -- the whole of Phase 4 --
+            // is measured against the grid `Ri` starts on. In Phase 3 `Ri` is
+            // never pending from `B1d`, so a call that does not fall back is
+            // unchanged.
+            // `Rf` for the same reason as `Rd`: 9.9.1.2.2 names the boundary
+            // outright -- "The signal `Rf` shall begin on the boundary of a
+            // data frame" (`v92.txt:3081-3082`).
+            Some(Out::Rd | Out::RdBar | Out::Rt | Out::RtBar | Out::Ri | Out::RiBar | Out::Rf | Out::RfBar)
+        )
+    }
+
+    /// One codeword of Rd or Rt, from the interval [`Source::symbol`] is in.
+    ///
+    /// The sign comes from V.90 8.6.4's "repeating the 6 symbol sequence ...
+    /// with the sign pattern + + + - - -", so it repeats every [`INTERVALS`];
+    /// the *codeword* comes from "each data frame interval", which is
+    /// [`DOWN_INTERVALS`] of them. Two periods of different length, which is
+    /// why they are counted apart.
+    fn r_codeword(&self, training: bool, positive: bool) -> f64 {
+        let Some(reneg) = self.reneg.as_ref() else {
+            // No constellation to name, and no codeword that means "nothing".
+            // `arm_renegotiation` (`2066`) is called before either `Rd` or `Rt`
+            // is ever asked for (`5780`, `5837`), so this is a caller that
+            // skipped it -- and a U_INFO `Rd` is -18 dB below the data mode
+            // peak, the same shape as `docs/218`'s Ucode 2: a level that
+            // silently means "no answer" is a level a far end reads as a
+            // signal. Loud instead of silent, and the value unchanged so that
+            // no path a bench call reaches today moves.
+            debug_assert!(
+                false,
+                "9.8's Rd/Rt asked for before arm_renegotiation: no constellation to take \
+                 a codeword from (v90.txt:1841-1848)"
+            );
+            return self.level(self.uinfo, positive);
+        };
+        let points = if training { &reneg.rt } else { &reneg.rd };
+        let interval = (self.symbol % DOWN_INTERVALS as u64) as usize;
+        let ucode = points[interval.min(DOWN_INTERVALS - 1)];
+        self.level(ucode, positive)
+    }
+
+    /// Is the emitted signal of 9.8 the 24T bar, and has it run its 24T?
+    fn r_bar_ended(&self) -> bool {
+        self.count >= R_BAR_FRAMES * INTERVALS
+    }
+
     fn start(&mut self, out: Out) {
         self.out = out;
         self.count = 0;
@@ -1654,12 +2432,18 @@ impl Source {
                 if let Some(phase4) = self.phase4.as_mut() {
                     phase4.samples.clear();
                 }
+                if let Some(data4) = self.data4.as_mut() {
+                    data4.samples.clear();
+                }
             }
             _ => self.last.clear(),
         }
         if out != Out::B1d {
             self.codes.clear();
         }
+        // A signal beginning is not a repeat of the last codeword of the one
+        // before it, whatever it was.
+        self.last_code = None;
         match out {
             // "The first symbol of Sd is defined to be transmitted in data
             // frame interval 0" (V.90 8.4.4).
@@ -1699,6 +2483,23 @@ impl Source {
     /// Ask for `out` at the next place the signal now on the line can end.
     pub fn change(&mut self, out: Out) {
         self.pending = Some(out);
+        self.hold = 0;
+    }
+
+    /// Ask for `out` after `symbols` more codewords of silence: 9.5.1.1.3's
+    /// "may wait for up to 500 ms and shall then transmit signal Sd"
+    /// (`v92.txt:2535-2536`).
+    ///
+    /// `symbols` is a whole number of frames ([`Habits::sd_after_ja_symbols`]
+    /// guarantees it), so the wait only moves *when* `Sd` starts and leaves the
+    /// frame grid -- and with it the six-symbol pattern every frame-counted
+    /// signal is measured against -- exactly where it was. The wait is counted
+    /// only while silence is on the line: it belongs to the gap after `Ja`, and
+    /// a hand-over that finds some other signal in flight has nothing to wait
+    /// in.
+    pub fn change_after(&mut self, out: Out, symbols: usize) {
+        self.pending = Some(out);
+        self.hold = if self.out == Out::Silence { symbols } else { 0 };
     }
 
     /// One codeword out.
@@ -1720,6 +2521,14 @@ impl Source {
         loop {
             match self.out {
                 Out::Silence => {
+                    // 9.5.1.1.3's wait, spent as silence on the frame grid: the
+                    // pending signal starts at the first frame boundary at or
+                    // after the hold runs out, so it is still whole frames
+                    // (`Source::next`'s rotation) and only its placement moved.
+                    if self.hold > 0 {
+                        self.hold -= 1;
+                        return 0.0;
+                    }
                     if self.at_frame_boundary()
                         && let Some(next) = self.pending.take()
                     {
@@ -1839,7 +2648,26 @@ impl Source {
                     // rate and constellation the analogue modem's CPu named.
                     // Its octets are handed in whole -- the mapper has already
                     // chosen them -- so they go out as they are (3.6).
-                    if self.codes.is_empty()
+                    //
+                    // A renegotiation waiting in `pending` is the one thing
+                    // here that may not start where the codeword queue happens
+                    // to empty: `v92.txt:2839` and 9.8.1.2.2 both put `Rd` on
+                    // a data frame boundary. The gate applies to nothing else,
+                    // so an ordinary hand-over out of data mode is unchanged.
+                    // A signal that has to begin on a data frame boundary does
+                    // **not** wait for the codeword queue to run dry:
+                    // `fill_downstream` refills it every symbol, so "empty" is a
+                    // moment that need never come and the signal would sit in
+                    // `pending` for ever. Measured on `runs-216`'s first call:
+                    // `data mode lost` fired at 25.000 s, `Ri` was asked for --
+                    // and never went out, because `codes` was never empty on a
+                    // frame boundary. A frame boundary is the whole gate.
+                    let startable = if self.pending_needs_frame_boundary() {
+                        self.at_frame_boundary()
+                    } else {
+                        self.codes.is_empty()
+                    };
+                    if startable
                         && let Some(next) = self.pending.take()
                     {
                         self.start(next);
@@ -1857,11 +2685,27 @@ impl Source {
                             // nothing hides from a receiver that looks at the
                             // codeword itself.
                             let (u, negative) = ucode::from_octet(self.law, octet);
+                            // Kept, because `None` below is "the last codeword
+                            // again" and this is the only place that knows it.
+                            self.last_code = Some((u, !negative));
                             return self.level(u, !negative);
                         }
-                        // Nothing queued yet: the last codeword again rather
-                        // than a silence the far end would read as a cleardown.
-                        None => return self.level(self.uinfo, self.sign),
+                        // Nothing queued: the **last codeword again**, which is
+                        // what this comment said while the code sent U_INFO --
+                        // a -18 dB hole in the middle of data mode, on the one
+                        // path where every symbol is a data symbol. `None` here
+                        // is a scheduling defect (`needs_codes`, `2040`), and a
+                        // repeated data codeword is the only non-signal that
+                        // keeps the frame grid and the constellation both
+                        // right. Measured latent, not current: in
+                        // `runs-218/172503-r218b/agr-rx.raw` the data mode
+                        // window (190 000-199 988) has 3772 -- U_INFO -- in
+                        // proportion with its neighbours, so the fallback did
+                        // not fire there (`docs/221`).
+                        None => {
+                            let (u, positive) = self.last_code.unwrap_or((self.uinfo, self.sign));
+                            return self.level(u, positive);
+                        }
                     }
                 }
                 Out::Dil => {
@@ -1912,11 +2756,128 @@ impl Source {
                         self.start(next);
                         continue;
                     }
+                    // `ri_opener`'s `Ri` runs the clause's 384T and then turns
+                    // over, exactly where an `E1u` would have turned it over.
+                    if !bar && self.ri_timed && self.count >= R_FRAMES * INTERVALS && self.at_frame_boundary() {
+                        self.ri_timed = false;
+                        self.start(Out::RiBar);
+                        continue;
+                    }
                     // "+ + + - - -": UINFO in every interval, and the bar the
                     // other way up (V.90 8.6.4).
                     let interval = (self.symbol % INTERVALS as u64) as usize;
                     self.count += 1;
                     return self.level(self.uinfo, (interval < 3) ^ bar);
+                }
+                // 9.8.1.1.1 and 9.8.1.2.2: "transmit signal Rd for 384T and
+                // then R-bar-d for 24T", the same pair for Rt. Four arms and
+                // not two because the *codeword* differs between them -- CPd's
+                // data mode constellation against CPt's training one (V.90
+                // 8.6.4) -- and the sign pattern between R and its bar.
+                Out::Rd | Out::RdBar | Out::Rt | Out::RtBar => {
+                    let bar = matches!(self.out, Out::RdBar | Out::RtBar);
+                    let training = matches!(self.out, Out::Rt | Out::RtBar);
+                    // "The signal Rd shall begin on the boundary of a data
+                    // frame" (9.8.1.1.1, 9.8.1.2.2). Asserted rather than
+                    // assumed: a signal started off-frame that rotated a
+                    // frame-counted grid is the bug recorded at the top of
+                    // docs/214 and at `digital.rs:1781-1782`, and it is silent
+                    // on this side of the line.
+                    if self.count == 0 {
+                        debug_assert!(
+                            self.at_frame_boundary(),
+                            "9.8.1.2.2: {} began {} symbols into a data frame, not on its boundary",
+                            if training { "Rt" } else { "Rd" },
+                            self.symbol % INTERVALS as u64
+                        );
+                    }
+                    // The bar is 24T and then the signal after it: 9.8.1.1.2's
+                    // TRN2d for the responder, 9.8.1.1.4's SUVd for the
+                    // initiator. R is 384T.
+                    let ends = if bar {
+                        self.r_bar_ended()
+                    } else {
+                        self.count >= R_FRAMES * INTERVALS
+                    };
+                    if ends && self.at_frame_boundary() {
+                        // 9.8.1.2.2 and 9.8.1.1.1 each name the pair: R for
+                        // 384T and *then* R-bar for 24T. With nothing asked
+                        // for past the bar, the bar is followed by 9.8.1.1.2's
+                        // TRN2d; with nothing asked for past the R, by its own
+                        // bar.
+                        let next = self.pending.take().unwrap_or(if bar {
+                            Out::Trn2d
+                        } else if training {
+                            Out::RtBar
+                        } else {
+                            Out::RdBar
+                        });
+                        self.start(next);
+                        continue;
+                    }
+                    self.count += 1;
+                    let interval = (self.symbol % INTERVALS as u64) as usize;
+                    // R-bar is "4 repetitions of the 6-symbol sequence ... with
+                    // the sign pattern - - - + + +" (`v90.txt:1835`): the same
+                    // codewords, the pattern inverted, and "neither R nor R-bar
+                    // are differentially encoded" -- so the polarity is the
+                    // literal one, not the encoder's. (An earlier draft of this
+                    // comment had `- - - + + -`, a PDF hyphenation artifact of
+                    // the em dashes; it is read off the source line.)
+                    return self.r_codeword(training, (interval < 3) ^ bar);
+                }
+                // 9.9.1.2.2: "After detecting the RM-to-RM-bar transition, the
+                // digital modem shall transmit signal Rf for 384T and then
+                // R-bar-f for 24T. The signal Rf shall begin on the boundary of
+                // a data frame" (`v92.txt:3079-3082`).
+                //
+                // The codeword is 8.8.4's -- "the highest power PCM codeword
+                // from the data mode constellation of each data frame interval
+                // as passed in CPu" (`v92.txt:1961-1962`) -- the same source
+                // `Rd` already resolves (`docs/218`), read here through
+                // `r_codeword`'s data-mode branch rather than through a second
+                // resolution of the same message. `renegotiation_points` fills
+                // `reneg.rd` from `self.downstream`'s mapping, i.e. from the
+                // encoder B1d actually goes out on.
+                Out::Rf | Out::RfBar => {
+                    let bar = self.out == Out::RfBar;
+                    // "The signal Rf shall begin on the boundary of a data
+                    // frame": asserted, like `Rd`'s, because a signal started
+                    // off the grid is silent on this side of the line and
+                    // rotates every interval after it.
+                    if self.count == 0 {
+                        debug_assert!(
+                            self.at_frame_boundary(),
+                            "9.9.1.2.2: Rf began {} symbols into a data frame, not on its boundary",
+                            self.symbol % INTERVALS as u64
+                        );
+                    }
+                    // Rf is 384T and R-bar-f is 24T: 384T is 8.8.4's 12-symbol
+                    // sequence 32 times, 24T its two repetitions.
+                    let ends = if bar {
+                        self.count >= R_BAR_FRAMES * INTERVALS
+                    } else {
+                        self.count >= R_FRAMES * INTERVALS
+                    };
+                    if ends && self.at_frame_boundary() {
+                        let next = self.pending.take().unwrap_or(if bar {
+                            // 9.9.1.2.3's SUVd is asked for by `RenegTail`
+                            // before the bar ends; this fallback is reached
+                            // only by a source driven without a tail.
+                            Out::Silence
+                        } else {
+                            Out::RfBar
+                        });
+                        self.start(next);
+                        continue;
+                    }
+                    // "+ + - -" with the left-most sign first, and the bar the
+                    // other way up. The sign is the literal one: 8.8.4 gives
+                    // `Rf` a sign pattern rather than a differential encoding,
+                    // exactly as V.90 8.6.4 does for `R`/`R-bar`.
+                    let positive = (self.count % RF_SIGN_PERIOD) < RF_SIGN_PERIOD / 2;
+                    self.count += 1;
+                    return self.r_codeword(false, positive ^ bar);
                 }
                 // 9.5.1.1.13 with V.90 8.6.6: with no DIL asked for, the
                 // signal in the DIL's place is SCR -- TRN1d's own -- and it
@@ -1998,21 +2959,722 @@ impl Source {
     /// CPt". U_INFO is the fallback for a Phase 4 with no CPt, which is a
     /// Phase 4 that cannot go out on the encoder either.
     fn trn2d_point(&self) -> u8 {
-        let Some(phase4) = self.phase4.as_ref() else {
-            return self.uinfo;
-        };
-        let sets = &phase4.coder.mapping().sets;
-        let Some(first) = sets.first() else {
-            return self.uinfo;
-        };
-        // `points` is loudest first, so the first one common to all six is the
-        // loudest common one.
-        first
-            .points()
-            .iter()
-            .copied()
-            .find(|&u| sets.iter().all(|s| s.points().contains(&u)))
+        // The table, not a hand-derived maxima: `Mapping::common_loudest` is
+        // the single owner of "a codeword legal in all six of CPt's
+        // intervals", so this cannot drift from the levels Phase 4 actually
+        // emits. U_INFO is the fallback for a Phase 4 with no CPt, which is a
+        // Phase 4 that cannot go out on the encoder either.
+        self.phase4
+            .as_ref()
+            .and_then(|phase4| phase4.coder.mapping().common_loudest())
             .unwrap_or(self.uinfo)
+    }
+}
+
+/// How the digital modem learns that the far end has **left data mode**.
+///
+/// **[our choice]**, and the threshold is the one thing on this path the
+/// clauses do not give. V.92 has no signal for "I have stopped sending data":
+/// 9.8.1 is a rate renegotiation, which starts with an `Ru` the Agere measured
+/// for `docs/216` never sends anywhere in a call, and 9.7 is a retrain, which
+/// starts with Tone A. What is left is the property the clauses *do* define the
+/// far end's upstream by: 6.4.2 and 8.7.1 put every B1u symbol on a point of
+/// the constellation this end declared in `CPd`, so a symbol outside that
+/// constellation's loudest point by more than one constellation step is not a
+/// B1u symbol at all -- and a sustained run of them is a far end that is not
+/// sending B1u.
+///
+/// That is why this test is a magnitude compare and not a pattern match. A
+/// pattern would be a property of the far end's generator (`V34TxDataReset` /
+/// `DisableScrambler` / `SetPatternGenerator` at `.text+0x5e530`), which is a
+/// property of its *implementation*; a level outside the constellation it
+/// agreed to is a property of the protocol. Cost is one comparison a symbol.
+///
+/// The margin of one whole constellation step is measured, not chosen: on
+/// `/tmp/agr-v90-interop/164250-sd108ab170-r214/agr-tx.raw` (the far end's own
+/// transmit, 24 000 bit/s, `CPd` over 8 points, gap 2 LSB) the data mode's
+/// loudest symbol in 9 440 symbols of data is 8 931, the loudest point of the
+/// table is 10 746, and no symbol at all reaches the 12 179 threshold; the
+/// generator pattern that follows reaches 22 303 and has 15 of its 40 levels
+/// above it.
+// ---------------------------------------------------------------------------
+// 9.9.1.2.1/.2: RM, and the RM-to-RM-bar transition
+// ---------------------------------------------------------------------------
+
+/// What one received data mode symbol says about 9.9's `RM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmEvent {
+    /// Nothing: data mode as usual.
+    None,
+    /// 9.9.1.2.1: "After detecting `RM`" -- the far end has begun a fast
+    /// parameter exchange.
+    RmDetected,
+    /// 9.9.1.2.2: the `RM`-to-`RM`-bar transition, which is what `Rf` answers.
+    RmToRmBar,
+}
+
+/// `RM`'s pattern as Table 25 gives it, one byte a symbol: 1 is
+/// `K_i = M_i - 1` (the loudest point of the interval's set) and 0 is
+/// `K_i = 0` (the quietest).
+///
+/// **Generated from the table's own rows and not typed from memory**: Table 25
+/// (`v92.txt:1630-1647`) lists `K_i = M_i - 1` for `i` in `{0,1,4,5,8,9}` and
+/// `K_i = 0` for `i` in `{2,3,6,7,10}`, with `u11 = 0`. The twelve-symbol
+/// pattern is therefore `{max, max, min, min}` three times: period four, the
+/// loud pair first.
+pub const RM_K_LOUD: [bool; 12] = {
+    let mut k = [false; 12];
+    let mut i = 0;
+    while i < 12 {
+        // Rows 0,1,4,5,8,9 and row 11 (u11 = 0) -- i.e. every i whose row in
+        // Table 25 is `M_i - 1` for 0..11, plus `u11 = 0`.
+        k[i] = matches!(i, 0 | 1 | 4 | 5 | 8 | 9);
+        i += 1;
+    }
+    k
+};
+
+/// Table 26's `RM`-bar, the same way: `K_i = 0` for `i` in `{0,1,4,5,8,9}`,
+/// `K_i = M_i - 1` for `i` in `{2,3,6,7,10,11}` (`v92.txt:1654-1667`).
+pub const RM_BAR_K_LOUD: [bool; 12] = {
+    let mut k = [false; 12];
+    let mut i = 0;
+    while i < 12 {
+        k[i] = matches!(i, 2 | 3 | 6 | 7 | 10 | 11);
+        i += 1;
+    }
+    k
+};
+
+/// How many symbols of `RM`'s period-four pattern must agree before the far end
+/// is taken to be sending `RM`. **`[our choice]`**, **24 symbols** -- six whole
+/// periods of Table 25's four-symbol pattern, i.e. detection latency of 24
+/// symbols (3 ms of `RM`'s 384T, which is 6 % of the signal).
+///
+/// Two bounds and both are measured, not guessed. The lower one is chance: a
+/// data mode's own symbols reach both ends of the constellation continually, so
+/// a `{loud,loud,quiet,quiet}` alignment happens by accident, and on a 40-level
+/// constellation a twelve-symbol run (three periods) locks about once in two
+/// thousand trials -- which is once in a few seconds of data. Twenty-four
+/// symbols is 2^-24 a trial per phase. The upper one is the far end's own bar:
+/// its `V90DataModeDecoder` detector needs ">= 40 complement pairs" and four
+/// period-4 hits (`docs/220`, `[verified]`), so 24 symbols of evidence is under
+/// what the other end asks for itself and over what chance produces. Timing is
+/// in symbols, never wall clock.
+const RM_SYMBOLS: usize = 24;
+
+/// How many symbols of Table 26's pattern must agree before 9.9.1.2.2's
+/// transition is taken. **`[our choice]`**
+///
+/// One period, four symbols, for the same reason [`RU_BAR_DEVIATIONS`] is
+/// three: `R-bar-M` is 24T, two periods of Table 26's twelve, and a detector
+/// that waited for all of it would put `Rf` on the line at the end of the
+/// 24T rather than at its start. The transition is the *complement* of the
+/// pattern `RM` locked on, so these four symbols are the four that Table 26
+/// moves the loud pair to.
+const RM_BAR_SYMBOLS: usize = 4;
+
+/// 9.9.1.2.1's receiver conditioning and 9.9.1.2.2's transition, on the
+/// received data mode level stream.
+///
+/// **What is detectable without a trellis decoder, and why this is it.** `RM`
+/// "shall be trellis encoded" (8.7.4, `v92.txt:1666-1667`) and goes out on "the
+/// constellation parameters used for the data mode", so its *symbols* are not
+/// Table 25's values -- they are whatever the trellis code and the prefilter
+/// put on the line. What Table 25 does fix is the **modulus encoder output**,
+/// and that is what the magnitude carries: `K_i = M_i - 1` puts the symbol at
+/// the loudest point of interval `i`'s set and `K_i = 0` at the quietest, so
+/// the received magnitudes show `{loud, loud, quiet, quiet}` three times over.
+/// That signature is what this reads: **no trellis decoder, no modulus
+/// decoder**, only the two ends of the constellation the far end's own `CPu`
+/// (and this end's CPd) declared.
+///
+/// `[inferred]` in exactly one place: that the trellis code and the prefilter
+/// leave the loud/quiet distinction of the modulus encoder output intact. The
+/// margins are what make that safe -- `hi` is the midpoint of the constellation
+/// table's top two points and `lo` of its bottom two, so a symbol only has to
+/// be in the right half of the range, not at the right point.
+///
+/// A **side channel**, like [`RuDetector`] and [`DataModeLoss`]: it is fed the
+/// same levels the B1u decoder is fed and returns nothing to it, so a call with
+/// no `RM` in it puts exactly the same symbols through exactly the same
+/// arithmetic it did before.
+#[derive(Debug, Clone)]
+pub struct RmDetector {
+    /// Above this a symbol is near the loud end of the constellation.
+    hi: f64,
+    /// Below this it is near the quiet end.
+    lo: f64,
+    /// The last four classifications, oldest first; `None` is neither end.
+    window: [Option<bool>; 4],
+    /// Symbols classified since the last reset, saturating at four.
+    filled: usize,
+    /// The phase of the four-symbol cycle `RM` locked on, if it has.
+    phase: Option<usize>,
+    /// Symbols in a row that agree with that phase, counting from the symbol
+    /// that established it.
+    agreed: usize,
+    /// Symbols in a row that agree with the *complement* -- 9.9.1.2.2's
+    /// transition.
+    inverted: usize,
+    /// `RM` seen: 9.9.1.2.1's conditioning is in force.
+    heard: bool,
+    /// The transition has been reported, once.
+    fired: bool,
+}
+
+impl RmDetector {
+    /// A detector against the level table [`Modem::begin_b1u`] built -- the
+    /// same table [`DataModeLoss`] is built from, because both ask the same
+    /// question of it: which levels are points of the constellation the far
+    /// end agreed to send.
+    #[must_use]
+    pub fn new(levels: &[f64]) -> Option<Self> {
+        let mut magnitudes: Vec<f64> =
+            levels.iter().map(|l| l.abs()).filter(|l| l.is_finite() && *l > 0.0).collect();
+        magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let top = *magnitudes.last()?;
+        let bottom = *magnitudes.first()?;
+        if top <= bottom {
+            return None;
+        }
+        // The midpoint of the top two and of the bottom two points: a symbol
+        // has to be in the right half of the constellation's range, not at the
+        // right point, which is what survives the trellis code and the line.
+        let second_top = magnitudes.iter().rev().nth(1).copied().unwrap_or(top);
+        let second_bottom = magnitudes.get(1).copied().unwrap_or(bottom);
+        Some(Self {
+            hi: (top + second_top) / 2.0,
+            lo: (bottom + second_bottom) / 2.0,
+            window: [None; 4],
+            filled: 0,
+            phase: None,
+            agreed: 0,
+            inverted: 0,
+            heard: false,
+            fired: false,
+        })
+    }
+
+    /// Whether 9.9.1.2.1's conditioning is in force: `RM` has been seen.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.heard
+    }
+
+    pub fn reset(&mut self) {
+        let hi = self.hi;
+        let lo = self.lo;
+        *self = Self {
+            hi,
+            lo,
+            window: [None; 4],
+            filled: 0,
+            phase: None,
+            agreed: 0,
+            inverted: 0,
+            heard: false,
+            fired: false,
+        };
+    }
+
+    /// One received data mode symbol, as the level the slicer saw.
+    pub fn feed(&mut self, level: f64) -> RmEvent {
+        if self.fired {
+            return RmEvent::None;
+        }
+        let magnitude = level.abs();
+        let class = if !magnitude.is_finite() || magnitude <= self.lo {
+            Some(false)
+        } else if magnitude >= self.hi {
+            Some(true)
+        } else {
+            None
+        };
+        self.window.rotate_left(1);
+        self.window[3] = class;
+        if self.filled < 4 {
+            self.filled += 1;
+        }
+        // Table 25's pattern, at whichever phase it started on: `RM` begins on
+        // a data frame boundary of the far end's, which is not a boundary of
+        // this end's slicing.
+        let pattern = [true, true, false, false];
+        if !self.heard {
+            let Some(phase) = self.phase else {
+                if self.filled < 4 {
+                    return RmEvent::None;
+                }
+                let found = (0..4).find(|p| {
+                    (0..4).all(|k| self.window[k] == Some(pattern[(p + k) % 4]))
+                });
+                match found {
+                    Some(p) => {
+                        self.phase = Some(p);
+                        self.agreed = 4;
+                    }
+                    None => return RmEvent::None,
+                }
+                return RmEvent::None;
+            };
+            let expected = pattern[(phase + self.agreed) % 4];
+            if class == Some(expected) {
+                self.agreed += 1;
+                if self.agreed >= RM_SYMBOLS {
+                    self.heard = true;
+                    return RmEvent::RmDetected;
+                }
+            } else {
+                // Off the pattern: `RM` did not happen here, and the next four
+                // symbols may establish it again.
+                self.phase = None;
+                self.agreed = 0;
+            }
+            return RmEvent::None;
+        }
+        // 9.9.1.2.1: "condition its receiver to detect the RM-to-RM-bar
+        // transition". Table 26 moves the loud pair two places, so the expected
+        // symbol is the complement of `RM`'s own.
+        let phase = self.phase.unwrap_or(0);
+        let counted = self.agreed + self.inverted;
+        let expected = pattern[(phase + counted) % 4];
+        if class == Some(!expected) {
+            self.inverted += 1;
+            if self.inverted >= RM_BAR_SYMBOLS {
+                self.fired = true;
+                return RmEvent::RmToRmBar;
+            }
+        } else {
+            self.inverted = 0;
+            if class == Some(expected) {
+                self.agreed += 1;
+            }
+        }
+        RmEvent::None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DataModeLoss {
+    /// The loudest level of the data mode constellation CPd declared, plus one
+    /// constellation step. Above this a level is not a point of that
+    /// constellation by any reading.
+    threshold: f64,
+    /// Symbols seen in the data frame now open.
+    in_frame: usize,
+    /// Whether the data frame now open has carried an illegal symbol yet.
+    frame_illegal: bool,
+    /// Data frames in a row that carried an illegal symbol.
+    failed: usize,
+    /// Set once, so that a far end that stays out of data mode fires once and
+    /// the re-entry is not restarted under itself.
+    fired: bool,
+}
+
+/// How many consecutive data frames must carry an illegal symbol before the
+/// far end is taken to have left data mode. **`[our choice]`**
+///
+/// Eight data frames is 96 symbols, 12 ms. The two bounds are the far end's and
+/// this end's: it has to be short against the 4 000 samples (0.5 s) the far
+/// end's own data-mode receive state waits before it gives up (`docs/213`,
+/// `V92ClientDataModeRxState` at `.text+0x5dea0` sets `+0x11698` to
+/// `RTDEd + 4000`), and long against a burst of line noise, which is what a
+/// single failed frame is. On the measured call above every one of those eight
+/// frames fails on the first symbol of it (37 % of the generator's symbols are
+/// above the threshold, so a frame of twelve that carries none has probability
+/// 0.003), which leaves the whole 0.5 s of the far end's wait for the re-entry
+/// itself.
+const DATA_MODE_LOSS_FRAMES: usize = 8;
+
+impl DataModeLoss {
+    /// A detector against the level table [`Modem::begin_b1u`] built, or `None`
+    /// when that table has no step to measure against.
+    #[must_use]
+    pub fn new(levels: &[f64]) -> Option<Self> {
+        let mut sorted: Vec<f64> = levels.iter().copied().filter(|l| l.is_finite()).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let top = *sorted.last()?;
+        let step = sorted
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|d| *d > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if !step.is_finite() || step <= 0.0 {
+            return None;
+        }
+        Some(Self { threshold: top + step, in_frame: 0, frame_illegal: false, failed: 0, fired: false })
+    }
+
+    /// The level above which a symbol is not a point of the declared
+    /// constellation.
+    #[must_use]
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Whether the far end has been declared out of data mode.
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        self.fired
+    }
+
+    /// One received data mode symbol. `true` on the symbol the condition
+    /// becomes sustained, and never again after it.
+    ///
+    /// A data frame is twelve symbols (Figure 1) and fails on **one** illegal
+    /// symbol in it: the test is not "how many errors", it is "was this frame a
+    /// point sequence of the constellation at all", and one symbol that is not
+    /// is enough to answer no.
+    pub fn feed(&mut self, level: f64) -> bool {
+        if self.fired {
+            return false;
+        }
+        self.frame_illegal |= !level.is_finite() || level.abs() > self.threshold;
+        self.in_frame += 1;
+        if self.in_frame < UP_INTERVALS {
+            return false;
+        }
+        // One whole data frame has been read: it either carried a symbol that
+        // is not a point of the constellation or it did not.
+        self.in_frame = 0;
+        if std::mem::take(&mut self.frame_illegal) {
+            self.failed += 1;
+        } else {
+            self.failed = 0;
+        }
+        if self.failed >= DATA_MODE_LOSS_FRAMES {
+            self.fired = true;
+            return true;
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9.8.1.1.2 to 9.6.1.1.2: the tail after Rd and R-bar-d
+// ---------------------------------------------------------------------------
+
+/// Where 9.8's tail has got to.
+///
+/// The clause chain is 9.8.1.2.3 -> 9.8.1.1.2 -> .3 -> .4/.5 -> 9.6.1.1.2, and
+/// every step of it hands the next one a signal this end has already got an
+/// emitter for. What was missing was the machine that asks for them in the
+/// clause's order, which is this and [`RenegTail::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenegStage {
+    /// 9.8.1.2.2 and 9.8.1.1.2's first half: `Rd` 384T, `R-bar-d` 24T and then
+    /// `TRN2d` are on [`Source`]'s own arms, and nothing is asked for until
+    /// `TRN2d` is on the line.
+    Trn2d,
+    /// 9.8.1.1.2/.3: `SUVd` sequences. Which of the two they are is the bit-32
+    /// branch, and it is decided here and nowhere else.
+    Suvd,
+    /// 9.8.1.1.3: `Ed` has gone out and the line is Ucode 0 until an `SUVu`
+    /// with bit 32 clear (9.8.1.1.4).
+    Silence,
+    /// 9.8.1.1.4/.5: `Rt` for 384T then `R-bar-t` for 24T.
+    Rt,
+    /// 9.6.1.1.2: the exchange -- `SUVd` sequences and the one `CPd`.
+    Cp,
+    /// 9.6.1.1.4's `Ed` was the last thing in the clause: B1d again.
+    Done,
+}
+
+/// The tail of 9.8: what to ask [`Source`] for after `R-bar-d`, and when.
+///
+/// One machine for the initiating and responding halves, because 9.8.1.2.3 says
+/// so outright -- "The digital modem shall then proceed according to 9.8.1.1.2"
+/// -- and 9.8.1.1.4/.5 end at 9.6.1.1.2 like everything else. The exchange is
+/// the same [`Exchange`] Phase 4 uses, with [`Context::Renegotiation`], which is
+/// what selects 9.8's silent period and refuses CPd bit 29's one-symbol E2u
+/// extension (`Context::may_extend_e2u`).
+#[derive(Debug, Clone)]
+pub struct RenegTail {
+    stage: RenegStage,
+    /// 9.8.1.1.3's `SUVd'` -- bit 33 set -- has gone out in the silence
+    /// handshake, which is what "the current SUVd" has to be before the `Ed`.
+    sent_ack_suvd: bool,
+    /// 9.8.1.1.3's `Ed` has been asked for.
+    ed_asked: bool,
+    /// And the silence behind it.
+    silence_asked: bool,
+}
+
+impl RenegTail {
+    /// A tail at 9.8.1.2.3, with the exchange 9.6.1.1.2 is entered from.
+    ///
+    /// This is `Exchange::new(Context::Renegotiation, ...)`. It is a **live**
+    /// caller at last: `docs/214` §6 gap 3 recorded that the context was
+    /// constructible and had none.
+    /// Returns the tail **and** the exchange it drives, because the exchange is
+    /// what the far end's `SUVu` is reported to ([`Exchange::peer_suv`]) and the
+    /// owner has to hold it for the reader that does the reporting.
+    pub fn new(round_trip: f64, fs: f64) -> (Self, Exchange) {
+        let mut exchange = Exchange::new(Context::Renegotiation, round_trip, fs);
+        // 9.6.1.1.3's repeats, interleaved with SUVd as 9.6.2.1.2's CPu needs.
+        exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // `CPD_WAITS_FOR_PARKED_TX`: 18 ms after its `CPu` the far end's chain
+        // is mid-sequence and the acknowledgement it sets never leaves it; one
+        // window later it is parked and `a001` comes out.
+        exchange.hold_cp_for_parked_tx();
+        // 9.8.1.1.2's "either SUVd or SUVu"; see [`RENEG_REQUEST_SILENCE`].
+        exchange.request_silence(RENEG_REQUEST_SILENCE);
+        (
+            Self { stage: RenegStage::Trn2d, sent_ack_suvd: false, ed_asked: false, silence_asked: false },
+            exchange,
+        )
+    }
+
+    /// A tail that begins at **9.9.1.2.3's** `SUVd`, with no `TRN2d` before it.
+    ///
+    /// 9.9.1.2.3 asks for exactly three things -- "initialize the scrambler,
+    /// differential encoder and spectral shaping filter memory to zero and
+    /// transmit `SUVd` sequences with **bit 32 clear** and proceed according to
+    /// 9.6.1.1.2" -- and no `TRN2d` at all: the far end has *stayed* in the data
+    /// mode modulation (8.8.5: during a fast parameter exchange `SUVd` is
+    /// "transmitted using the preceding data mode modulation"), so the
+    /// `TRN2d` that 9.8.1.1.2 wants has nothing to retrain. This constructor is
+    /// the entry at [`RenegStage::Suvd`] for that, and it is the only
+    /// difference from [`RenegTail::new`]: no `TRN2d` stage, and bit 32 of this
+    /// end's own `SUVd` clear (9.9.1.2.3 says so outright, rather than leaving
+    /// it to [`RENEG_REQUEST_SILENCE`]).
+    pub fn from_suvd(round_trip: f64, fs: f64) -> (Self, Exchange) {
+        let mut exchange = Exchange::new(Context::Renegotiation, round_trip, fs);
+        exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // "with bit 32 clear" (9.9.1.2.3): no silent period is requested.
+        exchange.request_silence(false);
+        (
+            Self { stage: RenegStage::Suvd, sent_ack_suvd: false, ed_asked: false, silence_asked: false },
+            exchange,
+        )
+    }
+
+    #[must_use]
+    pub fn stage(&self) -> RenegStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.stage == RenegStage::Done
+    }
+
+    /// One of this end's Phase 4 sequences has just run out of bits.
+    ///
+    /// 9.8.1.1.3's `Ed` is followed by silence and 9.6.1.1.4's by B1d, which is
+    /// the whole difference between the two stages that end on an `Ed`.
+    fn sequence_ended(&mut self, done: Out, exchange: &mut Exchange, at: u64) {
+        // 9.8.1.1.3's Ed is **not** the exchange's E: 9.8.1.1.4 carries on to
+        // `Rt` and only then to 9.6.1.1.2, so reporting it as
+        // `SequenceKind::E` would set `Exchange`'s `finished` and every later
+        // `next_sequence` would answer `B1` -- no `CPd` at all after the
+        // silence.
+        if done == Out::Ed && self.ed_asked {
+            self.stage = RenegStage::Silence;
+            return;
+        }
+        let kind = match done {
+            Out::Cpd => SequenceKind::Cp,
+            Out::Ed => SequenceKind::E,
+            _ => SequenceKind::Suv,
+        };
+        exchange.sequence_ended(kind, at);
+        // 9.6.1.1.4's Ed is the end of the clause.
+        if done == Out::Ed {
+            self.stage = RenegStage::Done;
+        }
+    }
+
+    /// One symbol of the tail: what ended, then what the clause wants next.
+    ///
+    /// This is the whole of the per-symbol work, so that the driver in
+    /// [`Modem::reneg_out`] and the tests below drive the same code: a machine
+    /// proved in one shape and used in another is the bug `docs/214` records of
+    /// the two-point TRN2d.
+    fn push(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        // "complete sending the current SUVd" (9.8.1.1.3): a sequence that has
+        // run out has ended, and the acknowledge bit of 9.6.1.1.2 changes at a
+        // boundary and nowhere else.
+        if let Some(finished) = source.take_finished() {
+            self.sequence_ended(finished, exchange, now);
+        }
+        self.step(source, exchange, cpd, now)
+    }
+
+    /// One symbol: whatever the clause asks of the signal now in flight.
+    ///
+    /// Returns the sequence this asked the source for, or `None` when the
+    /// signal on the line is one the source runs by itself.
+    fn step(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        match self.stage {
+            RenegStage::Done => None,
+            RenegStage::Trn2d => {
+                // 9.8.1.1.2: "shall then transmit TRN2d for up to 16008T
+                // followed by SUVd sequences". The 16008T is
+                // [`Source::bound_trn2d`]'s countdown: the SUVd is asked for
+                // now and the source holds it until the count is spent.
+                if source.out() != Out::Trn2d {
+                    return None;
+                }
+                self.stage = RenegStage::Suvd;
+                self.step(source, exchange, cpd, now)
+            }
+            RenegStage::Suvd | RenegStage::Cp => {
+                // "unless bit 32 is set in either SUVd or SUVu" (9.8.1.1.2) --
+                // the one place the two directions interact. Bit 32 of our own
+                // SUVd is [`RENEG_REQUEST_SILENCE`]; bit 32 of the far end's
+                // SUVu is `Exchange::peer_asked_silence`, latched for the whole
+                // exchange because 9.8.1.1.4 tests the bit that *was* set.
+                //
+                // Re-tested on **every** symbol and not once at the start of the
+                // stage: the far end's bit arrives with its SUVu, which is after
+                // this end's first SUVd, so a branch taken at the first SUVd
+                // would never see it.
+                let silence = exchange.silence_requested() || exchange.peer_asked_silence();
+                if !silence {
+                    return self.exchange_step(source, exchange, cpd, now);
+                }
+                // 9.8.1.1.3: "shall then transmit SUVd sequences with bit 33
+                // set. After receiving an SUVu sequence with bit 33 set or E2u,
+                // the digital modem shall complete sending the current SUVd and
+                // then transmit Ed followed by silence."
+                if self.ed_asked {
+                    // The Ed is on the line; "followed by silence" is asked for
+                    // behind it, so the source starts the silence at the frame
+                    // boundary the Ed ends on and never repeats the Ed.
+                    if source.out() == Out::Ed && !self.silence_asked {
+                        self.silence_asked = true;
+                        source.change(Out::Silence);
+                    }
+                    return None;
+                }
+                // "complete sending the current SUVd and then transmit Ed": an
+                // SUVd that is only *pending* is not a current one -- the
+                // sequence in flight may still be TRN2d's countdown, and asking
+                // for the Ed there would displace the SUVd and never put one on
+                // the line at all.
+                // And it comes after an `SUVd'`, not before one: 9.8.1.1.3's
+                // order is "SUVd with bit 33 set" **then** "after receiving an
+                // SUVu with bit 33 set ... Ed".
+                if self.sent_ack_suvd && exchange.peer_acked() && source.out() == Out::Suvd {
+                    self.ed_asked = true;
+                    source.send(Out::Ed, source.ed_bits());
+                    return Some(Out::Ed);
+                }
+                if exchange.sending().is_some() {
+                    return None;
+                }
+                exchange.sequence_started(SequenceKind::Suv);
+                let bits = Suvd { silence: true, ack: true }.to_bits(INTERVALS);
+                source.send(Out::Suvd, bits);
+                self.sent_ack_suvd = true;
+                Some(Out::Suvd)
+            }
+            RenegStage::Silence => {
+                if source.out() != Out::Silence {
+                    // The Ed is still finishing: the silence was asked for when
+                    // it started, and the source takes it at the boundary.
+                    if !self.silence_asked {
+                        self.silence_asked = true;
+                        source.change(Out::Silence);
+                    }
+                    return None;
+                }
+                // 9.8.1.1.4: "If bit 32 of SUVu was set, the digital modem shall
+                // wait to receive SUVu with bit 32 clear." `peer_silence` follows
+                // the *latest* SUVu and not a latch, which is what makes this
+                // the wait the clause describes.
+                if exchange.peer_silence() {
+                    return None;
+                }
+                // The silent period is over and 9.6.1.1.2 starts again behind
+                // `Rt`: `Exchange::silence_ended` drops the acknowledge state
+                // bit 33 carried *inside* the silence, so that it means "your
+                // CP was received" again afterwards (Tables 27 and 31;
+                // `SILENCE_CLEARS_ACK_STATE`).
+                exchange.silence_ended();
+                // "After receiving SUVu with bit 32 clear, the digital modem shall
+                // transmit Rt for 384T followed by R-bar-t for 24T and SUVd."
+                self.stage = RenegStage::Rt;
+                source.change(Out::Rt);
+                Some(Out::Rt)
+            }
+            RenegStage::Rt => {
+                match source.out() {
+                    // The bar is 9.8.1.1.4's last R signal and the SUVd comes
+                    // straight after it; the Cp stage asks for it, and the
+                    // source holds it for the bar's 24T.
+                    Out::RtBar => {
+                        // 9.8.1.1.4: "...and SUVd. The digital modem shall then
+                        // proceed according to 9.6.1.1.2." The exchange is the
+                        // same one, so what changes is only that 9.8.1.1.3's Ed
+                        // is behind us.
+                        self.stage = RenegStage::Cp;
+                        self.ed_asked = false;
+                        self.step(source, exchange, cpd, now)
+                    }
+                    // Rt or R-bar-t: the source's own arm counts them out.
+                    Out::Rt | Out::Trn2d => None,
+                    // Still waiting for the silence to end on a frame boundary.
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// 9.8.1.1.2's other half and 9.6.1.1.2: the exchange's own order, which is
+    /// `SUVd` until the far end's `SUVu` arrives and one `CPd` after it.
+    fn exchange_step(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        if exchange.sending().is_some() {
+            return None;
+        }
+        let kind = exchange.next_sequence(now);
+        let ack = exchange.sequence_started(kind);
+        match kind {
+            SequenceKind::Suv => {
+                let bits = Suvd { silence: exchange.silence_requested(), ack }.to_bits(INTERVALS);
+                source.send(Out::Suvd, bits);
+                Some(Out::Suvd)
+            }
+            // 9.6.1.1.2: "After receiving an SUVu sequence, the digital modem
+            // shall transmit a single CPd".
+            SequenceKind::Cp => {
+                let Some(cpd) = cpd else {
+                    // Nothing to declare (9.6.1.1.2 allows the wait): keep the
+                    // SUVs going rather than send a CPd that says nothing.
+                    let bits = Suvd { silence: false, ack }.to_bits(INTERVALS);
+                    source.send(Out::Suvd, bits);
+                    return Some(Out::Suvd);
+                };
+                let mut cpd = cpd.clone();
+                cpd.ack = ack;
+                source.send(Out::Cpd, cpd.to_bits(INTERVALS));
+                Some(Out::Cpd)
+            }
+            SequenceKind::E => {
+                source.send(Out::Ed, source.ed_bits());
+                Some(Out::Ed)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2106,6 +3768,43 @@ fn up_table(levelset: LevelSet, set: &[u16], k: f64) -> Vec<u16> {
         LevelSet::Uniform => set.to_vec(),
         LevelSet::Code => crate::v92::codegrid::scaled(set, k),
     }
+}
+
+/// The levels `B1u` is sliced against, in equaliser units, ascending, deduplicated.
+///
+/// Two things decide it and they are not the same decision:
+///
+/// * the **set**, from `up_table`: the odd lattice `2 eta + 1` on
+///   [`LevelSet::Uniform`] whatever `k` says, the far end's codes `round(k a)`
+///   on [`LevelSet::Code`] -- `docs/216` and `docs/114` R4;
+/// * the **lattice**, from [`crate::v92::receiver::lattice_levels`], and only
+///   when the set is the code grid. CPd's points are G.711 code values when the
+///   far end's constellation is its codec's output (`docs/242` sec 2); on the odd
+///   lattice they are not, the far end cannot emit them and must not, and a
+///   table snapped to the nearest code is a table displaced by half a chord step:
+///   36 LSB at 1 920 LSB on drn 1's 349-LSB spacing, a fifth of the decision
+///   half-gap. That is `docs/257`'s regression: the snap was applied to
+///   every set here, it was validated only as a fit figure (36.5 -> 35.7 dB,
+///   `docs/242` sec 2) and never as a payload, and the call it broke decoded
+///   nothing in either direction.
+///
+/// The gain is CPd's `G`: the far end transmits at `G a(eta)` and 8.8.3's power
+/// identity is what makes that one number this end's equaliser unit.
+fn data_mode_levels(parameters: &Parameters, k: f64) -> Vec<f64> {
+    let mut levels: Vec<f64> = Vec::new();
+    for set in &parameters.sets {
+        for point in up_table(parameters.levelset, set, k) {
+            let level = parameters.gain * f64::from(point);
+            levels.push(level);
+            levels.push(-level);
+        }
+    }
+    if parameters.levelset == LevelSet::Code {
+        levels = crate::v92::receiver::lattice_levels(&levels);
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    levels
 }
 
 fn jp_offset() -> f64 {
@@ -2303,6 +4002,41 @@ pub struct Modem {
     upstream_size: Trn2uSize,
     /// And what picks a CPu or an SUVu out of the bits it gives back.
     up_finder: Option<UpFinder>,
+    /// 9.8.1.2.1's receiver conditioning: the `Ru` detector that runs *during
+    /// data mode*, where the B1u decoder above is what is being fed and
+    /// `up_finder` is not (see `docs/213` section 6). A side channel: it is
+    /// told the level the decoder is told and it answers with nothing the
+    /// decoder sees.
+    ru_detector: RuDetector,
+    /// The far end's upstream against the constellation `CPd` declared: the
+    /// detector behind `docs/216`'s re-entry. `None` until `begin_b1u` has a
+    /// level table to measure against.
+    data_loss: Option<DataModeLoss>,
+    /// 9.9.1.2.1/.2's `RM` detector: the far end's **fast parameter exchange**,
+    /// which is a different procedure from 9.8's rate renegotiation and answers
+    /// with `Rf`/`R-bar-f` rather than `Rd`/`R-bar-d` (`docs/222`).
+    rm_detector: Option<RmDetector>,
+    /// 9.9.1.2.1's clamp has been applied for *this* exchange: one note, one
+    /// clamp, however many `RM` symbols follow.
+    rm_responder_started: bool,
+    /// `docs/216` §3: `Ri`/`R-bar-i` have gone out and the far end's `TRN2u`
+    /// is due. The re-entry's one difference from 9.8's tail is where the
+    /// upstream reader is armed, because there is no `Ru`-to-`R-bar-u`
+    /// transition to be the fiducial for it.
+    reentry: bool,
+    /// 9.9's fast parameter exchange is the procedure in flight, not 9.8's:
+    /// its tail is `RenegTail::from_suvd`'s and it never sends `TRN2d`.
+    fpe: bool,
+    /// 9.8.1.2.1's clamp has been done for this renegotiation, so that a run of
+    /// `Ru` does not clamp and log once a period.
+    ru_responder_started: bool,
+    /// 9.8.1.1.2 to 9.6.1.1.2: the tail after `R-bar-d`, from TRN2d's end to the
+    /// one `CPd`. `None` outside a rate renegotiation, and that is also the gate
+    /// on the far end's `SUVu` reader below.
+    reneg: Option<RenegTail>,
+    /// The symbol the far end's renegotiation `TRN2u` begins on, once `Ru` has
+    /// become `R-bar-u`. See [`TRN2U_AFTER_RU_BAR`].
+    reneg_trn2u_from: Option<u64>,
     /// The CPd this end will send, and the parameters behind it, which are also
     /// what the upstream decoder needs once B1u starts (6.4).
     cpd: Option<Cpd>,
@@ -2482,6 +4216,140 @@ fn prefilter_source() -> Prefilter {
     prefilter_for(std::env::var("V92_Z2").ok().as_deref())
 }
 
+/// **The live `bin`/`adj` instrument** (`docs/264` sec 3): the fraction of
+/// `B1u`'s symbols whose *decided index* differs from the index that was
+/// **sent**, and the share of those errors that landed one index away.
+///
+/// This is `docs/253` sec 2's statistic, on the call path instead of in an
+/// example, and it is measurable live for one reason and no other: **8.7.1
+/// makes `B1u`'s payload known** -- forty-eight data frames of scrambled
+/// ones -- so the far end's etas are a function of the clause and of the
+/// rung, not of what the far end happens to be sending. `UpEncoder::b1u`
+/// generates exactly the sequence CPd's own set will carry, and the
+/// decoder's own frame indices (`take_decisions_indexed`: "index 0 is
+/// `B1u`'s first four symbols") pair with it symbol for symbol, which is
+/// why a dropped frame cannot shift the pairing.
+///
+/// **The chords** are the µ-law chords of the *sent* level, as `docs/253`
+/// sec 2 defines them, and the rate reported is the **population-weighted**
+/// one: each chord's own error rate times the share of the symbols it
+/// carries. One global rate over a set whose chords differ by 64x in step
+/// is the number this arm is not allowed to report.
+///
+/// **Cost**: one `Vec` of decided frames, already allocated by the decoder,
+/// drained once per candidate at the boundary (thirteen candidates, ~134
+/// frames each, 4 `i32` per frame), and one pass of 576 symbols to build the
+/// sent sequence. Nothing is added to the per-symbol path: the instrument
+/// reads what the decoder decided and never feeds it anything.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct B1uBins {
+    /// Per chord: symbols sent, and the ones decided as another index.
+    sent: [u64; 8],
+    wrong: [u64; 8],
+    total: u64,
+    total_wrong: u64,
+    /// Of the errors, the ones that landed on the adjacent index.
+    adjacent: u64,
+    /// Decisions that had no sent index to pair with (the decoder read past
+    /// the end of `B1u`'s known content), so the pairing's own honesty is
+    /// visible.
+    unpaired: u64,
+    /// The direction of the level error the error is *about*: `true` when
+    /// the far end is high.
+    high: bool,
+}
+
+impl B1uBins {
+    /// Pair every decided index with the one 8.7.1 says was sent.
+    ///
+    /// `first` is the `B1u` symbol the decoder's frame 0 begins on: the
+    /// decoders `b1u_decoders` builds are fed from `skip + 1` symbols after
+    /// `B1u`'s frame 0, which is the same `skip` they seed the differential
+    /// chain and the descrambler with.
+    fn measure(parameters: &Parameters, decisions: &[(u64, [i32; 4])], first: usize, high: bool) -> Self {
+        let mut bins = Self { high, ..Self::default() };
+        let Ok(mut encoder) = crate::v92::upstream::UpEncoder::new(parameters) else {
+            return bins;
+        };
+        let sent: Vec<i32> = encoder.b1u().iter().map(|symbol| symbol.eta).collect();
+        let set = &parameters.sets[0];
+        let chord_of = |eta: i32| -> usize {
+            let index = if eta >= 0 { eta as usize } else { (-eta - 1) as usize };
+            let value = f64::from(set.get(index).copied().unwrap_or(0));
+            let full = (parameters.gain * value).clamp(0.0, 32767.0).round() as i32;
+            let (code, _) = crate::v90::ucode::nearest(crate::v90::ucode::Law::Mu, full);
+            usize::from(code >> 4).min(7)
+        };
+        for (index, etas) in decisions {
+            for (position, &eta) in etas.iter().enumerate() {
+                let symbol = first + *index as usize * 4 + position;
+                let Some(&sent) = sent.get(symbol) else {
+                    bins.unpaired += 1;
+                    continue;
+                };
+                let chord = chord_of(sent);
+                bins.sent[chord] += 1;
+                bins.total += 1;
+                if eta != sent {
+                    bins.wrong[chord] += 1;
+                    bins.total_wrong += 1;
+                    if (eta - sent).abs() == 1 {
+                        bins.adjacent += 1;
+                    }
+                }
+            }
+        }
+        bins
+    }
+
+    /// The population-weighted bin error rate, as a fraction.
+    fn weighted(&self) -> f64 {
+        if self.total == 0 {
+            return f64::NAN;
+        }
+        let mut sum = 0.0;
+        for chord in 0..8 {
+            if self.sent[chord] == 0 {
+                continue;
+            }
+            let share = self.sent[chord] as f64 / self.total as f64;
+            sum += share * (self.wrong[chord] as f64 / self.sent[chord] as f64);
+        }
+        sum
+    }
+
+    /// The one line a call carries: the population, both rates, the adjacent
+    /// share, and the per-chord table behind the weighted number.
+    fn lines(&self, drn: u8) -> Vec<String> {
+        let mut out = Vec::new();
+        let pct = 100.0 * self.weighted();
+        let adjacent = if self.total_wrong == 0 {
+            "0".to_owned()
+        } else {
+            format!("{} of {} ({:.1} %)", self.adjacent, self.total_wrong, 100.0 * self.adjacent as f64 / self.total_wrong as f64)
+        };
+        out.push(format!(
+            "V.92: BIN drn={drn} symbols={} bin={pct:.2}% adj={adjacent} unpaired={} \
+             (decided index against 8.7.1's sent index, population-weighted over the \u{b5}-law chords)",
+            self.total, self.unpaired
+        ));
+        for chord in (0..8).rev() {
+            if self.sent[chord] == 0 {
+                continue;
+            }
+            out.push(format!(
+                "V.92: BIN drn={drn} chord={chord} pop={:.1}% n={} bin={:.2}% nwrong={}",
+                100.0 * self.sent[chord] as f64 / self.total.max(1) as f64,
+                self.sent[chord],
+                100.0 * self.wrong[chord] as f64 / self.sent[chord] as f64,
+                self.wrong[chord],
+            ));
+        }
+        out
+    }
+}
+
+
 /// What the rate ladder decided, in the numbers it decided on.
 ///
 /// A rung being *refused* is a pass in this design, and it looks like
@@ -2569,6 +4437,15 @@ impl Modem {
             b1u_history: std::collections::VecDeque::with_capacity(1024),
             upstream_dropped: 0,
             up_finder: None,
+            ru_detector: RuDetector::new(),
+            data_loss: None,
+            rm_detector: None,
+            rm_responder_started: false,
+            reentry: false,
+            fpe: false,
+            ru_responder_started: false,
+            reneg: None,
+            reneg_trn2u_from: None,
             cpd: None,
             parameters: None,
             cpu: None,
@@ -2901,6 +4778,23 @@ impl Modem {
                 ));
                 wanted
             };
+            // Bits 48 and 49 are 0: 4-point upstream training constellations.
+            // 8.7.6 (`v92.txt:1717`) says TRN2u "is a 4- or 8-point
+            // constellation signal **as requested by the digital modem via Jp
+            // bits 48 and 49**", and Table 22's own wording (`v92.txt:1420-1424`)
+            // is `0 = 4-point; 1 = 8-point` for CPu, E2u, SUVu and TRN2u in
+            // training (bit 48) and in rate renegotiation (bit 49). The clause
+            // fixes neither: it asks which, and the answer is ours.
+            //
+            // Ours is 4-point, and it is the default every call this end has
+            // made: the upstream training sequences are *received* here, and
+            // every one of them is demodulated against Tables 28's 4-point maps
+            // (TRN2u's sign, Table 29, is 8-point and unused). Asking for
+            // 8-point without the receiver beside it would put a training
+            // signal on the line that this end cannot read, which is the same
+            // class of breakage `EXTEND_E2U`'s constant exists to prevent. So
+            // the default is correct rather than merely harmless, and
+            // `a_four_point_training_constellation_is_what_we_ask_for` pins it.
             let jp = Jp { epsilon, eight_in_training: false, eight_in_renegotiation: false };
             self.source.jp = jp.to_bits();
             // "shall finish the current Jd and then send Jp" (9.5.1.1.8). The
@@ -3474,6 +5368,12 @@ impl Modem {
     /// 9.6.1.1.5-6 B1d out; B1u in, then data mode
     /// ```
     fn phase4_out(&mut self) {
+        // 9.8's tail is not Phase 4's: 9.6.1.1.5's B1d is not where a
+        // renegotiation ends, and the exchange it runs is Context::Renegotiation.
+        if self.reneg.is_some() {
+            self.reneg_out();
+            return;
+        }
         // 9.6.1.1.1: TRN2d "for at least 2040T" and then the exchange.
         if self.exchange.is_none() {
             if !self.source.trn2d_done() {
@@ -3600,6 +5500,22 @@ impl Modem {
         self.begin_upstream();
         let mut exchange = Exchange::new(Context::Training, self.settings.round_trip, FS);
         exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // `CPD_WAITS_FOR_PARKED_TX`: the far end answers a `CPd` only when its
+        // own transmit chain is parked, so the one `CPd` waits one window after
+        // its `CPu` instead of chasing it.
+        exchange.hold_cp_for_parked_tx();
+        // And it waits for the `CPu` itself, which is the same thing one step
+        // earlier: the `CPd` is what acknowledges the far end's `CPu`
+        // (9.6.1.1.2's bit 33), so a `CPd` released before that `CPu` has been
+        // decoded carries the bit clear *and* lands inside the sequence it is
+        // answering. The renegotiation's exchange already waits; the initial
+        // Phase 4 did not, and its `CPd` therefore went out unacknowledged
+        // whenever the far end's `CPu` was decoded a moment too late -- on 3
+        // of 3 calls at answer point 170 it was 20 ms too late (CPd 22.340,
+        // `ack false`; `CPu` 22.360), and the far end fell forward with
+        // `0x6009521a` 1.002 s after data mode. The wait is bounded by
+        // [`Exchange::peer_cp_wait`].
+        exchange.wait_for_peer_cp(true);
         self.exchange = Some(exchange);
         self.upstream_data = None;
         self.note("V.92: TRN2d done, SUVd out".into());
@@ -4061,6 +5977,113 @@ impl Modem {
     /// known symbols, so no pre-CPd measurement can license a rung the line has
     /// not already been watched carrying. The number is *reported* either way,
     /// so a call says what the line looked like and what it was allowed.
+    /// **The ladder, on the live decision** (`docs/264` sec 2): which rungs the
+    /// level measured on this call permits, by `docs/261` sec 4's per-rung
+    /// tolerance, with every rung's verdict written to the log in
+    /// `rung::Reading::line`'s own form.
+    ///
+    /// # Why the level and not the rate
+    ///
+    /// `CPd` carries the rung (9.6.1.1.2) and goes out **before** `B1u` exists,
+    /// so at the instant this decision is taken there is no `B1u` window for the
+    /// bin error rate to be measured over. The one measurement there is, is the
+    /// level: the four-point fit's gain against the design's own four points,
+    /// which is the far end's distance from the `1/G` this end named in the
+    /// previous `CPd` (`docs/256` sec 1.2; 8.8.3 makes `1/G` the level the
+    /// design's points arrive at). So the ladder is read with `symbols = 0` --
+    /// no rate, `instrument=level` -- and `admit` says exactly that rather than
+    /// reporting a zero it did not measure.
+    ///
+    /// The residual sigma is *not* the gate. It is a `Bound::Lower` on the
+    /// data-mode residual (see `decide_upstream_rung`), it refuses rungs on
+    /// evidence that cannot justify any, and on the bench it floors the ladder
+    /// at `drn 1` whatever the level does (`docs/256` sec 3.1) -- a criterion
+    /// that answers "24 000" before it looks. It stays in the log as an
+    /// advisory number beside the gate, so that a call shows both and neither is
+    /// inferred from the other.
+    ///
+    /// # The cap
+    ///
+    /// The mask this returns is **cut to
+    /// `rung::MEASURED_WORKING_MAX_DRN`** before it is returned, whatever the
+    /// ladder granted: the ladder is printed in full -- one `LADDER` line per
+    /// rung, saying what each instrument says -- and then
+    /// `rung::cap_line` says what that grant would have been and what the call
+    /// actually gets (`docs/266` sec 4: 33 333 and 25 333 do not carry data,
+    /// only 24 000 is measured working; `docs/269` sec 3: why `drn 2` fails is
+    /// open, and `drn 7` fails too). The tolerance table and `admit` are kept
+    /// exactly as they were: they are the instrument, not the licence.
+    ///
+    /// # When there is no level
+    ///
+    /// A call whose four-point measurement never ran has no `delta` to judge, so
+    /// there is nothing for the tolerance to be about: the ladder is not
+    /// consulted, the sigma mask stands as it did, and the log says so. That is
+    /// the only branch in which the old criterion still decides.
+    fn upstream_ladder(&mut self, ja: u32, measured: Sigma, ceiling: Option<u8>) -> (u32, RateDecision) {
+        let (inner, outer, level_gain, seen) = self.rx.measured_levels();
+        let mut mask = 0u32;
+        if seen > 0 {
+            // The far end's distance from `1/G`, as a fraction: the four-point
+            // gain the receiver settled on is the ratio between the amplitude
+            // arriving and the design's own `1/sqrt(5)`, `3/sqrt(5)`, so one
+            // means the far end put the design's points on the line.
+            let delta = level_gain - 1.0;
+            for drn in 1..=crate::v92::UP_RATES as u8 {
+                if ja & (1 << (drn - 1)) == 0 {
+                    continue;
+                }
+                let lc = crate::v92::rung::lc_for(drn);
+                // The design's own `G` for this rung, which is the number `CPd`
+                // carries: `1/G` is then the level the tolerance is measured
+                // from, and `delta` is the same relative error at every rung.
+                let gain = crate::v92::upchoice::gain_for(lc);
+                let reading = crate::v92::rung::Reading {
+                    drn,
+                    lc,
+                    min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(drn))
+                        .unwrap_or(0.0),
+                    level_lsb: gain.recip() * (1.0 + delta),
+                    gain,
+                    bin: 0.0,
+                    crossing: 0.0,
+                    // No `B1u` yet: this is a `CPd` decision.
+                    symbols: 0,
+                };
+                let verdict = crate::v92::rung::admit(&reading);
+                if verdict.granted() {
+                    mask |= 1 << (drn - 1);
+                }
+                self.note(format!("V.92: {}", reading.line(verdict)));
+            }
+            // What the instruments granted, printed as it always was, and then
+            // the cap: the ladder is read in full -- one `LADDER` line per
+            // rung, and the summary line carries the mask all of them make --
+            // and the mask the call is *decided* on is that grant cut to
+            // `MEASURED_WORKING_MAX_DRN`. The instruments are the instrument;
+            // they are not the licence (`docs/266` sec 4, `docs/269` sec 3).
+            let granted = mask;
+            mask = crate::v92::rung::cap_to_measured(granted);
+            self.note(format!(
+                "V.92: upstream rate: level {delta:+.2}% against 1/G (four points {inner:.3}/{outer:.3} \
+                 over {seen}), tolerance per rung from docs/261 sec 4, mask {granted:#07x}"
+            ));
+            self.note(crate::v92::rung::cap_line(granted));
+        } else {
+            // The one branch in which the old sigma criterion still decides,
+            // and the cap binds it exactly as it binds the ladder.
+            let granted = apply_ceiling(ja, measured);
+            mask = crate::v92::rung::cap_to_measured(granted);
+            self.note(
+                "V.92: no four-point level to judge (the ladder needs one); the sigma mask stands, and \
+                 it is a lower bound that can only refuse"
+                    .into(),
+            );
+            self.note(crate::v92::rung::cap_line(granted));
+        }
+        (mask, RateDecision { measured, ceiling, mask, empty: false })
+    }
+
     fn decide_upstream_rung(&mut self) {
         let Some(designed) = self.upstream_plan.take() else { return };
         if self.cpd_sent {
@@ -4081,14 +6104,20 @@ impl Modem {
         // sanity rule works in variances; the same reading supplies it.
         let noise = 10f64.powf(-snr_db / 10.0);
         let ja = self.ja.upstream_rates().unwrap_or(0);
-        let ceiling = ceiling_rung(measured, lc_for);
-        let allowed = apply_ceiling(ja, measured, lc_for);
+        // The ceiling the sigma reading implies. It is a **`Bound::Lower`** on
+        // the data-mode residual (the doc comment above is why), so it is not
+        // evidence a rung may be spent on: `docs/264` sec 2 keeps the number and
+        // its refusals in the log as an *advisory* and stops it from deciding.
+        // What decides is the ladder below.
+        let ceiling = ceiling_rung(measured);
+        let advisory = apply_ceiling(ja, measured);
+        let (allowed, decision) = self.upstream_ladder(ja, measured, ceiling);
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
         // still gets, because the alternative is no call at all. Which of the
         // two left it there is what the log carries.
         let (mask, empty) = if allowed == 0 { (1u32, true) } else { (allowed, false) };
-        let decision = RateDecision { measured, ceiling, mask, empty };
+        let decision = RateDecision { empty, ..decision };
         let found = if empty {
             pin(&designed, 1, trellis, noise)
         } else {
@@ -4104,31 +6133,34 @@ impl Modem {
         };
         self.parameters = Some(choice.parameters.clone());
         self.cpd = Some(Cpd::from(&choice.parameters));
-        // The decision, in the numbers it was made on: the residual the Phase 4
-        // fit measured, the ceiling that implies, the mask that came out of the
-        // AND, and the rung. A refusal is invisible without them.
-        let ceiling = match decision.ceiling {
+        // What the sigma reading says, kept and not spent. It is a `Lower`
+        // bound on the data-mode residual, so it can refuse a rung and can never
+        // justify one; the ladder above is what decided, and this line is what
+        // keeps the two numbers comparable on one call (`docs/264` sec 2).
+        let advisory_ceiling = match ceiling {
             Some(drn) => format!("drn {drn}"),
             None => "none".to_string(),
         };
         self.note(format!(
-            "V.92: upstream rate: sigma {:.4} index steps at LC {} from the four-point fit at {snr_db:.1} dB \
-             ({:?}), ceiling {ceiling}, mask {:#07x}, chose drn {} at {} bit/s",
+            "V.92: advisory (not the gate): sigma {:.4} index steps at LC {} from the four-point fit at \
+             {snr_db:.1} dB ({:?}) would allow {advisory_ceiling} and mask {advisory:#07x}; the ladder, \
+             capped at drn {}, grants mask {:#07x}",
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
             decision.measured.bound(),
+            crate::v92::rung::MEASURED_WORKING_MAX_DRN,
             decision.mask,
-            choice.parameters.drn,
-            choice.parameters.rate()
         ));
         if decision.empty {
-            // The event the ceiling exists to make visible.
+            // The event the ceiling exists to make visible: every rung the far
+            // end offered was refused, and the refusal is in the ladder's own
+            // lines above with the number that refused it.
             self.note(format!(
-                "V.92: the measurement leaves no rung of the ladder (sigma {:.4} index steps, {:.4} at LC {} is the slowest rung's budget); keeping the slowest, drn 1 at {} bit/s",
-                decision.measured.steps(),
-                crate::v92::rung::sigma_max(crate::v92::rung::REFERENCE_LC),
-                crate::v92::rung::REFERENCE_LC,
-                crate::v92::up_rate(1)
+                "V.92: the level refuses every rung the far end offered, drn 1 included; keeping the \
+                 slowest, drn 1 at {} bit/s (the cap is not what emptied this mask -- it can only \
+                 refuse above drn {})",
+                crate::v92::up_rate(1),
+                crate::v92::rung::MEASURED_WORKING_MAX_DRN
             ));
         }
         if let Some(drn) = self.parameters.as_ref().map(|p| p.drn) {
@@ -4144,8 +6176,40 @@ impl Modem {
     /// The downstream's mapping comes from the analogue modem's CPu, which is
     /// the same table V.90's data mode reads (V.92 8.8.1 points at V.90 8.6.1),
     /// and the upstream's decoder from this end's own CPd.
+    ///
+    /// Phase 4's `Ed` is only **one** of the two ways into 9.6.1.1.5, and this
+    /// function is that way's name for it: the body is
+    /// [`Self::enter_data_mode`], which 9.8's renegotiation calls too. Two
+    /// copies of "the data mode is up" is exactly what lost the far end's
+    /// `LAPM` after a renegotiation -- `ru_ended` un-latched the state (9.8.1.2.1
+    /// takes the data mode down) and the way back never re-ran the latch, so
+    /// the pump reported `Phase4` for the rest of the call, the modem above read
+    /// that as `Retraining` and never rebuilt its stack, V.42's clocks were held
+    /// at zero with it (`lib.rs:1924`), and no `LAPM` frame went downstream
+    /// again: the far end's T401 expired 1.008 s into its data mode.
     fn begin_data(&mut self) {
         self.note("V.92: Ed out".into());
+        self.enter_data_mode();
+    }
+
+    /// The data mode is up: 9.6.1.1.5's `B1d` out, and everything that follows
+    /// from it, in the one place, for every way in.
+    ///
+    /// What it latches, and each is why that lives here rather than at a call
+    /// site:
+    ///
+    /// * `Status::Connected` -- the only thing `v90::startup`'s
+    ///   `pcm::Status::Connected` arm (`startup.rs:534`) turns into
+    ///   `Progress::Connected`, which is what makes the modem above build its
+    ///   V.42/LAPM stack (`lib.rs:2011-2141`) and stop holding V.42's clocks
+    ///   (`lib.rs:1924`).
+    /// * `B1d` itself: the encoder rebuilt from CPu, 8.6.1's scrambler
+    ///   initialised to zero, and `B1D_FRAMES` of scrambled ones counted down
+    ///   -- a renegotiation's `B1d` is a *new* `B1d`, and the far end drops
+    ///   that many symbols through a countdown this starts.
+    /// * 9.6.1.1.6's `B1u` arm -- `b1u_pending` and its 2 s deadline -- for the
+    ///   `E2u` that follows every one of these entries.
+    fn enter_data_mode(&mut self) {
         let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
         // The receiver is *not* reconditioned here. 9.6.1.1.6 has it done
         // "after receiving E2u", and that is not pedantry: E2u is a data frame
@@ -4266,14 +6330,7 @@ impl Modem {
         // of `K` happening to be one -- `K` is not one on a mask the far end
         // fills in, and a fit against the odd lattice returns 433.75, which read
         // B1u at 327 of 576.
-        let mut levels: Vec<f64> = Vec::new();
-        for set in &parameters.sets {
-            for point in up_table(parameters.levelset, set, self.up_scale) {
-                let level = parameters.gain * f64::from(point);
-                levels.push(level);
-                levels.push(-level);
-            }
-        }
+        let levels = data_mode_levels(&parameters, self.up_scale);
         self.note(format!(
             "V.92: upstream level table at K {:.5} ({}) over {} point(s), gap {:.0} LSB",
             self.up_scale,
@@ -4281,12 +6338,16 @@ impl Modem {
             parameters.sets.first().map_or(0, Vec::len),
             crate::v92::codegrid::min_gap(parameters.sets.first().map_or(&[][..], Vec::as_slice)),
         ));
-        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         // The slicer moves to CPd's constellation and the equaliser stays: the
         // prefilter the far end runs is this end's design of it, and on a line
         // with insertion loss it is never exact.
-        self.rx.set_data_mode(levels);
+        self.rx.set_data_mode(levels.clone());
+        // `docs/216` §2: the same table, as the threshold above which a symbol
+        // is not a point of the constellation the far end agreed to send.
+        self.data_loss = DataModeLoss::new(&levels);
+        // 9.9.1.2.1/.2: the same table, as `RM`'s loud/quiet signature
+        // (`RmDetector`, Table 25/26). A side channel like the two around it.
+        self.rm_detector = RmDetector::new(&levels);
         // Where B1u's frame interval 0 is, in symbols after the one E2u's zero
         // run was found to have ended on.
         //
@@ -4532,6 +6593,15 @@ impl Modem {
             self.b1u_symbol(symbol);
             return;
         }
+        // 9.8.1.1.2: a rate renegotiation is in progress, so the far end is out
+        // of data mode as well and what it sends is its TRN2u and then SUVu.
+        // Reading it is the same reader and finder Phase 3 uses, and this is the
+        // one place outside Phase 3 that either is fed. The gate is the
+        // renegotiation itself: no `Ru`, no tail, no feed.
+        if self.reneg.is_some() || self.reneg_trn2u_from.is_some() {
+            self.reneg_symbol(symbol);
+            return;
+        }
         let Some(reader) = self.upstream.as_mut() else { return };
         {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -4640,6 +6710,540 @@ impl Modem {
     /// The same path `V92_B1U_ADJ` and both bit traces have always been on; it
     /// is a function so that the symbols a boundary search placed inside its
     /// own window (`b1u_backlog`) and the live ones cannot be read differently.
+    /// 9.8.1.2.1: "After detecting `Ru`, the digital modem shall clamp circuit
+    /// 104 to binary one and condition its receiver to detect the `Ru`-to-
+    /// `R-bar-u` transition."
+    ///
+    /// Circuit 104 is the one the *data* direction of the DTE interface runs
+    /// on, and this end has no such line: the clamp is modelled where it shows
+    /// -- the downstream data mode signal stops and the transmitter is reset,
+    /// which is the same thing `agrmodemlib.o`'s `V92ClientDataModeRxState`
+    /// does at `.text+0x5e530` when the client side of this procedure starts
+    /// (`V34TxDataReset` / `DisableScrambler` / `SetPatternGenerator`). The
+    /// receiver conditioning is `RuDetector::locked`.
+    fn ru_detected(&mut self) {
+        if !self.clamp_circuit_104("9.8.1.2.1") {
+            return;
+        }
+        self.note(
+            "V.92: 9.8.1.2.1 -- the far end is renegotiating (Ru detected in data mode); \
+             circuit 104 clamped and the receiver conditioned for the Ru-to-R-bar-u transition"
+                .to_string(),
+        );
+    }
+
+    /// 9.8.1.2.2: "After detecting the `Ru`-to-`R-bar-u` transition, the digital
+    /// modem shall transmit signal `Rd` for 384T and then `R-bar-d` for 24T.
+    /// The signal `Rd` shall begin on the boundary of a data frame."
+    ///
+    /// Then 9.8.1.2.3 hands the rest to 9.8.1.1.2, which is the initiator's own
+    /// tail: `TRN2d` for up to 16008T, `SUVd`, and the exchange of 9.6.1.1.2.
+    fn ru_ended(&mut self) {
+        let (data, training) = self.renegotiation_points();
+        self.source.arm_renegotiation(data, training);
+        // §9.8.1.2.3 chains into §9.8.1.1.2, whose first signal is TRN2d; the
+        // 24T of R-bar-d takes its place at the frame boundary `Source` waits
+        // for (`pending_needs_frame_boundary`). TRN2d in a renegotiation is
+        // capped by 9.8.1.1.2's "up to 16008T" rather than the 2040T of
+        // 9.6.1.1.1, and that cap is a **countdown**: without it the TRN2d arm's
+        // exit condition never fires and TRN2d runs on for ever -- `docs/214`
+        // §6 gap 1. The SUVd after it is asked for by [`RenegTail`], which also
+        // owns 9.6.1.1.2's exchange.
+        self.source.bound_trn2d(TRN2D_MOST);
+        self.source.change(Out::Rd);
+        let (tail, mut exchange) = RenegTail::new(self.settings.round_trip, FS);
+        // A far end this call has already heard send a CPu sends another; the
+        // CPd waits for it, so that it carries bit 33 and lands one window
+        // after the CP it answers rather than inside it
+        // (`CPD_WAITS_FOR_PARKED_TX`).
+        exchange.wait_for_peer_cp(self.cpu.is_some());
+        self.reneg = Some(tail);
+        // The exchange 9.6.1.1.2 is entered from, and the one the far end's
+        // SUVu is reported to while the tail runs.
+        self.exchange = Some(exchange);
+        // 9.8.2.1.1 and 9.8.2.2.3: the far end's TRN2u begins where its 24T of
+        // R-bar-u ends, and this end's own detector is the fiducial for it.
+        self.reneg_trn2u_from = Some(self.now + TRN2U_AFTER_RU_BAR);
+        // Out of data mode: 9.8.1.2.1 clamped circuit 104, so the B1u decoder is
+        // not reading data any more, and the finder that reads the far end's
+        // SUVu is armed here -- and only here. A call with no `Ru` in it never
+        // reaches this function, which is what keeps the data path identical.
+        self.upstream_data = None;
+        self.upstream = None;
+        self.up_finder = None;
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = false;
+        self.e2u_zeroes = 0;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.b1u_search = None;
+        self.data_loss = None;
+        // 9.8.1.2.1 clamps circuit 104 and takes the data mode down: from here
+        // to 9.6.1.1.5's `B1d` the line carries `Rd`, `TRN2d`, `SUVd` and
+        // `CPd`, and there is no data mode to be connected to. `begin_data`
+        // latched `Status::Connected` at the first data mode (`:5874`) and
+        // nothing used to un-latch it, so the pump went on reporting a
+        // connected call through the whole of 9.8: the modem above built a
+        // V.42 stack over a line that had just stopped carrying B1u, its
+        // detection phase failed, and the CONNECT it had been holding was
+        // released for a call that never got past `SUVd`. 9.6.1.1.5's
+        // `begin_data` sets `Connected` again, and that one is real.
+        self.status = Status::Phase4;
+        self.note(
+            "V.92: 9.8.1.2.2 -- Ru-to-R-bar-u seen; sending Rd for 384T and R-bar-d for 24T \
+             from the next data frame boundary, then 9.8.1.1.2's TRN2d (up to 16008T) and SUVd"
+                .to_string(),
+        );
+    }
+
+    /// The far end has left data mode: 9.6.1.1 from the top, entered with
+    /// 9.5.1.1.12's `Ri` because that is the state it went back to.
+    ///
+    /// The trigger is [`DataModeLoss`] and it is `[our choice]`; everything
+    /// asked for here is the clause's:
+    ///
+    /// * 9.5.1.1.13/9.5.2.1.10: `Ri` is what the analogue modem conditions on
+    ///   to receive `CPt` -- or, in the fallback state measured for `docs/216`,
+    ///   `V92ClientPhase4RxWaitRiBarState`, what it waits for to re-open Phase
+    ///   4 at all.
+    /// * 9.6.1.1.1: `TRN2d` "for at least 2040T", which the source's own
+    ///   `Ri`->`R-bar-i`->`TRN2d` chain starts, and whose upper bound here is
+    ///   9.8.1.1.2's `up to 16008T` -- the same countdown 9.8.1.2.3 uses.
+    /// * 9.6.1.1.2/.3/.4: one `CPd` after the far end's `SUVu`, then `Ed`,
+    ///   which is [`RenegTail`] and is reused rather than copied.
+    fn data_mode_lost(&mut self) {
+        if self.reneg.is_some() {
+            return;
+        }
+        let threshold = self.data_loss.as_ref().map_or(0.0, DataModeLoss::threshold);
+        self.note(format!(
+            "V.92: data mode lost -- {} consecutive data frames carried a symbol outside the \
+             constellation CPd declared (over {threshold:.2}); sending Ri 384T and R-bar-i 24T \
+             on the data frame grid, then 9.6.1.1 again",
+            DATA_MODE_LOSS_FRAMES
+        ));
+        let (data, training) = self.renegotiation_points();
+        self.source.arm_renegotiation(data, training);
+        // The opener, and it is **`Ri`**, not `Rd`: `Ri` is the signal the far
+        // end's own state is named for (`V92ClientPhase4RxWaitRiBarState`,
+        // `0x5dea0`, `docs/216` §1). Both were tried on the bench and both were
+        // silent (`docs/216` §5): `Ri` 384T + `R-bar-i` 24T at 24.998 s
+        // (`runs-216/165935`) and `Rd` 384T + `R-bar-d` 24T at 24.998 s
+        // (`runs-216/170104`), each 408 symbols on the line and no `R detected`
+        // from either. What is committed is the one the far end's own state
+        // name asks for; the A/B is measured and recorded, not pending.
+        self.source.ri_opener();
+        self.source.bound_trn2d(TRN2D_MOST);
+        let (tail, mut exchange) = RenegTail::new(self.settings.round_trip, FS);
+        // A far end this call has already heard send a CPu sends another; the
+        // CPd waits for it, so that it carries bit 33 and lands one window
+        // after the CP it answers rather than inside it
+        // (`CPD_WAITS_FOR_PARKED_TX`).
+        exchange.wait_for_peer_cp(self.cpu.is_some());
+        self.reneg = Some(tail);
+        self.exchange = Some(exchange);
+        // 9.8.1.1.2's 16008T is 9.8's ceiling and not 9.6.1.1.1's 2040T floor:
+        // the floor is satisfied by the tail's own exchange, which cannot send
+        // SUVd before the far end's SUVu, and the ceiling is what keeps TRN2d
+        // from running on for ever (`Source::bound_trn2d`).
+        self.reentry = true;
+        self.reneg_trn2u_from = None;
+        // Out of data mode: the B1u decoder is dropped and the reader for the
+        // far end's TRN2u/SUVu is armed when our own TRN2d begins (`reneg_out`).
+        self.upstream_data = None;
+        self.upstream = None;
+        self.up_finder = None;
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = false;
+        self.e2u_zeroes = 0;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.b1u_search = None;
+        self.b1u_probe = None;
+    }
+
+    /// "Clamp circuit 104 to binary one", for **both** of the procedures that
+    /// ask it -- 9.8.1.2.1's `Ru` and 9.9.1.2.1's `RM` (`v92.txt:3076`,
+    /// `3079-3081`).
+    ///
+    /// One mechanism and not two, and the same one `docs/214` introduced for
+    /// 9.8.1.2.1: circuit 104 is the line the *data* direction of the DTE
+    /// interface runs on, and this end has no such line, so the clamp is
+    /// modelled where it shows -- the downstream data mode signal stops and the
+    /// transmitter is reset, which is what `agrmodemlib.o`'s
+    /// `V92ClientDataModeRxState` does at `.text+0x5e530`
+    /// (`V34TxDataReset` / `DisableScrambler` / `SetPatternGenerator`).
+    /// Returns whether it clamped now, so that a hundred `RM` symbols and a
+    /// hundred `Ru` periods report once.
+    fn clamp_circuit_104(&mut self, clause: &'static str) -> bool {
+        if self.ru_responder_started {
+            return false;
+        }
+        self.ru_responder_started = true;
+        self.note(format!(
+            "V.92: {clause} -- circuit 104 clamped and the receiver conditioned for the \
+             transition to the bar of the R signal the far end is sending"
+        ));
+        true
+    }
+
+    /// 9.9.1.2.1: "After detecting `RM`, the digital modem shall clamp circuit
+    /// 104 to binary one and condition its receiver to detect the `RM`-to-
+    /// `RM`-bar transition" (`v92.txt:3079-3081`).
+    ///
+    /// The conditioning *is* [`RmDetector`]: once it has heard `RM` it stops
+    /// matching Table 25's pattern and starts matching Table 26's complement of
+    /// it, which is 9.9.1.2.1's second half. Nothing else about the receiver
+    /// changes -- `RM` goes out on "the constellation parameters used for the
+    /// data mode" (8.7.4, `v92.txt:1664-1666`), so the slicer that was reading
+    /// `B1u` is already the right one.
+    fn rm_detected(&mut self) {
+        if self.reneg.is_some() {
+            return;
+        }
+        self.clamp_circuit_104("9.9.1.2.1");
+        self.note(
+            "V.92: 9.9.1.2.1 -- RM detected in data mode; the far end has begun a fast \
+             parameter exchange, receiver conditioned for the RM-to-RM-bar transition"
+                .to_string(),
+        );
+    }
+
+    /// 9.9.1.2.2: "After detecting the `RM`-to-`RM`-bar transition, the digital
+    /// modem shall transmit signal `Rf` for 384T and then `R-bar-f` for 24T. The
+    /// signal `Rf` shall begin on the boundary of a data frame."
+    ///
+    /// Then 9.9.1.2.3: "initialize the scrambler, differential encoder and
+    /// spectral shaping filter memory to zero and transmit `SUVd` sequences with
+    /// bit 32 clear and proceed according to 9.6.1.1.2."
+    ///
+    /// **Why this and not 9.8's `Rd`.** The two procedures are cross-linked by
+    /// the Recommendation itself: 9.9.1.1.2 ends "If signal `Ru` is detected
+    /// the modem shall proceed according to 9.8.1.2.1" and 9.9.2.1.2 ends "If
+    /// signal `Rd` is detected, the modem shall proceed according to
+    /// 9.8.2.2.1" (`v92.txt:3074-3075`, `3097-3098`). `Rd`/`Ru` are the
+    /// **fallback** branches of a modem that has *not* moved to 9.9; a far end
+    /// that is sending `RM` has, and no `Rd` it receives is looked for. That is
+    /// the whole of why `runs-216/170104`'s `Rd`, at the data mode maximum and
+    /// at the right 3772/7932 levels, produced nothing at all.
+    fn rm_ended(&mut self) {
+        if self.reneg.is_some() {
+            return;
+        }
+        let (data, training) = self.renegotiation_points();
+        self.source.arm_renegotiation(data, training);
+        // The three resets of 9.9.1.2.3, applied here rather than at the
+        // `R-bar-f`-to-`SUVd` boundary the clause puts them at: `Rf` and
+        // `R-bar-f` are **not** produced through any of the three memories.
+        // 8.8.4 gives them a literal sign pattern and one codeword an interval,
+        // so the memories they reset are first used by the `SUVd` after them --
+        // which is the boundary the clause is protecting. See
+        // [`Self::reset_data_mode_memory`].
+        self.reset_data_mode_memory();
+        // 8.8.5's "the preceding data mode modulation": the sequence coder for
+        // this exchange is CPu's, not CPt's. Without it the SUVd after `R-bar-f`
+        // goes out on the *training* constellation, which the far end's data
+        // mode slicer is not reading -- `docs/222` §7's gap.
+        if let Some(cpu) = self.cpu.clone() {
+            if !self.source.begin_fpe(&cpu) {
+                self.note("V.92: 8.8.5 -- no CPu mapping for the fast parameter exchange's SUVd".into());
+            }
+        }
+        // 9.9.1.2.2's opener: `Rf` 384T then `R-bar-f` 24T, on the data frame
+        // grid (`Source::pending_needs_frame_boundary`).
+        self.source.change(Out::Rf);
+        // 9.9.1.2.3's tail is **9.6.1.1.2 directly**: no `TRN2d`, because the
+        // far end never left the data mode modulation (8.8.5: during a fast
+        // parameter exchange a short information sequence is "transmitted using
+        // the preceding data mode modulation"). `RenegTail::from_suvd` is that
+        // entry and it requests no silent period -- "bit 32 clear".
+        let (tail, exchange) = RenegTail::from_suvd(self.settings.round_trip, FS);
+        self.reneg = Some(tail);
+        self.exchange = Some(exchange);
+        self.fpe = true;
+        self.reentry = false;
+        self.reneg_trn2u_from = None;
+        // Out of data mode: the B1u decoder is dropped, and the reader for the
+        // far end's `SUVu` is armed now -- 9.9's exchange has no `TRN2u` in
+        // front of it (Figure 19: `RM`, `R-bar-M`, `SUVu`, `SUVu`, `SUVu`,
+        // `CPu`, ...), so there is no fiducial to wait for the way 9.8's has.
+        self.upstream_data = None;
+        self.upstream = None;
+        self.up_finder = None;
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = false;
+        self.e2u_zeroes = 0;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.b1u_search = None;
+        self.b1u_probe = None;
+        self.data_loss = None;
+        self.rm_detector = None;
+        self.begin_upstream();
+        self.note(
+            "V.92: 9.9.1.2.2 -- RM-to-RM-bar seen; sending Rf for 384T and R-bar-f for 24T \
+             from the next data frame boundary, then 9.9.1.2.3's SUVd (bit 32 clear) and 9.6.1.1.2"
+                .to_string(),
+        );
+    }
+
+    /// 9.9.1.2.3: "initialize the scrambler, differential encoder and spectral
+    /// shaping filter memory to zero" (`v92.txt:3083-3085`).
+    ///
+    /// All three live in the **data mode** transmitter, not in Phase 4's:
+    ///
+    /// * the scrambler is `self.downstream_scrambler`
+    ///   (`crates/datapump/src/v92/digital.rs:3809`, built afresh by
+    ///   `begin_data` at `:4038-4039`) -- 8.6.1's data mode scrambler;
+    /// * the differential encoder is `v90::encoder::Encoder`'s `signs:
+    ///   Differential` (`crates/datapump/src/v90/encoder.rs:144`, built by
+    ///   `Encoder::new` at `:159`) and the spectral shaping filter memory is the
+    ///   same encoder's `shaper: Shaper` (`encoder.rs:144`, `Shaper::new` at
+    ///   `:155`). `Encoder` says of itself, at `encoder.rs:129-133`:
+    ///   "**Built afresh wherever the Recommendation starts the coding again**
+    ///   -- TRN2d and B1d both begin with 'the scrambler, differential encoder
+    ///   and spectral shape filter memory ... initialized to zero' -- so
+    ///   **there is no reset**."
+    ///
+    /// So the shaping memory has **never** been reset at a sequence boundary and
+    /// could not have been: the only way this end zeroes it is to rebuild the
+    /// encoder, which is what 8.6.5/TRN2d does at
+    /// `digital.rs:2216-2224` for Phase 4's coder. This does the same for the
+    /// data mode's encoder, out of the same `Mapping` -- CPu's, the one B1d was
+    /// going out on -- so nothing but the memories changes.
+    fn reset_data_mode_memory(&mut self) {
+        self.downstream_scrambler = Scrambler::new(Mode::Call);
+        if let Some(encoder) = self.downstream.as_ref() {
+            let mapping = encoder.mapping().clone();
+            self.downstream = Some(crate::v90::encoder::Encoder::new(mapping, self.settings.law));
+        }
+        self.note(
+            "V.92: 9.9.1.2.3 -- scrambler, differential encoder and spectral shaping filter \
+             memory initialised to zero"
+                .to_string(),
+        );
+    }
+
+    /// 9.8.1.1.2 to 9.6.1.1.2, one symbol: the renegotiation's own tail.
+    ///
+    /// Separate from [`Self::phase4_out`] because 9.8's exchange is
+    /// [`Context::Renegotiation`] and because what follows Ed is silence and
+    /// then `Rt` rather than data mode. Everything before the tail -- `Rd`,
+    /// `R-bar-d`, `TRN2d`, `Rt`, `R-bar-t` -- is on [`Source`]'s own arms, so
+    /// what this drives is only the sequence-boundary decisions.
+    fn reneg_out(&mut self) {
+        let now = self.now;
+        // 9.6.1.1.1: `TRN2d` is on the line, so the far end's `TRN2u` begins --
+        // and 8.7.6 resets the scrambler at its first symbol, which is why the
+        // reader is built here and not before. On 9.8's own path the fiducial
+        // is the `Ru`-to-`R-bar-u` transition; a re-entry has no `Ru`, so the
+        // end of our own `R-bar-i` is used instead (`[our choice]`, and the one
+        // place this path can be a few symbols out: the far end has to notice
+        // `R-bar-i` before it can answer with `TRN2u`).
+        if self.reentry && self.source.out() == Out::Trn2d {
+            self.reentry = false;
+            self.begin_upstream();
+            self.note("V.92: 9.6.1.1.1 -- TRN2d out; conditioning for the far end's TRN2u and SUVu".into());
+        }
+        let asked;
+        let done;
+        {
+            let Self { source, reneg, exchange, cpd, .. } = self;
+            let (Some(tail), Some(exchange)) = (reneg.as_mut(), exchange.as_mut()) else {
+                return;
+            };
+            asked = tail.push(source, exchange, cpd.as_ref(), now);
+            done = tail.is_done();
+        }
+        match asked {
+            // 9.6.1.1.2: "After receiving an SUVu sequence, the digital modem
+            // shall transmit a single CPd".
+            Some(Out::Cpd) => {
+                let drn = self.cpd.as_ref().map_or(0, |cpd| cpd.drn);
+                self.note(format!(
+                    "V.92: 9.6.1.1.2 -- the renegotiation's single CPd, drn {drn}"
+                ));
+            }
+            // 9.8.1.1.4: "After receiving SUVu with bit 32 clear, the digital
+            // modem shall transmit Rt for 384T followed by R-bar-t for 24T".
+            Some(Out::Rt) => self.note(
+                "V.92: 9.8.1.1.4 -- SUVu with bit 32 clear; sending Rt for 384T and \
+                 R-bar-t for 24T, then SUVd"
+                    .into(),
+            ),
+            _ => {}
+        }
+        if done {
+            self.finish_renegotiation();
+        }
+    }
+
+    /// 9.6.1.1.4's `Ed` was the last signal of the renegotiation: back to B1d,
+    /// and re-arm the search that finds the far end's next B1u.
+    ///
+    /// The receiver, not the transmitter, is what this has to put right. Out of
+    /// data mode this end dropped the B1u decoder (`ru_ended`), so B1u's return
+    /// is the Phase 4 acquisition again: 9.6.1.1.6's E2u run, and B1u's frame
+    /// interval 0 on the symbol after it. `awaiting_e2u` and `b1u_pending` are
+    /// what `begin_data` arms, and they are armed here for the same reason.
+    fn finish_renegotiation(&mut self) {
+        self.reneg = None;
+        self.exchange = None;
+        self.reneg_trn2u_from = None;
+        self.reentry = false;
+        self.fpe = false;
+        self.rm_responder_started = false;
+        self.data_loss = None;
+        self.ru_detector.reset();
+        self.ru_responder_started = false;
+        self.upstream_data = None;
+        // The reader the `E2u` is read through is the one put on the line at the
+        // far end's **`TRN2u`**, and Ed is not a place to start a new one.
+        // 8.7.6: "The scrambler shall be reset at the beginning of `TRN2u`", and
+        // 8.7.2: "`E2u` is a data frame of **scrambled**, differentially encoded
+        // zeroes ... transmitted using the corresponding `TRN2u` modulation
+        // during Training and Rate Renegotiation." So its zeroes decode to
+        // zeroes only through the descrambler state that reset began and every
+        // sequence since has advanced -- and a `Trn2uReader::new` here is a
+        // descrambler starting again at zero, mid-stream, with nothing on the far
+        // end's side to match it.
+        //
+        // Rebuilding it here was the whole of the renegotiation's `E2u` defect:
+        // measured at answer point 171 (`runs-236c/203200-f171-1`), the
+        // renegotiation's exchange completed at 36.540, the far end's `E2u` came
+        // and no run of zeroes was ever read from it, and at 38.540 this end
+        // failed the exchange with "no E2u that reads as B1u within 2 s of Ed" --
+        // the far end answering `6009521a` at 41.880. Phase 4 never exposed it
+        // because its reader is built once, at `TRN2u`'s first symbol
+        // (`begin_upstream`), and nothing between there and its `E2u` replaces
+        // it.
+        //
+        // A reader that is *not* on the line is the one case that still needs
+        // building: 9.6.1.1.1's re-entry (`data_mode_lost`) arms its own at our
+        // `TRN2d` (`reneg_out` -> `begin_upstream`), so this is a fallback for a
+        // path that reached Ed without one, not the ordinary path.
+        if self.upstream.is_none() {
+            self.upstream = Some(Trn2uReader::new(self.upstream_size));
+        }
+        if self.up_finder.is_none() {
+            self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+        }
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = true;
+        self.e2u_zeroes = 0;
+        self.source.end_fpe();
+        self.note("V.92: 9.8 rate renegotiation over -- B1d again".into());
+        // 9.6.1.1.5-6 by the same door Phase 4 uses. The renegotiation took the
+        // data mode down (`ru_ended` -> `Status::Phase4`), and *this* is the
+        // signal that puts it back: `Ed` was the last one out, so `B1d` is what
+        // follows, and the state that goes with `B1d` -- `Status::Connected`,
+        // CPu's encoder, 8.6.1's scrambler, `B1D_FRAMES`, the 9.6.1.1.6 `B1u`
+        // arm -- is `begin_data`'s body and not a second copy of it. Calling it
+        // here is at worst idempotent; not calling it was `docs/238`'s defect.
+        self.enter_data_mode();
+    }
+
+    /// One symbol of the far end's side of a renegotiation.
+    ///
+    /// This is the feed `docs/213` §6 named as missing: `up_finder` was fed in
+    /// Phase 3 and never again, so a renegotiation's `SUVu` had no reader. It is
+    /// legitimate here because 9.8.1.2.1 has taken this end *out of data mode* --
+    /// the far end's `TRN2u` and `SUVu` are the only signals on its upstream --
+    /// and it is gated on [`Self::reneg`], which only `ru_ended` sets.
+    fn reneg_symbol(&mut self, symbol: Symbol) {
+        if let Some(at) = self.reneg_trn2u_from {
+            if self.now < at {
+                return;
+            }
+            // 8.7.6: "The scrambler shall be reset at the beginning of TRN2u" --
+            // so the reader is built *on* its first symbol, as Phase 4 builds it
+            // on TRN2u's first symbol too. One symbol either way and the
+            // descrambler sits on the wrong phase and no `SUVu` comes out.
+            self.reneg_trn2u_from = None;
+            self.upstream = Some(Trn2uReader::new(self.upstream_size));
+            self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+            self.upstream_drop_until = 0;
+            self.note(format!("V.92: the far end's renegotiation TRN2u begins at {}", self.now));
+        }
+        let level = symbol.value;
+        let Some(reader) = self.upstream.as_mut() else { return };
+        let bits: Vec<bool> = reader.feed(level).into_iter().collect();
+        for bit in bits {
+            if let Some(finder) = self.up_finder.as_mut()
+                && let Some(family) = finder.feed(bit)
+            {
+                self.up_sequence(family);
+            }
+        }
+    }
+
+    /// The two constellations V.90 8.6.4 separates `Rd` from `Rt` by.
+    ///
+    /// `Rd` is "the highest power PCM codeword from the **data mode**
+    /// constellation of each data frame interval as passed in **CP**", `Rt` the
+    /// same "from the **training** constellation ... as passed in **CPt**".
+    /// Twelve intervals each, three different level sources, and the two arrays
+    /// are never the same one.
+    ///
+    /// `Ri` is not here at all: it is "the single PCM codeword whose Ucode is
+    /// U_INFO for all data frame intervals" (`v90.txt:1844`), a codeword and
+    /// not a constellation, and it is emitted at `Source::uinfo`
+    /// (`digital.rs:2487`).
+    fn renegotiation_points(&self) -> ([u8; DOWN_INTERVALS], [u8; DOWN_INTERVALS]) {
+        // Data mode, out of the constellation **we transmit**.
+        //
+        // The CP that carries the digital modem's data mode constellations is
+        // **CPu**: `v92.txt:1474` -- "The long CPu sequence contains modulation
+        // parameters for use by the digital modem in data mode" -- and 8.8.4's
+        // `Rf` reads its own level out of it by name, "the highest power PCM
+        // codeword from the data mode constellation of each data frame interval
+        // as passed in **CPu**" (`v92.txt:1961-1962`). `Rd`'s "as passed in CP"
+        // (`v90.txt:1841-1842`) is that same message under V.90's name for it.
+        //
+        // `begin_data` (`digital.rs:5254`) builds `self.downstream` out of that
+        // CPu, so the mapping read here is the one `B1d` is actually going out
+        // on. `Constellation::points()` holds Ucodes "sorted so that index 0 is
+        // the largest" (`modulus.rs:103`), so the *first* of an interval's set
+        // is its highest-power codeword -- taken from the encoder on the line
+        // rather than from a second reading of the same message.
+        //
+        // It is **not** `self.cpd`. A CPd is "modulation parameters for use by
+        // the analogue modem in data mode" (`v92.txt:1764`) -- the *upstream*
+        // constellation -- and its points are `V92_LEVELSET`'s level indices
+        // `a(eta) = 2eta + 1` (`upchoice.rs:429`), not Table 1 linear
+        // magnitudes. Reading it here and inverting it with `ucode::nearest`
+        // took the odd lattice's last index, 15 at LC 8, for a linear value and
+        // made Ucode 2 = linear 16: the -66 dBFS `Rd` of
+        // `runs-216/170104`.
+        let mut data = [self.source.uinfo; DOWN_INTERVALS];
+        if let Some(encoder) = self.downstream.as_ref() {
+            let sets = &encoder.mapping().sets;
+            for (i, slot) in data.iter_mut().enumerate() {
+                if let Some(&loudest) = sets.get(i % INTERVALS).and_then(|s| s.points().first()) {
+                    *slot = loudest;
+                }
+            }
+        }
+        // Training, out of CPt's own coder -- the encoder TRN2d, SUVd, CPd and
+        // Ed go out on, which `set_cpt` built from the far end's CPt (8.6.5).
+        // `Constellation::points()` is "sorted so that index 0 is the largest"
+        // (`modulus.rs:103`), i.e. **loudest first**, so the highest-power
+        // codeword of an interval's set is its *first* -- `.last()` is the
+        // quietest and was what this read before `docs/218`; `Rt` is not
+        // emitted on any path a bench call has reached, which is why nothing
+        // measured it.
+        let mut training = [self.source.uinfo; DOWN_INTERVALS];
+        if let Some(phase4) = self.source.phase4.as_ref() {
+            let sets = &phase4.coder.mapping().sets;
+            for (i, slot) in training.iter_mut().enumerate() {
+                if let Some(&loudest) = sets.get(i % INTERVALS).and_then(|s| s.points().first()) {
+                    *slot = loudest;
+                }
+            }
+        }
+        (data, training)
+    }
+
     fn b1u_symbol(&mut self, symbol: Symbol) {
         let level = symbol.value;
         // The polarity the measurement above found, then whatever diagnostic
@@ -4653,6 +7257,39 @@ impl Modem {
         }
         write_b1u_line(&symbol, self.now, "data");
         let level = self.adjust_b1u_level(self.b1u_polarity * level);
+        // 9.8.1.2.1's conditioning, on the side: the detector is told the same
+        // level the B1u decoder is about to be told, and nothing it answers
+        // reaches that decoder. A call with no `Ru` in it runs this and then
+        // runs exactly what it ran before -- `docs/214` pins that.
+        match self.ru_detector.feed(level) {
+            RuEvent::None => {}
+            RuEvent::RuDetected => self.ru_detected(),
+            RuEvent::RuToRuBar => self.ru_ended(),
+        }
+        // `docs/216` §2: the same level again, against the constellation CPd
+        // declared. A side channel like the one above -- until it fires, the
+        // decoder below is fed exactly what it was fed before.
+        // `Ru` is two-point and every one of its symbols is outside the
+        // constellation `CPd` declared, so 9.6.1.1.2's loss detector would call
+        // the far end's rate renegotiation a lost data mode and answer it with
+        // `Ri`. While 9.8.1.2.1's conditioning is in force the symbols are not
+        // data mode symbols at all, so that detector is not shown them.
+        let lost = !self.ru_detector.is_locked()
+            && self.data_loss.as_mut().is_some_and(|loss| loss.feed(level));
+        if lost {
+            self.data_mode_lost();
+            return;
+        }
+        // docs/222: 9.9.1.2.1/.2's `RM`, on the same level and with the same
+        // side-channel discipline. `RM` is Table 25's period-four
+        // `{max,max,min,min}` modulus encoder output, which is what makes it
+        // visible without a trellis decoder; before it fires the decoder below
+        // is fed exactly what it was fed before.
+        match self.rm_detector.as_mut().map(|rm| rm.feed(level)) {
+            Some(RmEvent::None) | None => {}
+            Some(RmEvent::RmDetected) => self.rm_detected(),
+            Some(RmEvent::RmToRmBar) => self.rm_ended(),
+        }
         if let Some(decoder) = self.upstream_data.as_mut() {
             decoder.feed(level);
             let bits = decoder.take_bits();
@@ -4821,7 +7458,22 @@ impl Modem {
             return;
         };
         let (back, origin) = (readings[winner].back, readings[winner].origin);
-        let chosen = readings.swap_remove(winner);
+        let mut chosen = readings.swap_remove(winner);
+        // `docs/264` sec 3: the window's decided indices, both polarities, taken
+        // here because both decoders are still in hand and not yet committed to
+        // the stream. They are a record of decisions already taken -- draining
+        // them cannot move one -- and `keep_decisions` goes back off before
+        // either decoder reads a symbol of the far end's data.
+        let first = self.b1u_skip + 1;
+        let high = self.rx.measured_levels().2 > 1.0;
+        let mut straight = std::mem::replace(&mut chosen.straight, Decoder::new(&parameters));
+        let mut probe = std::mem::replace(&mut chosen.probe, Decoder::new(&parameters));
+        straight.keep_decisions(false);
+        probe.keep_decisions(false);
+        let bins_straight = B1uBins::measure(&parameters, &straight.take_decisions_indexed(), first, high);
+        let bins_probe = B1uBins::measure(&parameters, &probe.take_decisions_indexed(), first, high);
+        chosen.straight = straight;
+        chosen.probe = probe;
         if let Some(file) = b1u_bits_file()
             && let Ok(mut file) = file.lock()
         {
@@ -4861,6 +7513,39 @@ impl Modem {
         // it now runs on the chosen candidate's window instead of on the
         // window the run's end happened to open.
         self.decide_b1u_polarity();
+        // `docs/264` sec 3: the `bin`/`adj` table, on the window that was just
+        // read, through the polarity the call settled on -- and then the ladder
+        // asked the same question again with the rate it could not have had
+        // before `CPd`: the grant is confirmed or refused *by the instrument*,
+        // in the ladder's own line, on the same call.
+        let bins = if self.b1u_polarity < 0.0 { bins_probe } else { bins_straight };
+        for line in bins.lines(parameters.drn) {
+            self.note(line);
+        }
+        let (_, _, level_gain, _) = self.rx.measured_levels();
+        let lc = crate::v92::rung::lc_for(parameters.drn);
+        let gain = crate::v92::upchoice::gain_for(lc);
+        let reading = crate::v92::rung::Reading {
+            drn: parameters.drn,
+            lc,
+            min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(parameters.drn)).unwrap_or(0.0),
+            level_lsb: gain.recip() * level_gain,
+            gain,
+            bin: bins.weighted(),
+            // The live receive path keeps the decided index, not the level
+            // stream the crossing is measured on: `n/a`, not zero.
+            crossing: f64::NAN,
+            symbols: bins.total,
+        };
+        let verdict = crate::v92::rung::admit(&reading);
+        self.note(format!("V.92: B1u confirms the ladder: {}", reading.line(verdict)));
+        if !verdict.granted() {
+            self.note(
+                "V.92: the rung CPd carries is refused by B1u's own bin rate -- the number is above"
+                    .to_owned()
+                    + " and it is what the next renegotiation has to act on",
+            );
+        }
     }
 
     /// Which way up B1u came, from the two readings [`Self::decide_b1u_boundary`] took.
@@ -5215,7 +7900,20 @@ impl Modem {
     fn symbol(&mut self, symbol: Symbol) {
         // 8.7.2-8.7.6: Phase 4's upstream arrives four points to a symbol, and
         // what it carries is SUVu, CPu, E2u and then B1u's payload.
-        if self.upstream.is_some() || self.upstream_data.is_some() {
+        //
+        // A renegotiation is the one stretch where **neither** reader is on the
+        // line: `ru_ended` drops both (`upstream` and `upstream_data`) so that
+        // the far end's `TRN2u`/`SUVu` are read by `reneg_symbol`, which
+        // `symbol_upstream` routes to on `reneg`/`reneg_trn2u_from`. Gating the
+        // feed on the two readers alone therefore silences the upstream for the
+        // whole of 9.8: no `SUVu` is decoded, `Exchange::peer_suv` is never
+        // called, the tail stops at `RenegStage::Suvd` repeating `SUVd`, and the
+        // far end never gets the `CPd` 9.6.1.1.2 owes it (docs/227).
+        if self.upstream.is_some()
+            || self.upstream_data.is_some()
+            || self.reneg.is_some()
+            || self.reneg_trn2u_from.is_some()
+        {
             self.symbol_upstream(symbol);
         }
         match self.stage {
@@ -5264,7 +7962,16 @@ impl Modem {
         ));
         let no_dil = descriptor.is_empty();
         self.descriptor = Some(descriptor);
-        self.source.change(Out::Sd);
+        // 9.5.1.1.3's wait: how much of the clause's 500 ms this end uses, on
+        // the frame grid so the following signal still begins on a boundary.
+        let wait = self.settings.habits.sd_after_ja_symbols() as u64;
+        if wait > 0 {
+            self.note(format!(
+                "V.92: waiting {}T (9.5.1.1.3) before Sd",
+                wait
+            ));
+        }
+        self.source.change_after(Out::Sd, wait as usize);
         self.stage = Stage::AwaitSu;
         // DR2 runs from TRN1d's start, and everything between here and there
         // has to come off the deadline: Sd is 384T, S-bar-d 48T, and TRN1d is
@@ -5274,14 +7981,24 @@ impl Modem {
         // 9.5.2.1.6 allows it before Su is cut off, and the call retrains
         // instead of connecting. That is what an Agere SV92PP on an 8 kHz
         // line did: it waited, and this end had already gone back to tone A.
+        // `now` is the sample `Ja` was read on and every term below is a
+        // duration this end spends before TRN1d starts: the 9.5.1.1.3 wait,
+        // Sd, S-bar-d, and then TRN1d itself. The wait is a term here for the
+        // same reason Sd and S-bar-d are: leave it out and the deadline is
+        // armed `wait` symbols early, which for a 500 ms wait is the whole of
+        // what the clause allows Su to be late by.
         let trn1d = (self.settings.habits.trn1d * FS) as u64;
         self.su_deadline = Some(
             self.now
+                + wait
                 + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
                 + trn1d
                 + ((SU_WITHIN + self.settings.round_trip) * FS) as u64,
         );
         if no_dil && !ZERO_DIL_USES_SCR {
+            // No Sd goes out on this path at all, so there is nothing for
+            // 9.5.1.1.3's wait to precede and it is not spent: the deadline
+            // above carries it, which can only make the deadline later.
             self.source.change(Out::Ri);
         }
         self.rx.restart_hunt();
@@ -5561,7 +8278,7 @@ mod tests {
         Cp {
             data_mode: false,
             drn,
-            redundancy: Redundancy::None,
+            redundancy: crate::v90::sign::Redundancy::None,
             trn1d_ratio: 1 << 13,
             intervals: [0; INTERVALS],
             constellations: vec![mask],
@@ -6364,6 +9081,70 @@ mod tests {
         assert_ne!(up_table(LevelSet::Code, &code.sets[0], 1.0 + code_k), code.sets[0].clone());
     }
 
+    /// **The data mode's table is the design's set on the odd lattice, point
+    /// for point.** `docs/257` sec 2: `set_data_mode` used to put every level on
+    /// the far end's code lattice, which is right for the code grid and wrong
+    /// for `2 eta + 1`, and the snap is not a rounding -- it displaces each point
+    /// by up to half a mu-law chord step.
+    ///
+    /// The assertion is on the slicer's own table, read back through
+    /// `Receiver::data_levels`, and not on a helper's output: what broke the
+    /// `loop-260` call was the table the decoder decided against, and a test that
+    /// stops one call short of it would have passed on `54e9e1e`.
+    #[test]
+    fn the_data_mode_table_is_the_designs_set_on_the_odd_lattice() {
+        let design = crate::v92::design::Design {
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let uniform =
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform)
+                .expect("drn 1 on the odd lattice")
+                .parameters;
+        assert_eq!(uniform.levelset, LevelSet::Uniform);
+        assert_eq!(uniform.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
+        let levels = data_mode_levels(&uniform, 1.0);
+        // The eight points the far end will transmit, at CPd's own `G`: `G a(eta)`
+        // and its negation, and nothing else. This is the call `docs/256` sec 1.2
+        // made -- `levelset uniform`, `G` 0.1085, eight points.
+        for eta in uniform.sets[0].iter().copied().map(f64::from) {
+            let want = uniform.gain * eta;
+            assert!(
+                levels.iter().any(|&level| (level - want).abs() < 1e-12),
+                "drn 1 point {} is not in the table the slicer decides against",
+                eta,
+            );
+        }
+        // The live path: the slicer holds what the design emitted, unchanged.
+        let mut rx = Receiver::new();
+        rx.set_data_mode(levels.clone());
+        assert_eq!(rx.data_levels(), levels.as_slice(), "the slicer moved a point of the design's set");
+        // The mechanism, so that removing the gate fails here and not on a bench:
+        // snapping this set is not the identity, and what it moves is not small.
+        let snapped = crate::v92::receiver::lattice_levels(&levels);
+        let worst = levels
+            .iter()
+            .zip(&snapped)
+            .map(|(design, snap)| (design - snap).abs() * crate::v92::receiver::LATTICE_LSB)
+            .fold(0.0f64, f64::max);
+        let spacing = uniform.gain * 2.0 * crate::v92::receiver::LATTICE_LSB;
+        assert!(worst > 0.0, "the snap is the identity on this set; the gate is untested");
+        assert!(worst > 0.03 * spacing, "{worst} LSB of a {spacing} LSB step is not the mechanism");
+        // And the code grid's own table *is* put on the lattice, so the gate is a
+        // gate and not a removal: every point of it is a code value.
+        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code)
+            .expect("drn 1 on the grid")
+            .parameters;
+        assert_eq!(code.levelset, LevelSet::Code);
+        for level in data_mode_levels(&code, 1.0) {
+            let moved = (crate::v92::receiver::on_lattice(level) - level).abs();
+            assert!(moved < 1.0 / crate::v92::receiver::LATTICE_LSB, "{level} is off the code grid by {moved}");
+        }
+    }
+
     /// docs/131 case (a): a **compliant** far end -- `Su` 144T, its 24.5T
     /// `S-bar-u`, `Su` again -- is confirmed by the reversal detector, and the
     /// detector's report is what the timetable is checked against. No timetable
@@ -6868,6 +9649,22 @@ mod conformance_158 {
             .collect()
     }
 
+    /// How many *sequences* of `want` went out: the stream is one codeword a
+    /// symbol, and a CPd is four hundred and eighty of them.
+    fn runs(stream: &[(Out, f64)], want: Out) -> usize {
+        let mut count = 0;
+        let mut in_run = false;
+        for (out, _) in stream {
+            if *out == want && !in_run {
+                count += 1;
+                in_run = true;
+            } else if *out != want {
+                in_run = false;
+            }
+        }
+        count
+    }
+
     fn only(stream: &[(Out, f64)], want: Out) -> Vec<f64> {
         stream.iter().filter(|(out, _)| *out == want).map(|(_, level)| *level).collect()
     }
@@ -7183,5 +9980,2658 @@ mod conformance_158 {
         // four fill bits, the eight-bit sync, thirty bits of information and a
         // sixteen-bit CRC, so the CRC occupies 42 to 57.
         assert!(flipped[1..].iter().all(|at| (42..58).contains(at)), "{flipped:?}");
+    }
+    /// 9.5.1.1.3: "the digital modem **may wait for up to 500 ms** and shall
+    /// then transmit signal Sd for 384T and signal S-d for 48T"
+    /// (`v92.txt:2535-2536`). The wait is a setting, clamped into the clause's
+    /// window and snapped to the frame grid; what follows it is untouched.
+    #[test]
+    fn sd_after_ja_is_clamped_into_the_clause_and_snapped_to_the_frame_grid() {
+        // The window, from the clause's own two numbers: at most 500 ms, and
+        // never negative.
+        for asked in [-1.0, 0.0, 3.0, 6.0, 48.0, 54.0, 250.0, 499.0, 500.0, 501.0, 1000.0] {
+            let habits = Habits { sd_after_ja: asked / 1000.0, ..Habits::LIVE };
+            let frames = habits.sd_after_ja_frames();
+            let ms = habits.sd_after_ja_symbols() as f64 * 1000.0 / FS;
+            assert_eq!(
+                habits.sd_after_ja_symbols(),
+                frames * INTERVALS,
+                "{asked} ms: the wait is not a whole number of frames"
+            );
+            assert!(
+                (0.0..=SD_AFTER_JA_WITHIN * 1000.0).contains(&ms),
+                "{asked} ms: the wait {ms} ms is outside 9.5.1.1.3's window"
+            );
+            assert!(
+                frames <= Habits::sd_after_ja_frames_most(),
+                "{asked} ms: more frames than the window holds"
+            );
+        }
+        // The window's two ends, and the largest whole frame inside it.
+        assert_eq!(Habits::sd_after_ja_frames_most(), 666);
+        assert!((Habits::sd_after_ja_frames_most() as f64 * SD_FRAME_MS) <= 500.0);
+        assert!((Habits::sd_after_ja_frames_most() as f64 + 1.0) * SD_FRAME_MS > 500.0);
+        assert_eq!(Habits { sd_after_ja: -1.0, ..Habits::LIVE }.sd_after_ja_frames(), 0);
+        assert_eq!(Habits { sd_after_ja: 0.0, ..Habits::LIVE }.sd_after_ja_frames(), 0);
+        assert_eq!(Habits { sd_after_ja: 0.054, ..Habits::LIVE }.sd_after_ja_frames(), 72);
+        assert_eq!(Habits { sd_after_ja: 1000.0, ..Habits::LIVE }.sd_after_ja_frames(), 666);
+        // A request that is not on the grid is **snapped**, not accepted as
+        // it stands and not rounded silently into something off-grid.
+        for (asked, frames) in [(250.0, 333), (499.0, 665), (500.0, 666), (1.0, 1)] {
+            let habits = Habits { sd_after_ja: asked / 1000.0, ..Habits::LIVE };
+            assert_eq!(habits.sd_after_ja_frames(), frames, "{asked} ms");
+            let ms = habits.sd_after_ja_symbols() as f64 / FS * 1000.0;
+            assert_ne!(ms, asked, "{asked} ms is off the grid and was not snapped");
+            assert_eq!(ms, frames as f64 * SD_FRAME_MS);
+        }
+        // And the default reproduces the behaviour every call had before this
+        // existed: no wait at all.
+        assert_eq!(Habits::LIVE.sd_after_ja_frames(), 0);
+        assert_eq!(Habits::PROMPT.sd_after_ja_frames(), 0);
+        assert_eq!(Habits::default().sd_after_ja_symbols(), 0);
+    }
+
+    /// The wait goes on the line **before** Sd and nowhere else: the source is
+    /// silent for exactly the waiting frames, Sd is exactly 384T, S-bar-d
+    /// exactly 48T, and TRN1d starts on the codeword immediately after it.
+    ///
+    /// And it is a *shift*: the same Ja read with a wait of W frames puts Sd's
+    /// first symbol exactly `W * INTERVALS` later than with no wait, so what the
+    /// wait moves is the placement and not the frame grid (the residue mod
+    /// `INTERVALS` is identical, which is the whole point -- see `Source::next`).
+    #[test]
+    fn the_wait_delays_sd_by_whole_frames_and_leaves_every_length_alone() {
+        let mut settings = settings();
+        settings.habits = Habits { trn1d: 0.3, sd_after_ja: 0.054, ..Habits::LIVE };
+        let wait = settings.habits.sd_after_ja_symbols();
+        assert_eq!(wait, 432, "54 ms is 72 frames of six");
+
+        // Ja read at symbol 2, i.e. four codewords into a frame: the residue a
+        // real Ja ends on is not zero, and the wait must not move it.
+        let mut with_wait = Modem::new(settings.clone());
+        for _ in 0..2 {
+            with_wait.source.next();
+        }
+        with_wait.heard_ja(asked_dil());
+        let total = 2 * INTERVALS + wait + SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS + 6;
+        let stream = labelled(&mut with_wait.source, total);
+        let first_sd = stream
+            .iter()
+            .position(|(out, _)| *out == Out::Sd)
+            .expect("Sd never reached the line");
+        // The stream starts two codewords into a frame, so the frame boundary
+        // is an absolute property: index + 2.
+        let sd_at = first_sd + 2;
+        assert_eq!(sd_at % INTERVALS, 0, "Sd did not start on a frame boundary");
+        assert_eq!(
+            &stream[..first_sd],
+            &vec![(Out::Silence, 0.0); first_sd][..],
+            "something other than silence went out before Sd"
+        );
+        assert_eq!(only(&stream, Out::Sd).len(), 384, "9.5.1.1.3: Sd is 384T");
+        assert_eq!(only(&stream, Out::SdBar).len(), 48, "9.5.1.1.3: S-bar-d is 48T");
+        assert_eq!(
+            stream[first_sd + 432].0,
+            Out::Trn1d,
+            "TRN1d does not start on the codeword after S-bar-d"
+        );
+
+        // The control: the same Ja, no wait.
+        let mut bare = settings.clone();
+        bare.habits.sd_after_ja = 0.0;
+        let mut no_wait = Modem::new(bare);
+        for _ in 0..2 {
+            no_wait.source.next();
+        }
+        no_wait.heard_ja(asked_dil());
+        let stream = labelled(&mut no_wait.source, total);
+        let first_sd_now = stream
+            .iter()
+            .position(|(out, _)| *out == Out::Sd)
+            .expect("Sd never reached the line");
+        assert_eq!(
+            first_sd - first_sd_now,
+            wait,
+            "the wait did not move Sd by exactly its own whole frames"
+        );
+        assert_eq!(
+            sd_at % INTERVALS,
+            (first_sd_now + 2) % INTERVALS,
+            "the frame residue moved"
+        );
+    }
+
+    /// The 5.1 s deadline is what carries the whole of Phase 3's preamble from
+    /// the sample Ja was read on, so 9.5.1.1.3's wait is one of its terms.
+    #[test]
+    fn the_su_deadline_carries_the_sd_wait_too() {
+        let mut settings = settings();
+        settings.habits = Habits { trn1d: 3.6, sd_after_ja: 0.5, ..Habits::LIVE };
+        let habits = settings.habits;
+        let wait = habits.sd_after_ja_symbols() as u64;
+        assert!(wait > 0);
+        let mut modem = Modem::new(settings);
+        let ja_read = 8000u64;
+        modem.now = ja_read;
+        modem.heard_ja(asked_dil());
+        let deadline = modem.su_deadline.expect("a deadline from Ja");
+        assert_eq!(
+            deadline,
+            ja_read
+                + wait
+                + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64
+                + (habits.trn1d * FS) as u64
+                + (SU_WITHIN * FS) as u64,
+            "the deadline does not carry 9.5.1.1.3's wait"
+        );
+        // Which leaves the 5.1 s where 9.5.1.2.2 puts it -- after TRN1d's own
+        // length from TRN1d's start, exactly as it was before the wait existed,
+        // so the wait moved the deadline by its own length and nothing else.
+        let trn1d_start = ja_read
+            + wait
+            + (SD_FRAMES * INTERVALS + SD_BAR_FRAMES * INTERVALS) as u64;
+        assert_eq!(
+            deadline - trn1d_start,
+            (habits.trn1d * FS) as u64 + (SU_WITHIN * FS) as u64
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 9.8 rate renegotiation: the responder (docs/214)
+    // -----------------------------------------------------------------
+
+    /// A data mode level stream: legal codewords of a V.92 downstream
+    /// constellation, whose signs and magnitudes both wander. A six-symbol
+    /// stretch of signs will match something by chance; a six-symbol stretch of
+    /// signs *and* constant magnitude will not, which is what 8.5.5's "same
+    /// structure used while transmitting 2 point TRN1u signal" is.
+    fn data_levels(count: usize) -> Vec<f64> {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        (0..count)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // 1..=31, the spread of a mu-law data set, either sign.
+                let magnitude = 1.0 + (x % 31) as f64;
+                if x & 0x100 == 0 { magnitude } else { -magnitude }
+            })
+            .collect()
+    }
+
+    /// The six-symbol period of `Ru`, at a fixed magnitude.
+    fn ru_periods(periods: usize, magnitude: f64, bar: bool) -> Vec<f64> {
+        (0..periods)
+            .flat_map(|_| {
+                RU_PERIOD.iter().map(move |&positive| {
+                    let positive = positive ^ bar;
+                    if positive { magnitude } else { -magnitude }
+                })
+            })
+            .collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // docs/216: the far end has left data mode -- the trigger and the re-entry
+    // ---------------------------------------------------------------------
+
+    /// A level table of the shape `begin_b1u` builds: `a(eta) = 2 eta + 1` over
+    /// `points` positive points, at the gain 8.8.3 gives a sixteen-point set.
+    fn data_table(points: usize) -> Vec<f64> {
+        let gain = crate::v92::upchoice::gain_for(points);
+        let mut levels: Vec<f64> = (0..points)
+            .flat_map(|eta| {
+                let level = gain * f64::from(2 * eta as u32 + 1);
+                [level, -level]
+            })
+            .collect();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        levels
+    }
+
+    /// The far end's generator pattern as `agr-tx.raw` carries it: a uniform
+    /// ladder of 40 magnitudes over the whole scale, all of them above the
+    /// constellation's loudest point by the table's own measure.
+    fn generator_levels(count: usize) -> Vec<f64> {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        (0..count)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // 360 ..= 22303, the magnitudes the far end's generator puts on
+                // the line on the measured call.
+                let magnitude = 360.0 + (x % 40) as f64 * (22303.0 - 360.0) / 39.0;
+                if x & 0x100 == 0 { magnitude } else { -magnitude }
+            })
+            .collect()
+    }
+
+    /// Requirement 1 (`docs/216` §2): **the data mode of a call that does not
+    /// fall back is unchanged.** The detector runs on every data mode symbol,
+    /// and over a stream that is data and not a foreign pattern it must never
+    /// fire -- not once, at any of a thousand symbols -- because a false fire
+    /// puts `Ri` on the line in the middle of the far end's data and loses the
+    /// call.
+    #[test]
+    fn no_data_loss_is_signalled_by_a_healthy_data_mode_run() {
+        let table = data_table(8);
+        let step = table[1] - table[0];
+        assert!(step > 0.0);
+        let mut detector = DataModeLoss::new(&table).expect("a table with a step");
+        assert!(detector.threshold() > *table.last().unwrap(), "no margin over the loudest point");
+        // Data mode: every symbol a point of the constellation, plus noise that
+        // never carries it past the decision boundary of the point either side.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut fired = 0;
+        for _ in 0..4000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let point = table[(x as usize) % table.len()];
+            let noise = (((x >> 20) & 0xFFFF) as f64 / 65_535.0 - 0.5) * step;
+            if detector.feed(point + noise) {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 0, "a healthy data mode fired the re-entry");
+        assert!(!detector.fired());
+    }
+
+    /// `docs/216` §2: the trigger fires on a **sustained** upstream failure and
+    /// not on one bad frame -- `[our choice]`'s whole content.
+    #[test]
+    fn the_data_loss_trigger_needs_a_sustained_failure_and_not_one_bad_frame() {
+        let table = data_table(8);
+        let step = table[1] - table[0];
+        let loudest = *table.last().unwrap();
+        let inside = { let _ = step; *table.last().unwrap() * 0.5 };
+        assert!(inside < loudest);
+
+        // One data frame of a foreign pattern, then data again: no fire.
+        let mut detector = DataModeLoss::new(&table).expect("a table");
+        let mut fired = false;
+        for _ in 0..UP_INTERVALS {
+            fired |= detector.feed(loudest * 2.0);
+        }
+        for _ in 0..(DATA_MODE_LOSS_FRAMES * UP_INTERVALS) {
+            fired |= detector.feed(inside);
+        }
+        assert!(!fired, "one bad frame fired the re-entry");
+
+        // Sustained: fire, and exactly once.
+        let mut detector = DataModeLoss::new(&table).expect("a table");
+        let mut fires = 0;
+        let mut at = None;
+        for (n, level) in generator_levels(4000).into_iter().enumerate() {
+            if detector.feed(level) {
+                fires += 1;
+                at = Some(n);
+            }
+        }
+        assert_eq!(fires, 1, "the trigger fired {} times", fires);
+        let at = at.expect("the trigger never fired");
+        assert!(
+            at < DATA_MODE_LOSS_FRAMES * UP_INTERVALS + 40,
+            "the trigger took {at} symbols, more than {} data frames",
+            DATA_MODE_LOSS_FRAMES
+        );
+    }
+
+    /// 9.5.1.1.12 with 9.5.2.1.10: `Ri` for 384T and `R-bar-i` for 24T, on the
+    /// data frame grid, and then 9.6.1.1.1's `TRN2d`.
+    ///
+    /// The bar is V.90 8.6.4's "with the sign pattern - - - + + +"
+    /// (`v90.txt:1835`) read off the source line, and not the `- - - + + -` an
+    /// earlier draft had out of a PDF hyphenation artefact.
+    #[test]
+    fn ri_is_384t_and_r_bar_i_24t_on_a_data_frame_grid() {
+        let mut settings = settings();
+        settings.law = Law::Mu;
+        let mut source = Source::new(&settings);
+        source.change(Out::B1d);
+        let mut emitted: Vec<f64> = Vec::new();
+        // Seven symbols of data mode first, so that the opener has to wait for
+        // the grid rather than starting where it was asked for.
+        for _ in 0..7 {
+            emitted.push(source.next());
+        }
+        assert_eq!(source.out(), Out::B1d);
+        source.ri_opener();
+        while source.out() != Out::Trn2d {
+            emitted.push(source.next());
+            assert!(emitted.len() < 1000, "Ri never ended");
+        }
+        let start = 12;
+        // The last symbol pushed is TRN2d's first: the loop pushes until the
+        // signal on the line has changed.
+        assert_eq!(emitted.len(), start + R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS + 1);
+        let ri = &emitted[start..start + R_FRAMES * INTERVALS];
+        assert_eq!(ri.len(), 384);
+        assert!(ri.iter().all(|v| (*v - ri[0]).abs() < 1e-9 || (*v + ri[0]).abs() < 1e-9));
+        for (i, level) in ri.iter().enumerate() {
+            assert_eq!(*level > 0.0, i % INTERVALS < 3, "Ri symbol {i} is not + + + - - -");
+        }
+        let bar = &emitted[start + R_FRAMES * INTERVALS..start + R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS];
+        assert_eq!(bar.len(), 24, "R-bar-i is not 24T");
+        assert!(bar.iter().all(|v| (*v - ri[0]).abs() < 1e-9 || (*v + ri[0]).abs() < 1e-9));
+        for (i, level) in bar.iter().enumerate() {
+            assert_eq!(*level > 0.0, i % INTERVALS >= 3, "R-bar-i symbol {i} is not - - - + + +");
+        }
+        assert_eq!(source.out(), Out::Trn2d);
+    }
+
+    /// 9.6.1.1.1: "The digital modem shall transmit TRN2d for at least 2040T",
+    /// with 9.8.1.1.2's "up to 16008T" as the ceiling on this path.
+    #[test]
+    fn the_re_entry_trn2d_is_within_2040t_and_16008t() {
+        let mut settings = settings();
+        settings.law = Law::Mu;
+        let mut source = Source::new(&settings);
+        source.ri_opener();
+        source.bound_trn2d(TRN2D_MOST);
+        while source.out() != Out::Trn2d {
+            source.next();
+        }
+        // The exchange asks for SUVd as soon as it can; the ceiling is what
+        // bounds TRN2d then.
+        source.send(Out::Suvd, vec![true; 24]);
+        let mut symbols = 0;
+        while source.out() == Out::Trn2d {
+            source.next();
+            symbols += 1;
+            assert!(symbols <= TRN2D_MOST + INTERVALS, "TRN2d ran past 16008T");
+        }
+        assert!(symbols >= 2040, "TRN2d ran {symbols}T, under 2040T");
+        assert!(symbols <= TRN2D_MOST);
+    }
+    /// Requirement 1: **a call with no renegotiation in it is unchanged.**
+    ///
+    /// The detector runs on every data mode symbol. Over a stream that is data
+    /// and not `Ru` it must never fire -- not once, at any of a thousand
+    /// symbols -- because a false fire puts `Rd` on the line in the middle of
+    /// the far end's data and loses the call. This is the guard the whole
+    /// ticket rests on.
+    #[test]
+    fn no_ru_in_data_mode_never_fires_the_responder() {
+        let mut detector = RuDetector::new();
+        let events: Vec<RuEvent> = data_levels(4000).into_iter().map(|l| detector.feed(l)).collect();
+        assert!(
+            events.iter().all(|e| *e == RuEvent::None),
+            "a data mode stream fired the 9.8 responder: {:?}",
+            events.iter().filter(|e| **e != RuEvent::None).count()
+        );
+        assert!(!detector.is_locked(), "the receiver was conditioned with no Ru");
+    }
+
+    /// 9.8.1.2.1: "After detecting `Ru`, the digital modem shall clamp circuit
+    /// 104 to binary one and condition its receiver to detect the `Ru`-to-
+    /// `R-bar-u` transition."
+    ///
+    /// `Ru` is 8.5.5's {+LU, +LU, +LU, -LU, -LU, -LU} repeated, and the
+    /// detector needs [`RU_LOCK_PERIODS`] of them -- a number inside the 384T
+    /// 9.8.2.1.1 gives the far end to spend.
+    #[test]
+    fn ru_is_detected_after_four_periods_and_then_the_receiver_waits_for_the_transition() {
+        let mut detector = RuDetector::new();
+        let mut events = Vec::new();
+        // Three periods: not enough.
+        for level in ru_periods(RU_LOCK_PERIODS - 1, 40.0, false) {
+            events.push(detector.feed(level));
+        }
+        assert_eq!(events, vec![RuEvent::None; 6 * (RU_LOCK_PERIODS - 1)]);
+        assert!(!detector.is_locked(), "locked one period early");
+        // The fourth.
+        for level in ru_periods(1, 40.0, false) {
+            events.push(detector.feed(level));
+        }
+        assert_eq!(
+            events.iter().filter(|e| **e == RuEvent::RuDetected).count(),
+            1,
+            "9.8.1.2.1 did not fire"
+        );
+        assert!(detector.is_locked(), "the receiver was not conditioned");
+        // More Ru: still renegotiating, still waiting -- and no second clamp.
+        for level in ru_periods(4, 40.0, false) {
+            assert_eq!(detector.feed(level), RuEvent::None, "Ru fired twice");
+        }
+    }
+
+    /// **What the far end actually puts on the line.** 8.5.5's
+    /// {+LU, +LU, +LU, -LU, -LU, -LU} is a period-six wave; the Agere SV92PP's
+    /// transmit path leaves one component of it, so the six symbols arrive as a
+    /// 1 333.33 Hz tone whose *magnitudes* are three values and not one. The
+    /// levels below are read off `runs-214/164250-sd108ab170-r214/agr-tx.raw`,
+    /// records 192 090..192 470, which is the far end's own `Ru` (docs/224 §2):
+    /// a 5 389-amplitude six-symbol wave at a constant phase, 46.5 ms long.
+    ///
+    /// This is the test that fails on the detector before `docs/224`: six
+    /// magnitudes of 4 683 / 4 650 / 33 are 99 % apart, so the two-point test
+    /// rejects every symbol and `Ru detected` is never printed -- which is
+    /// exactly what the bench showed.
+    #[test]
+    fn the_far_ends_ru_is_a_period_six_wave_and_is_detected_as_one() {
+        // One period as measured, oldest first. Six symbols, three magnitudes.
+        let period = [-4683.0_f64, -33.0, 4650.0, 4683.0, 33.0, -4650.0];
+        // The two-point reading of 8.5.5 cannot see this: the magnitudes are
+        // 99 % apart, nearly three times RU_MAGNITUDE_SLACK.
+        let loud = 4683.0;
+        let quiet = 33.0;
+        assert!((loud - quiet) / loud > 2.0 * RU_MAGNITUDE_SLACK);
+        let mut detector = RuDetector::new();
+        let mut events = Vec::new();
+        // 9.8.2.1.1 gives the far end 384T of Ru; feed exactly that.
+        for _ in 0..64 {
+            for level in period {
+                events.push(detector.feed(level));
+            }
+        }
+        assert_eq!(
+            events.iter().filter(|e| **e == RuEvent::RuDetected).count(),
+            1,
+            "9.8.1.2.1 did not fire on the far end's own Ru"
+        );
+        assert!(detector.is_locked(), "the receiver was not conditioned");
+        // Where in the 384T it fires: after RU_TONE_SYMBOLS, not later -- the
+        // 384T has 288 symbols left for R-bar-u and the frame boundary.
+        let at = events.iter().position(|e| *e == RuEvent::RuDetected).unwrap();
+        assert_eq!(at + 1, RU_TONE_SYMBOLS);
+        // And no second fire inside the same Ru.
+        assert_eq!(events.iter().filter(|e| **e == RuEvent::RuDetected).count(), 1);
+    }
+
+    /// The far end's `Ru` ends without an `R-bar-u` -- measured, phase constant
+    /// to 0.3 degree over all 46.5 ms of it (docs/224 §2) -- so the transition
+    /// 9.8.1.2.2 releases `Rd` on is the end of the wave. Back to data after it
+    /// and the detector must say so, once.
+    #[test]
+    fn the_end_of_the_far_ends_ru_releases_rd_when_no_ru_bar_follows() {
+        let period = [-4683.0_f64, -33.0, 4650.0, 4683.0, 33.0, -4650.0];
+        let mut detector = RuDetector::new();
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            for level in period {
+                events.push(detector.feed(level));
+            }
+        }
+        assert!(detector.is_locked());
+        // Data mode again: no six-symbol component, and the magnitudes wander.
+        for level in data_levels(400) {
+            events.push(detector.feed(level));
+        }
+        assert_eq!(
+            events.iter().filter(|e| **e == RuEvent::RuToRuBar).count(),
+            1,
+            "the end of the far end's Ru did not release Rd"
+        );
+    }
+
+    /// 9.8.1.2.2: "After detecting the `Ru`-to-`R-bar-u` transition, the digital
+    /// modem shall transmit signal `Rd` ..."
+    ///
+    /// `R-bar-u` is the negation of 8.5.5's pattern and 9.8.2.1.1 gives it 24T,
+    /// so the transition is one period of the inverted pattern -- and it is only
+    /// a transition *after* `Ru`, which is what the conditioning is for.
+    #[test]
+    fn the_ru_to_ru_bar_transition_is_what_releases_rd_and_only_after_ru() {
+        // Without Ru first, the bar cannot release Rd.
+        //
+        // It cannot even be *told apart* from Ru: 8.5.5's {+ + + - - -} read
+        // three symbols on is {- - - + + +}, so the negation of the pattern is
+        // the pattern itself started at another phase. A receiver watching
+        // signs alone therefore sees a run of R-bar-u as a run of Ru -- which
+        // is the whole reason 9.8.1.2.1 conditions the receiver *after*
+        // detecting Ru rather than merely watching for a sequence. What must
+        // not happen is a transition firing with nothing locked.
+        let mut detector = RuDetector::new();
+        let alone = ru_periods(8, 40.0, true);
+        assert!(
+            alone
+                .into_iter()
+                .all(|l| detector.feed(l) != RuEvent::RuToRuBar),
+            "R-bar-u with no Ru locked released Rd"
+        );
+        // With Ru first, the first inverted period does it: 9.8.2.1.1 gives the
+        // far end 384T + 24T, so 24T is all the transition has.
+        let mut detector = RuDetector::new();
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            let _ = detector.feed(level);
+        }
+        assert!(detector.is_locked());
+        let after: Vec<RuEvent> = ru_periods(1, 40.0, true).into_iter().map(|l| detector.feed(l)).collect();
+        assert_eq!(
+            after.last(),
+            Some(&RuEvent::RuToRuBar),
+            "the 24T of R-bar-u did not release Rd: {after:?}"
+        );
+    }
+
+    /// A Source whose data mode constellation is CPd's and whose training
+    /// constellation is CPt's, with the two deliberately disjoint so that a
+    /// signal sent on the wrong one is visible in the levels.
+    fn renegotiating_source() -> Source {
+        let mut source = Source::new(&settings_with(79));
+        // Twelve intervals, the data mode set a different codeword each one.
+        let mut data = [0u8; DOWN_INTERVALS];
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = 100 + i as u8;
+        }
+        // And training on different codewords again.
+        let mut training = [0u8; DOWN_INTERVALS];
+        for (i, slot) in training.iter_mut().enumerate() {
+            *slot = 40 + i as u8;
+        }
+        source.arm_renegotiation(data, training);
+        source
+    }
+
+    /// 9.8.1.1.1 and 9.8.1.2.2: "**The signal Rd shall begin on the boundary of
+    /// a data frame.**"
+    ///
+    /// Asserted, not eyeballed -- `digital.rs:1781-1782` records a signal that
+    /// started off-frame and rotated the grid the far end counts against, and
+    /// the failure is silent on this side of the line.
+    #[test]
+    fn rd_begins_on_the_boundary_of_a_data_frame() {
+        let mut source = renegotiating_source();
+        // Land in the middle of data mode, three symbols into a frame.
+        source.start(Out::B1d);
+        source.symbol = 60; // ten frames exactly, then three more
+        source.next();
+        source.next();
+        source.next();
+        assert_eq!(source.symbol % INTERVALS as u64, 3 % INTERVALS as u64);
+        // The far end's Ru-to-R-bar-u is read: Rd is asked for.
+        source.change(Out::Rd);
+        // Whatever is left of the frame goes out as data, and Rd starts on the
+        // next boundary.
+        let mut began_at = None;
+        for _ in 0..64 {
+            source.next();
+            if source.out() == Out::Rd && began_at.is_none() {
+                began_at = Some(source.symbol - 1);
+            }
+        }
+        let at = began_at.expect("Rd never reached the line");
+        assert_eq!(
+            at % INTERVALS as u64,
+            0,
+            "9.8.1.2.2: Rd began {at} symbols in, {} into a data frame",
+            at % INTERVALS as u64
+        );
+    }
+
+    /// 9.8.1.1.1, 9.8.1.2.2: "transmit signal `Rd` for **384T** and then
+    /// `R-bar-d` for **24T**", and V.90 8.6.4's "`R` consists of 4 repetitions
+    /// of the 6-symbol sequence ... with the sign pattern - - - + + +"
+    /// (`v90.txt:1835`).
+    #[test]
+    fn rd_is_384t_then_rd_bar_is_24t_with_the_four_repetition_structure() {
+        let mut source = renegotiating_source();
+        source.change(Out::Rd);
+        let rd = labelled(&mut source, R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS + 12);
+        let rd_len = rd.iter().filter(|(o, _)| *o == Out::Rd).count();
+        let bar_len = rd.iter().filter(|(o, _)| *o == Out::RdBar).count();
+        assert_eq!(rd_len, 384, "Rd is not 384T: {rd_len}");
+        assert_eq!(bar_len, 24, "R-bar-d is not 24T: {bar_len}");
+        // The bar's sign pattern, out of the clause: four repetitions of
+        // - - - + + - with the left-most sign transmitted first.
+        let bar: Vec<bool> = rd
+            .iter()
+            .filter(|(o, _)| *o == Out::RdBar)
+            .map(|(_, level)| *level > 0.0)
+            .collect();
+        let want: Vec<bool> = (0..R_BAR_FRAMES)
+            .flat_map(|_| [false, false, false, true, true, true])
+            .collect();
+        assert_eq!(bar, want, "R-bar-d is not 8.6.4's four repetitions");
+        // And R's own: + + + - - - over the 384T.
+        let r: Vec<bool> = rd
+            .iter()
+            .filter(|(o, _)| *o == Out::Rd)
+            .take(INTERVALS)
+            .map(|(_, level)| *level > 0.0)
+            .collect();
+        assert_eq!(r, [true, true, true, false, false, false], "Rd is not + + + - - -");
+    }
+
+    /// V.90 8.6.4: "**Rd** denotes signal R using the highest power PCM codeword
+    /// from the **data mode** constellation of each data frame interval as
+    /// passed in **CP**", while "**Rt** denotes signal R using the highest power
+    /// PCM codeword from the **training** constellation of each data frame
+    /// interval as passed in **CPt**".
+    ///
+    /// Two signals, two constellations, and 9.8.1.2.2 asks for one of them while
+    /// 9.8.1.1.4 asks for the other. Sharing a hard-coded level between them is
+    /// the mistake this test exists to catch.
+    #[test]
+    fn rd_is_the_data_mode_constellation_and_rt_is_the_training_one() {
+        let mut source = renegotiating_source();
+        source.change(Out::Rd);
+        let rd: Vec<f64> = labelled(&mut source, R_FRAMES * INTERVALS)
+            .into_iter()
+            .filter(|(o, _)| *o == Out::Rd)
+            .map(|(_, level)| level.abs())
+            .collect();
+        let mut source = renegotiating_source();
+        source.change(Out::Rt);
+        let rt: Vec<f64> = labelled(&mut source, R_FRAMES * INTERVALS)
+            .into_iter()
+            .filter(|(o, _)| *o == Out::Rt)
+            .map(|(_, level)| level.abs())
+            .collect();
+        assert_eq!(rd.len(), 384);
+        assert_eq!(rt.len(), 384);
+        assert_ne!(rd[0], rt[0], "Rd and Rt were sent at the same level");
+        // Twelve data frame intervals, twelve codewords: the pattern is a
+        // twelve-symbol cycle even though the signs cycle every six.
+        let distinct: std::collections::BTreeSet<u64> =
+            rt.iter().take(DOWN_INTERVALS).map(|l| l.to_bits()).collect();
+        assert_eq!(distinct.len(), DOWN_INTERVALS, "Rt did not follow the twelve intervals");
+    }
+
+    /// 9.8.1.2.3 -> 9.8.1.1.2: "The digital modem shall then proceed according
+    /// to 9.8.1.1.2", which is "shall then transmit `TRN2d` for **up to
+    /// 16008T** followed by `SUVd` sequences".
+    ///
+    /// "Up to" is a ceiling. What the bar is followed by is TRN2d, and how long
+    /// this end holds TRN2d is inside the clause's bound.
+    #[test]
+    fn after_rd_bar_comes_trn2d_and_it_is_within_16008t() {
+        let mut source = renegotiating_source();
+        source.change(Out::Rd);
+        let stream = labelled(&mut source, R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS + 40);
+        let last_bar = stream.iter().rposition(|(o, _)| *o == Out::RdBar).unwrap();
+        assert_eq!(
+            stream[last_bar + 1].0,
+            Out::Trn2d,
+            "9.8.1.2.3/9.8.1.1.2: the bar was not followed by TRN2d"
+        );
+        // The clause's ceiling, and this end's own choice inside it.
+        assert!(TRN2D_MOST == 16008, "9.8.1.1.2's ceiling was changed");
+        assert!(
+            TRN2D_LEAST <= TRN2D_MOST,
+            "this end's TRN2d ({TRN2D_LEAST}) exceeds 9.8.1.1.2's 16008T ceiling"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 9.8.1.1.2 to 9.6.1.1.2: the tail (docs/215)
+    // -----------------------------------------------------------------
+
+    /// One symbol as the receiver would hand it over.
+    fn symbol_at(level: f64) -> Symbol {
+        Symbol { index: 0, raw: 0, value: level, decided: None, line: level, forward: 0.0 }
+    }
+
+    /// A CPd for drn 1, as `upchoice` would design it.
+    fn reneg_cpd() -> Cpd {
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let parameters =
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, crate::v92::upchoice::LevelSet::Code)
+                .expect("drn 1 is pinnable")
+                .parameters;
+        Cpd::from(&parameters)
+    }
+
+    /// A source, a tail and the exchange 9.8.1.1.2 hands 9.6.1.1.2 to: the
+    /// things a renegotiation's tail passes between them.
+    fn tail_rig() -> (Source, RenegTail, Exchange, Cpd) {
+        let mut source = renegotiating_source();
+        // 9.8.1.2.3 -> 9.8.1.1.2: the cap the tail's own TRN2d must respect.
+        source.bound_trn2d(TRN2D_MOST);
+        let cpd = reneg_cpd();
+        let (tail, exchange) = RenegTail::new(0.0, FS);
+        (source, tail, exchange, cpd)
+    }
+
+    /// Drive the tail and the source together, symbol by symbol, with `peer`
+    /// called on every symbol so a test can deliver an `SUVu` at the instant it
+    /// means to.
+    fn drive_tail(
+        source: &mut Source,
+        tail: &mut RenegTail,
+        exchange: &mut Exchange,
+        cpd: &Cpd,
+        symbols: usize,
+        peer: &mut dyn FnMut(u64, &mut Exchange),
+    ) -> Vec<(Out, f64)> {
+        let mut stream = Vec::with_capacity(symbols);
+        for now in 0..symbols as u64 {
+            tail.push(source, exchange, Some(cpd), now);
+            peer(now, exchange);
+            let level = source.next();
+            stream.push((source.out(), level));
+        }
+        stream
+    }
+
+    /// 9.8.1.1.2: "The digital modem shall then transmit `TRN2d` for **up to
+    /// 16008T** followed by `SUVd` sequences."
+    ///
+    /// "Up to" is a ceiling and the countdown is what makes it one: `docs/214`
+    /// §6 gap 1 was that nothing set a pending change after TRN2d, so the arm's
+    /// exit condition never fired and TRN2d ran on for ever -- no `SUVd`, no
+    /// `CPd`, nothing for the far end to answer.
+    #[test]
+    fn trn2d_is_cut_at_16008t_and_suvd_follows() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        // 9.8.1.2.2's Rd and R-bar-d first, on the source's own arms.
+        source.change(Out::Rd);
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 60,
+            &mut |_, _| {},
+        );
+        let trn2d = stream.iter().filter(|(out, _)| *out == Out::Trn2d).count();
+        assert_eq!(trn2d, 16008, "9.8.1.1.2: TRN2d is not cut at 16008T");
+        let last_trn2d = stream.iter().rposition(|(out, _)| *out == Out::Trn2d).unwrap();
+        assert_eq!(
+            stream[last_trn2d + 1].0,
+            Out::Suvd,
+            "9.8.1.1.2: TRN2d was not followed by SUVd"
+        );
+        // And the cut is on the data frame grid the SUVd after it must start on.
+        assert_eq!(
+            (last_trn2d + 1) % INTERVALS,
+            0,
+            "the SUVd after TRN2d began off the data frame boundary"
+        );
+    }
+
+    /// 9.8.1.1.2 with 9.6.1.1.2: with bit 32 clear in both directions -- "the
+    /// digital modem shall proceed according to 9.6.1.1.2 unless bit 32 is set
+    /// in either `SUVd` or `SUVu`" -- the far end's `SUVu` releases **one**
+    /// `CPd`.
+    #[test]
+    fn with_bit_32_clear_in_both_directions_one_cpd_follows_the_suvu() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        // The far end's SUVu arrives 200 symbols into the SUVd that follows
+        // TRN2d, with bit 32 clear and the acknowledge bit clear (it has not
+        // received a CPd yet: 9.8.2.1.3).
+        let mut delivered = false;
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 1200,
+            &mut |_, exchange| {
+                if !delivered && exchange.sending().is_some() {
+                    delivered = true;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 0);
+                }
+            },
+        );
+        assert!(delivered, "no SUVd went out to answer");
+        let cpds = runs(&stream, Out::Cpd);
+        assert_eq!(cpds, 1, "9.6.1.1.2: `a single CPd`, and {cpds} went out");
+        // And it went out after the SUVd that answered the SUVu, not before.
+        let first_cpd = stream.iter().position(|(out, _)| *out == Out::Cpd).unwrap();
+        assert!(
+            stream[..first_cpd].iter().any(|(out, _)| *out == Out::Suvd),
+            "the CPd went out before any SUVd"
+        );
+        assert!(tail.stage() != RenegStage::Silence, "bit 32 clear took the silence branch");
+    }
+
+    /// 9.8.1.1.3: "The digital modem shall then transmit `SUVd` sequences with
+    /// **bit 33 set**. After receiving an `SUVu` sequence with bit 33 set or
+    /// `E2u`, the digital modem shall complete sending the current `SUVd` and
+    /// then transmit `Ed` followed by silence ... It shall **retain data frame
+    /// alignment** during this period of silence."
+    ///
+    /// This is the branch 9.8.1.1.2 opens when bit 32 is set in *either*
+    /// direction, and here it is the far end's `SUVu` that sets it -- the one
+    /// place the two directions interact.
+    #[test]
+    fn suvu_bit_32_set_takes_9_8_1_1_3_s_suvd_bit_33_then_ed_then_silence() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        let total = R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 2400;
+        let mut asked = false;
+        let mut acked = false;
+        // What the SUVd sequences on the line actually carry: bit 32 and bit
+        // 33 read back out of the sequence itself (`Suvd::from_bits`), not out
+        // of the intent.
+        let mut carried: Vec<(bool, bool)> = Vec::new();
+        let mut stream = Vec::with_capacity(total);
+        for now in 0..total as u64 {
+            if let Some(Out::Suvd) = tail.push(&mut source, &mut exchange, Some(&cpd), now) {
+                // What the sequence this just asked for carries, read back out
+                // of it (`Suvd::from_bits`) rather than out of the intent.
+                let sent = Suvd::from_bits(&source.last).expect("an SUVd was asked for but not built");
+                if !carried.contains(&(sent.silence, sent.ack)) {
+                    carried.push((sent.silence, sent.ack));
+                }
+            }
+            // 9.8.2.1.3: SUVu with bit 32 set asks for the silent period.
+            if !asked && exchange.sending().is_some() {
+                asked = true;
+                exchange.peer_suv(PeerSuv { ack: false, silence: true, wait_for_cp: false }, 0);
+            }
+            // Then "an SUVu sequence with bit 33 set", which is 9.8.1.1.3's
+            // other trigger.
+            if asked && !acked && exchange.peer_silence() {
+                acked = true;
+                exchange.peer_suv(PeerSuv { ack: true, silence: true, wait_for_cp: false }, 1);
+            }
+            let level = source.next();
+            stream.push((source.out(), level));
+        }
+        assert!(
+            carried.contains(&(true, true)),
+            "9.8.1.1.3: no SUVd went out with bit 32 and bit 33 both set: {carried:?}"
+        );
+        // SUVd with bit 33 set: the sequence in the SUVd after TRN2d that
+        // follows the far end's request.
+        let first_suvd = stream.iter().position(|(out, _)| *out == Out::Suvd).unwrap();
+        let first_ed = stream.iter().position(|(out, _)| *out == Out::Ed).expect("no Ed: 9.8.1.1.3");
+        assert!(first_ed > first_suvd, "the Ed came before any SUVd'");
+        // "complete sending the current SUVd and then transmit Ed": the Ed
+        // begins where a whole SUVd has run out, which is a data frame multiple.
+        assert_eq!(
+            first_ed % INTERVALS,
+            0,
+            "the Ed began {} symbols into a data frame, not after a whole SUVd",
+            first_ed % INTERVALS
+        );
+        // "followed by silence", Ucode 0 (9.8.1.1.3's own definition of it).
+        let after: Vec<&(Out, f64)> = stream[first_ed..].iter().collect();
+        let silent = after.iter().position(|(out, _)| *out == Out::Silence);
+        let silent = silent.unwrap_or_else(|| panic!("no silence after the Ed: {after:?}"));
+        assert!(
+            stream[first_ed + silent..first_ed + silent + 12]
+                .iter()
+                .all(|(out, level)| *out != Out::Silence || *level == 0.0),
+            "9.8.1.1.3: the silence is not Ucode 0"
+        );
+        // "It shall retain data frame alignment during this period of silence":
+        // the silence begins on a frame boundary and runs whole frames, because
+        // it occupies data frame intervals like every other signal
+        // (`Source::next`) and the Ed before it ended on a boundary.
+        let silence_start = first_ed + silent;
+        assert_eq!(
+            silence_start % INTERVALS,
+            0,
+            "the silence began {} symbols into a data frame",
+            silence_start % INTERVALS
+        );
+        let run = stream[silence_start..].iter().take_while(|(out, _)| *out == Out::Silence).count();
+        assert!(run >= INTERVALS, "the silence was shorter than a data frame: {run}");
+        assert_eq!(run % INTERVALS, 0, "the silence did not occupy whole data frames: {run}");
+        assert_eq!(tail.stage(), RenegStage::Silence, "the tail did not reach the silence");
+    }
+
+    /// 9.8.1.1.4: "If bit 32 of `SUVu` was set, the digital modem shall wait to
+    /// receive `SUVu` with bit 32 clear. After receiving `SUVu` with bit 32
+    /// clear, the digital modem shall transmit `Rt` for 384T followed by
+    /// `R-bar-t` for 24T and `SUVd`. The digital modem shall then proceed
+    /// according to 9.6.1.1.2."
+    ///
+    /// `R-bar-t` is V.90 8.6.4's "4 repetitions of the 6-symbol sequence ...
+    /// with the sign pattern – – – + + +" (`v90.txt:1835`), read off that line.
+    #[test]
+    fn suvu_bit_32_cleared_after_the_silence_releases_rt_then_r_bar_t_then_suvd() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        let mut phase = 0;
+        let mut acked_at = None;
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS
+                + R_BAR_SYMBOLS
+                + TRN2D_MOST
+                + 2400
+                + R_FRAMES * INTERVALS
+                + R_BAR_SYMBOLS
+                + 600,
+            &mut |now, exchange| {
+                if phase == 0 && exchange.sending().is_some() {
+                    phase = 1;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: true, wait_for_cp: false }, 0);
+                } else if phase == 1 && exchange.peer_silence() {
+                    phase = 2;
+                    acked_at = Some(now);
+                    exchange.peer_suv(PeerSuv { ack: true, silence: true, wait_for_cp: false }, 1);
+                } else if phase == 2 && now >= acked_at.unwrap_or(u64::MAX) + 2 * INTERVALS as u64 {
+                    // 9.8.1.1.4's "SUVu with bit 32 clear", after the Ed and
+                    // into the silence -- and then the plain SUVu sequences of
+                    // Figures 16 and 17, which are what release the CPd.
+                    phase = 3;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 2);
+                } else if phase == 3 {
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 3);
+                }
+            },
+        );
+        assert!(phase == 3, "the far end never sent the SUVu with bit 32 clear");
+        let rt = stream.iter().filter(|(out, _)| *out == Out::Rt).count();
+        let rt_bar = stream.iter().filter(|(out, _)| *out == Out::RtBar).count();
+        assert_eq!(rt, 384, "9.8.1.1.4: Rt is not 384T: {rt}");
+        assert_eq!(rt_bar, 24, "9.8.1.1.4: R-bar-t is not 24T: {rt_bar}");
+        // The bar's sign pattern, from `v90.txt:1835` and not from memory.
+        let bar: Vec<bool> = stream
+            .iter()
+            .filter(|(out, _)| *out == Out::RtBar)
+            .map(|(_, level)| *level > 0.0)
+            .collect();
+        let want: Vec<bool> = (0..R_BAR_FRAMES).flat_map(|_| [false, false, false, true, true, true]).collect();
+        assert_eq!(bar, want, "R-bar-t is not 8.6.4's four repetitions of – – – + + +");
+        // And the SUVd after the bar, then 9.6.1.1.2's one CPd.
+        let last_bar = stream.iter().rposition(|(out, _)| *out == Out::RtBar).unwrap();
+        assert!(
+            stream[last_bar + 1..].iter().any(|(out, _)| *out == Out::Suvd),
+            "9.8.1.1.4: the bar was not followed by SUVd"
+        );
+        assert_eq!(runs(&stream, Out::Cpd), 1, "9.6.1.1.2: not exactly one CPd after 9.8.1.1.4");
+    }
+
+    /// `docs/213` §6's missing feed: the far end's `SUVu` reader is the Phase 3
+    /// `up_finder`, and it must be fed **only** once a renegotiation is in
+    /// progress.
+    ///
+    /// Two halves, and the second is the one the whole ticket rests on. A call
+    /// with no `Ru` in it must reach the data path byte for byte as it did: the
+    /// feed is gated on the tail, the tail is only built by `ru_ended`, and
+    /// `ru_ended` is only reached from [`RuEvent::RuToRuBar`] -- which
+    /// `no_ru_in_data_mode_never_fires_the_responder` pins at zero firings over
+    /// 4000 data mode symbols.
+    #[test]
+    fn the_suvu_feed_is_armed_by_a_renegotiation_and_by_nothing_else() {
+        let mut modem = Modem::default();
+        // The data mode path: the detector runs on every symbol (it is a side
+        // channel), and four thousand of them never arm the finder.
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_none(), "a renegotiation's tail was built with no Ru");
+        assert!(modem.reneg_trn2u_from.is_none(), "the SUVu reader was armed with no Ru");
+        assert!(modem.up_finder.is_none(), "the SUVu finder was armed in data mode");
+        assert!(modem.upstream_data.is_none(), "a decoder was invented for a call with no data mode");
+
+        // And with Ru followed by R-bar-u the same feed is armed, which is the
+        // other side of the gate.
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.reneg_trn2u_from,
+            Some(modem.now + TRN2U_AFTER_RU_BAR),
+            "the far end's TRN2u 24T after R-bar-u begins is not the fiducial"
+        );
+        // Out of data mode, and the reader is built *on* TRN2u's first symbol
+        // (8.7.6's scrambler reset), not before it.
+        assert!(modem.upstream.is_none());
+        assert!(modem.up_finder.is_none());
+        assert_eq!(TRN2U_AFTER_RU_BAR, (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64);
+    }
+
+    /// 9.8.1.2.1: a rate renegotiation takes the data mode down, so the pump is
+    /// **not** connected while it runs.
+    ///
+    /// This is the spurious CONNECT (docs/227 §3, docs/230 §1). `begin_data`
+    /// latches `Status::Connected` at the first data mode and `ru_ended` used
+    /// to leave it set, so `Pump::status` reported `Progress::Connected` for
+    /// the whole of 9.8. The modem above built a V.42 stack over a line that
+    /// had stopped carrying B1u, its detection phase found no ODP and gave up,
+    /// and the CONNECT it had been holding was released -- for a call whose
+    /// line had only ever reached `SUVd`. It goes out on the bench as
+    /// `CONNECT 24000` followed by `0 octets`, which is a lie that masks every
+    /// failure underneath it.
+    ///
+    /// Fails on `e3d1114`: there the status is still `Connected` here.
+    #[test]
+    fn nine_eight_takes_the_digital_modem_out_of_the_connected_state() {
+        // A first data mode, the one whose CONNECT the modem above is holding
+        // while V.42's detection phase runs.
+        let mask = |points: std::ops::RangeInclusive<u8>| {
+            points.fold(0u128, |m, u| m | 1 << u)
+        };
+        let cpu = Cp {
+            data_mode: true,
+            drn: 18,
+            intervals: [0, 1, 0, 1, 0, 1],
+            constellations: vec![mask(3..=95), mask(3..=88)],
+            ..Cp::default()
+        };
+        let mut modem = Modem::default();
+        modem.cpu = Some(cpu);
+        modem.begin_data();
+        assert!(modem.downstream.is_some(), "no B1d mapping was built from that CPu");
+        assert!(
+            matches!(modem.status(), Status::Connected { .. }),
+            "no first data mode: nothing to be un-latched from"
+        );
+
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.status(),
+            Status::Phase4,
+            "9.8.1.2.1: the data mode was torn down, so the pump must not report \
+             `Connected` through the renegotiation -- the modem above releases \
+             the held CONNECT on it"
+        );
+    }
+
+
+    /// 9.8.1.2.3 -> 9.8.1.1.2 -> 9.6.1.1.2 -> 9.6.1.1.4's `Ed` -> 9.6.1.1.5's
+    /// `B1d`: a renegotiation the far end starts with `Ru` ends in data mode
+    /// again.
+    ///
+    /// Two halves, and the first is the one the bench found dead (docs/227).
+    /// `ru_ended` drops **both** upstream readers -- `upstream` and
+    /// `upstream_data` -- so that `reneg_symbol` can read the far end's
+    /// `TRN2u`/`SUVu`, but `symbol()` gated the feed on those two readers
+    /// alone. The upstream was therefore silent for the whole of 9.8: no
+    /// `SUVu` was decoded, `Exchange::peer_suv` was never called, the tail sat
+    /// at `RenegStage::Suvd` repeating `SUVd`, nothing ever answered the far
+    /// end's `CPu`, and this end never reached its own data mode -- while the
+    /// far end, having heard the `Rd` and the `SUVd`, threw `0x96212` ten
+    /// seconds later.
+    #[test]
+    fn nine_eight_one_two_three_to_nine_six_one_one_two_then_ed_then_b1d() {
+        let mut modem = Modem::default();
+        // Into data mode, then the far end's Ru and the end of it (9.8.1.2.1).
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        assert!(modem.upstream.is_none(), "a reader was built before the far end's TRN2u");
+
+        // 9.8.1.2.3 hands 9.8.1.1.2 `TRN2d`; from the fiducial on, the far
+        // end's symbols have to reach `reneg_symbol`, which builds the reader
+        // on TRN2u's first symbol (8.7.6's scrambler reset). This is the line
+        // that was dead: `symbol()` never called `symbol_upstream` during 9.8.
+        modem.now = fiducial;
+        modem.symbol(symbol_at(1.0));
+        assert!(
+            modem.upstream.is_some() && modem.up_finder.is_some(),
+            "9.8.1.1.2: the far end's TRN2u/SUVu feed is not armed -- `symbol()` \
+             did not route the symbol to `reneg_symbol`"
+        );
+
+        // The exchange itself, from 9.6.1.1.2 to 9.6.1.1.5: one CPd after the
+        // far end's SUVu, Ed after the far end's CPu and its acknowledged
+        // SUVu, and B1d after the Ed.
+        modem.cpd = Some(reneg_cpd());
+        let mut stream: Vec<Out> = Vec::new();
+        let mut suv_seen = 0;
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    // 9.8.2.1.3: the far end's first SUVu carries no
+                    // acknowledge -- it has not received our CPd yet.
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    // 9.6.2.1.2: its CPu answers a CPd.
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    // 9.6.1.1.4: it acknowledges once it has our CPd, and the
+                    // Ed follows the acknowledged SUVd.
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                // 9.6.1.1.5: `B1d` is asked for at the Ed's boundary and is on
+                // the line from the source's next symbol, so run a few more.
+                for _ in 0..(2 * INTERVALS) {
+                    let _ = modem.source.next();
+                    stream.push(modem.source.out());
+                }
+                break;
+            }
+        }
+        // `runs` counts runs and not symbols: a CPd is 480 symbols.
+        let runs: Vec<&Out> = stream.windows(1).map(|w| &w[0]).collect();
+        let first_suv = runs.iter().position(|o| **o == Out::Suvd).expect("no SUVd went out");
+        let cpd = runs.iter().position(|o| **o == Out::Cpd).expect("9.6.1.1.2: no CPd went out");
+        let ed = runs.iter().position(|o| **o == Out::Ed).expect("9.6.1.1.4: no Ed went out");
+        let b1d = runs.iter().position(|o| **o == Out::B1d).expect("9.6.1.1.5: no B1d went out");
+        assert!(first_suv < cpd, "the CPd went out before any SUVd");
+        assert!(cpd < ed, "the Ed went out before the CPd");
+        assert!(ed < b1d, "the B1d went out before the Ed");
+        assert!(modem.reneg.is_none(), "the tail did not finish at 9.6.1.1.5");
+        assert!(modem.exchange.is_none(), "the exchange outlived the renegotiation");
+    }
+
+    /// 9.6.1.1.5 after 9.8: **a renegotiation leaves the pump connected**, and
+    /// leaves it connected through the same door Phase 4 uses.
+    ///
+    /// This is the mirror of
+    /// [`Self::nine_eight_takes_the_digital_modem_out_of_the_connected_state`],
+    /// and the pair exists because the two halves were fixed a ticket apart.
+    /// 9.8.1.2.1 takes the data mode down (`ru_ended` latches `Status::Phase4`),
+    /// the modem above reads that as `Progress::Retraining`, withdraws the
+    /// `announce`+`ec` it was holding (`lib.rs:1966`) -- and nothing in 9.8 put
+    /// any of it back. Measured (`runs-237/204437-b1u171-1`): the renegotiation
+    /// completed at 36.540, `E2u` at 36.560, `B1u confirmed` 576/576 ones at
+    /// 36.620, and the far end logged `Fallback initiated! LAPM timeout`
+    /// 1.008 s into its data mode because no `LAPM` frame ever went downstream
+    /// again: the pump reported `Phase4` (-> `Progress::Retraining`) for the
+    /// rest of the call, so the modem above never built a stack and V.42's
+    /// clocks stayed held at zero (`lib.rs:1924`).
+    ///
+    /// Fails on `150ad56`: there the status is still `Phase4` and `B1d`'s
+    /// countdown is still zero, because `finish_renegotiation` re-armed the
+    /// `B1u` wait by hand and never re-ran `begin_data`'s body.
+    #[test]
+    fn nine_eight_leaves_the_digital_modem_connected_and_lapm_able() {
+        // A first data mode with a CPu, so both rates are real and the second
+        // `B1d` has an encoder to be rebuilt from.
+        let mask = |points: std::ops::RangeInclusive<u8>| {
+            points.fold(0u128, |m, u| m | 1 << u)
+        };
+        let cpu = Cp {
+            data_mode: true,
+            drn: 18,
+            intervals: [0, 1, 0, 1, 0, 1],
+            constellations: vec![mask(3..=95), mask(3..=88)],
+            ..Cp::default()
+        };
+        // CPd's own design, so the upstream half of the latch has a rate to
+        // report and 9.6.1.1.6's arm has something to arm on -- `begin_data`
+        // and `enter_data_mode` both read `parameters` for it.
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let parameters = crate::v92::upchoice::pin_with(
+            &design,
+            1,
+            Trellis::Sixteen,
+            1e-9,
+            crate::v92::upchoice::LevelSet::Code,
+        )
+        .expect("drn 1 is pinnable")
+        .parameters;
+        let mut modem = Modem::default();
+        modem.cpu = Some(cpu);
+        modem.parameters = Some(parameters);
+        modem.begin_data();
+        assert!(
+            matches!(modem.status(), Status::Connected { .. }),
+            "no first data mode: nothing to be un-latched from"
+        );
+        // What a fresh 9.6.1.1.5 leaves `B1d`'s countdown at, so that the
+        // re-latch is held to starting one rather than to a number.
+        let armed = modem.b1d_left;
+        assert!(armed > 0, "9.6.1.1.5: the first B1d armed no countdown at all");
+
+        // 9.8.1.2.1: Ru, then the transition that releases Rd.
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.status(),
+            Status::Phase4,
+            "9.8.1.2.1: the data mode was torn down, so the pump must not report \
+             `Connected` while the renegotiation runs"
+        );
+
+        // 9.8.1.2.3 -> 9.8.1.1.2 -> 9.6.1.1.2 -> Ed, exactly as the test above
+        // drives it: the far end's SUVu, its CPu, and its acknowledged SUVu.
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        modem.now = fiducial;
+        modem.symbol(symbol_at(1.0));
+        modem.cpd = Some(reneg_cpd());
+        let mut stream: Vec<Out> = Vec::new();
+        let mut suv_seen = 0;
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                for _ in 0..(2 * INTERVALS) {
+                    let _ = modem.source.next();
+                    stream.push(modem.source.out());
+                }
+                break;
+            }
+        }
+        assert!(modem.reneg.is_none(), "the tail did not finish at 9.6.1.1.5");
+        assert!(
+            stream.contains(&Out::B1d),
+            "9.6.1.1.5: no B1d went out after the renegotiation's Ed"
+        );
+
+        // **The defect.** 9.6.1.1.5-6 is data mode again, so the pump says so:
+        // `v90::startup`'s `pcm::Status::Connected` arm (`startup.rs:534`) turns
+        // this into `Progress::Connected`, and that is what makes the modem
+        // above build its V.42/LAPM stack (`lib.rs:2011-2141`) and run V.42's
+        // clocks (`lib.rs:1924`) instead of holding them.
+        let Status::Connected { downstream, upstream } = modem.status() else {
+            panic!(
+                "9.6.1.1.5: after a renegotiation the pump must report `Connected` \
+                 again -- it reports {:?}, so no LAPM frame goes downstream and the \
+                 far end's T401 expires 1.008 s into its data mode",
+                modem.status()
+            );
+        };
+        assert!(downstream > 0, "the re-latch did not rebuild B1d's encoder from CPu");
+        assert_eq!(upstream, modem.parameters.as_ref().map_or(0, Parameters::rate));
+        // 8.6.1: the second `B1d` is a `B1d` -- a fresh scrambler and 48 data
+        // frames of scrambled ones the far end counts down before its data.
+        assert_eq!(
+            modem.b1d_left, armed,
+            "9.6.1.1.5: the renegotiation's B1d was not re-armed -- a fresh one \
+             starts at {armed} and this one is at {}",
+            modem.b1d_left
+        );
+        // 9.6.1.1.6: and the E2u that follows every 9.6.1.1.5 is waited for.
+        assert!(modem.awaiting_e2u, "the renegotiation's E2u is not being waited for");
+        assert!(modem.b1u_pending, "9.6.1.1.6's B1u arm is not armed after the renegotiation");
+        assert!(
+            modem.b1u_deadline.is_some_and(|d| d > modem.now),
+            "9.6.1.1.6's B1u deadline was not re-armed by the re-latch: {:?} at {}",
+            modem.b1u_deadline, modem.now
+        );
+    }
+
+    /// 8.7.2 with 8.7.6: the renegotiation's `E2u` is read by the descrambler
+    /// that has run **since `TRN2u`'s first symbol**, not by a new one at `Ed`.
+    ///
+    /// 8.7.2: "`E2u` is a data frame of **scrambled**, differentially encoded
+    /// zeroes. It is transmitted using the corresponding `TRN2u` modulation
+    /// during Training and **Rate Renegotiation**." 8.7.6: "The scrambler shall
+    /// be reset at the beginning of `TRN2u`." So its zeroes are only zeroes
+    /// through the state `TRN2u`'s reset began, carried through every sequence
+    /// between it and `E2u` -- and `Ed` is not a place a reader may start,
+    /// because nothing on the far end's side restarts there.
+    ///
+    /// Fails on `73d5ad1`: `finish_renegotiation` built a fresh `Trn2uReader` at
+    /// `Ed`, restarting the GPA descrambler mid-stream, so the renegotiation's
+    /// `E2u` read as white data, no data frame's worth of zeroes ever formed,
+    /// and the call ended on our own line "no E2u that reads as B1u within 2 s
+    /// of Ed" (`runs-236c/203200-f171-1`, 38.540) with the far end's
+    /// `6009521a` after it. The initial Phase 4 never exposed it: its reader is
+    /// built once, at `TRN2u`'s first symbol (`begin_upstream`), and nothing
+    /// between there and its `E2u` rebuilds it.
+    #[test]
+    fn a_renegotiations_e2u_is_read_by_the_descrambler_that_started_at_trn2u() {
+        use crate::v92::up_signals::Trn2uSender;
+        let mut modem = Modem::default();
+        // A first data mode, and the far end's Ru and R-bar-u (9.8.1.2.1).
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        // 9.8.2.1.1's fiducial: the far end's renegotiation TRN2u begins here,
+        // and 8.7.6's scrambler reset is on its first symbol.
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        let mut peer = Trn2uSender::seeded(Trn2uSize::Four, false);
+        modem.now = fiducial;
+        let first = peer.next_symbol();
+        modem.symbol(symbol_at(first));
+        assert!(modem.upstream.is_some(), "no reader on the far end's TRN2u");
+        // The renegotiation's exchange, 9.6.1.1.2 to 9.6.1.1.4's Ed, with the
+        // far end's line present the whole way: its TRN2u idles on ones, which
+        // carry no start bit and so no sequence the finder can mistake.
+        modem.cpd = Some(reneg_cpd());
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        modem.parameters = Some(
+            crate::v92::upchoice::pin_with(
+                &design,
+                1,
+                Trellis::Sixteen,
+                1e-9,
+                crate::v92::upchoice::LevelSet::Code,
+            )
+            .expect("drn 1 is pinnable")
+            .parameters,
+        );
+        let mut suv_seen = 0;
+        let mut stream: Vec<Out> = Vec::new();
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let level = peer.next_symbol();
+            modem.symbol(symbol_at(level));
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                break;
+            }
+        }
+        assert!(modem.reneg.is_none(), "the renegotiation never reached 9.6.1.1.4's Ed");
+        assert!(modem.awaiting_e2u, "Ed did not arm the search for E2u");
+        // 8.7.2: E2u is a data frame of scrambled zeroes -- twelve symbols, two
+        // bits each on TRN2u's four points -- and 8.7.1's B1u, which reads as
+        // ones, is where the run ends.
+        let frame = crate::v92::UP_INTERVALS;
+        peer.push(&vec![false; 2 * frame]);
+        peer.push(&vec![true; 2 * frame]);
+        for _ in 0..(3 * frame) {
+            modem.now += 1;
+            let level = peer.next_symbol();
+            modem.symbol(symbol_at(level));
+        }
+        assert!(
+            !modem.awaiting_e2u,
+            "8.7.2/8.7.6: the renegotiation's E2u was not read as E2u -- the descrambler that \
+             recovers its zeroes is not the one that has run since TRN2u's first symbol"
+        );
+        assert!(modem.b1u_search.is_some(), "9.6.1.1.6: E2u did not condition the receiver for B1u");
+    }
+
+    /// 9.8.1.1.3: "The digital modem shall generate silence by sending PCM
+    /// codewords with magnitudes represented by **Ucode 0**. It shall **retain
+    /// data frame alignment** during this period of silence."
+    ///
+    /// The alignment is the load-bearing half: silence that does not advance
+    /// the frame count leaves the next signal off the grid.
+    #[test]
+    fn silence_is_ucode_zero_and_it_keeps_the_data_frame_grid() {
+        let mut source = renegotiating_source();
+        source.start(Out::B1d);
+        source.symbol = 12 * 5; // on a frame boundary
+        source.change(Out::Silence);
+        let stream = labelled(&mut source, 30);
+        let silent = stream.iter().filter(|(o, _)| *o == Out::Silence).count();
+        assert!(silent >= 6, "no silence to measure: {stream:?}");
+        assert!(
+            stream.iter().all(|(o, level)| *o != Out::Silence || *level == 0.0),
+            "9.8.1.1.3: silence is not Ucode 0"
+        );
+        // The grid moved by exactly the codewords that went out.
+        assert_eq!(source.symbol % INTERVALS as u64, 0, "the frame grid was rotated by silence");
+    }
+
+}
+
+/// docs/218: V.90 8.6.4's three level sources, kept apart.
+///
+/// `Rd`, `Ri` and `Rt` take their levels from three different places -- the
+/// data mode constellation as passed in CP, the single codeword U_INFO, and the
+/// training constellation as passed in CPt -- and the defect this module pins
+/// was one message's numbers reaching the wrong one of them: `Rd` went out at
+/// Ucode 2, linear 16, out of this end's own CPd.
+#[cfg(test)]
+mod conformance_218 {
+    use super::*;
+
+
+// ---------------------------------------------------------------------
+// docs/218: 8.6.4's three level sources, kept apart
+// ---------------------------------------------------------------------
+
+/// Every level `count` symbols of the source produce, after asking for
+/// `out` (`Source::arm_renegotiation` first where 9.8's codewords matter).
+pub(super) fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
+    source.change(out);
+    (0..count).map(|_| source.next()).collect()
+}
+
+
+/// Settings at a named U_INFO, which is what `Ri` is emitted at.
+pub(super) fn settings_uinfo(uinfo: u8) -> Settings {
+    Settings {
+        law: Law::Mu,
+        uinfo,
+        far_md: 0,
+        round_trip: 0.0,
+        wide: true,
+        limits: FilterLimits::from_info1a(0, 0, 0),
+        habits: Habits::PROMPT,
+        probing: None,
+    }
+}
+
+/// A CPt of the shape the analogue modem sends in Phase 3: `points` Ucodes in
+/// every interval's one constellation, at the rate `drn` names.
+pub(super) fn cpt_of(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
+    let mask = points.fold(0u128, |m, u| m | 1 << u);
+    Cp {
+        data_mode: false,
+        drn,
+        redundancy: crate::v90::sign::Redundancy::None,
+        trn1d_ratio: 1 << 13,
+        intervals: [0; INTERVALS],
+        constellations: vec![mask],
+        ..Cp::default()
+    }
+}
+
+/// A CPu as a far end sends one in data mode: `sets` constellations, each a
+/// dense run of Ucodes, and the interval index naming which of them each of
+/// the six constellation frames uses. `drn 18` is 38 bits a frame, which is
+/// what these masks carry.
+pub(super) fn cpu_of(sets: &[std::ops::RangeInclusive<u8>], intervals: [u8; INTERVALS]) -> Cp {
+    Cp {
+        data_mode: true,
+        drn: 18,
+        intervals,
+        constellations: sets
+            .iter()
+            .map(|r| (*r.start()..=*r.end()).fold(0u128, |mask, u| mask | 1 << u))
+            .collect(),
+        ..Cp::default()
+    }
+}
+
+/// The modem in data mode on that CPu: `B1d`'s own encoder is built, so
+/// `renegotiation_points` reads the constellation on the line and not a
+/// description of one.
+pub(super) fn in_data_mode(cpu: Cp) -> Modem {
+    let mut modem = Modem::default();
+    modem.cpu = Some(cpu);
+    modem.begin_data();
+    assert!(modem.downstream.is_some(), "no B1d mapping was built from that CPu");
+    modem
+}
+
+/// **`Rd`** — V.90 8.6.4 (`v90.txt:1841-1842`): "**Rd** denotes signal R
+/// using the highest power PCM codeword from the **data mode** constellation
+/// of each data frame interval as passed in **CP**".
+///
+/// The CP that carries the digital modem's data mode constellations is the
+/// CPu (`v92.txt:1474`, and 8.8.4's `Rf` reads its own level out of it by
+/// name, `v92.txt:1961-1962`), and `begin_data` builds `B1d`'s encoder out
+/// of exactly that. So the test drives a known CPu through the modem and
+/// compares `Rd` against the level table the encoder is already using.
+///
+/// This is the test the -66 dBFS `Rd` of `runs-216/170104` would have
+/// failed: it was Ucode 2, linear 16, because the level came out of this
+/// end's own CPd -- the **upstream** constellation, whose points are
+/// `V92_LEVELSET` level indices -- instead of the downstream one.
+#[test]
+fn rd_is_the_highest_power_codeword_of_the_data_mode_constellation() {
+    let intervals = [0u8, 1, 0, 1, 0, 1];
+    let cpu = cpu_of(&[3..=95, 3..=88], intervals);
+    let mut modem = in_data_mode(cpu.clone());
+    let (data, _) = modem.renegotiation_points();
+
+    // Interval by interval: the loudest Ucode of the constellation that
+    // interval transmits on, read off the CPu's own masks ...
+    let expected: Vec<u8> = (0..DOWN_INTERVALS)
+        .map(|i| *cpu.points(i % INTERVALS).last().expect("a mask with points"))
+        .collect();
+    assert_eq!(data.to_vec(), expected, "Rd is not the data mode constellation's loudest point");
+    // ... and off the level table the encoder on the line is sliced from.
+    let table: Vec<u8> = (0..DOWN_INTERVALS)
+        .map(|i| {
+            modem
+                .downstream
+                .as_ref()
+                .expect("B1d's encoder")
+                .mapping()
+                .sets[i % INTERVALS]
+                .points()
+                .iter()
+                .copied()
+                .max()
+                .expect("a set with points")
+        })
+        .collect();
+    assert_eq!(data.to_vec(), table, "Rd does not agree with the encoder B1d goes out on");
+
+    // And it reaches the line at that codeword's level: 95 is Table 1's
+    // 7932, not the 16 that went out at 24.998 s in `runs-216/170104`.
+    let law = modem.settings.law;
+    assert_eq!(ucode::linear(law, 95), 7932, "Ucode 95 is not the codeword measured on the line");
+    let training = modem.renegotiation_points().1;
+    modem.source.arm_renegotiation(data, training);
+    let levels = r_stream(&mut modem.source, Out::Rd, R_FRAMES * INTERVALS);
+    for (n, level) in levels.iter().enumerate() {
+        let want = ucode::level(law, data[n % DOWN_INTERVALS]);
+        assert!((level.abs() - want).abs() < 1e-12, "Rd symbol {n} is {level}, not {want}");
+    }
+    let loudest = levels.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!((loudest - ucode::level(law, 95)).abs() < 1e-12, "Rd's loudest symbol is {loudest}");
+    assert!((loudest - ucode::level(law, 2)).abs() > 1e-6, "Rd is still the CPd reading's Ucode 2");
+}
+
+/// **`Ri`** — V.90 8.6.4 (`v90.txt:1844`): "**Ri** denotes signal R using
+/// the single PCM codeword whose Ucode is U_INFO for all data frame
+/// intervals". A codeword, not a constellation: arming 9.8 with the loudest
+/// data mode points must not move it.
+#[test]
+fn ri_is_the_u_info_codeword_in_every_interval() {
+    let law = Law::Mu;
+    // U_INFO 78 is what this bench's far end put in its INFO1a: Table 1's
+    // linear 3772, the magnitude `Ri` was measured at in
+    // `runs-216/170104` and `runs-216/165935`.
+    assert_eq!(ucode::linear(law, 78), 3772);
+    let mut source = Source::new(&settings_uinfo(78));
+    source.change(Out::B1d);
+    let mut emitted: Vec<f64> = (0..7).map(|_| source.next()).collect();
+    assert_eq!(source.out(), Out::B1d);
+    // 9.8's codewords are armed and are **not** what Ri is made of.
+    source.arm_renegotiation([95; DOWN_INTERVALS], [88; DOWN_INTERVALS]);
+    source.ri_opener();
+    while source.out() != Out::Trn2d {
+        emitted.push(source.next());
+        assert!(emitted.len() < 1000, "Ri never ended");
+    }
+    let start = 12;
+    let ri = &emitted[start..start + R_FRAMES * INTERVALS];
+    assert_eq!(ri.len(), 384);
+    let want = ucode::level(law, 78);
+    for (i, level) in ri.iter().enumerate() {
+        assert!((level.abs() - want).abs() < 1e-12, "Ri symbol {i} is {level}, not U_INFO");
+        assert_eq!(*level > 0.0, i % INTERVALS < 3, "Ri symbol {i} is not + + + - - -");
+    }
+    let bar = &emitted[start + R_FRAMES * INTERVALS..start + R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS];
+    assert_eq!(bar.len(), 24, "R-bar-i is not 24T");
+    for level in bar {
+        assert!((level.abs() - want).abs() < 1e-12, "R-bar-i is {level}, not U_INFO");
+    }
+    // Three sources, three levels: U_INFO here is neither Rd's nor Rt's.
+    assert!((want - ucode::level(law, 95)).abs() > 1e-6);
+    assert!((want - ucode::level(law, 88)).abs() > 1e-6);
+}
+
+/// **`Rt`** — V.90 8.6.4 (`v90.txt:1847-1848`): "**Rt** denotes signal R
+/// using the highest power PCM codeword from the **training** constellation
+/// of each data frame interval as passed in **CPt**". CPt and CPu are not
+/// the same constellation and this end sends both, so the two arrays must
+/// differ whenever the messages do.
+#[test]
+fn rt_is_the_largest_codeword_of_the_training_constellation_not_the_data_mode_one() {
+    let law = Law::Mu;
+    let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+    assert!(modem.source.set_cpt(&cpt_of(16, 72..=88)), "CPt of 17 points at drn 16 was refused");
+    let (data, training) = modem.renegotiation_points();
+    // CPt's loudest point in every interval, and CPu's in its own.
+    assert_eq!(training, [88u8; DOWN_INTERVALS], "Rt is not CPt's loudest codeword");
+    assert_eq!(data, [95, 88, 95, 88, 95, 88, 95, 88, 95, 88, 95, 88], "Rd moved with CPt");
+    assert_ne!(data, training, "Rd and Rt came out the same array");
+    // 88 is Table 1's 6140: the level the Phase 4 modulation actually went
+    // out at in `runs-216/170104` after the opener, and **not** the data
+    // mode's 7932.
+    assert_eq!(ucode::linear(law, 88), 6140);
+
+    let mut source = modem.source;
+    source.arm_renegotiation(data, training);
+    let levels = r_stream(&mut source, Out::Rt, R_FRAMES * INTERVALS);
+    for (n, level) in levels.iter().enumerate() {
+        let want = ucode::level(law, training[n % DOWN_INTERVALS]);
+        assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} is {level}, not {want}");
+    }
+    let loudest = levels.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!((loudest - ucode::level(law, 88)).abs() < 1e-12, "Rt's loudest symbol is {loudest}");
+}
+}
+
+#[cfg(test)]
+mod conformance_222 {
+    use super::*;
+
+    fn settings() -> Settings {
+        Settings {
+            law: Law::Mu,
+            uinfo: 79,
+            far_md: 0,
+            round_trip: 0.0,
+            wide: true,
+            limits: FilterLimits::from_info1a(0, 0, 0),
+            habits: Habits::PROMPT,
+            probing: None,
+        }
+    }
+
+    /// One level a symbol, labelled with the signal it belongs to.
+    fn labelled(source: &mut Source, count: usize) -> Vec<(Out, f64)> {
+        (0..count)
+            .map(|_| {
+                let level = source.next();
+                (source.out(), level)
+            })
+            .collect()
+    }
+
+// ---------------------------------------------------------------------------
+// docs/222: 9.9.1.2, the fast parameter exchange
+// ---------------------------------------------------------------------------
+
+    fn cpt(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
+        let mask = points.fold(0u128, |m, u| m | 1 << u);
+        Cp {
+            data_mode: false,
+            drn,
+            redundancy: crate::v90::sign::Redundancy::None,
+            trn1d_ratio: 1 << 13,
+            intervals: [0; INTERVALS],
+            constellations: vec![mask],
+            ..Cp::default()
+        }
+    }
+
+    /// A CPu over one contiguous set of codewords -- the data mode's own
+    /// constellation, which is what `Rf` and a fast parameter exchange's `SUVd`
+    /// both have to be built from.
+    fn cpu_over(points: std::ops::RangeInclusive<u8>) -> Cp {
+        let mask = points.fold(0u128, |m, u| m | 1 << u);
+        Cp {
+            data_mode: true,
+            drn: 3,
+            intervals: [0; INTERVALS],
+            constellations: vec![mask],
+            ..Cp::default()
+        }
+    }
+
+
+/// [quoted] 8.8.5 (`v92.txt:1963-1966`): `SUVd` is sent on "the corresponding
+/// TRN2d modulation" during Training and Rate Renegotiation, but "**During Fast
+/// Parameter Exchange it is transmitted using the preceding data mode
+/// modulation**". Fails on the code before `Source::begin_fpe`: `SUVd` went out
+/// on CPt's constellation whatever procedure was in flight.
+#[test]
+fn s_8_8_5_suvd_during_a_fast_parameter_exchange_leaves_on_the_data_mode_modulation() {
+    let law = Law::Mu;
+    // CPt: the training constellation, a Phase 4 coder.
+    // CPt: a *quieter* training constellation, so that a sequence on CPt's
+    // modulation and one on CPu's cannot be confused.
+    let training = cpt(3, 64..=71);
+    // CPu: the data mode constellation B1d is going out on.
+    let data = cpu_over(88..=95);
+    let bits: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
+
+    let loudest = |source: &mut Source| -> f64 {
+        source.send(Out::Suvd, bits.clone());
+        let stream = labelled(source, 96);
+        stream
+            .iter()
+            .filter(|(out, _)| *out == Out::Suvd)
+            .fold(0.0f64, |m, (_, level)| m.max(level.abs()))
+    };
+
+    // The data mode's loudest codeword, straight out of CPu's own mapping: the
+    // same resolution `renegotiation_points` makes for `Rf`.
+    let data_loudest = {
+        let mapping = CodeMapping::from_cp(&data).expect("CPu mapping");
+        mapping
+            .sets
+            .iter()
+            .flat_map(|set| set.points().iter().copied())
+            .map(|ucode| ucode::level(law, ucode).abs())
+            .fold(0.0f64, f64::max)
+    };
+
+    // Without a fast parameter exchange, CPt is the corresponding modulation.
+    let mut phase4 = Source::new(&settings());
+    assert!(phase4.set_cpt(&training), "CPt");
+    let without = loudest(&mut phase4);
+    let training_loudest = {
+        let mapping = CodeMapping::from_cp(&training).expect("CPt mapping");
+        mapping
+            .sets
+            .iter()
+            .flat_map(|set| set.points().iter().copied())
+            .map(|ucode| ucode::level(law, ucode).abs())
+            .fold(0.0f64, f64::max)
+    };
+    assert!(
+        (without - training_loudest).abs() < 1e-9 && (without - data_loudest).abs() > 1e-9,
+        "SUVd off the FPE path is CPt's {training_loudest}, not the data mode's {data_loudest}: {without}"
+    );
+
+    // On it, the preceding data mode modulation is -- and 9.9.1.2.3's resets.
+    let mut fpe = Source::new(&settings());
+    assert!(fpe.set_cpt(&training), "CPt");
+    assert!(fpe.begin_fpe(&data), "CPu mapping");
+    let during = loudest(&mut fpe);
+    assert!(
+        (during - data_loudest).abs() < 1e-9,
+        "8.8.5: SUVd during a fast parameter exchange is the data mode modulation, \
+         whose loudest is {data_loudest}, and it went out at {during}"
+    );
+    assert_ne!(
+        during,
+        ucode::level(law, 88),
+        "SUVd during a fast parameter exchange went out on CPt's constellation -- 8.8.5"
+    );
+    fpe.end_fpe();
+}
+
+/// 9.9.1.2.1/.2's patterns, **generated from Table 25/26's `K_i` rows**.
+#[test]
+fn s_9_9_1_2_1_the_rm_patterns_are_tables_25_and_26() {
+    // Table 25 (`v92.txt:1630-1647`): `K_i = M_i - 1` for i in {0,1,4,5,8,9},
+    // `K_i = 0` for i in {2,3,6,7,10}, u11 = 0.
+    let table25 = [
+        true, true, false, false, true, true, false, false, true, true, false, false,
+    ];
+    assert_eq!(RM_K_LOUD, table25, "Table 25 is {{max, max, min, min}} three times");
+    // Table 26 (`v92.txt:1654-1667`): `K_i = 0` for i in {0,1,4,5,8,9} and
+    // `K_i = M_i - 1` for i in {2,3,6,7,10,11}.
+    assert_eq!(RM_BAR_K_LOUD, table25.map(|loud| !loud), "Table 26 is Table 25 inverted");
+}
+
+/// 9.9.1.2.1 and 9.9.1.2.2's two detections, with their latency in **symbols**.
+#[test]
+fn s_9_9_1_2_1_rm_is_detected_from_table_25_and_the_transition_from_table_26() {
+    // The ends of the constellation the far end's CPu declared, as levels.
+    let levels = [1000.0, 2000.0, 3000.0, 9000.0, 10_000.0];
+    let mut detector = RmDetector::new(&levels).expect("a table to measure against");
+    let loud = 10_000.0;
+    let quiet = 1000.0;
+    let mut stream: Vec<f64> = Vec::new();
+    // 384T of RM is Table 25 repeated 32 times; 24T of R-bar-M is Table 26
+    // repeated twice. Eight repetitions here is enough for both the detection
+    // and the transition, and the lengths that matter are the detector's.
+    for _ in 0..8 {
+        stream.extend(RM_K_LOUD.iter().map(|l| if *l { loud } else { quiet }));
+    }
+    for _ in 0..2 {
+        stream.extend(RM_BAR_K_LOUD.iter().map(|l| if *l { loud } else { quiet }));
+    }
+    let transition = 8 * RM_K_LOUD.len();
+    let mut seen: Vec<(usize, RmEvent)> = Vec::new();
+    for (i, level) in stream.iter().enumerate() {
+        // The far end's signs are its own; 8.8.4's pattern is not RM's, so a
+        // negative sign must not matter to a magnitude detector.
+        let level = if i % 2 == 0 { *level } else { -*level };
+        match detector.feed(level) {
+            RmEvent::None => {}
+            event => seen.push((i, event)),
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (RM_SYMBOLS - 1, RmEvent::RmDetected),
+            (transition + RM_BAR_SYMBOLS - 1, RmEvent::RmToRmBar)
+        ],
+        "RM detected {} symbols in, RM-to-R-bar-M {} symbols after the transition",
+        RM_SYMBOLS,
+        RM_BAR_SYMBOLS
+    );
+}
+
+/// The guard: a healthy data mode carries no `RM` and the detector stays quiet.
+#[test]
+fn no_rm_in_a_healthy_data_mode_fires_the_9_9_detector() {
+    let levels = [1000.0, 2000.0, 3000.0, 9000.0, 10_000.0];
+    let mut detector = RmDetector::new(&levels).expect("a table");
+    // A data mode's symbols, everywhere in the constellation including both
+    // ends, on a plain LCG: no RM, and nothing here may ask for Rf.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..20_000 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let pick = (state >> 33) as usize % levels.len();
+        let level = levels[pick] * if (state >> 20) & 1 == 0 { 1.0 } else { -1.0 };
+        assert_eq!(detector.feed(level), RmEvent::None, "a healthy data mode fired 9.9");
+    }
+}
+
+/// [quoted] 9.9.1.2.2: `Rf` 384T and `R-bar-f` 24T, the sign pattern read off
+/// `v92.txt:1957-1961`, the codeword off `CPu`'s loudest, all on the grid.
+#[test]
+fn s_9_9_1_2_2_rf_is_384t_and_r_bar_f_is_24t_on_a_data_frame_grid() {
+    let mut source = Source::new(&settings());
+    // `docs/218`'s resolution: one codeword an interval, the loudest of the
+    // data mode constellation CPu passed. Distinct values here so that the
+    // interval each symbol came from is checkable.
+    let data: [u8; DOWN_INTERVALS] = std::array::from_fn(|i| 60 + i as u8);
+    let training = [79u8; DOWN_INTERVALS];
+    source.arm_renegotiation(data, training);
+    source.change(Out::Rf);
+    let stream = labelled(&mut source, R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS + 12);
+
+    let rf: Vec<f64> = stream
+        .iter()
+        .filter(|(out, _)| *out == Out::Rf)
+        .map(|(_, level)| *level)
+        .collect();
+    let bar: Vec<f64> = stream
+        .iter()
+        .filter(|(out, _)| *out == Out::RfBar)
+        .map(|(_, level)| *level)
+        .collect();
+    assert_eq!(rf.len(), R_FRAMES * INTERVALS, "Rf is 384T");
+    assert_eq!(bar.len(), R_BAR_FRAMES * INTERVALS, "R-bar-f is 24T");
+    // "Rf shall begin on the boundary of a data frame" (9.9.1.2.2).
+    assert_eq!(stream[0].0, Out::Rf, "Rf did not begin where the source was asked for it");
+    // 8.8.4's sign pattern, from the source line: `+ + - - + + - - + + - -`
+    // with "the left-most sign ... transmitted first", and R-bar-f's
+    // `- - + + - - + + - - + +` -- the same codewords, inverted.
+    let signs = |levels: &[f64]| -> Vec<bool> { levels.iter().map(|l| *l > 0.0).collect() };
+    let rf_signs = signs(&rf);
+    let bar_signs = signs(&bar);
+    let rf_12 = [
+        true, true, false, false, true, true, false, false, true, true, false, false,
+    ];
+    assert_eq!(&rf_signs[..12], &rf_12, "Rf's twelve-symbol sign pattern");
+    assert_eq!(
+        &bar_signs[..12],
+        &rf_12.map(|s| !s),
+        "R-bar-f is 2 repetitions of the 12-symbol inverted pattern"
+    );
+    // The pattern is period four and it never slips: all 384T of Rf.
+    for (i, sign) in rf_signs.iter().enumerate() {
+        assert_eq!(*sign, rf_12[i % 12], "Rf symbol {i} left 8.8.4's pattern");
+    }
+    // And the codewords are the ones CPu named, one an interval, unchanged by
+    // the bar: "the highest power PCM codeword from the data mode constellation
+    // of each data frame interval as passed in CPu" (8.8.4).
+    for (i, level) in rf.iter().enumerate() {
+        let interval = i % DOWN_INTERVALS;
+        let expected = ucode::level(Law::Mu, data[interval]).abs();
+        assert!(
+            (level.abs() - expected).abs() < 1e-9,
+            "Rf symbol {i} is {} and interval {interval}'s loudest is {expected}",
+            level.abs()
+        );
+    }
+}
+
+/// 9.9.1.2.3: the tail is `SUVd` and 9.6.1.1.2 -- **no `TRN2d` on this path**.
+#[test]
+fn s_9_9_1_2_3_the_tail_begins_at_suvd_with_no_trn2d_before_it() {
+    let (mut tail, mut exchange) = RenegTail::from_suvd(0.0, FS);
+    assert_eq!(tail.stage(), RenegStage::Suvd, "9.9.1.2.3 begins at SUVd");
+    let mut source = Source::new(&settings());
+    let data = [90u8; DOWN_INTERVALS];
+    source.arm_renegotiation(data, data);
+    // The SUVd 9.9.1.2.3 asks for goes out with bit 32 clear: no silent period
+    // is entered, so the exchange never asks for Ed-and-silence here.
+    let asked = tail.push(&mut source, &mut exchange, None, 0);
+    assert_eq!(asked, Some(Out::Suvd), "9.9.1.2.3's first sequence is SUVd");
+    assert!(!exchange.silence_requested(), "9.9.1.2.3 sets bit 32 clear");
+    assert!(!exchange.peer_asked_silence());
+}}
+
+/// `docs/221`: the differential harness and the property tests behind it.
+///
+/// The claim being tested is `v92.txt:339-341`'s -- "The data signalling
+/// rates, symbol rate, scrambler and encoder for the digital modem shall be
+/// the same as those given in clause 5/V.90" -- plus its ten single-sentence
+/// imports. It is a claim about a signal **repertoire**, and it is false about
+/// the signal **stream**, so the diffable set is closed by construction:
+/// [`DIFFABLE`] names every signal the harness diffs, and every signal it does
+/// not is named in [`EXCLUSIONS`] with the clause line that excludes it. There
+/// is no unexplained skip.
+///
+/// The V.90 side of each diff is the V.90 **transmitter itself**, through
+/// `crate::v90::digital::probe` (`v90/digital.rs`, test-only), not a
+/// re-derivation of it: a re-derivation would agree with a V.92 bug that the
+/// V.90 transmitter does not have.
+///
+/// **The oracle's limits, stated where they are used.** The V.90 path is a
+/// valid oracle for codeword *ordering* (`v90.txt:654-656`, "label 0 ...
+/// largest") and for the level table (`ucode::level`, Table 1). It is **not**
+/// an oracle for constellation *legality*: neither path enforces V.90's Table
+/// 15 average-power ceiling (`v90.txt:1649-1671`) anywhere, and V.92 has no
+/// such clause at all, so no test here may conclude from "the V.90 path did
+/// the same thing" that a constellation we were handed is legal to send.
+#[cfg(test)]
+mod conformance_221 {
+    use super::conformance_218::{cpt_of, cpu_of as cpu_218, in_data_mode, r_stream, settings_uinfo};
+    use super::*;
+    use crate::v90::digital::probe::Tx as V90Tx;
+
+    /// The signals this harness diffs, and the clause each is imported by.
+    ///
+    /// One row per signal: `(name, clause)`. A signal in this table is
+    /// asserted equal, symbol for symbol, between the two transmitters.
+    pub(super) const DIFFABLE: [(&str, &str); 8] = [
+        ("Sd", "v92.txt:1445-1446 -> v90.txt:1509-1516 (8.4.4)"),
+        ("Trn1d", "v92.txt:1448-1449 -> v90.txt:1520-1525 (8.4.5)"),
+        ("Dil", "v92.txt:1349-1350 -> v90.txt:1424-1465 (8.4.1)"),
+        ("Ri", "v92.txt:1436-1437 -> v90.txt:1844 (8.6.4)"),
+        ("Rd", "v92.txt:1956 -> v90.txt:1841-1842 (8.6.4)"),
+        ("Rt", "v92.txt:1956 -> v90.txt:1847-1848 (8.6.4)"),
+        ("Trn2d", "v92.txt:2000-2001 -> v90.txt:1853-1859 (8.6.5)"),
+        ("Ed", "v92.txt:1758-1762 -> v90.txt:1741-1744 (8.6.2), FPE excluded (E7)"),
+    ];
+
+    /// The closed exception set: every signal the diff must **not** contain,
+    /// and the clause line that puts it out. A reader who wonders why `Jd` or
+    /// `SCR` is missing from [`DIFFABLE`] finds the answer here rather than a
+    /// gap.
+    pub(super) const EXCLUSIONS: [(&str, &str, &str); 9] = [
+        ("E1 Jd", "v92.txt:1371-1372 vs v90.txt:1492-1494", "bits 47/48 redefined: Jd/Jp identifier and a reserved bit, against constellation size and rate-renegotiation"),
+        ("E2 Jd-prime", "v90.txt:1503-1507", "deleted from V.92 8.6; V.90 always sends it after Jd"),
+        ("E3 Jp/Jp-prime", "v92.txt:1391-1435", "no V.90 downstream counterpart exists"),
+        ("E4 SCR", "v92.txt:1436-1444", "V.92-only downstream signal; V.90's SCR is the analogue modem's (v90.txt:1411-1415)"),
+        // E5 is the one exception whose signal *does* have a transmit path in
+        // this tree (`Out::Rf`/`Out::RfBar`): it stays excluded from the diff
+        // because V.90 has no `Rf` (v92.txt:1957) to diff it against, and it is
+        // pinned instead by
+        // `c_8_8_4_rf_is_the_loudest_codeword_of_the_data_mode_constellation_as_passed_in_cpu`.
+        ("E5 Rf", "v92.txt:1957-1962", "V.92-only: 8.8.4 defines it, V.90 has no Rf at all, so there is no V.90 stream to diff; pinned by c_8_8_4_rf_* instead"),
+
+        ("E6 CPd/SUVd", "v92.txt:1763-1843, 1964-1998", "V.92-only; they replace V.90's MP (v90.txt:1746-1830)"),
+        ("E7 Ed transmitted during Fast Parameter Exchange", "v92.txt:1758-1762", "FPE puts Ed on the preceding data mode modulation; the diff covers the training framing only"),
+        ("E8 Ri/R-bar-i placement and Ucode 0 silence", "v92.txt:2557-2562, 2971-2975", "Ri is at the end of Phase 3 and the silence is V.92-only; Ri's *symbols* are diffed, its *position* cannot be"),
+        ("E9 power ceiling", "v92.txt 0 hits vs v90.txt:1649-1671", "no downstream average-power limit in V.92; not a signal, and not enforced by our V.90 path either"),
+    ];
+
+    /// The table is closed and every entry says why: diffed implies not
+    /// excluded, excluded implies a clause line and a reason, and no signal is
+    /// in both.
+    #[test]
+    fn the_diffable_set_and_the_exception_set_are_closed_and_disjoint() {
+        for (name, clause) in DIFFABLE {
+            assert!(clause.contains("v90.txt:"), "{name} is diffed without naming the V.90 clause");
+            assert!(
+                !EXCLUSIONS.iter().any(|(e, _, _)| {
+                    // The tag is "En signal": the signal is what follows the
+                    // number, and nothing shorter than it, so that "Ed
+                    // transmitted during Fast Parameter Exchange" does not
+                    // collide with the diffed "Ed".
+                    e.split_once(' ').map(|(_, rest)| rest).unwrap_or(e) == name
+                }),
+                "{name} is both diffed and excluded"
+            );
+        }
+        for (tag, clause, why) in EXCLUSIONS {
+            assert!(
+                clause.contains("v92.txt") || clause.contains("v90.txt"),
+                "{tag} is excluded without a clause line"
+            );
+            assert!(!why.trim().is_empty(), "{tag} is excluded without a reason");
+        }
+        // The nine of docs/219 §2, and no more: an exclusion added here to
+        // hide a disagreement must be a clause change, not an edit.
+        assert_eq!(EXCLUSIONS.len(), 9);
+        assert_eq!(DIFFABLE.len(), 8);
+    }
+
+    const TRN1D_SYMBOLS: usize = 96;
+    const SD_SYMBOLS: usize = (SD_FRAMES + SD_BAR_FRAMES) * INTERVALS;
+    const B1D_SYMBOLS: usize = B1D_FRAMES * INTERVALS;
+
+    fn settings() -> Settings {
+        settings_uinfo(78)
+    }
+
+    /// The two transmitters, started at the same place.
+    fn pair() -> (Source, V90Tx) {
+        let s = settings();
+        (Source::new(&s), V90Tx::new(s.law, s.uinfo, s.habits.trn1d))
+    }
+
+    /// **D4** `Sd` and `S-bar-d`, `v92.txt:1445-1446` -> `v90.txt:1509-1516`.
+    #[test]
+    fn d4_sd_and_sd_bar_are_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Sd);
+        assert!(v90.change("Sd"));
+        let a = (0..SD_SYMBOLS).map(|_| v92.next()).collect::<Vec<f64>>();
+        let b = v90.symbols(SD_SYMBOLS);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a, b, "8.4.4's Sd/S-bar-d differ between the two transmitters");
+    }
+
+    /// **D5** `TRN1d`, `v92.txt:1448-1449` -> `v90.txt:1520-1525`.
+    #[test]
+    fn d5_trn1d_is_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Trn1d);
+        assert!(v90.change("Trn1d"));
+        let a = (0..TRN1D_SYMBOLS).map(|_| v92.next()).collect::<Vec<f64>>();
+        let b = v90.symbols(TRN1D_SYMBOLS);
+        assert_eq!(a, b, "8.4.5's TRN1d differs between the two transmitters");
+    }
+
+    /// **D6** `Ri` and `R-bar-i`, `v92.txt:1436-1437` -> `v90.txt:1844`.
+    ///
+    /// The *symbols*, not the placement: V.92 moves `Ri` to the end of Phase 3
+    /// (`v92.txt:2557-2562`), which is E8 and is not diffable.
+    #[test]
+    fn d6_ri_and_ri_bar_are_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Ri);
+        assert!(v90.change("Ri"));
+        let ri: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| v92.next()).collect();
+        assert_eq!(ri, v90.symbols(R_FRAMES * INTERVALS), "8.6.4's Ri differs");
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::RiBar);
+        assert!(v90.change("RiBar"));
+        let bar: Vec<f64> = (0..R_BAR_FRAMES * INTERVALS).map(|_| v92.next()).collect();
+        assert_eq!(bar, v90.symbols(R_BAR_FRAMES * INTERVALS), "8.6.4's R-bar-i differs");
+    }
+
+    /// **D7** `Rd`, `v92.txt:1956` -> `v90.txt:1841-1842`.
+    ///
+    /// `Rt` is in [`DIFFABLE`] too but the V.90 transmitter has no `Out::Rt`
+    /// (V.90 sends `Rt` only as 9.4.1.4's `R` in Phase 3, which this test
+    /// harness does not drive), so `Rt` is diffed against the V.90 mapping --
+    /// `Mapping::from_cp(CPt)`, whose loudest point it must be -- in
+    /// [`c_8_6_4_rt_is_the_loudest_codeword_of_the_training_constellation`].
+    #[test]
+    fn d7_rd_is_the_same_stream_on_both_transmitters() {
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_218(&sets, intervals);
+            let mut modem = in_data_mode(cpu.clone());
+            let (data, training) = modem.renegotiation_points();
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rd);
+            let a: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+
+            let s = settings();
+            let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+            assert!(v90.set_cpu(&cpu));
+            assert!(v90.change("Rd"));
+            let b = v90.symbols(R_FRAMES * INTERVALS);
+            assert_eq!(a, b, "8.6.4's Rd differs from the V.90 transmitter's: {sets:?}");
+        }
+    }
+
+    /// **D1** `B1d`, `v92.txt:1755-1756` -> `v90.txt:1731-1739`.
+    ///
+    /// The V.90 transmitter maps `B1d`'s 48 data frames itself; this end takes
+    /// octets that the mapper has already chosen (3.6). So the diff hands the
+    /// V.92 side the V.90 side's own codewords and demands the same samples and
+    /// the same length, which is where a sign convention error (`from_octet`'s
+    /// inverse read as "positive") shows up on the first symbol.
+    #[test]
+    fn d1_b1d_is_the_same_stream_on_both_transmitters() {
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_218(&sets, intervals);
+            let s = settings();
+            let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+            assert!(v90.set_cpu(&cpu));
+            assert!(v90.change("B1d"));
+            let want = v90.symbols(B1D_SYMBOLS);
+            assert_eq!(want.len(), 48 * INTERVALS, "8.6.1: B1d is 48 data frames");
+
+            let mut v92 = Source::new(&s);
+            v92.change(Out::B1d);
+            for level in &want {
+                let (u, negative) = ucode::nearest(s.law, (level * 32768.0).round() as i32);
+                v92.codes.push_back(ucode::octet(s.law, u, negative));
+            }
+            let got: Vec<f64> = (0..B1D_SYMBOLS).map(|_| v92.next()).collect();
+            assert_eq!(got, want, "8.6.1's B1d differs between the two transmitters");
+        }
+    }
+
+    /// **D2** `TRN2d`, `v92.txt:2000-2001` -> `v90.txt:1853-1859`.
+    #[test]
+    fn d2_trn2d_is_the_same_stream_on_both_transmitters() {
+        let cpt = cpt_of(16, 72..=88);
+        let s = settings();
+        let mut v92 = Source::new(&s);
+        assert!(v92.set_cpt(&cpt));
+        v92.change(Out::Trn2d);
+        let a: Vec<f64> = (0..60).map(|_| v92.next()).collect();
+
+        let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+        assert!(v90.set_cpt(&cpt));
+        assert!(v90.change("Trn2d"));
+        let b = v90.symbols(60);
+        assert_eq!(a, b, "8.6.5's TRN2d differs between the two transmitters");
+    }
+
+    /// **D3** `Ed` in the training/renegotiation framing, `v92.txt:1758-1762`
+    /// -> `v90.txt:1741-1744`. E7 excludes the FPE framing.
+    #[test]
+    fn d3_ed_is_the_same_stream_on_both_transmitters_outside_fpe() {
+        let cpt = cpt_of(16, 72..=88);
+        let s = settings();
+        let d = CodeMapping::from_cp(&cpt).expect("a CPt that fits its rate").frame_bits();
+        let mut v92 = Source::new(&s);
+        assert!(v92.set_cpt(&cpt));
+        v92.change(Out::Trn2d);
+        let _: Vec<f64> = (0..60).map(|_| v92.next()).collect();
+        v92.last = vec![false; 2 * d];
+        v92.change(Out::Ed);
+        let a: Vec<f64> = (0..2 * INTERVALS).map(|_| v92.next()).collect();
+
+        let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+        assert!(v90.set_cpt(&cpt));
+        assert!(v90.change("Trn2d"));
+        let _ = v90.symbols(60);
+        assert!(v90.change("Ed"));
+        let b = v90.symbols(2 * INTERVALS);
+        assert_eq!(a, b, "8.6.2's Ed differs between the two transmitters");
+    }
+
+    /// **D9** `DIL`, `v92.txt:1349-1350` -> `v90.txt:1424-1465`.
+    ///
+    /// The descriptor's symbols are built once, by `crate::v90::sequences::
+    /// Descriptor::symbols` -- the same function `v90/digital.rs:1062` fills
+    /// the V.90 transmitter with -- so the diff is that the V.92 source puts
+    /// exactly those (Ucode, sign) pairs on the line and ends the pass where
+    /// the descriptor says a segment ends.
+    #[test]
+    fn d9_dil_is_the_descriptors_own_symbols() {
+        let mut descriptor = Descriptor::none();
+        descriptor.signs = vec![true, false, true, true, false, false];
+        descriptor.training = vec![false; 6];
+        descriptor.h = [0, 2, 0, 0, 0, 0, 0, 0];
+        descriptor.refs = [0, 60, 0, 0, 0, 0, 0, 0];
+        descriptor.ucodes = vec![0, 32, 16, 0, 0, 0, 0, 0, 0];
+        let want: Vec<f64> = descriptor
+            .symbols()
+            .map(|(u, positive)| ucode::level(Law::Mu, u) * if positive { 1.0 } else { -1.0 })
+            .collect();
+        assert!(!want.is_empty(), "8.4.1: this descriptor has no DIL at all");
+        let mut source = Source::new(&settings());
+        source.dil = descriptor.symbols().collect();
+        source.change(Out::Dil);
+        let got: Vec<f64> = (0..want.len()).map(|_| source.next()).collect();
+        assert_eq!(got, want, "8.4.1's DIL symbols are not the descriptor's");
+    }
+
+    /// **D8** the `drn` table, `v92.txt:1492-1495` = `v90.txt:1580-1582`:
+    /// "drn between 0 and 22 ... Data signalling rate = (drn + 20) x 8000/6 in
+    /// CP(u) and (drn + 8) x 8000/6 in CPt". One table, two callers.
+    #[test]
+    fn d8_the_drn_table_is_v90s_unchanged() {
+        for drn in 1..=22u8 {
+            let want = (u32::from(drn) + 20) * 8000 / 6;
+            assert_eq!(crate::v90::sequences::data_rate(drn), Some(want), "drn {drn}");
+            assert_eq!(crate::v90::sequences::data_bits(drn), usize::from(drn) + 20);
+        }
+        assert_eq!(crate::v90::sequences::data_rate(0), None, "drn 0 is cleardown");
+        assert_eq!(crate::v90::sequences::data_rate(1), Some(28_000));
+        assert_eq!(crate::v90::sequences::data_rate(22), Some(56_000));
+    }
+}
+
+/// `docs/221` §2: the property tests, which catch the class whether or not a
+/// signal is diffable.
+///
+/// Every one of them compares against **the level table the code itself
+/// builds** for the constellation in force, driven by a known input, so that an
+/// index read as a codeword and a `.last()` on a loudest-first list are both
+/// mistakes a test makes red rather than mistakes a reader has to notice.
+#[cfg(test)]
+mod conformance_221_properties {
+    use super::conformance_218::{cpu_of, cpt_of, in_data_mode, settings_uinfo};
+    use super::*;
+
+    /// A CPt of six *different* constellations, one per interval: the shape
+    /// that makes "a point legal in all six" a real intersection.
+    fn cpt_six(drn: u8) -> Cp {
+        let sets: Vec<u128> = (0..INTERVALS)
+            .map(|i| (u32::from(50 - i as u8)..=95u32).fold(0u128, |m, u| m | 1 << u))
+            .collect();
+        Cp {
+            data_mode: false,
+            drn,
+            redundancy: crate::v90::sign::Redundancy::None,
+            trn1d_ratio: 1 << 13,
+            intervals: [0, 1, 2, 3, 4, 5],
+            constellations: sets,
+            ..Cp::default()
+        }
+    }
+
+    /// 5.4.4/V.90 (`v90.txt:654-656`): the mapper's "label 0 ... largest".
+    /// This is the one fact every level test below stands on, so it is asserted
+    /// once, over every mapping this end constructs, rather than assumed.
+    #[test]
+    fn c_5_4_4_label_zero_is_the_largest_pcm_code() {
+        let law = Law::Mu;
+        let cps = [
+            cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]),
+            cpu_of(&[40..=95, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+            cpt_of(16, 72..=88),
+            cpt_six(16),
+        ];
+        for cp in &cps {
+            let mapping = CodeMapping::from_cp(cp).expect("a CP that fits its own rate");
+            for (i, set) in mapping.sets.iter().enumerate() {
+                let points = set.points();
+                let first = *points.first().expect("a set with points");
+                let loudest = points.iter().copied().max_by_key(|&u| ucode::linear(law, u)).unwrap();
+                assert_eq!(first, loudest, "interval {i}: label 0 is not the largest code");
+                let quietest = points.iter().copied().min_by_key(|&u| ucode::linear(law, u)).unwrap();
+                if points.len() > 1 {
+                    assert_ne!(*points.last().unwrap(), first, "interval {i}: first and last agree");
+                    assert_eq!(quietest, *points.last().unwrap(), "interval {i}: last is not quietest");
+                }
+            }
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1841-1842`): `Rd` is "the highest power PCM codeword
+    /// from the data mode constellation of each data frame interval", and
+    /// `docs/218`'s defect was a **level index** from this end's own CPd read as
+    /// one of those codewords -- Ucode 2, linear 16, -66 dBFS.
+    ///
+    /// Driven by two CPu shapes so the property holds for the table the code
+    /// builds and not for one vector, and the regression half asserts the
+    /// emitted levels are points of that table at all.
+    #[test]
+    fn c_8_6_4_rd_is_the_loudest_codeword_of_the_data_mode_constellation() {
+        let law = Law::Mu;
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_of(&sets, intervals);
+            let mut modem = in_data_mode(cpu.clone());
+            let (data, training) = modem.renegotiation_points();
+            let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let loudest = *set.points().first().expect("a set with points");
+                assert_eq!(data[i], loudest, "interval {i}: Rd is not the loudest codeword");
+                assert!(
+                    set.points().contains(&data[i]),
+                    "interval {i}: Rd's codeword is not a point of the constellation in force"
+                );
+            }
+            // **Regression, docs/218**: a CPd *level index* (15 at LC 8) read as
+            // a codeword gives Ucode 15/2, whose level is nowhere near.
+            let wrong = ucode::level(law, 2);
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rd);
+            let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+            assert!(
+                !levels.iter().any(|l| (l.abs() - wrong).abs() < 1e-12),
+                "Rd went out at the CPd level index again (docs/218)"
+            );
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1847-1848`): `Rt` is the same rule against the
+    /// **training** constellation, CPt. **Regression, docs/218**: `.last()` on
+    /// `Constellation::points()` -- which is sorted loudest first -- took the
+    /// *quietest* codeword.
+    #[test]
+    fn c_8_6_4_rt_is_the_loudest_codeword_of_the_training_constellation() {
+        for cpt in [cpt_of(16, 72..=88), cpt_six(16)] {
+            let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+            assert!(modem.source.set_cpt(&cpt));
+            let (data, training) = modem.renegotiation_points();
+            let mapping = modem.source.phase4.as_ref().expect("CPt's coder").coder.mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let points = set.points();
+                assert_eq!(training[i], points[0], "interval {i}: Rt is not the loudest codeword");
+                if points.len() > 1 {
+                    assert_ne!(training[i], *points.last().unwrap(), "interval {i}: Rt is the quietest");
+                }
+            }
+            assert_ne!(data, training, "Rd and Rt came out the same array");
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rt);
+            let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+            for (n, level) in levels.iter().enumerate() {
+                let want = ucode::level(Law::Mu, training[n % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} is {level}, not {want}");
+            }
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1844`): `Ri` is "the single PCM codeword whose Ucode
+    /// is U_INFO for all data frame intervals". Pinned to U_INFO 78 = 3772, the
+    /// magnitude measured on the line, and kept apart from both R arrays.
+    #[test]
+    fn c_8_6_4_ri_is_the_u_info_codeword_in_every_interval() {
+        let law = Law::Mu;
+        assert_eq!(ucode::linear(law, 78), 3772, "U_INFO 78 is not Table 1's 3772");
+        let mut source = Source::new(&settings_uinfo(78));
+        // 9.8's own codewords are armed and are not what Ri is made of.
+        source.arm_renegotiation([95; DOWN_INTERVALS], [88; DOWN_INTERVALS]);
+        source.change(Out::Ri);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| source.next()).collect();
+        for (i, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, 78);
+            assert!((level.abs() - want).abs() < 1e-12, "Ri symbol {i} is {level}, not U_INFO");
+            assert_eq!(*level > 0.0, i % INTERVALS < 3, "Ri symbol {i} is not + + + - - -");
+            assert!((level.abs() - ucode::level(law, 95)).abs() > 1e-9);
+            assert!((level.abs() - ucode::level(law, 88)).abs() > 1e-9);
+        }
+    }
+
+    /// 8.4.4/V.90 (`v90.txt:1509-1516`): `Sd` is 64 data frames of
+    /// `{+W, +0, +W, -W, -0, -W}` with `W` the Ucode `16 + UINFO`, and
+    /// `S-bar-d` is the same magnitudes turned over.
+    ///
+    /// `W` comes from the clause literally and not from a constellation -- that
+    /// is what the clause says -- so what is *checked* here is that it is never
+    /// quietly moved onto one, and *recorded* is whether it happens to be a
+    /// point of the constellation in force. A `W` outside every constellation
+    /// is a compliant `Sd` and an unreadable one; requiring membership would
+    /// make a compliant transmitter fail.
+    #[test]
+    fn c_8_4_4_sd_is_w_and_zero() {
+        let law = Law::Mu;
+        for uinfo in [66u8, 70, 78, 85] {
+            let mut source = Source::new(&settings_uinfo(uinfo));
+            source.change(Out::Sd);
+            let w = ucode::level(law, 16 + uinfo);
+            let z = 0.0;
+            let pattern = [w, z, w, -w, -z, -w];
+            let sd: Vec<f64> = (0..SD_FRAMES * INTERVALS).map(|_| source.next()).collect();
+            for (i, level) in sd.iter().enumerate() {
+                let want = pattern[i % INTERVALS];
+                assert!((level - want).abs() < 1e-12, "Sd symbol {i} at U_INFO {uinfo} is {level}");
+            }
+            let bar: Vec<f64> = (0..SD_BAR_FRAMES * INTERVALS).map(|_| source.next()).collect();
+            for (i, level) in bar.iter().enumerate() {
+                let want = -pattern[i % INTERVALS];
+                assert!((level - want).abs() < 1e-12, "S-bar-d symbol {i} at U_INFO {uinfo} is {level}");
+            }
+            // W is `16 + UINFO` and never a point chosen for convenience.
+            assert_eq!(ucode::linear(law, 16 + uinfo) as f64 / 32768.0, w);
+            // Membership, recorded rather than required: `Sd` is Phase 3, so
+            // the constellation in force is CPt's.
+            let cpt = cpt_of(16, 40..=95);
+            let in_cpt = cpt.points(0).contains(&(16 + uinfo));
+            assert_eq!(
+                in_cpt,
+                (40..=95).contains(&(16 + uinfo)),
+                "W's membership of CPt disagrees with the mask, U_INFO {uinfo}"
+            );
+        }
+    }
+
+    /// 8.6.1/V.90 (`v90.txt:1731-1739`): `B1d`'s codewords are the ones the
+    /// data mode encoder produces. Every symbol of a `B1d` run must be a point
+    /// of the constellation in force **for its interval**.
+    ///
+    /// This is the property that makes a U_INFO fallback in data mode
+    /// impossible to write: U_INFO 78 is not in the CPu used here.
+    #[test]
+    fn c_8_6_1_no_b1d_symbol_outside_the_constellation_in_force() {
+        // U_INFO 78 is deliberately outside every interval here: that is what
+        // makes a U_INFO symbol in data mode visible rather than plausible.
+        let cpu = Cp {
+            data_mode: true,
+            drn: 3,
+            intervals: [0, 1, 2, 0, 1, 2],
+            constellations: [79..=95u8, 80..=95, 81..=95]
+                .iter()
+                .map(|r| r.clone().fold(0u128, |m, u| m | 1 << u))
+                .collect(),
+            ..Cp::default()
+        };
+        assert!(!cpu.points(0).contains(&78), "this CPu contains U_INFO, so it cannot catch the hole");
+        let mut modem = in_data_mode(cpu);
+        let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+        modem.source.change(Out::B1d);
+        // A quarter of a data frame queued and nothing else: the queue runs dry
+        // and the arm has to hold a codeword rather than invent a level.
+        let octet = ucode::octet(Law::Mu, 95, false);
+        modem.source.codes.push_back(octet);
+        for n in 0..B1D_FRAMES * INTERVALS {
+            let level = modem.source.next();
+            let interval = (modem.source.symbol as usize - 1) % INTERVALS;
+            let set = &mapping.sets[interval];
+            let legal = set
+                .points()
+                .iter()
+                .any(|&u| (ucode::level(Law::Mu, u) - level.abs()).abs() < 1e-12);
+            assert!(legal, "B1d symbol {n} is {level}, which is not a point of interval {interval}");
+        }
+    }
+
+    /// **`docs/221`'s live latent bug, `digital.rs:2425`.** `B1d`'s
+    /// queue-empty arm emitted `self.uinfo` while its own comment said "the last
+    /// codeword again": a -18 dB hole in the middle of data mode. It must hold
+    /// the last codeword.
+    #[test]
+    fn regression_docs_221_b1d_queue_empty_holds_the_last_codeword() {
+        let law = Law::Mu;
+        let mut source = Source::new(&settings_uinfo(78));
+        source.change(Out::B1d);
+        source.codes.push_back(ucode::octet(law, 95, false));
+        source.codes.push_back(ucode::octet(law, 60, true));
+        let first = source.next();
+        let second = source.next();
+        assert!((first.abs() - ucode::level(law, 95)).abs() < 1e-12);
+        assert!(second < 0.0, "the queued sign was lost");
+        assert!((second.abs() - ucode::level(law, 60)).abs() < 1e-12);
+        // The queue is dry from here: every further symbol repeats the last
+        // codeword, sign and all, and is never U_INFO.
+        for n in 0..12 {
+            let level = source.next();
+            assert!(
+                (level - second).abs() < 1e-12,
+                "symbol {n} after the queue ran dry is {level}, not the last codeword {second}"
+            );
+            assert!((level.abs() - ucode::level(law, 78)).abs() > 1e-9, "the queue fell back to U_INFO");
+        }
+    }
+
+    /// 8.6.5/V.90 (`v90.txt:1853-1859`): `TRN2d`'s codeword comes from CPt.
+    /// `trn2d_point` used to hand-derive "the loudest point common to all six
+    /// intervals"; it now asks `Mapping::common_loudest`, the owner of the
+    /// table, and this asserts the two agree on a CPt whose six sets differ.
+    #[test]
+    fn c_8_6_5_trn2d_point_is_the_tables_loudest_common_point() {
+        let cpt = cpt_six(16);
+        let mut source = Source::new(&settings_uinfo(78));
+        assert!(source.set_cpt(&cpt));
+        let mapping = source.phase4.as_ref().expect("CPt's coder").coder.mapping().clone();
+        // Independently: the loudest Ucode by `ucode::linear` present in every
+        // one of the six constellations.
+        let common: Vec<u8> = (0..=95u8)
+            .filter(|u| (0..INTERVALS).all(|i| mapping.sets[i].points().contains(u)))
+            .collect();
+        let loudest = *common
+            .iter()
+            .max_by_key(|&&u| ucode::linear(Law::Mu, u))
+            .expect("these six constellations share a point");
+        assert_eq!(source.trn2d_point(), loudest, "TRN2d's codeword is not the table's loudest common");
+        assert_eq!(mapping.common_loudest(), Some(loudest));
+        assert_ne!(loudest, 78, "the CPt of this test contains U_INFO, so the branch is untested");
+        // And it is a legal symbol in all six intervals, which is the whole
+        // reason the two-point fallback exists.
+        for i in 0..INTERVALS {
+            assert!(mapping.sets[i].points().contains(&loudest), "interval {i} cannot send it");
+        }
+    }
+
+    /// 9.8.1.1.4 / 8.6.4/V.90: `Rd` and `Rt` are "already resolved" when the
+    /// renegotiation starts -- `arm_renegotiation` (`2066`) is called at
+    /// `5780`/`5837` -- so a CPu or CPt arriving *during* the renegotiation
+    /// must not move them. Nothing tested this before `docs/221`.
+    #[test]
+    fn c_9_8_1_1_4_the_armed_r_arrays_are_frozen_against_later_messages() {
+        let law = Law::Mu;
+        let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+        assert!(modem.source.set_cpt(&cpt_of(16, 72..=88)));
+        let (data, training) = modem.renegotiation_points();
+        modem.source.arm_renegotiation(data, training);
+        // A second CPt and a second CPu, both narrower, arrive mid-signal.
+        assert!(modem.source.set_cpt(&cpt_of(16, 40..=60)));
+        modem.cpu = Some(cpu_of(&[70..=90u8, 71..=91u8], [0, 1, 0, 1, 0, 1]));
+        modem.begin_data();
+        modem.source.change(Out::Rd);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+        for (n, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, data[n % DOWN_INTERVALS]);
+            assert!((level.abs() - want).abs() < 1e-12, "Rd symbol {n} moved when a message arrived");
+        }
+        modem.source.change(Out::Rt);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+        for (n, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, training[n % DOWN_INTERVALS]);
+            assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} moved when a message arrived");
+        }
+    }
+
+    /// 8.6.4/V.90: `Rd`/`Rt` with no constellation armed has no defined signal,
+    /// and `docs/221` made the silent U_INFO fallback loud (`digital.rs:2149`).
+    #[test]
+    fn c_8_6_4_rd_without_arming_is_a_loud_failure() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut source = Source::new(&settings_uinfo(78));
+        source.change(Out::Rd);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.next()));
+        assert!(result.is_err(), "a codeword meaning nothing went out quietly");
+    }
+
+    /// 8.8.4 (`v92.txt:1957-1962`) [quoted]: "*Rf is transmitted by ... repeating
+    /// the 12-symbol sequence containing the PCM codewords with the sign pattern
+    /// `+ + - - + + - - + + - -` where the left-most sign is transmitted
+    /// first*", "*R f consists of 2 repetitions of the 12-symbol sequence
+    /// containing the same PCM codewords with the sign pattern
+    /// `- - + + - - + + - - + +`*", and "*The PCM codewords used are the
+    /// highest power PCM codeword from the data mode constellation of each data
+    /// frame interval as passed in CPu*".
+    ///
+    /// `docs/221` could not write this test: `Rf` had no transmit path in that
+    /// tree, which is why `docs/221` left `Rf` to "whoever implements it". It
+    /// now has one (`Out::Rf`/`Out::RfBar`,
+    /// `digital.rs`, and the arm that emits it), so the exclusion keeps it out
+    /// of the **diff** -- V.90 has no `Rf` to diff it against, `v92.txt:1957` --
+    /// and this property test pins it against the three mistakes this end can
+    /// still make: a codeword that is not the loudest of the CPu in force, a
+    /// pattern read off an em dash instead of the line, or a bar that repeats
+    /// rather than inverts.
+    ///
+    /// The codewords are read through `renegotiation_points`, i.e. from the
+    /// mapping `B1d`'s encoder is sliced from, not from a vector this test
+    /// made up: two CPu shapes, so the property is the table's.
+    #[test]
+    fn c_8_8_4_rf_is_the_loudest_codeword_of_the_data_mode_constellation_as_passed_in_cpu() {
+        let law = Law::Mu;
+        // [quoted] v92.txt:1957-1958 and 1958-1960, left-most sign first:
+        // `+ + - - + + - - + + - -`, and R-bar-f's `- - + + - - + + - - + +`.
+        let rf_12 = [true, true, false, false, true, true, false, false, true, true, false, false];
+        let bar_12 = rf_12.map(|sign| !sign);
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let mut modem = in_data_mode(cpu_of(&sets, intervals));
+            let (data, training) = modem.renegotiation_points();
+            // "the highest power PCM codeword ... as passed in CPu": one an
+            // interval, resolved off the constellation mask the CPu carried.
+            let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let loudest = *set.points().first().expect("a set with points");
+                assert_eq!(data[i], loudest, "interval {i}: Rf's codeword is not CPu's loudest");
+                assert!(set.points().contains(&data[i]), "interval {i}: Rf's codeword is not in CPu");
+            }
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rf);
+            let mut rf = Vec::new();
+            let mut bar = Vec::new();
+            for _ in 0..(R_FRAMES + R_BAR_FRAMES) * INTERVALS {
+                let level = modem.source.next();
+                match modem.source.out() {
+                    Out::Rf => rf.push(level),
+                    Out::RfBar => bar.push(level),
+                    other => panic!("Rf ran into {other:?} before R-bar-f was over"),
+                }
+            }
+            assert_eq!(rf.len(), R_FRAMES * INTERVALS, "Rf is 384T (9.9.1.2.2)");
+            assert_eq!(bar.len(), R_BAR_FRAMES * INTERVALS, "R-bar-f is 24T (9.9.1.2.2)");
+            for (i, level) in rf.iter().enumerate() {
+                let want = ucode::level(law, data[i % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "Rf symbol {i} is not CPu interval {}'s loudest codeword", i % DOWN_INTERVALS);
+                assert_eq!(*level > 0.0, rf_12[i % 12], "Rf symbol {i} left 8.8.4's sign pattern");
+            }
+            for (i, level) in bar.iter().enumerate() {
+                let want = ucode::level(law, data[i % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "R-bar-f symbol {i} is not the same PCM codewords");
+                assert_eq!(
+                    *level > 0.0,
+                    bar_12[i % 12],
+                    "R-bar-f symbol {i} is not 2 repetitions of the inverted 12"
+                );
+            }
+        }
     }
 }

@@ -557,6 +557,80 @@ fn best_share(window: &[f64], template: &[f64; RU_PERIOD], steps: usize) -> f64 
 }
 
 #[cfg(test)]
+mod local_scale_tests {
+    use super::*;
+
+    /// Two chords' worth of codes, straight out of the codec's table: the
+    /// innermost, where neighbouring codes are 8 LSB apart, and one where they
+    /// are 512. The oracle is the alphabet -- `codegrid::value` -- and nothing
+    /// here measures against a formula of ours.
+    fn pair(high_code: u8, low_code: u8) -> (f64, f64) {
+        let v = |c: u8| f64::from(crate::v92::codegrid::value(c));
+        (v(low_code).min(v(high_code)), v(low_code).max(v(high_code)))
+    }
+
+    /// A sample on a point is on a point; halfway between two points is the
+    /// boundary between *those two*, and reads 1.0 whatever the chord; and the
+    /// half-gap is half of the gap between them. One decision, three numbers,
+    /// all read off the pair US7391816B2 claim 1 calls "the two constellation
+    /// points that are proximate".
+    #[test]
+    fn the_scale_is_taken_from_the_pair_the_sample_fell_between() {
+        for (high_code, low_code) in [(125u8, 126u8), (16, 17)] {
+            let (low, high) = pair(high_code, low_code);
+            let gap = high - low;
+            let slicer = Slicer::Levels(vec![low, high]);
+            let (level, fraction, half) = slicer.decide_local(low).unwrap();
+            assert_eq!(level, low);
+            assert!(fraction < 1e-12, "{fraction}");
+            assert!((half - gap / 2.0).abs() < 1e-9, "{half} against {}", gap / 2.0);
+            let (level, fraction, _) = slicer.decide_local(low + gap / 2.0).unwrap();
+            assert!(level == low || level == high);
+            assert!((fraction - 1.0).abs() < 1e-9, "{fraction}");
+            let (level, fraction, _) = slicer.decide_local(low + gap / 4.0).unwrap();
+            assert_eq!(level, low);
+            assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
+            let (level, fraction, _) = slicer.decide_local(low + 3.0 * gap / 4.0).unwrap();
+            assert_eq!(level, high);
+            assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
+        }
+    }
+
+    /// The point of the local scale, in two assertions: the same fractional
+    /// position in two chords of very different width reads the same, and the
+    /// global half-span -- the number the anchor used before `docs/244` -- reads
+    /// them apart by the ratio of the gaps, which is why a gate written on it
+    /// means a different thing in every chord.
+    #[test]
+    fn the_local_fraction_is_the_same_in_every_chord_and_the_global_one_is_not() {
+        // `codegrid::value` ascends with the code: 16/17 are a chord where
+        // neighbouring codes are 16 LSB apart, 125/126 one where they are 1024.
+        let (inner_low, inner_high) = pair(17, 16);
+        let (outer_low, outer_high) = pair(126, 125);
+        let (inner_gap, outer_gap) = (inner_high - inner_low, outer_high - outer_low);
+        assert!(outer_gap > 10.0 * inner_gap, "{outer_gap} against {inner_gap}");
+        let inner = Slicer::Levels(vec![inner_low, inner_high]);
+        let outer = Slicer::Levels(vec![outer_low, outer_high]);
+        let (_, inner_local, _) = inner.decide_local(inner_low + 0.25 * inner_gap).unwrap();
+        let (_, outer_local, _) = outer.decide_local(outer_low + 0.25 * outer_gap).unwrap();
+        assert!((inner_local - outer_local).abs() < 1e-9, "{inner_local} against {outer_local}");
+        // One set spanning both chords, judged by one global half-span: the
+        // same two samples read 64 times apart (512 / 8), which is the defect.
+        let both = Slicer::Levels(vec![inner_low, inner_high, outer_low, outer_high]);
+        let global = both.half_span();
+        assert!((global - inner_gap / 2.0).abs() < 1e-9, "{global}");
+        let inner_global = (0.25 * inner_gap) / global;
+        let outer_global = (0.25 * outer_gap) / global;
+        assert!(
+            (outer_global / inner_global - outer_gap / inner_gap).abs() < 1e-9,
+            "{} against {}",
+            outer_global / inner_global,
+            outer_gap / inner_gap
+        );
+    }
+}
+
+#[cfg(test)]
 mod reread_tests {
     use super::*;
 
@@ -735,6 +809,62 @@ impl Slicer {
         }
     }
 
+    /// The nearer of the two levels `value` sits between, how far it is from
+    /// that level as a fraction of **that pair's** half-gap, and the half-gap
+    /// itself.
+    ///
+    /// This is the art's upstream slicer, and it is not a refinement of
+    /// [`Self::decide`]: it is the same decision with the *local* scale taken
+    /// from the two points it decided between. US7391816B2 claim 1 [quoted]: "a
+    /// constellation mapper circuit to determine **two constellation points
+    /// that are proximate a received symbol**; an index mapper circuit to
+    /// determine a **constellation index** corresponding to the received symbol
+    /// **based on the received symbol and the two constellation points that are
+    /// proximate**". Claim 12 takes the scale from the same pair; US7321618B2
+    /// claim 2 states the arithmetic [quoted]: "linearly interpolating between
+    /// the two possible mu-law levels".
+    ///
+    /// Why the local pair is the definition and not a tuning: on a mu-law
+    /// constellation the distance between neighbouring points is not one number
+    /// (ours spans 8 ... 1024 LSB, `docs/243` sec 1.2), so "how far from the
+    /// nearest point, as a fraction of a step" has no global answer, and a
+    /// receiver that divides by one global half-span reports a different margin
+    /// in every chord. The fraction is only defined against the pair that
+    /// brackets the sample, which is true of every receiver whose alphabet is
+    /// the codec's (`v92.txt` sec 6.4.2 orders the points "in the same order as
+    /// the levels"; Table 23 is a Ucode mask). `docs/244` sec 1 measures it.
+    ///
+    /// The fraction is 0.0 on a point and 1.0 exactly on the boundary between
+    /// the pair, so a caller can ask "inside half the local gap" without knowing
+    /// which chord it is in.
+    fn decide_local(&self, value: f64) -> Option<(f64, f64, f64)> {
+        let Self::Levels(levels) = self else {
+            let (level, error) = self.decide(value)?;
+            let span = self.half_span();
+            let fraction = if span > 0.0 { (error / span).min(1.0) } else { 0.0 };
+            return Some((level, fraction, span));
+        };
+        if levels.len() < 2 || !value.is_finite() {
+            return None;
+        }
+        // The pair that brackets `value`, clamped at the ends: outside the set
+        // the outermost pair is the scale to judge it by, exactly as `decide`
+        // clamps to the outermost level.
+        let mut i = 0usize;
+        while i + 2 < levels.len() && value > levels[i + 1] {
+            i += 1;
+        }
+        let (low, high) = (levels[i], levels[i + 1]);
+        let gap = high - low;
+        if !(gap > 0.0) {
+            return None;
+        }
+        let t = ((value - low) / gap).clamp(0.0, 1.0);
+        let level = if t < 0.5 { low } else { high };
+        // `1 - |2t - 1|`: 0 on a point, 1 on the boundary.
+        Some((level, 1.0 - (2.0f64.mul_add(t, -1.0)).abs(), gap / 2.0))
+    }
+
     /// Half the distance between the two closest levels: what an error has to
     /// exceed to be a wrong decision rather than a noisy one.
     fn half_span(&self) -> f64 {
@@ -878,7 +1008,102 @@ fn ridges_in_use() -> Vec<f64> {
     }
 }
 
+/// One equaliser unit in the codec's int16 domain, from `[8.8.3]`'s power
+/// identity: TRN1u's `+-LU` is the receiver's `+-1`, and the far end transmits
+/// at the power `[8.8.3]` derives, which is the bench's 1609 LSB rms
+/// ([`crate::v92::codegrid::TARGET_RMS`], `docs/25` §2, docs/242 §1).
+pub const LATTICE_LSB: f64 = crate::v92::codegrid::TARGET_RMS;
+
+/// Whether the decision reference is built on the far end's code lattice.
+///
+/// On unless `V92_LATTICE=off`, which is the linear grid every call before
+/// `docs/242` read; kept so the two can be compared on one capture and so that
+/// a lattice that ever mis-decides can be taken out of the path without a build.
+fn lattice_reference() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("V92_LATTICE").ok().as_deref(),
+            Some("0") | Some("off") | Some("no") | Some("false")
+        )
+    })
+}
+
+/// One equaliser unit in the codec's int16 domain.
+///
+/// `V92_LATTICE_LSB` overrides it, which is how the far end's own operating
+/// point is *measured* rather than assumed: `[8.8.3]` fixes the power this end
+/// asks at, and which code that power lands on is the far end's own scale.
+fn lattice_unit() -> f64 {
+    static UNIT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *UNIT.get_or_init(|| {
+        std::env::var("V92_LATTICE_LSB")
+            .ok()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(LATTICE_LSB)
+    })
+}
+
+/// The code value the far end's quantiser puts out for a reference `value`.
+///
+/// Code 0 is silence and `[8.8.3]` forbids it in a constellation
+/// ([`crate::v92::codegrid`]), so the smallest magnitude this returns is code 1's.
+pub fn on_lattice(value: f64) -> f64 {
+    if !lattice_reference() || value == 0.0 {
+        return value;
+    }
+    let unit = lattice_unit();
+    let code = crate::v92::codegrid::nearest_code((value.abs() * unit).round());
+    f64::from(crate::v92::codegrid::value(code)).copysign(value) / unit
+}
+
+/// The same over a whole reference sequence or decision table.
+pub fn lattice_levels(levels: &[f64]) -> Vec<f64> {
+    if !lattice_reference() {
+        return levels.to_vec();
+    }
+    levels.iter().map(|&level| on_lattice(level)).collect()
+}
+
 /// TRN2u's own symbols: 8.7.6's scrambled ones on Tables 28's four points.
+///
+/// The sequence is built as Tables 28 draws it and then put **on the far end's
+/// code lattice** ([`on_lattice`]): what the far end can put on the line is a
+/// G.711 code value, not the point the drawing names, and a reference that
+/// ignores that spends decision margin on points the far end cannot emit. The
+/// two middle levels are 719.6 LSB at `[8.8.3]`'s power, where the nearest
+/// mu-law code is 716, and the two outer are 2158.7 LSB, where it is 2108: 51
+/// LSB of a *signal-dependent* offset that no linear equaliser can cancel and no
+/// gain can move, because it is the codec doing its job (`docs/241` sec 5).
+///
+/// # The basis, in the standard and not in the measurement
+///
+/// `[8.8.3]`: "the digital modem shall design the modulation parameters
+/// assuming that, when the prefilter output multiplied by `G` has a mean-square
+/// value of 1, the analogue modem will transmit at the desired power"
+/// (`/tmp/v92.txt:1793`), which is what makes one equaliser unit a fixed number
+/// of codec LSB. `Table 23` bit 35 names the far end's codec type and bit 128
+/// whether its transmit constellations differ from its codec's D/A output
+/// constellations (`/tmp/v92.txt` sec 8.7.3), and the constellation it reports is
+/// a Ucode mask: "a bit set to 1 indicates that the constellation includes the
+/// PCM code represented by the corresponding Ucode". A far end with bit 128
+/// clear is code-transparent and its levels **are** code values; V.90's Table 1
+/// is that lattice in the codec's units ([`crate::v90::ucode::linear`]
+/// reproduces all 512 published values).
+///
+/// # Why this is an algorithm fix and not a tuning
+///
+/// A tuning constant moves a boundary by a number nobody can derive. This
+/// replaces the *set of permitted points* with the one the standard says the far
+/// end has: before, the reference said "the level is 2158.7 LSB", which no
+/// codeword can be; after, it says "the level is the code that decodes to
+/// 2108 LSB", which is a point the far end can emit and does. The error is still
+/// measured against those points and still reported -- nothing is masked and
+/// nothing is capped, and `V92_LATTICE=off` restores the linear grid bit for
+/// bit.
+///
+/// `phase` says which of the two bits in a symbol is the magnitude, `seed` is
 ///
 /// `phase` says which of the two bits in a symbol is the magnitude, `seed` is
 /// the differential sign the far end started from; between them the four
@@ -914,13 +1139,21 @@ fn trn2u_levels(
         levels.push(if sign == 1 { -tier } else { tier } / 5f64.sqrt());
         j += 1;
     }
-    Some(levels)
+    Some(lattice_levels(&levels))
 }
 
-/// The four TRN2u levels, in the units the equaliser's output carries.
+/// The four TRN2u levels, in the units the equaliser's output carries -- and on
+/// the far end's code lattice, for the reason [`on_lattice`] gives: the
+/// boundary a four-point decision is taken at has to be half way between the
+/// two codes the far end can emit, not between two points it cannot.
 fn four_point_levels() -> [f64; 4] {
     let size = up_signals::Trn2uSize::Four;
-    [-size.magnitude(1), -size.magnitude(0), size.magnitude(0), size.magnitude(1)]
+    let linear = [-size.magnitude(1), -size.magnitude(0), size.magnitude(0), size.magnitude(1)];
+    let mut out = [0.0f64; 4];
+    for (slot, &level) in out.iter_mut().zip(linear.iter()) {
+        *slot = on_lattice(level);
+    }
+    out
 }
 
 /// The nearest of `levels` to `value`, with the distance.
@@ -1763,6 +1996,19 @@ impl Receiver {
     /// The `gain` the four-point tiers established is kept as well: it is the
     /// AGC that puts the equaliser's output on the scale the levels are on, and
     /// TRN2u and B1u are transmitted at the same power (3.8, 8.7.1).
+    /// **The table is the caller's, and this function does not move a point of
+    /// it.** It used to put every level on the far end's code lattice
+    /// (`lattice_levels`, `docs/242` sec 2) on the way in, and that is right only
+    /// for a constellation whose points *are* G.711 code values. On the odd
+    /// lattice `a(eta) = 2 eta + 1` they are not, and snapping displaces each
+    /// point by half a mu-law chord step: measured on the call's own set (drn 1,
+    /// `G` 0.1085, eight points spaced 349 LSB) the worst is **36 LSB** at
+    /// 1 920 LSB -- a tenth of the point spacing and a fifth of the decision
+    /// half-gap, added to a receiver whose far end already lands 0.59 half off
+    /// the grid (`docs/256` sec 2). `docs/257` sec 2 is the call that cost. Which
+    /// lattice a set is on is CPd's to say and `begin_b1u`'s to apply
+    /// (`digital.rs`, `data_mode_levels`): it is the level set, not this
+    /// slicer, that knows whether there is a code grid under it.
     pub fn set_data_mode(&mut self, levels: Vec<f64>) {
         self.slicer = Slicer::Levels(levels);
         // Diagnostic (`V92_DATA_FB`): what to do with the fitted feedback
@@ -1790,6 +2036,17 @@ impl Receiver {
             Some(step) => step,
             None => DATA_TRACKING,
         };
+    }
+
+    /// The data mode's decision table, in ascending order, or an empty slice
+    /// before [`Self::set_data_mode`] has been called. A diagnostic: it is what
+    /// the slicer is deciding against, so a test can ask whether the table is
+    /// the one CPd named instead of trusting that it is.
+    pub fn data_levels(&self) -> &[f64] {
+        match &self.slicer {
+            Slicer::Levels(levels) => levels,
+            _ => &[],
+        }
     }
 
     /// 9.5.1.1.10: "the first symbol of the second TRN1u shall be symbol 0 of
@@ -2892,14 +3149,20 @@ impl Receiver {
         if *OFF.get_or_init(|| std::env::var("V92_ANCHOR").ok().as_deref() == Some("off")) {
             return;
         }
-        let Some((level, error)) = self.slicer.decide(value * self.gain) else { return };
+        let Some((level, local, _half)) = self.slicer.decide_local(value * self.gain) else {
+            return;
+        };
         if level == 0.0 || value == 0.0 {
             return;
         }
         // Only the decisions worth trusting: half a level step inside the
         // boundary, which is where a symbol that the line actually carried
-        // lands.
-        if error > 0.5 * self.slicer.half_span() {
+        // lands. The step is the *local* one -- the gap between the two points
+        // the sample fell between (US7391816B2 claim 12) -- so an inner chord,
+        // whose points are 8 LSB apart, is judged on 4 LSB and an outer one on
+        // 256, which is the only reading that means the same thing in both
+        // (`docs/244` sec 3).
+        if local > 0.5 {
             return;
         }
         self.level_by_line = 0.999f64.mul_add(self.level_by_line, level * value);
@@ -3826,6 +4089,57 @@ pub(crate) fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f6
 mod tests {
     use super::*;
     use crate::v92::up_signals::{ru, su};
+
+    /// **The reference sits on the far end's code lattice.**
+    ///
+    /// Two things, both of them a property of the decision reference and not of
+    /// a threshold: a TRN2u symbol decodes to a point whose value in the codec's
+    /// domain *is* a µ-law code value, and a value half way between two codes is
+    /// resolved to the nearer one rather than left in the gap.
+    ///
+    /// The numbers are the ones `docs/242` sec 2 measured: Tables 28's four
+    /// points are `+-(1, 3)/sqrt(5)` in equaliser units, which at `[8.8.3]`'s
+    /// power are 719.6 and 2158.7 LSB, and the µ-law lattice's nearest codes
+    /// decode to 716 and 2108. On `7a32cb7` the same four points came back as
+    /// 719.57 and 2158.70 -- the drawing, not the line.
+    #[test]
+    fn the_decision_reference_is_on_the_far_ends_code_lattice() {
+        assert!(lattice_reference(), "the lattice is the default; V92_LATTICE=off only for an A/B");
+        let unit = LATTICE_LSB;
+        // The two tiers of TRN2u, and no other values.
+        let inner = on_lattice(1.0 / 5f64.sqrt());
+        let outer = on_lattice(3.0 / 5f64.sqrt());
+        assert_eq!((inner * unit).round(), 716.0, "the inner tier is not on a code");
+        assert_eq!((outer * unit).round(), 2108.0, "the outer tier is not on a code");
+        for level in four_point_levels() {
+            let lsb = (level.abs() * unit).round();
+            let code = crate::v92::codegrid::nearest_code(lsb);
+            assert_eq!(f64::from(crate::v92::codegrid::value(code)), lsb, "{level} is not a code value");
+        }
+        // A midpoint between two codes resolves to the nearer of them, and a
+        // point just past the midpoint to the other: the boundary moved to the
+        // lattice and did not simply shrink towards the ideal.
+        let low = f64::from(crate::v92::codegrid::value(60));
+        let high = f64::from(crate::v92::codegrid::value(61));
+        assert!(high > low + 1.0, "codes 60 and 61 must be distinct LSB");
+        let mid = 0.5 * (low + high);
+        let near = |value: f64| (on_lattice(value / unit) * unit).round();
+        assert!(near(mid) == low || near(mid) == high, "a midpoint landed off the lattice");
+        assert_eq!(near(mid + 1.0), high, "just above the midpoint took the lower code");
+        assert_eq!(near(mid - 1.0), low, "just below the midpoint took the upper code");
+        assert_eq!(near(-(mid + 1.0)), -high, "the sign did not survive");
+        // A TRN2u symbol sequence is built out of those values only.
+        let bits = reference(0, 64, Mode::Answer).expect("a reference");
+        let levels = trn2u_levels(&bits, 32, 0, 0, false).expect("levels");
+        let allowed = [inner, outer, -inner, -outer];
+        for level in &levels {
+            assert!(
+                allowed.iter().any(|want| (want - level).abs() < 1e-12),
+                "{level} is not one of the four code values {:?}",
+                allowed
+            );
+        }
+    }
 
     /// The hunt's answer is the same at every level, and it is the same
     /// *index*: 9.5.2.1.7's Su, its half-symbol S-bar-u and the Su after it,
