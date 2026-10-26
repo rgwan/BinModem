@@ -100,6 +100,54 @@ pub const SD_FRAME_MS: f64 = INTERVALS as f64 * 1000.0 / FS;
 /// R-bar-i: "4 repetitions of the 6-symbol sequence" (V.90 8.6.4).
 const R_BAR_FRAMES: usize = 4;
 
+/// `R-bar` in symbols: "R for 384T followed by R-bar for 24T" (9.8.1.1.1,
+/// 9.8.1.1.4) is four repetitions of six.
+const R_BAR_SYMBOLS: usize = R_BAR_FRAMES * INTERVALS;
+
+/// How many symbols off the phase `Ru` locked on say the far end has turned
+/// `Ru` into `R-bar-u`.
+///
+/// **[inferred]**, and the one number the fiducial below rests on: 8.5.5's
+/// `R-bar-u` is `{-LU x3, +LU x3}`, so the first *three* symbols after the
+/// transition disagree with `Ru`'s phase and no later symbol does. Waiting for
+/// a whole period would put `Rd` on the line at the end of the 24T rather than
+/// near its start.
+const RU_BAR_DEVIATIONS: usize = 3;
+
+/// Where the far end's renegotiation `TRN2u` begins, in symbols after this end
+/// sees the `Ru`-to-`R-bar-u` transition.
+///
+/// 9.8.2.1.1 puts `Ru` at 384T and `R-bar-u` at 24T, and 9.8.2.2.3 (responding)
+/// and 9.8.2.1.2 (initiating) put `TRN2u` straight after `R-bar-u`'s 24T. This
+/// end's detector fires on the [`RU_BAR_DEVIATIONS`]-th disagreeing symbol, so
+/// `R-bar-u` has `24 - 3` symbols left to run when it does, and the far end's
+/// `TRN2u` starts here.
+///
+/// It is a **fiducial and not a guess**: the reader for the far end's `SUVu` is
+/// built on this symbol, and one symbol either way would leave its descrambler
+/// on the wrong phase and the `SUVu` unreadable -- the same silent failure the
+/// downstream frame grid has (`Source::next`).
+///
+/// **[inferred]** from 9.8.2.1.1/9.8.2.2.3 plus [`RU_BAR_DEVIATIONS`]; no
+/// signal is involved that 8.5.5 and 8.7.6 do not define.
+pub const TRN2U_AFTER_RU_BAR: u64 = (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64;
+
+/// Whether this end asks for 9.8.1.1.3's silent period in its own `SUVd`.
+///
+/// **[our choice]**, and the clause leaves it open twice over: 9.8.1.1.2 enters
+/// the silent-period branch only "if bit 32 is set in **either** `SUVd` or
+/// `SUVu`", and 9.8.1.1.5 has the digital modem "wait to receive another
+/// `SUVu`" when the bit is clear. `false` is Figure 15's shape -- "Rate
+/// renegotiation with no silence initiated by the digital modem": `SUVd`,
+/// `SUVd`, `CPd` -- which reaches the `CPd` without a handshake whose only
+/// purpose is a retrain of `Rt` this end does not need, since what is changing
+/// is the far end's upstream and not this end's downstream. The far end can
+/// still take this end into the branch by setting bit 32 in its own `SUVu`, and
+/// that path *is* implemented and tested; the alternative reading is `true`,
+/// which puts 9.8.1.1.3's `SUVd'`, `Ed`, silence and `Rt` on every
+/// renegotiation, as Figures 16 and 17 draw.
+const RENEG_REQUEST_SILENCE: bool = false;
+
 /// Rd and Rt, in frames: "transmit signal Rd for 384T and then R-bar-d for
 /// 24T" (9.8.1.1.1, 9.8.1.2.2), and the same pair for Rt (9.8.1.1.4, .5).
 ///
@@ -293,7 +341,7 @@ impl RuDetector {
                 // not noise: `R-bar-u` is 24T, so waiting for a whole period
                 // would put `Rd` on the line at the end of it rather than at
                 // its start.
-                if self.deviations >= 3 {
+                if self.deviations >= RU_BAR_DEVIATIONS {
                     return RuEvent::RuToRuBar;
                 }
             }
@@ -2018,6 +2066,29 @@ impl Source {
         });
     }
 
+    /// 9.8.1.1.2's "up to 16008T": how long TRN2d may run before the `SUVd`
+    /// the clause puts after it goes out.
+    ///
+    /// The bound is a **countdown**, not a check: the `TRN2d` arm takes a
+    /// pending change only at a frame boundary at or after this many symbols,
+    /// so asking for `SUVd` while TRN2d is on the line cuts it at exactly this
+    /// count instead of letting it run on. Without it the arm's exit condition
+    /// (`count >= trn2d_symbols && at_frame_boundary && pending`) never fires in
+    /// a renegotiation and the far end never sees an `SUVd` -- `docs/214` §6's
+    /// first gap.
+    ///
+    /// 16008T is 2668 whole data frame intervals, so the cut lands on the frame
+    /// boundary the `SUVd` after it must start on.
+    pub fn bound_trn2d(&mut self, symbols: usize) {
+        self.trn2d_symbols = symbols;
+    }
+
+    /// How long TRN2d is being held for, in symbols.
+    #[must_use]
+    pub fn trn2d_bound(&self) -> usize {
+        self.trn2d_symbols
+    }
+
     /// Whether the signal waiting to go out may only begin on a data frame
     /// boundary.
     ///
@@ -2421,10 +2492,12 @@ impl Source {
                     self.count += 1;
                     let interval = (self.symbol % INTERVALS as u64) as usize;
                     // R-bar is "4 repetitions of the 6-symbol sequence ... with
-                    // the sign pattern - - - + + -" (V.90 8.6.4): the same
+                    // the sign pattern - - - + + +" (`v90.txt:1835`): the same
                     // codewords, the pattern inverted, and "neither R nor R-bar
                     // are differentially encoded" -- so the polarity is the
-                    // literal one, not the encoder's.
+                    // literal one, not the encoder's. (An earlier draft of this
+                    // comment had `- - - + + -`, a PDF hyphenation artifact of
+                    // the em dashes; it is read off the source line.)
                     return self.r_codeword(training, (interval < 3) ^ bar);
                 }
                 // 9.5.1.1.13 with V.90 8.6.6: with no DIL asked for, the
@@ -2522,6 +2595,306 @@ impl Source {
             .copied()
             .find(|&u| sets.iter().all(|s| s.points().contains(&u)))
             .unwrap_or(self.uinfo)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9.8.1.1.2 to 9.6.1.1.2: the tail after Rd and R-bar-d
+// ---------------------------------------------------------------------------
+
+/// Where 9.8's tail has got to.
+///
+/// The clause chain is 9.8.1.2.3 -> 9.8.1.1.2 -> .3 -> .4/.5 -> 9.6.1.1.2, and
+/// every step of it hands the next one a signal this end has already got an
+/// emitter for. What was missing was the machine that asks for them in the
+/// clause's order, which is this and [`RenegTail::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenegStage {
+    /// 9.8.1.2.2 and 9.8.1.1.2's first half: `Rd` 384T, `R-bar-d` 24T and then
+    /// `TRN2d` are on [`Source`]'s own arms, and nothing is asked for until
+    /// `TRN2d` is on the line.
+    Trn2d,
+    /// 9.8.1.1.2/.3: `SUVd` sequences. Which of the two they are is the bit-32
+    /// branch, and it is decided here and nowhere else.
+    Suvd,
+    /// 9.8.1.1.3: `Ed` has gone out and the line is Ucode 0 until an `SUVu`
+    /// with bit 32 clear (9.8.1.1.4).
+    Silence,
+    /// 9.8.1.1.4/.5: `Rt` for 384T then `R-bar-t` for 24T.
+    Rt,
+    /// 9.6.1.1.2: the exchange -- `SUVd` sequences and the one `CPd`.
+    Cp,
+    /// 9.6.1.1.4's `Ed` was the last thing in the clause: B1d again.
+    Done,
+}
+
+/// The tail of 9.8: what to ask [`Source`] for after `R-bar-d`, and when.
+///
+/// One machine for the initiating and responding halves, because 9.8.1.2.3 says
+/// so outright -- "The digital modem shall then proceed according to 9.8.1.1.2"
+/// -- and 9.8.1.1.4/.5 end at 9.6.1.1.2 like everything else. The exchange is
+/// the same [`Exchange`] Phase 4 uses, with [`Context::Renegotiation`], which is
+/// what selects 9.8's silent period and refuses CPd bit 29's one-symbol E2u
+/// extension (`Context::may_extend_e2u`).
+#[derive(Debug, Clone)]
+pub struct RenegTail {
+    stage: RenegStage,
+    /// 9.8.1.1.3's `SUVd'` -- bit 33 set -- has gone out in the silence
+    /// handshake, which is what "the current SUVd" has to be before the `Ed`.
+    sent_ack_suvd: bool,
+    /// 9.8.1.1.3's `Ed` has been asked for.
+    ed_asked: bool,
+    /// And the silence behind it.
+    silence_asked: bool,
+}
+
+impl RenegTail {
+    /// A tail at 9.8.1.2.3, with the exchange 9.6.1.1.2 is entered from.
+    ///
+    /// This is `Exchange::new(Context::Renegotiation, ...)`. It is a **live**
+    /// caller at last: `docs/214` §6 gap 3 recorded that the context was
+    /// constructible and had none.
+    /// Returns the tail **and** the exchange it drives, because the exchange is
+    /// what the far end's `SUVu` is reported to ([`Exchange::peer_suv`]) and the
+    /// owner has to hold it for the reader that does the reporting.
+    pub fn new(round_trip: f64, fs: f64) -> (Self, Exchange) {
+        let mut exchange = Exchange::new(Context::Renegotiation, round_trip, fs);
+        // 9.6.1.1.3's repeats, interleaved with SUVd as 9.6.2.1.2's CPu needs.
+        exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // 9.8.1.1.2's "either SUVd or SUVu"; see [`RENEG_REQUEST_SILENCE`].
+        exchange.request_silence(RENEG_REQUEST_SILENCE);
+        (
+            Self { stage: RenegStage::Trn2d, sent_ack_suvd: false, ed_asked: false, silence_asked: false },
+            exchange,
+        )
+    }
+
+    #[must_use]
+    pub fn stage(&self) -> RenegStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.stage == RenegStage::Done
+    }
+
+    /// One of this end's Phase 4 sequences has just run out of bits.
+    ///
+    /// 9.8.1.1.3's `Ed` is followed by silence and 9.6.1.1.4's by B1d, which is
+    /// the whole difference between the two stages that end on an `Ed`.
+    fn sequence_ended(&mut self, done: Out, exchange: &mut Exchange, at: u64) {
+        // 9.8.1.1.3's Ed is **not** the exchange's E: 9.8.1.1.4 carries on to
+        // `Rt` and only then to 9.6.1.1.2, so reporting it as
+        // `SequenceKind::E` would set `Exchange`'s `finished` and every later
+        // `next_sequence` would answer `B1` -- no `CPd` at all after the
+        // silence.
+        if done == Out::Ed && self.ed_asked {
+            self.stage = RenegStage::Silence;
+            return;
+        }
+        let kind = match done {
+            Out::Cpd => SequenceKind::Cp,
+            Out::Ed => SequenceKind::E,
+            _ => SequenceKind::Suv,
+        };
+        exchange.sequence_ended(kind, at);
+        // 9.6.1.1.4's Ed is the end of the clause.
+        if done == Out::Ed {
+            self.stage = RenegStage::Done;
+        }
+    }
+
+    /// One symbol of the tail: what ended, then what the clause wants next.
+    ///
+    /// This is the whole of the per-symbol work, so that the driver in
+    /// [`Modem::reneg_out`] and the tests below drive the same code: a machine
+    /// proved in one shape and used in another is the bug `docs/214` records of
+    /// the two-point TRN2d.
+    fn push(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        // "complete sending the current SUVd" (9.8.1.1.3): a sequence that has
+        // run out has ended, and the acknowledge bit of 9.6.1.1.2 changes at a
+        // boundary and nowhere else.
+        if let Some(finished) = source.take_finished() {
+            self.sequence_ended(finished, exchange, now);
+        }
+        self.step(source, exchange, cpd, now)
+    }
+
+    /// One symbol: whatever the clause asks of the signal now in flight.
+    ///
+    /// Returns the sequence this asked the source for, or `None` when the
+    /// signal on the line is one the source runs by itself.
+    fn step(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        match self.stage {
+            RenegStage::Done => None,
+            RenegStage::Trn2d => {
+                // 9.8.1.1.2: "shall then transmit TRN2d for up to 16008T
+                // followed by SUVd sequences". The 16008T is
+                // [`Source::bound_trn2d`]'s countdown: the SUVd is asked for
+                // now and the source holds it until the count is spent.
+                if source.out() != Out::Trn2d {
+                    return None;
+                }
+                self.stage = RenegStage::Suvd;
+                self.step(source, exchange, cpd, now)
+            }
+            RenegStage::Suvd | RenegStage::Cp => {
+                // "unless bit 32 is set in either SUVd or SUVu" (9.8.1.1.2) --
+                // the one place the two directions interact. Bit 32 of our own
+                // SUVd is [`RENEG_REQUEST_SILENCE`]; bit 32 of the far end's
+                // SUVu is `Exchange::peer_asked_silence`, latched for the whole
+                // exchange because 9.8.1.1.4 tests the bit that *was* set.
+                //
+                // Re-tested on **every** symbol and not once at the start of the
+                // stage: the far end's bit arrives with its SUVu, which is after
+                // this end's first SUVd, so a branch taken at the first SUVd
+                // would never see it.
+                let silence = exchange.silence_requested() || exchange.peer_asked_silence();
+                if !silence {
+                    return self.exchange_step(source, exchange, cpd, now);
+                }
+                // 9.8.1.1.3: "shall then transmit SUVd sequences with bit 33
+                // set. After receiving an SUVu sequence with bit 33 set or E2u,
+                // the digital modem shall complete sending the current SUVd and
+                // then transmit Ed followed by silence."
+                if self.ed_asked {
+                    // The Ed is on the line; "followed by silence" is asked for
+                    // behind it, so the source starts the silence at the frame
+                    // boundary the Ed ends on and never repeats the Ed.
+                    if source.out() == Out::Ed && !self.silence_asked {
+                        self.silence_asked = true;
+                        source.change(Out::Silence);
+                    }
+                    return None;
+                }
+                // "complete sending the current SUVd and then transmit Ed": an
+                // SUVd that is only *pending* is not a current one -- the
+                // sequence in flight may still be TRN2d's countdown, and asking
+                // for the Ed there would displace the SUVd and never put one on
+                // the line at all.
+                // And it comes after an `SUVd'`, not before one: 9.8.1.1.3's
+                // order is "SUVd with bit 33 set" **then** "after receiving an
+                // SUVu with bit 33 set ... Ed".
+                if self.sent_ack_suvd && exchange.peer_acked() && source.out() == Out::Suvd {
+                    self.ed_asked = true;
+                    source.send(Out::Ed, source.ed_bits());
+                    return Some(Out::Ed);
+                }
+                if exchange.sending().is_some() {
+                    return None;
+                }
+                exchange.sequence_started(SequenceKind::Suv);
+                let bits = Suvd { silence: true, ack: true }.to_bits(INTERVALS);
+                source.send(Out::Suvd, bits);
+                self.sent_ack_suvd = true;
+                Some(Out::Suvd)
+            }
+            RenegStage::Silence => {
+                if source.out() != Out::Silence {
+                    // The Ed is still finishing: the silence was asked for when
+                    // it started, and the source takes it at the boundary.
+                    if !self.silence_asked {
+                        self.silence_asked = true;
+                        source.change(Out::Silence);
+                    }
+                    return None;
+                }
+                // 9.8.1.1.4: "If bit 32 of SUVu was set, the digital modem shall
+                // wait to receive SUVu with bit 32 clear." `peer_silence` follows
+                // the *latest* SUVu and not a latch, which is what makes this
+                // the wait the clause describes.
+                if exchange.peer_silence() {
+                    return None;
+                }
+                // The silent period is over and 9.6.1.1.2 starts again behind
+                // `Rt`: `Exchange::silence_ended` drops the acknowledge state
+                // bit 33 carried *inside* the silence, so that it means "your
+                // CP was received" again afterwards (Tables 27 and 31;
+                // `SILENCE_CLEARS_ACK_STATE`).
+                exchange.silence_ended();
+                // "After receiving SUVu with bit 32 clear, the digital modem shall
+                // transmit Rt for 384T followed by R-bar-t for 24T and SUVd."
+                self.stage = RenegStage::Rt;
+                source.change(Out::Rt);
+                Some(Out::Rt)
+            }
+            RenegStage::Rt => {
+                match source.out() {
+                    // The bar is 9.8.1.1.4's last R signal and the SUVd comes
+                    // straight after it; the Cp stage asks for it, and the
+                    // source holds it for the bar's 24T.
+                    Out::RtBar => {
+                        // 9.8.1.1.4: "...and SUVd. The digital modem shall then
+                        // proceed according to 9.6.1.1.2." The exchange is the
+                        // same one, so what changes is only that 9.8.1.1.3's Ed
+                        // is behind us.
+                        self.stage = RenegStage::Cp;
+                        self.ed_asked = false;
+                        self.step(source, exchange, cpd, now)
+                    }
+                    // Rt or R-bar-t: the source's own arm counts them out.
+                    Out::Rt | Out::Trn2d => None,
+                    // Still waiting for the silence to end on a frame boundary.
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// 9.8.1.1.2's other half and 9.6.1.1.2: the exchange's own order, which is
+    /// `SUVd` until the far end's `SUVu` arrives and one `CPd` after it.
+    fn exchange_step(
+        &mut self,
+        source: &mut Source,
+        exchange: &mut Exchange,
+        cpd: Option<&Cpd>,
+        now: u64,
+    ) -> Option<Out> {
+        if exchange.sending().is_some() {
+            return None;
+        }
+        let kind = exchange.next_sequence(now);
+        let ack = exchange.sequence_started(kind);
+        match kind {
+            SequenceKind::Suv => {
+                let bits = Suvd { silence: exchange.silence_requested(), ack }.to_bits(INTERVALS);
+                source.send(Out::Suvd, bits);
+                Some(Out::Suvd)
+            }
+            // 9.6.1.1.2: "After receiving an SUVu sequence, the digital modem
+            // shall transmit a single CPd".
+            SequenceKind::Cp => {
+                let Some(cpd) = cpd else {
+                    // Nothing to declare (9.6.1.1.2 allows the wait): keep the
+                    // SUVs going rather than send a CPd that says nothing.
+                    let bits = Suvd { silence: false, ack }.to_bits(INTERVALS);
+                    source.send(Out::Suvd, bits);
+                    return Some(Out::Suvd);
+                };
+                let mut cpd = cpd.clone();
+                cpd.ack = ack;
+                source.send(Out::Cpd, cpd.to_bits(INTERVALS));
+                Some(Out::Cpd)
+            }
+            SequenceKind::E => {
+                source.send(Out::Ed, source.ed_bits());
+                Some(Out::Ed)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2821,6 +3194,13 @@ pub struct Modem {
     /// 9.8.1.2.1's clamp has been done for this renegotiation, so that a run of
     /// `Ru` does not clamp and log once a period.
     ru_responder_started: bool,
+    /// 9.8.1.1.2 to 9.6.1.1.2: the tail after `R-bar-d`, from TRN2d's end to the
+    /// one `CPd`. `None` outside a rate renegotiation, and that is also the gate
+    /// on the far end's `SUVu` reader below.
+    reneg: Option<RenegTail>,
+    /// The symbol the far end's renegotiation `TRN2u` begins on, once `Ru` has
+    /// become `R-bar-u`. See [`TRN2U_AFTER_RU_BAR`].
+    reneg_trn2u_from: Option<u64>,
     /// The CPd this end will send, and the parameters behind it, which are also
     /// what the upstream decoder needs once B1u starts (6.4).
     cpd: Option<Cpd>,
@@ -3089,6 +3469,8 @@ impl Modem {
             up_finder: None,
             ru_detector: RuDetector::new(),
             ru_responder_started: false,
+            reneg: None,
+            reneg_trn2u_from: None,
             cpd: None,
             parameters: None,
             cpu: None,
@@ -3994,6 +4376,12 @@ impl Modem {
     /// 9.6.1.1.5-6 B1d out; B1u in, then data mode
     /// ```
     fn phase4_out(&mut self) {
+        // 9.8's tail is not Phase 4's: 9.6.1.1.5's B1d is not where a
+        // renegotiation ends, and the exchange it runs is Context::Renegotiation.
+        if self.reneg.is_some() {
+            self.reneg_out();
+            return;
+        }
         // 9.6.1.1.1: TRN2d "for at least 2040T" and then the exchange.
         if self.exchange.is_none() {
             if !self.source.trn2d_done() {
@@ -5052,6 +5440,15 @@ impl Modem {
             self.b1u_symbol(symbol);
             return;
         }
+        // 9.8.1.1.2: a rate renegotiation is in progress, so the far end is out
+        // of data mode as well and what it sends is its TRN2u and then SUVu.
+        // Reading it is the same reader and finder Phase 3 uses, and this is the
+        // one place outside Phase 3 that either is fed. The gate is the
+        // renegotiation itself: no `Ru`, no tail, no feed.
+        if self.reneg.is_some() || self.reneg_trn2u_from.is_some() {
+            self.reneg_symbol(symbol);
+            return;
+        }
         let Some(reader) = self.upstream.as_mut() else { return };
         {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -5196,13 +5593,140 @@ impl Modem {
         // 24T of R-bar-d takes its place at the frame boundary `Source` waits
         // for (`pending_needs_frame_boundary`). TRN2d in a renegotiation is
         // capped by 9.8.1.1.2's "up to 16008T" rather than the 2040T of
-        // 9.6.1.1.1, and the exchange that follows it is the renegotiation's.
+        // 9.6.1.1.1, and that cap is a **countdown**: without it the TRN2d arm's
+        // exit condition never fires and TRN2d runs on for ever -- `docs/214`
+        // §6 gap 1. The SUVd after it is asked for by [`RenegTail`], which also
+        // owns 9.6.1.1.2's exchange.
+        self.source.bound_trn2d(TRN2D_MOST);
         self.source.change(Out::Rd);
+        let (tail, exchange) = RenegTail::new(self.settings.round_trip, FS);
+        self.reneg = Some(tail);
+        // The exchange 9.6.1.1.2 is entered from, and the one the far end's
+        // SUVu is reported to while the tail runs.
+        self.exchange = Some(exchange);
+        // 9.8.2.1.1 and 9.8.2.2.3: the far end's TRN2u begins where its 24T of
+        // R-bar-u ends, and this end's own detector is the fiducial for it.
+        self.reneg_trn2u_from = Some(self.now + TRN2U_AFTER_RU_BAR);
+        // Out of data mode: 9.8.1.2.1 clamped circuit 104, so the B1u decoder is
+        // not reading data any more, and the finder that reads the far end's
+        // SUVu is armed here -- and only here. A call with no `Ru` in it never
+        // reaches this function, which is what keeps the data path identical.
+        self.upstream_data = None;
+        self.upstream = None;
+        self.up_finder = None;
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = false;
+        self.e2u_zeroes = 0;
+        self.b1u_pending = false;
+        self.b1u_deadline = None;
+        self.b1u_search = None;
         self.note(
             "V.92: 9.8.1.2.2 -- Ru-to-R-bar-u seen; sending Rd for 384T and R-bar-d for 24T \
-             from the next data frame boundary, then 9.8.1.1.2's TRN2d and SUVd"
+             from the next data frame boundary, then 9.8.1.1.2's TRN2d (up to 16008T) and SUVd"
                 .to_string(),
         );
+    }
+
+    /// 9.8.1.1.2 to 9.6.1.1.2, one symbol: the renegotiation's own tail.
+    ///
+    /// Separate from [`Self::phase4_out`] because 9.8's exchange is
+    /// [`Context::Renegotiation`] and because what follows Ed is silence and
+    /// then `Rt` rather than data mode. Everything before the tail -- `Rd`,
+    /// `R-bar-d`, `TRN2d`, `Rt`, `R-bar-t` -- is on [`Source`]'s own arms, so
+    /// what this drives is only the sequence-boundary decisions.
+    fn reneg_out(&mut self) {
+        let now = self.now;
+        let asked;
+        let done;
+        {
+            let Self { source, reneg, exchange, cpd, .. } = self;
+            let (Some(tail), Some(exchange)) = (reneg.as_mut(), exchange.as_mut()) else {
+                return;
+            };
+            asked = tail.push(source, exchange, cpd.as_ref(), now);
+            done = tail.is_done();
+        }
+        match asked {
+            // 9.6.1.1.2: "After receiving an SUVu sequence, the digital modem
+            // shall transmit a single CPd".
+            Some(Out::Cpd) => {
+                let drn = self.cpd.as_ref().map_or(0, |cpd| cpd.drn);
+                self.note(format!(
+                    "V.92: 9.6.1.1.2 -- the renegotiation's single CPd, drn {drn}"
+                ));
+            }
+            // 9.8.1.1.4: "After receiving SUVu with bit 32 clear, the digital
+            // modem shall transmit Rt for 384T followed by R-bar-t for 24T".
+            Some(Out::Rt) => self.note(
+                "V.92: 9.8.1.1.4 -- SUVu with bit 32 clear; sending Rt for 384T and \
+                 R-bar-t for 24T, then SUVd"
+                    .into(),
+            ),
+            _ => {}
+        }
+        if done {
+            self.finish_renegotiation();
+        }
+    }
+
+    /// 9.6.1.1.4's `Ed` was the last signal of the renegotiation: back to B1d,
+    /// and re-arm the search that finds the far end's next B1u.
+    ///
+    /// The receiver, not the transmitter, is what this has to put right. Out of
+    /// data mode this end dropped the B1u decoder (`ru_ended`), so B1u's return
+    /// is the Phase 4 acquisition again: 9.6.1.1.6's E2u run, and B1u's frame
+    /// interval 0 on the symbol after it. `awaiting_e2u` and `b1u_pending` are
+    /// what `begin_data` arms, and they are armed here for the same reason.
+    fn finish_renegotiation(&mut self) {
+        self.reneg = None;
+        self.exchange = None;
+        self.reneg_trn2u_from = None;
+        self.ru_detector.reset();
+        self.ru_responder_started = false;
+        self.upstream_data = None;
+        self.upstream = Some(Trn2uReader::new(self.upstream_size));
+        self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+        self.upstream_drop_until = 0;
+        self.awaiting_e2u = true;
+        self.e2u_zeroes = 0;
+        self.b1u_pending = true;
+        self.b1u_deadline = Some(self.now + (B1U_WAIT * FS) as u64);
+        self.source.change(Out::B1d);
+        self.note("V.92: 9.8 rate renegotiation over -- B1d again".into());
+    }
+
+    /// One symbol of the far end's side of a renegotiation.
+    ///
+    /// This is the feed `docs/213` §6 named as missing: `up_finder` was fed in
+    /// Phase 3 and never again, so a renegotiation's `SUVu` had no reader. It is
+    /// legitimate here because 9.8.1.2.1 has taken this end *out of data mode* --
+    /// the far end's `TRN2u` and `SUVu` are the only signals on its upstream --
+    /// and it is gated on [`Self::reneg`], which only `ru_ended` sets.
+    fn reneg_symbol(&mut self, symbol: Symbol) {
+        if let Some(at) = self.reneg_trn2u_from {
+            if self.now < at {
+                return;
+            }
+            // 8.7.6: "The scrambler shall be reset at the beginning of TRN2u" --
+            // so the reader is built *on* its first symbol, as Phase 4 builds it
+            // on TRN2u's first symbol too. One symbol either way and the
+            // descrambler sits on the wrong phase and no `SUVu` comes out.
+            self.reneg_trn2u_from = None;
+            self.upstream = Some(Trn2uReader::new(self.upstream_size));
+            self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+            self.upstream_drop_until = 0;
+            self.note(format!("V.92: the far end's renegotiation TRN2u begins at {}", self.now));
+        }
+        let level = symbol.value;
+        let Some(reader) = self.upstream.as_mut() else { return };
+        let bits: Vec<bool> = reader.feed(level).into_iter().collect();
+        for bit in bits {
+            if let Some(finder) = self.up_finder.as_mut()
+                && let Some(family) = finder.feed(bit)
+            {
+                self.up_sequence(family);
+            }
+        }
     }
 
     /// The two constellations V.90 8.6.4 separates `Rd` from `Rt` by.
@@ -7499,6 +8023,22 @@ mod conformance_158 {
             .collect()
     }
 
+    /// How many *sequences* of `want` went out: the stream is one codeword a
+    /// symbol, and a CPd is four hundred and eighty of them.
+    fn runs(stream: &[(Out, f64)], want: Out) -> usize {
+        let mut count = 0;
+        let mut in_run = false;
+        for (out, _) in stream {
+            if *out == want && !in_run {
+                count += 1;
+                in_run = true;
+            } else if *out != want {
+                in_run = false;
+            }
+        }
+        count
+    }
+
     fn only(stream: &[(Out, f64)], want: Out) -> Vec<f64> {
         stream.iter().filter(|(out, _)| *out == want).map(|(_, level)| *level).collect()
     }
@@ -8154,7 +8694,8 @@ mod conformance_158 {
 
     /// 9.8.1.1.1, 9.8.1.2.2: "transmit signal `Rd` for **384T** and then
     /// `R-bar-d` for **24T**", and V.90 8.6.4's "`R` consists of 4 repetitions
-    /// of the 6-symbol sequence ... with the sign pattern - - - + + -".
+    /// of the 6-symbol sequence ... with the sign pattern - - - + + +"
+    /// (`v90.txt:1835`).
     #[test]
     fn rd_is_384t_then_rd_bar_is_24t_with_the_four_repetition_structure() {
         let mut source = renegotiating_source();
