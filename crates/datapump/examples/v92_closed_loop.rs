@@ -302,6 +302,22 @@ struct Settings {
     /// post-cursor, so the depth axis is swept without handing the loop the
     /// answer (`docs/255` S3).
     depth: usize,
+    /// `docs/261`: the level error the **generator** puts on the far end's
+    /// emitted level, in per cent of `1/G`.
+    ///
+    /// This is the far end's own realisation error, applied inside `transmit`
+    /// after every parameter has been applied: the far end is told a level and
+    /// puts `(1 + far_level/100)` times it on the line. The loop is not told --
+    /// it sees the stream and estimates from it, and the receiver's only lever
+    /// is the scale `K` it measures (`--slice est`). V.92 has no field that
+    /// re-commands the level in data mode -- `G` went out once in CPd bits
+    /// 35:50 (`v92.txt:1824-1826`) -- so with `--hold-level` the commanded
+    /// level stays at the design's `1/G` and the far end's realisation error
+    /// persists for the whole call.
+    far_level: f64,
+    /// Whether our end may re-command the far end's level. `false` is the
+    /// physical case.
+    hold_level: bool,
 }
 
 /// How the chain turns the far end's fractional instant and the CO's sampling
@@ -340,6 +356,8 @@ fn parse() -> Settings {
         freeze: Vec::new(),
         landing: false,
         depth: farend::EQ_DEPTH,
+        far_level: 0.0,
+        hold_level: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -378,6 +396,8 @@ fn parse() -> Settings {
             }
             "--landing" => s.landing = true,
             "--depth" => s.depth = value().parse().expect("depth"),
+            "--far-level" => s.far_level = value().parse().expect("far-level"),
+            "--hold-level" => s.hold_level = true,
             other => panic!("unknown option {other}"),
         }
     }
@@ -393,6 +413,7 @@ fn transmit(
     tap: f64,
     law: Law,
     instant: Instant,
+    far: f64,
 ) -> (Vec<f64>, Vec<i32>) {
     let sampled = match instant {
         Instant::Single if params.delay != 0.0 => {
@@ -409,6 +430,11 @@ fn transmit(
             if timing == 0.0 { placed } else { farend::shift_centred(&placed, timing) }
         }
     };
+    // `docs/261`: the far end's own realisation error on the level it was told,
+    // applied by the *generator*, after every parameter and before the channel.
+    // `far == 1.0` is bit-for-bit the old path.
+    let sampled: Vec<f64> =
+        if far == 1.0 { sampled } else { sampled.iter().map(|&v| v * far).collect() };
     let mut continuous = Vec::with_capacity(sampled.len());
     let mut previous = 0.0;
     for &x in &sampled {
@@ -627,6 +653,9 @@ fn main() {
             2
         };
 
+        // `docs/261`: how much higher the far end's DAC sits than the level it
+        // was told, as a multiplier on top of every `FarEndParams::level_lsb`.
+        let far = 1.0 + s.far_level / 100.0;
         let (parameters, out, ideal_trn, b1u_at, b1u_etas) =
             stream(&Settings { drn, ..s.clone() });
         // `--lu 0` is 8.8.3's own operating point: the level at which one unit
@@ -643,7 +672,7 @@ fn main() {
             "closed" => {
                 // Pass 1: the far end is on the line it chose.
                 let start = FarEndParams::bypass(s.lu);
-                let (_, first) = transmit(&out, &start, s.timing, s.tap, s.law, s.instant);
+                let (_, first) = transmit(&out, &start, s.timing, s.tap, s.law, s.instant, far);
                 let observed: Vec<f64> = first.iter().map(|&q| f64::from(q)).collect();
                 let e = farend::estimate(
                     &ideal_trn,
@@ -675,6 +704,14 @@ fn main() {
                 let mut frozen = correction;
                 if s.depth != farend::EQ_DEPTH {
                     frozen.eq = farend::EqTaps::inverse_of_depth(frozen.eq.taps[1].abs(), s.depth);
+                }
+                if s.hold_level {
+                    // The level was named once (`G`, CPd 35:50) and no field in
+                    // data mode re-commands it: the far end's realisation error
+                    // is measured, not removed. This is not `--freeze level`,
+                    // which puts the *answer* back; here the command is `1/G`
+                    // and the answer is unknown to the loop.
+                    frozen.level_lsb = s.lu;
                 }
                 for name in &s.freeze {
                     match name.as_str() {
@@ -723,7 +760,8 @@ fn main() {
         };
         let _ = estimated;
 
-        let (continuous, codewords) = transmit(&out, &used, s.timing, s.tap, s.law, s.instant);
+        let (continuous, codewords) =
+            transmit(&out, &used, s.timing, s.tap, s.law, s.instant, far);
         let rms = (continuous.iter().map(|v| v * v).sum::<f64>() / continuous.len() as f64).sqrt();
         let peak = continuous.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let out_rms = (out.iter().map(|v| v * v).sum::<f64>() / out.len() as f64).sqrt();
@@ -741,6 +779,13 @@ fn main() {
         // half-gap's worth of scale and more.
         let k = match s.slice.as_str() {
             "auto" => Some(used.level_lsb / s.lu),
+            // `docs/261`: the scale our *own* estimator measured off TRN1u, in
+            // units of `1/G` -- the `K` a receiver builds its table at
+            // (`docs/114` R4). Nothing here reads `far`.
+            "est" => Some(match estimated {
+                Some(e) => e.level * parameters.gain,
+                None => 1.0,
+            }),
             "one" => None,
             other => Some(other.parse().expect("a scale")),
         };
@@ -753,7 +798,7 @@ fn main() {
             "RUNG drn={drn} rate={} lc={} points={points} gap={gap:.0} leastGap={least} \
              eq=[{}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
              rms={rms:.1} peak={peak:.0} \
-             xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.3} \
+             xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.4} farlev={flev:.2} \
              b1u={ones}/{bits}={pct:.1}% land={land:.3} \
              G9={g9:.9} energy={energy:.6} invG={invg:.3}",
             rung.rate,
@@ -771,6 +816,7 @@ fn main() {
             bin = bins.pct(),
             adj = if bins.aligned { bins.adjacent.to_string() } else { "unaligned".to_owned() },
             kb = bins.k,
+            flev = used.level_lsb * far,
             g9 = parameters.gain,
             energy = datapump::v92::sent_prefilter_energy(&parameters.filters.z2),
             invg = 1.0 / parameters.gain,
@@ -788,7 +834,7 @@ fn main() {
             drn,
             lc: rung.lc,
             min_gap_lsb: min_gap,
-            level_lsb: used.level_lsb,
+            level_lsb: used.level_lsb * far,
             gain: parameters.gain,
             bin: bins.pct() / 100.0,
             crossing: crossing / 100.0,
