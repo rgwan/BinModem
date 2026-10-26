@@ -4757,6 +4757,15 @@ impl Modem {
             modem.note(format!("V.92: L1 probing retained: {}", reading.summary()));
             modem.note(format!("V.92: L1 probing per tone: {}", reading.compact()));
         }
+        // `BINMODEM_V92_MAX_DRN` lifts the upstream cap for this call and this
+        // call only (`rung::cap_override`). It is off by default and the
+        // constant it lifts does not move, so a call that has it set is a
+        // measurement above the cap rather than a working configuration --
+        // which is a fact a transcript has to state at the top, in words that
+        // cannot be mistaken for the ordinary cap line further down.
+        if let Some(drn) = crate::v92::rung::cap_override() {
+            modem.note(crate::v92::rung::cap_override_line(drn));
+        }
         modem
     }
 
@@ -6419,7 +6428,7 @@ impl Modem {
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
             decision.measured.bound(),
-            crate::v92::rung::MEASURED_WORKING_MAX_DRN,
+            crate::v92::rung::effective_max_drn(),
             decision.mask,
             // Which criterion took the ceiling above, by name, and what the
             // mean-square screen would have said instead (`docs/277` sec 1).

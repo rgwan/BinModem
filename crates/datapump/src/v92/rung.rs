@@ -710,15 +710,76 @@ pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
 /// it.
 pub const MEASURED_WORKING_MAX_DRN: u8 = 1;
 
-/// The mask [`MEASURED_WORKING_MAX_DRN`] permits: bit k for drn k + 1, every
-/// rung at or below the cap.
+/// The one variable that lifts [`MEASURED_WORKING_MAX_DRN`] for **one call**,
+/// and the only way a call may spend a rung above it.
+///
+/// The constant is what the bench has carried payload at (`docs/266` sec 4,
+/// `docs/271` sec 1), and it does not move: a call made with this variable set
+/// is a **measurement above the cap**, not a working configuration, and
+/// `docs/288` is the one call made with it. Every other branch of the decision
+/// is left exactly as it is -- the four-point level, one `LADDER` line per
+/// rung, the instruments' grant, the cap line -- so the call differs from a
+/// canonical one in the cap and in nothing else. `V92_UP_RATE` is *not* this
+/// knob: it pins the provisional `CPd` rung with no measurement consulted and
+/// skips the ladder altogether (`digital.rs:6127-6148`), which is a different
+/// experiment.
+///
+/// Off unless the variable names a rung in `1..=19` that is **above** the cap:
+/// unset, unparsable, out of range, or at-or-below the cap all leave the call
+/// under [`MEASURED_WORKING_MAX_DRN`], the same rule `V92_UP_RATE` follows for
+/// a bench mistake. It is impossible to leave on by accident in the way that
+/// matters: [`measured_mask`] is what the protecting test
+/// (`the_granted_rung_never_exceeds_the_measured_maximum`) asserts is `1`, so a
+/// shell that still has the variable set fails the suite rather than quietly
+/// grading an above-cap tree.
 #[must_use]
-pub fn measured_mask() -> u32 {
-    if MEASURED_WORKING_MAX_DRN >= UP_RATES as u8 {
+pub fn cap_override() -> Option<u8> {
+    let drn = std::env::var(MAX_DRN_VAR).ok()?.trim().parse::<u8>().ok()?;
+    (1..=UP_RATES as u8).contains(&drn).then_some(drn).filter(|&drn| drn > MEASURED_WORKING_MAX_DRN)
+}
+
+/// The name [`cap_override`] reads.
+pub const MAX_DRN_VAR: &str = "BINMODEM_V92_MAX_DRN";
+
+/// The cap this call runs under: [`MEASURED_WORKING_MAX_DRN`], or the rung
+/// [`cap_override`] names when it names one above the cap.
+#[must_use]
+pub fn effective_max_drn() -> u8 {
+    cap_override().unwrap_or(MEASURED_WORKING_MAX_DRN)
+}
+
+/// The mask a cap of `cap` permits: bit k for drn k + 1, every rung at or
+/// below `cap`.
+#[must_use]
+fn mask_to(cap: u8) -> u32 {
+    if cap >= UP_RATES as u8 {
         JA_MASK_ALL
     } else {
-        (1u32 << MEASURED_WORKING_MAX_DRN) - 1
+        (1u32 << cap) - 1
     }
+}
+
+/// The mask this call permits: [`effective_max_drn`]'s, which is
+/// [`MEASURED_WORKING_MAX_DRN`]'s unless [`MAX_DRN_VAR`] lifted it.
+#[must_use]
+pub fn measured_mask() -> u32 {
+    mask_to(effective_max_drn())
+}
+
+/// The line that says a call is running above the cap, printed once at the top
+/// of the note list (`Modem::new`) so that a lifted-cap call cannot be mistaken
+/// for a normal one in a transcript, a `line.model` or a batch.
+#[must_use]
+pub fn cap_override_line(drn: u8) -> String {
+    format!(
+        "V.92: !!! CAP LIFTED !!! {MAX_DRN_VAR} = {drn} for THIS CALL ONLY: the live rung may go up to \
+         drn {drn} ({} bit/s) instead of drn {MEASURED_WORKING_MAX_DRN} ({} bit/s). \
+         MEASURED_WORKING_MAX_DRN is still {MEASURED_WORKING_MAX_DRN} and is unchanged; no bench call has \
+         carried payload above drn {MEASURED_WORKING_MAX_DRN}, so this call is a MEASUREMENT ABOVE THE CAP \
+         and is not a working configuration. Unset {MAX_DRN_VAR} before any other call.",
+        up_rate(drn),
+        up_rate(MEASURED_WORKING_MAX_DRN)
+    )
 }
 
 /// What the live rung decision may spend: what the instruments granted, cut to
@@ -757,7 +818,14 @@ pub fn highest_rung(mask: u32) -> Option<u8> {
 /// not what the call gets.
 #[must_use]
 pub fn cap_line(granted: u32) -> String {
-    let capped = cap_to_measured(granted);
+    cap_line_for(granted, cap_override())
+}
+
+/// [`cap_line`] with the override named rather than read, so that the lifted
+/// line can be tested without a process-global environment.
+fn cap_line_for(granted: u32, lift: Option<u8>) -> String {
+    let cap = lift.unwrap_or(MEASURED_WORKING_MAX_DRN);
+    let capped = granted & mask_to(cap);
     let would = match highest_rung(granted) {
         Some(drn) => format!("drn {drn} ({})", up_rate(drn)),
         None => "nothing".to_string(),
@@ -767,9 +835,17 @@ pub fn cap_line(granted: u32) -> String {
         None => "nothing -- drn 1 is pinned".to_string(),
     };
     let taken = granted.count_ones() - capped.count_ones();
-    let head = format!(
-        "V.92: capped: MEASURED_WORKING_MAX_DRN = {MEASURED_WORKING_MAX_DRN} takes the live rung from {would} to {got} ({taken} rung(s) removed); "
-    );
+    let head = match lift {
+        Some(drn) => format!(
+            "V.92: !!! CAP LIFTED !!! {MAX_DRN_VAR} = {drn}: this call may spend up to drn {drn} \
+             ({}) against MEASURED_WORKING_MAX_DRN = {MEASURED_WORKING_MAX_DRN}, which is UNCHANGED; \
+             the cap leaves the live rung at {got} rather than {would} ({taken} rung(s) removed); ",
+            up_rate(drn)
+        ),
+        None => format!(
+            "V.92: capped: MEASURED_WORKING_MAX_DRN = {MEASURED_WORKING_MAX_DRN} takes the live rung from {would} to {got} ({taken} rung(s) removed); "
+        ),
+    };
     let why = format!(
         "the instruments above granted mask {granted:#07x} and granted it on the level, which is not what fails here: "
     );
@@ -2014,6 +2090,50 @@ mod tests {
         // And nothing granted stays nothing: the cap does not invent a rung.
         assert_eq!(cap_to_measured(0), 0);
         assert_eq!(highest_rung(0), None);
+    }
+
+    /// The per-call lift (`docs/288`): `BINMODEM_V92_MAX_DRN` moves the cap the
+    /// **call** runs under and not the constant, and a lift to `drn 2` permits
+    /// `drn 1` and `drn 2` and nothing else.
+    #[test]
+    fn the_override_lifts_the_mask_for_one_call_and_not_the_constant() {
+        assert_eq!(MEASURED_WORKING_MAX_DRN, 1, "the constant is not the knob");
+        assert_eq!(mask_to(MEASURED_WORKING_MAX_DRN), 1);
+        assert_eq!(mask_to(2), 0b11);
+        assert_eq!(mask_to(3), 0b111);
+        assert_eq!(mask_to(UP_RATES as u8), JA_MASK_ALL);
+        // `drn 2` on 6.1's ladder is 25 333 bit/s, not 26 400: the step is
+        // 8000/6 and the printed rate is the floor of it (`v92/mod.rs:118-123`).
+        assert_eq!(up_rate(2), 25_333);
+        // The lifted line says so loudly, and says the constant did not move.
+        let granted = JA_MASK_ALL;
+        let lifted = cap_line_for(granted, Some(2));
+        for wanted in [
+            "CAP LIFTED",
+            "BINMODEM_V92_MAX_DRN = 2",
+            "MEASURED_WORKING_MAX_DRN = 1",
+            "UNCHANGED",
+            "to drn 2",
+            "17 rung(s) removed",
+        ] {
+            assert!(lifted.contains(wanted), "{lifted} does not carry {wanted}");
+        }
+        // The banner `Modem::new` prints names the same two numbers.
+        let banner = cap_override_line(2);
+        for wanted in ["CAP LIFTED", "THIS CALL ONLY", "25333", "MEASURED_WORKING_MAX_DRN is still 1"] {
+            assert!(banner.contains(wanted), "{banner} does not carry {wanted}");
+        }
+        // With nothing set the line is the one this ticket did not change.
+        assert!(cap_line_for(granted, None).contains("capped: MEASURED_WORKING_MAX_DRN = 1"));
+        // A lifted cap is still a cap: no bit above it survives any mask.
+        for mask in 0..(1u32 << UP_RATES) {
+            assert_eq!(
+                (mask & mask_to(2)) & !0b11,
+                0,
+                "mask {mask:#07x} carried a rung above the lifted cap"
+            );
+        }
+        assert_eq!(granted & mask_to(2), 0b11);
     }
 
     /// A grant's honesty is its resolution: the target is `1e-7` and a 2 448
