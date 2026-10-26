@@ -1931,6 +1931,34 @@ impl Modem {
         // reason on its own.
         let wants_ec = (self.want_error_control || self.role == Role::Answering)
             && !matches!(self.pump, Some(Pump::Bell103(_)));
+        // 9.8: a rate renegotiation takes the data mode down and puts it back
+        // up again. If the terminal has not been told the call is up yet --
+        // the first data mode's CONNECT is still held while V.42's detection
+        // phase runs -- then the data mode that stack was negotiating over no
+        // longer exists: the line carries `SUVd`/`CPd` until 9.6.1.1.5's
+        // `B1d`, the detection phase can only fail, and the CONNECT it was
+        // holding would be released for a call that is mid-exchange. Withdraw
+        // both. 9.6.1.1.5 puts `Status::Connected` back when the renegotiation
+        // ends, and the arm below builds the stack and announces then.
+        //
+        // A call that was already connected before the renegotiation has no
+        // `announce` left to withdraw and is untouched, which is what 9.8 asks
+        // for: that call stays up throughout.
+        if self.announce.is_some()
+            && matches!(self.pump.as_ref().map(Pump::status), Some(Progress::Retraining))
+        {
+            if std::env::var_os("V92_EC_TRACE").is_some() {
+                eprintln!(
+                    "V92EC withdrawn at {:.2}s: a renegotiation took the data mode down \
+                     before the call was announced",
+                    self.call_samples as f64 / self.fs
+                );
+            }
+            self.announce = None;
+            self.ec = None;
+            self.recovered.clear();
+            return;
+        }
         // Announced but no stack yet: the CONNECT went out before the pump
         // reported connected, and returning here would skip the arm below that
         // builds the error-control stack. A V.92 call does exactly that -- its

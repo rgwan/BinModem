@@ -6392,6 +6392,17 @@ impl Modem {
         self.b1u_deadline = None;
         self.b1u_search = None;
         self.data_loss = None;
+        // 9.8.1.2.1 clamps circuit 104 and takes the data mode down: from here
+        // to 9.6.1.1.5's `B1d` the line carries `Rd`, `TRN2d`, `SUVd` and
+        // `CPd`, and there is no data mode to be connected to. `begin_data`
+        // latched `Status::Connected` at the first data mode (`:5874`) and
+        // nothing used to un-latch it, so the pump went on reporting a
+        // connected call through the whole of 9.8: the modem above built a
+        // V.42 stack over a line that had just stopped carrying B1u, its
+        // detection phase failed, and the CONNECT it had been holding was
+        // released for a call that never got past `SUVd`. 9.6.1.1.5's
+        // `begin_data` sets `Connected` again, and that one is real.
+        self.status = Status::Phase4;
         self.note(
             "V.92: 9.8.1.2.2 -- Ru-to-R-bar-u seen; sending Rd for 384T and R-bar-d for 24T \
              from the next data frame boundary, then 9.8.1.1.2's TRN2d (up to 16008T) and SUVd"
@@ -10436,6 +10447,60 @@ mod conformance_158 {
         assert_eq!(TRN2U_AFTER_RU_BAR, (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64);
     }
 
+    /// 9.8.1.2.1: a rate renegotiation takes the data mode down, so the pump is
+    /// **not** connected while it runs.
+    ///
+    /// This is the spurious CONNECT (docs/227 §3, docs/230 §1). `begin_data`
+    /// latches `Status::Connected` at the first data mode and `ru_ended` used
+    /// to leave it set, so `Pump::status` reported `Progress::Connected` for
+    /// the whole of 9.8. The modem above built a V.42 stack over a line that
+    /// had stopped carrying B1u, its detection phase found no ODP and gave up,
+    /// and the CONNECT it had been holding was released -- for a call whose
+    /// line had only ever reached `SUVd`. It goes out on the bench as
+    /// `CONNECT 24000` followed by `0 octets`, which is a lie that masks every
+    /// failure underneath it.
+    ///
+    /// Fails on `e3d1114`: there the status is still `Connected` here.
+    #[test]
+    fn nine_eight_takes_the_digital_modem_out_of_the_connected_state() {
+        // A first data mode, the one whose CONNECT the modem above is holding
+        // while V.42's detection phase runs.
+        let mask = |points: std::ops::RangeInclusive<u8>| {
+            points.fold(0u128, |m, u| m | 1 << u)
+        };
+        let cpu = Cp {
+            data_mode: true,
+            drn: 18,
+            intervals: [0, 1, 0, 1, 0, 1],
+            constellations: vec![mask(3..=95), mask(3..=88)],
+            ..Cp::default()
+        };
+        let mut modem = Modem::default();
+        modem.cpu = Some(cpu);
+        modem.begin_data();
+        assert!(modem.downstream.is_some(), "no B1d mapping was built from that CPu");
+        assert!(
+            matches!(modem.status(), Status::Connected { .. }),
+            "no first data mode: nothing to be un-latched from"
+        );
+
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.status(),
+            Status::Phase4,
+            "9.8.1.2.1: the data mode was torn down, so the pump must not report \
+             `Connected` through the renegotiation -- the modem above releases \
+             the held CONNECT on it"
+        );
+    }
+
+
     /// 9.8.1.2.3 -> 9.8.1.1.2 -> 9.6.1.1.2 -> 9.6.1.1.4's `Ed` -> 9.6.1.1.5's
     /// `B1d`: a renegotiation the far end starts with `Ru` ends in data mode
     /// again.
@@ -10577,6 +10642,14 @@ mod conformance_218 {
 // docs/218: 8.6.4's three level sources, kept apart
 // ---------------------------------------------------------------------
 
+/// Every level `count` symbols of the source produce, after asking for
+/// `out` (`Source::arm_renegotiation` first where 9.8's codewords matter).
+fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
+    source.change(out);
+    (0..count).map(|_| source.next()).collect()
+}
+
+
 /// Settings at a named U_INFO, which is what `Ri` is emitted at.
 fn settings_uinfo(uinfo: u8) -> Settings {
     Settings {
@@ -10632,13 +10705,6 @@ fn in_data_mode(cpu: Cp) -> Modem {
     modem.begin_data();
     assert!(modem.downstream.is_some(), "no B1d mapping was built from that CPu");
     modem
-}
-
-/// Every level `count` symbols of the source produce, after asking for
-/// `out` (`Source::arm_renegotiation` first where 9.8's codewords matter).
-fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
-    source.change(out);
-    (0..count).map(|_| source.next()).collect()
 }
 
 /// **`Rd`** — V.90 8.6.4 (`v90.txt:1841-1842`): "**Rd** denotes signal R
