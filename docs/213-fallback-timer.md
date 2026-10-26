@@ -140,9 +140,9 @@ would not be logged — see the paths that would have to fire and cannot (§3.2)
 1. **The receiver stops listening for control sequences the moment data mode starts.**
    `crates/datapump/src/v92/digital.rs:4647` — after the `b1u_search` branch,
    `if self.upstream_data.is_some() { … self.b1u_symbol(symbol); return; }` — so the sequence finder
-   (`self.up_finder`, `digital.rs:4686`) is never fed again. Any Ru, TRN2u, CPu or CPus the far end
+   (`self.up_finder`, `digital.rs:4684`) is never fed again. Any Ru, TRN2u, CPu or CPus the far end
    sends after B1u is decoded as payload. [verified]
-2. **CPus is parsed and dropped.** `digital.rs:5158`: `// CPus is a rate renegotiation's short form
+2. **CPus is parsed and dropped.** `digital.rs:5157`-`5159`: `// CPus is a rate renegotiation's short form
    (Table 24); training never sees one.` / `CpFamily::Cpus(_) | CpFamily::Cpt(_) => {}` — the one
    message this layer could recognise exists in our parser and does nothing. [verified code, quoted
    comment; its claim about Table 24 is loose — §9.8 carries full CPu/CPd and CPus is the
