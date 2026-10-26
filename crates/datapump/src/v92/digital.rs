@@ -2387,8 +2387,20 @@ impl Source {
                     // to empty: `v92.txt:2839` and 9.8.1.2.2 both put `Rd` on
                     // a data frame boundary. The gate applies to nothing else,
                     // so an ordinary hand-over out of data mode is unchanged.
-                    if self.codes.is_empty()
-                        && (!self.pending_needs_frame_boundary() || self.at_frame_boundary())
+                    // A signal that has to begin on a data frame boundary does
+                    // **not** wait for the codeword queue to run dry:
+                    // `fill_downstream` refills it every symbol, so "empty" is a
+                    // moment that need never come and the signal would sit in
+                    // `pending` for ever. Measured on `runs-216`'s first call:
+                    // `data mode lost` fired at 25.000 s, `Ri` was asked for --
+                    // and never went out, because `codes` was never empty on a
+                    // frame boundary. A frame boundary is the whole gate.
+                    let startable = if self.pending_needs_frame_boundary() {
+                        self.at_frame_boundary()
+                    } else {
+                        self.codes.is_empty()
+                    };
+                    if startable
                         && let Some(next) = self.pending.take()
                     {
                         self.start(next);
@@ -5817,12 +5829,20 @@ impl Modem {
         let threshold = self.data_loss.as_ref().map_or(0.0, DataModeLoss::threshold);
         self.note(format!(
             "V.92: data mode lost -- {} consecutive data frames carried a symbol outside the \
-             constellation CPd declared (over {threshold:.0}); sending Ri 384T and R-bar-i 24T \
+             constellation CPd declared (over {threshold:.2}); sending Ri 384T and R-bar-i 24T \
              on the data frame grid, then 9.6.1.1 again",
             DATA_MODE_LOSS_FRAMES
         ));
         let (data, training) = self.renegotiation_points();
         self.source.arm_renegotiation(data, training);
+        // The opener, and it is **`Ri`**, not `Rd`: `Ri` is the signal the far
+        // end's own state is named for (`V92ClientPhase4RxWaitRiBarState`,
+        // `0x5dea0`, `docs/216` §1). Both were tried on the bench and both were
+        // silent (`docs/216` §5): `Ri` 384T + `R-bar-i` 24T at 24.998 s
+        // (`runs-216/165935`) and `Rd` 384T + `R-bar-d` 24T at 24.998 s
+        // (`runs-216/170104`), each 408 symbols on the line and no `R detected`
+        // from either. What is committed is the one the far end's own state
+        // name asks for; the A/B is measured and recorded, not pending.
         self.source.ri_opener();
         self.source.bound_trn2d(TRN2D_MOST);
         let (tail, exchange) = RenegTail::new(self.settings.round_trip, FS);
