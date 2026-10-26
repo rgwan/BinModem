@@ -5838,8 +5838,40 @@ impl Modem {
     /// The downstream's mapping comes from the analogue modem's CPu, which is
     /// the same table V.90's data mode reads (V.92 8.8.1 points at V.90 8.6.1),
     /// and the upstream's decoder from this end's own CPd.
+    ///
+    /// Phase 4's `Ed` is only **one** of the two ways into 9.6.1.1.5, and this
+    /// function is that way's name for it: the body is
+    /// [`Self::enter_data_mode`], which 9.8's renegotiation calls too. Two
+    /// copies of "the data mode is up" is exactly what lost the far end's
+    /// `LAPM` after a renegotiation -- `ru_ended` un-latched the state (9.8.1.2.1
+    /// takes the data mode down) and the way back never re-ran the latch, so
+    /// the pump reported `Phase4` for the rest of the call, the modem above read
+    /// that as `Retraining` and never rebuilt its stack, V.42's clocks were held
+    /// at zero with it (`lib.rs:1924`), and no `LAPM` frame went downstream
+    /// again: the far end's T401 expired 1.008 s into its data mode.
     fn begin_data(&mut self) {
         self.note("V.92: Ed out".into());
+        self.enter_data_mode();
+    }
+
+    /// The data mode is up: 9.6.1.1.5's `B1d` out, and everything that follows
+    /// from it, in the one place, for every way in.
+    ///
+    /// What it latches, and each is why that lives here rather than at a call
+    /// site:
+    ///
+    /// * `Status::Connected` -- the only thing `v90::startup`'s
+    ///   `pcm::Status::Connected` arm (`startup.rs:534`) turns into
+    ///   `Progress::Connected`, which is what makes the modem above build its
+    ///   V.42/LAPM stack (`lib.rs:2011-2141`) and stop holding V.42's clocks
+    ///   (`lib.rs:1924`).
+    /// * `B1d` itself: the encoder rebuilt from CPu, 8.6.1's scrambler
+    ///   initialised to zero, and `B1D_FRAMES` of scrambled ones counted down
+    ///   -- a renegotiation's `B1d` is a *new* `B1d`, and the far end drops
+    ///   that many symbols through a countdown this starts.
+    /// * 9.6.1.1.6's `B1u` arm -- `b1u_pending` and its 2 s deadline -- for the
+    ///   `E2u` that follows every one of these entries.
+    fn enter_data_mode(&mut self) {
         let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
         // The receiver is *not* reconditioned here. 9.6.1.1.6 has it done
         // "after receiving E2u", and that is not pedantry: E2u is a data frame
@@ -6770,11 +6802,16 @@ impl Modem {
         self.upstream_drop_until = 0;
         self.awaiting_e2u = true;
         self.e2u_zeroes = 0;
-        self.b1u_pending = true;
-        self.b1u_deadline = Some(self.now + (B1U_WAIT * FS) as u64);
         self.source.end_fpe();
-        self.source.change(Out::B1d);
         self.note("V.92: 9.8 rate renegotiation over -- B1d again".into());
+        // 9.6.1.1.5-6 by the same door Phase 4 uses. The renegotiation took the
+        // data mode down (`ru_ended` -> `Status::Phase4`), and *this* is the
+        // signal that puts it back: `Ed` was the last one out, so `B1d` is what
+        // follows, and the state that goes with `B1d` -- `Status::Connected`,
+        // CPu's encoder, 8.6.1's scrambler, `B1D_FRAMES`, the 9.6.1.1.6 `B1u`
+        // arm -- is `begin_data`'s body and not a second copy of it. Calling it
+        // here is at worst idempotent; not calling it was `docs/238`'s defect.
+        self.enter_data_mode();
     }
 
     /// One symbol of the far end's side of a renegotiation.
