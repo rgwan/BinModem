@@ -484,4 +484,106 @@ mod tests {
         let params = e.correction(level, 900.0);
         assert!((params.delay + delay).abs() < 1.0 / COARSE as f64);
     }
+
+    /// `docs/255` S1.2: the far end's fractional instant and the CO's sampling
+    /// instant are two *positions on one continuous line*, so they compose to a
+    /// single kernel at their difference (`shift_centred(x, d_fe + d_co)`).
+    /// Applying a kernel at each -- the convention `docs/250`-`docs/254`'s loop
+    /// numbers were taken in -- composes them to `H(f)^2` and leaves an ISI the
+    /// single kernel does not: the truncation error, squared and applied to a
+    /// symbol-rate stream that is not bandlimited below the interpolator's
+    /// passband. This is the size of the loop's old residual, and it is the
+    /// model's, not the far end's.
+    #[test]
+    fn two_kernels_in_series_leave_isi_that_one_kernel_at_the_residual_does_not() {
+        // A deterministic, full-band T-spaced stream: the upstream's own symbol
+        // rate is one sample per symbol, so nothing here is oversampled.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut symbols = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let point = (state >> 40) % 16;
+            symbols.push(point as f64 - 7.5);
+        }
+        let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+        let power = rms(&symbols);
+        // The error each chain leaves, as a fraction of the symbol stream's rms,
+        // measured over the interior so the zero-padded edges do not count.
+        let error = |v: &[f64]| {
+            let from = 2 * FE_HALF;
+            let to = v.len() - 2 * FE_HALF;
+            let e: Vec<f64> = (from..to).map(|i| v[i] - symbols[i]).collect();
+            rms(&e) / power
+        };
+        // The far end asks for -0.3 and the CO samples at +0.3: two kernels.
+        let twice = shift_centred(&shift_centred(&symbols, -0.3), 0.3);
+        // The same chain, sampled once: one kernel at the residual. 1e-4 is
+        // `docs/250`'s estimate error, which the loop cannot do better than.
+        let once = shift_centred(&symbols, -0.3 + 0.3 + 1e-4);
+        let (two, one) = (error(&twice), error(&once));
+        println!("kernel test: two={two:e} one={one:e} ratio={:e}", two / one);
+        // The single kernel at a 1e-4 residual is the interpolation error at
+        // that residual, i.e. nothing a slicer can see; the composed pair is
+        // three orders of magnitude larger and is what `docs/255` S1 removes.
+        assert!(one < 2e-3, "one kernel at the residual: {one:e} of the stream");
+        assert!(two > 1e-2, "two kernels in series: {two:e} of the stream");
+        assert!(two > 20.0 * one, "{two:e} against {one:e}");
+        // And a zero residual through one kernel is the identity to within one
+        // ulp -- not bit for bit, because `taps(0)` is normalised by a sum that
+        // is 1 +- 1e-16. That is why `FarEndParams::apply` short-circuits
+        // `delay == 0.0` instead of convolving with it, and it is the only
+        // cost the single kernel adds at a zero residual.
+        let exact = shift_centred(&symbols, 0.0);
+        let mut worst = 0.0f64;
+        for (a, b) in exact.iter().zip(&symbols) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(worst < 1e-13, "the zero-residual kernel moved {worst:e}");
+    }
+
+    /// `docs/255` S1.4: the loop's ceiling above `drn 10` is the *three-tap*
+    /// inverse's own residual, `a^3`, which the ideal case does not have. The
+    /// product of the pre-emphasis with the channel is `1 + a^3 z^-3`, and at
+    /// LC 64's 4-8 LSB half-gaps that is several whole code steps at the
+    /// stream's peak. The exact inverse is a stable causal recursion (the
+    /// channel's zero is at `z = -a`, inside the unit circle), so the depth is
+    /// a choice about the far end's filter, not a limit of the arithmetic.
+    #[test]
+    fn the_three_tap_inverse_leaves_a_cubed_and_that_is_the_high_rung_ceiling() {
+        let a = 0.24;
+        let eq = EqTaps::inverse_of(a);
+        // The pre-emphasis convolves with the channel `1 + a z^-1`.
+        let impulse = {
+            let mut v = vec![0.0; 8];
+            v[0] = 1.0;
+            v
+        };
+        let product = {
+            let shaped = eq.filter(&impulse);
+            let mut out = vec![0.0; 8];
+            for n in 0..8 {
+                out[n] = shaped[n] + if n > 0 { a * shaped[n - 1] } else { 0.0 };
+            }
+            out
+        };
+        assert!((product[0] - 1.0).abs() < 1e-12);
+        assert!(product[1].abs() < 1e-12, "a^1 must be cancelled: {}", product[1]);
+        assert!(product[2].abs() < 1e-12, "a^2 must be cancelled: {}", product[2]);
+        assert!((product[3] - a * a * a).abs() < 1e-12, "the residual is a^3");
+        // What a^3 costs against the rung it has to fit: LC 64's finest gap is
+        // 8 LSB (`rung::gap_lsb`), its half is 4, and the stream's peak at
+        // 48 000 is 3772 LSB (`docs/254` S5). The depth that would clear it:
+        let peak = 3772.0;
+        let half_gap = 4.0;
+        assert!(a.powi(3) * peak > 4.0 * half_gap, "a^3 must be over the gap");
+        let mut depth = 1;
+        let mut residual = a;
+        while residual * peak > half_gap && depth < 8 {
+            residual *= a;
+            depth += 1;
+        }
+        assert_eq!(depth, 5, "five taps clear LC 64's half-gap, not three");
+    }
 }

@@ -189,6 +189,77 @@ impl Stats {
     }
 }
 
+/// The landing, measured **before** the codec.
+///
+/// `Stats::scan` reads the quantiser's *codewords*, and a codeword is by
+/// construction one of `ucode::linear`'s values, so its error against the
+/// nearest code is zero for any level and any alphabet: `rms / half` on the
+/// codewords is a tautology (`docs/255` S1.1). This reads the far end's own
+/// line, `continuous`, where a level or a time error is visible.
+struct Landing {
+    rows: [Row; 8],
+    total: u64,
+}
+
+impl Landing {
+    fn scan(law: Law, ladder: &Ladder, xs: &[f64]) -> Self {
+        let mut out = Self { rows: [Row::default(); 8], total: 0 };
+        for &x in xs {
+            let full = x.abs();
+            if full < 0.5 {
+                continue;
+            }
+            let (code, _) = ucode::nearest(law, full.min(32767.0).round() as i32);
+            let level = f64::from(ucode::linear(law, code).abs());
+            let chord = ((code >> 4) as usize).min(7);
+            let error = (full - level).abs();
+            let row = &mut out.rows[chord];
+            row.n += 1;
+            row.sum_sq += error * error;
+            row.max = row.max.max(error);
+            out.total += 1;
+        }
+        let _ = ladder;
+        out
+    }
+
+    fn rms_half(&self, chord: usize, ladder: &Ladder) -> f64 {
+        let row = &self.rows[chord];
+        if row.n == 0 {
+            return 0.0;
+        }
+        (row.sum_sq / row.n as f64).sqrt() / (f64::from(ladder.step[chord]) / 2.0)
+    }
+
+    fn support(&self, chord: usize, ladder: &Ladder) -> f64 {
+        self.rows[chord].max / (f64::from(ladder.step[chord]) / 2.0)
+    }
+
+    fn pop(&self, chord: usize) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        100.0 * self.rows[chord].n as f64 / self.total as f64
+    }
+
+    /// The population-weighted `rms / half` over the whole stream, which is one
+    /// number a log line can carry.
+    fn weighted(&self, ladder: &Ladder) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        for chord in 0..8 {
+            if self.rows[chord].n == 0 {
+                continue;
+            }
+            let share = self.rows[chord].n as f64 / self.total as f64;
+            sum += share * self.rms_half(chord, ladder);
+        }
+        sum
+    }
+}
+
 #[derive(Clone)]
 struct Settings {
     drn: u8,
@@ -215,6 +286,31 @@ struct Settings {
     err_delay: Option<f64>,
     err_level: Option<f64>,
     err_tap: Option<f64>,
+    /// Whether the CO's sampling instant is a second interpolation kernel
+    /// (docs/250-254's convention) or the point sample of a continuous line it
+    /// physically is (`docs/255` S1).
+    instant: Instant,
+    /// `docs/255`'s freeze-and-sweep: in `--mode closed`, these components of
+    /// the estimate are replaced by their exact values, so the run carries that
+    /// component's error and no other's.
+    freeze: Vec<String>,
+    /// Whether to print the landing measured *before* the codec, which is the
+    /// only form of it that can fail.
+    landing: bool,
+}
+
+/// How the chain turns the far end's fractional instant and the CO's sampling
+/// instant into samples.
+#[derive(Clone, Copy, PartialEq)]
+enum Instant {
+    /// One sample of the continuous line: `S x(n) p((m - n)T + delta)`, i.e.
+    /// one kernel at the *difference* of the two positions. This is what a
+    /// point sample of a DAC's output does.
+    Single,
+    /// Two kernels in series: the far end's windowed sinc, then the CO's,
+    /// which composes them to `H(f)^2` and is `docs/250`-`docs/254`'s
+    /// convention.
+    Double,
 }
 
 fn parse() -> Settings {
@@ -235,6 +331,9 @@ fn parse() -> Settings {
         err_delay: None,
         err_level: None,
         err_tap: None,
+        instant: Instant::Single,
+        freeze: Vec::new(),
+        landing: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -261,6 +360,17 @@ fn parse() -> Settings {
             "--chords" => s.chords = true,
             "--slice" => s.slice = value(),
             "--receiver" => s.receiver = true,
+            "--instant" => {
+                s.instant = match value().as_str() {
+                    "single" => Instant::Single,
+                    "double" => Instant::Double,
+                    other => panic!("instant {other}"),
+                }
+            }
+            "--freeze" => {
+                s.freeze = value().split(',').map(str::to_owned).collect();
+            }
+            "--landing" => s.landing = true,
             other => panic!("unknown option {other}"),
         }
     }
@@ -275,10 +385,23 @@ fn transmit(
     timing: f64,
     tap: f64,
     law: Law,
+    instant: Instant,
 ) -> (Vec<f64>, Vec<i32>) {
-    let placed = params.apply(symbols);
-    let sampled =
-        if timing == 0.0 { placed.clone() } else { farend::shift_centred(&placed, timing) };
+    let sampled = match instant {
+        Instant::Single if params.delay != 0.0 => {
+            // The far end's instant and the CO's are two positions on one
+            // continuous line, so they compose to a single kernel at their
+            // difference. Applying two truncated sincs in series squares the
+            // interpolation error instead (`docs/255` S1).
+            let shaped = params.eq.filter(symbols);
+            let placed = farend::shift_centred(&shaped, params.delay + timing);
+            placed.iter().map(|&v| v * params.level_lsb).collect()
+        }
+        _ => {
+            let placed = params.apply(symbols);
+            if timing == 0.0 { placed } else { farend::shift_centred(&placed, timing) }
+        }
+    };
     let mut continuous = Vec::with_capacity(sampled.len());
     let mut previous = 0.0;
     for &x in &sampled {
@@ -513,7 +636,7 @@ fn main() {
             "closed" => {
                 // Pass 1: the far end is on the line it chose.
                 let start = FarEndParams::bypass(s.lu);
-                let (_, first) = transmit(&out, &start, s.timing, s.tap, s.law);
+                let (_, first) = transmit(&out, &start, s.timing, s.tap, s.law, s.instant);
                 let observed: Vec<f64> = first.iter().map(|&q| f64::from(q)).collect();
                 let e = farend::estimate(
                     &ideal_trn,
@@ -534,7 +657,20 @@ fn main() {
                     correction.eq.taps[1],
                     correction.eq.taps[2]
                 );
-                (correction, Some(e))
+                // docs/255's freeze-and-sweep: put the exact value back into
+                // one named component, so the run carries the others' error and
+                // nothing else's. The exact values are the truth of the line the
+                // far end is on, not the answer to the estimator's question.
+                let mut frozen = correction;
+                for name in &s.freeze {
+                    match name.as_str() {
+                        "delay" => frozen.delay = -s.timing,
+                        "level" => frozen.level_lsb = s.lu,
+                        "eq" => frozen.eq = farend::EqTaps::inverse_of(s.tap),
+                        other => panic!("freeze {other}"),
+                    }
+                }
+                (frozen, Some(e))
             }
             "sweep" => {
                 // The exact parameters, plus one named error and nothing else.
@@ -573,7 +709,7 @@ fn main() {
         };
         let _ = estimated;
 
-        let (continuous, codewords) = transmit(&out, &used, s.timing, s.tap, s.law);
+        let (continuous, codewords) = transmit(&out, &used, s.timing, s.tap, s.law, s.instant);
         let rms = (continuous.iter().map(|v| v * v).sum::<f64>() / continuous.len() as f64).sqrt();
         let peak = continuous.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let out_rms = (out.iter().map(|v| v * v).sum::<f64>() / out.len() as f64).sqrt();
@@ -598,12 +734,13 @@ fn main() {
         let pct = if bits > 0 { 100.0 * ones as f64 / bits as f64 } else { 0.0 };
         let bins = Bins::measure(&parameters, &b1u_etas, &codewords, b1u_at, s.lu, k, &ladder, s.law);
         let crossing = stats.crossing(&ladder, &rx, s.law, gap);
+        let landing = Landing::scan(s.law, &ladder, &continuous);
         println!(
             "RUNG drn={drn} rate={} lc={} points={points} gap={gap:.0} leastGap={least} \
              eq=[{:.3},{:+.3},{:+.3}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
-             rms={rms:.1} peak={peak:.0} pop1024={pop1024:.1} pop512={pop512:.1} \
+             rms={rms:.1} peak={peak:.0} \
              xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.3} \
-             b1u={ones}/{bits}={pct:.1}% rot={rotation} \
+             b1u={ones}/{bits}={pct:.1}% land={land:.3} \
              G9={g9:.9} energy={energy:.6} invG={invg:.3}",
             rung.rate,
             rung.lc,
@@ -613,8 +750,7 @@ fn main() {
             used.delay,
             used.level_lsb,
             parameters.gain,
-            pop1024 = stats.pop(7),
-            pop512 = stats.pop(6),
+            land = landing.weighted(&ladder),
             bin = bins.pct(),
             adj = if bins.aligned { bins.adjacent.to_string() } else { "unaligned".to_owned() },
             kb = bins.k,
@@ -649,7 +785,8 @@ fn main() {
                 }
                 println!(
                     "  CHORD drn={drn} chord={chord} step={} k_c={} n={} pop={:.1}% \
-                     rms/half={:.3} support={:.2} half={:.0} bin={:.1}% nbin={}",
+                     rms/half={:.3} support={:.2} half={:.0} bin={:.1}% nbin={} \
+                     land_rms/half={:.3} land_support={:.2} land_pop={:.1}%",
                     ladder.step[chord],
                     per_chord[chord],
                     stats.rows[chord].n,
@@ -659,6 +796,9 @@ fn main() {
                     f64::from(ladder.step[chord]) / 2.0,
                     bins.chord_pct(chord),
                     bins.sent[chord],
+                    landing.rms_half(chord, &ladder),
+                    landing.support(chord, &ladder),
+                    landing.pop(chord),
                 );
             }
         }
