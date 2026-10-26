@@ -707,6 +707,51 @@ mod tests {
         assert!((fixed - 1.0).abs() < 0.05, "the corrected gain measured {fixed:.4}");
     }
 
+    /// The two bits this end leaves at their default are named, with the clause
+    /// that makes the default legal and the consequence of it.
+    ///
+    /// * `CPd` bit 29 (`v92.txt:1818-1821`): "Extend the length of the E2u
+    ///   sequence: 0 = don't extend; 1 = extend by 1 symbol." 8.7.2
+    ///   (`v92.txt:1470-1471`) makes E2u "a data frame of scrambled,
+    ///   differentially encoded zeroes ... extended by a single symbol if bit 29
+    ///   of CPd is set". The extension is a lever for the *digital* modem's
+    ///   E2u-to-B1u boundary search: it lengthens the descrambled zero run by
+    ///   one symbol. This end's search is a candidate-set measurement over the
+    ///   run rather than a count (`digital::E2U_SYMBOLS`), so the extra symbol
+    ///   buys nothing here; leaving it 0 is compliant, and the same bit "shall
+    ///   be set to zero during rate renegotiation and fast parameter exchange"
+    ///   anyway. Consequence of the default: E2u is 12 symbols, not 13, and the
+    ///   receiver's window must stay 12 -- one constant, `EXTEND_E2U`, so the
+    ///   bit and the count cannot disagree.
+    /// * `Jp` bits 48 and 49 (Table 22, `v92.txt:1420-1424`; 8.7.6,
+    ///   `v92.txt:1717`): 0 = 4-point upstream training constellation, 1 =
+    ///   8-point. Consequence of the default: CPu, E2u, SUVu and TRN2u are
+    ///   4-point at every rung and in both procedures. That is what this end's
+    ///   receiver is built to read (Tables 28/29), so it is correct and not
+    ///   merely permitted.
+    #[test]
+    fn the_e2u_extension_and_the_training_constellation_are_left_at_the_default_with_a_reason() {
+        // CPd bit 29: 0, and the receiver's window agrees with it.
+        assert!(!EXTEND_E2U, "CPd bit 29 asks the far end to lengthen E2u by a symbol");
+        assert_eq!(E2U_SYMBOLS, UP_INTERVALS, "E2u is one data frame: 8.7.2's twelve symbols");
+        // Jp bits 48 and 49: 0, in both procedures.
+        let jp = crate::v92::sequences::Jp { epsilon: 0x8000, eight_in_training: false, eight_in_renegotiation: false };
+        let bits = jp.to_bits();
+        assert!(!bits[48], "Jp bit 48 asks for 8-point training constellations");
+        assert!(!bits[49], "Jp bit 49 asks for 8-point constellations in a renegotiation");
+        // And the parser agrees, so the pin survives a round trip.
+        let back = crate::v92::sequences::Jp::from_bits(&bits).expect("a Jp comes back");
+        assert_eq!(back, jp);
+        // The rungs never move either bit: a CPd built from any rung carries 0.
+        let design = design_for(0.0);
+        for drn in 1..=UP_RATES as u8 {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                continue;
+            };
+            assert!(!parameters.extend_e2u, "drn {drn}: CPd bit 29 was set");
+        }
+    }
+
     /// `p2` is absent by decision, and the decision has a clause and a bound.
     ///
     /// 6.4.2 (`v92.txt:463-466`) prints `v(n) = sum x(n-kappa) z2(kappa) +

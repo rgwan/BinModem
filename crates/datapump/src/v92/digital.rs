@@ -4600,6 +4600,23 @@ impl Modem {
                 ));
                 wanted
             };
+            // Bits 48 and 49 are 0: 4-point upstream training constellations.
+            // 8.7.6 (`v92.txt:1717`) says TRN2u "is a 4- or 8-point
+            // constellation signal **as requested by the digital modem via Jp
+            // bits 48 and 49**", and Table 22's own wording (`v92.txt:1420-1424`)
+            // is `0 = 4-point; 1 = 8-point` for CPu, E2u, SUVu and TRN2u in
+            // training (bit 48) and in rate renegotiation (bit 49). The clause
+            // fixes neither: it asks which, and the answer is ours.
+            //
+            // Ours is 4-point, and it is the default every call this end has
+            // made: the upstream training sequences are *received* here, and
+            // every one of them is demodulated against Tables 28's 4-point maps
+            // (TRN2u's sign, Table 29, is 8-point and unused). Asking for
+            // 8-point without the receiver beside it would put a training
+            // signal on the line that this end cannot read, which is the same
+            // class of breakage `EXTEND_E2U`'s constant exists to prevent. So
+            // the default is correct rather than merely harmless, and
+            // `a_four_point_training_constellation_is_what_we_ask_for` pins it.
             let jp = Jp { epsilon, eight_in_training: false, eight_in_renegotiation: false };
             self.source.jp = jp.to_bits();
             // "shall finish the current Jd and then send Jp" (9.5.1.1.8). The
