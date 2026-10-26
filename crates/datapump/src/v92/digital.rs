@@ -219,6 +219,52 @@ const RU_LOCK_PERIODS: usize = 4;
 /// not.
 const RU_MAGNITUDE_SLACK: f64 = 0.35;
 
+/// How much of a window the period-six component must account for before the
+/// far end is taken to be sending `Ru`, as the amplitude of the six-symbol
+/// component over the window's rms. **`[our choice]`**, and it is the one
+/// threshold that reads 8.5.5 off the line instead of off the clause's ideal
+/// waveform.
+///
+/// **Why a second reading of 8.5.5 is needed at all.** `RU_MAGNITUDE_SLACK`
+/// above asks for six *equal* magnitudes, which is what 8.5.5's
+/// `{+LU, +LU, +LU, -LU, -LU, -LU}` is at the modulator's input. What the Far
+/// end actually puts on the line is that sequence as a period-six wave, and the
+/// wave comes back through the far end's own transmit path. Measured on
+/// `/home/hikari/runs-214/164250-sd108ab170-r214/agr-tx.raw`, the far end's
+/// `Ru` at record sample 192 090 is **three** magnitudes, not one --
+/// 4 683 / 4 650 / 33 -- because the only component of a 1 333.33 Hz
+/// ({fs}/6) period-six wave left below Nyquist is the fundamental: the
+/// measured 6-symbol pattern is a pure 5 389-amplitude sine at a constant
+/// -30.4 deg for 46.5 ms, third harmonic 0.3 against a fundamental of 5 388.8.
+/// A detector that insists on six equal magnitudes can therefore never fire on
+/// this far end, which is why `docs/224`'s `Ru detected` was never printed.
+///
+/// The two forms bracket the threshold: a raw `{+ + + - - -}` square wave has a
+/// six-symbol component of 4/pi = 1.27 times its rms, the fundamental-only form
+/// has sqrt(2) = 1.414, and data mode levels -- measured over the same file,
+/// three separate data stretches, every third symbol -- reach 0.831 at
+/// [`RU_TONE_SYMBOLS`] and no more. The threshold sits 1.3 times above the
+/// third and 1.15 times below the first.
+const RU_TONE_DOMINANCE: f64 = 1.10;
+
+/// Symbols of history the period-six reading is taken over.
+///
+/// **[our choice]** 48, eight periods of 8.5.5's six. It is the shortest window
+/// that separates the two populations by a clear margin, and it is bounded from
+/// below by a race that is measured and not hypothetical: 9.6.1.1.2's
+/// data-mode-loss detector (`DATA_MODE_LOSS_FRAMES` of twelve symbols) calls
+/// `Ru` "a symbol outside the constellation CPd declared" and fires 96 symbols
+/// in -- `runs-223/181911-ab170-fpe-v92` did exactly that at 25.000 and sent
+/// `Ri` at a far end that was asking for a rate renegotiation. Forty-eight
+/// symbols is 6 ms of 8.5.5's 384T, half the loss detector's own latency, and
+/// leaves 336 for `R-bar-u` and the frame boundary `Rd` waits for.
+///
+/// The false-positive bound at this length: over three data stretches of the
+/// same recording the six-symbol component reaches 0.831. At 24 symbols it
+/// reaches 0.987 and at 96 it falls to 0.561 -- 48 is where the loss-detector
+/// race and that spread cross.
+const RU_TONE_SYMBOLS: usize = 48;
+
 /// 9.8.1.2.1's receiver conditioning, as a small state machine.
 ///
 /// "After detecting `Ru`, the digital modem shall clamp circuit 104 to binary
@@ -231,7 +277,7 @@ const RU_MAGNITUDE_SLACK: f64 = 0.35;
 /// renegotiation in it puts exactly the same symbols through exactly the same
 /// arithmetic it did before this existed. `no_ru_in_data_mode_never_fires_the_
 /// responder` pins that.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuDetector {
     /// The signs of the last four `Ru` periods, one bit a symbol, oldest in the
     /// most significant position: 1 positive.
@@ -253,6 +299,39 @@ pub struct RuDetector {
     phase: usize,
     /// Consecutive symbols since then that disagree with that phase.
     deviations: usize,
+    /// The last [`RU_TONE_SYMBOLS`] levels, oldest at [`Self::filled`]'s ring
+    /// position. Used only for 8.5.5's period-six reading.
+    recent: [f64; RU_TONE_SYMBOLS],
+    /// Where the next level goes in [`Self::recent`].
+    at: usize,
+    /// The six-symbol component's phase when the period-six reading locked.
+    tone_phase: Option<f64>,
+    /// Symbols the period-six reading has held the far end to `Ru` for.
+    tone_run: usize,
+    /// The period-six reading has already reported the end of `Ru`, once.
+    tone_fired: bool,
+    /// Symbols fed, saturating at [`RU_TONE_SYMBOLS`]: the ring is only a
+    /// window once it has been filled once.
+    seen: usize,
+}
+
+impl Default for RuDetector {
+    fn default() -> Self {
+        Self {
+            signs: 0,
+            magnitudes: [0.0; 6],
+            filled: 0,
+            locked: false,
+            phase: 0,
+            deviations: 0,
+            recent: [0.0; RU_TONE_SYMBOLS],
+            at: 0,
+            tone_phase: None,
+            tone_run: 0,
+            tone_fired: false,
+            seen: 0,
+        }
+    }
 }
 
 /// The 24 symbols of four `Ru` periods, oldest symbol in the top bit.
@@ -317,6 +396,21 @@ impl RuDetector {
         self.magnitudes.rotate_left(1);
         self.magnitudes[5] = magnitude;
         self.filled = (self.filled + 1).min(24);
+        self.recent[self.at] = level;
+        self.at = (self.at + 1) % RU_TONE_SYMBOLS;
+        self.seen = (self.seen + 1).min(RU_TONE_SYMBOLS);
+        // 8.5.5's period-six structure, read as the wave the far end actually
+        // sends it as. Checked first because it is the reading that survives
+        // the far end's transmit path (`RU_TONE_DOMINANCE`), while the
+        // two-point magnitude test below is the reading that survives an ideal
+        // modulator. A `Ru` satisfies whichever of the two its transmitter
+        // leaves intact; a data mode symbol satisfies neither.
+        if self.seen >= RU_TONE_SYMBOLS && !self.tone_fired {
+            match self.period_six() {
+                RuEvent::None => {}
+                event => return event,
+            }
+        }
         if self.filled < 24 {
             return RuEvent::None;
         }
@@ -368,6 +462,77 @@ impl RuDetector {
             self.phase = RU_SHIFTED.iter().position(|&p| p == self.signs).unwrap_or(0);
             self.deviations = 0;
             return RuEvent::RuDetected;
+        }
+        RuEvent::None
+    }
+
+    /// 8.5.5's `Ru` read as a period-six wave: the amplitude and phase of the
+    /// six-symbol component over [`RU_TONE_SYMBOLS`] symbols, against the
+    /// window's rms.
+    ///
+    /// "Signal `Ru` is transmitted by repeating the 6-symbol sequence
+    /// {+LU, +LU, +LU, -LU, -LU, -LU}" (`v92.txt:1325`) is a statement about
+    /// period, not about harmonics, and the detector may hold the far end to
+    /// what the clause guarantees: one period is six symbols, so the wave has
+    /// exactly one component below the Nyquist of a symbol rate of one symbol a
+    /// sample. At 8 000 symbols a second that component is at 1 333.33 Hz, and
+    /// that is what the bench's far end puts on the line (`RU_TONE_DOMINANCE`).
+    ///
+    /// The transition of 9.8.1.2.1 is read the same way. `R-bar-u` is the
+    /// negation, which for a single component is a 180-degree step of its
+    /// phase -- and, measured, this far end does not send one at all (`docs/224`
+    /// [verified]: phase constant to 0.3 degree over its 384T of `Ru`, then
+    /// data). So the end of `Ru` is taken as the transition too, because a far
+    /// end that spends its 384T and goes back to data has made the same
+    /// statement in the only way its transmitter makes it.
+    fn period_six(&mut self) -> RuEvent {
+        let n = RU_TONE_SYMBOLS as f64;
+        let (mut re, mut im, mut power) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for k in 0..RU_TONE_SYMBOLS {
+            let v = self.recent[(self.at + k) % RU_TONE_SYMBOLS];
+            let theta = -2.0 * std::f64::consts::PI * k as f64 / RU_PERIOD.len() as f64;
+            re += v * theta.cos();
+            im += v * theta.sin();
+            power += v * v;
+        }
+        let rms = (power / n).sqrt();
+        if rms <= 0.0 {
+            return RuEvent::None;
+        }
+        let amplitude = 2.0 * (re * re + im * im).sqrt() / n;
+        let phase = im.atan2(re);
+        if amplitude / rms >= RU_TONE_DOMINANCE {
+            if self.tone_phase.is_none() {
+                self.tone_phase = Some(phase);
+                self.tone_run = 0;
+                if !self.locked {
+                    self.locked = true;
+                    self.phase = 0;
+                    self.deviations = 0;
+                    return RuEvent::RuDetected;
+                }
+                return RuEvent::None;
+            }
+            self.tone_run += 1;
+            let turned = (phase - self.tone_phase.unwrap_or(phase)).abs();
+            let turned = turned.min(2.0 * std::f64::consts::PI - turned);
+            if turned > 2.0 * std::f64::consts::PI / 3.0 {
+                self.tone_fired = true;
+                self.tone_phase = None;
+                return RuEvent::RuToRuBar;
+            }
+            return RuEvent::None;
+        }
+        // The six-symbol component is gone. If it held for a period at least,
+        // the far end has left `Ru` without inverting it: 9.8.1.2.2's
+        // transition, in the only form this far end sends it.
+        if self.tone_phase.is_some() {
+            let held = self.tone_run;
+            self.tone_phase = None;
+            if held >= RU_PERIOD.len() {
+                self.tone_fired = true;
+                return RuEvent::RuToRuBar;
+            }
         }
         RuEvent::None
     }
@@ -6668,7 +6833,13 @@ impl Modem {
         // `docs/216` §2: the same level again, against the constellation CPd
         // declared. A side channel like the one above -- until it fires, the
         // decoder below is fed exactly what it was fed before.
-        let lost = self.data_loss.as_mut().is_some_and(|loss| loss.feed(level));
+        // `Ru` is two-point and every one of its symbols is outside the
+        // constellation `CPd` declared, so 9.6.1.1.2's loss detector would call
+        // the far end's rate renegotiation a lost data mode and answer it with
+        // `Ri`. While 9.8.1.2.1's conditioning is in force the symbols are not
+        // data mode symbols at all, so that detector is not shown them.
+        let lost = !self.ru_detector.is_locked()
+            && self.data_loss.as_mut().is_some_and(|loss| loss.feed(level));
         if lost {
             self.data_mode_lost();
             return;
@@ -9663,6 +9834,75 @@ mod conformance_158 {
         for level in ru_periods(4, 40.0, false) {
             assert_eq!(detector.feed(level), RuEvent::None, "Ru fired twice");
         }
+    }
+
+    /// **What the far end actually puts on the line.** 8.5.5's
+    /// {+LU, +LU, +LU, -LU, -LU, -LU} is a period-six wave; the Agere SV92PP's
+    /// transmit path leaves one component of it, so the six symbols arrive as a
+    /// 1 333.33 Hz tone whose *magnitudes* are three values and not one. The
+    /// levels below are read off `runs-214/164250-sd108ab170-r214/agr-tx.raw`,
+    /// records 192 090..192 470, which is the far end's own `Ru` (docs/224 §2):
+    /// a 5 389-amplitude six-symbol wave at a constant phase, 46.5 ms long.
+    ///
+    /// This is the test that fails on the detector before `docs/224`: six
+    /// magnitudes of 4 683 / 4 650 / 33 are 99 % apart, so the two-point test
+    /// rejects every symbol and `Ru detected` is never printed -- which is
+    /// exactly what the bench showed.
+    #[test]
+    fn the_far_ends_ru_is_a_period_six_wave_and_is_detected_as_one() {
+        // One period as measured, oldest first. Six symbols, three magnitudes.
+        let period = [-4683.0_f64, -33.0, 4650.0, 4683.0, 33.0, -4650.0];
+        // The two-point reading of 8.5.5 cannot see this: the magnitudes are
+        // 99 % apart, nearly three times RU_MAGNITUDE_SLACK.
+        let loud = 4683.0;
+        let quiet = 33.0;
+        assert!((loud - quiet) / loud > 2.0 * RU_MAGNITUDE_SLACK);
+        let mut detector = RuDetector::new();
+        let mut events = Vec::new();
+        // 9.8.2.1.1 gives the far end 384T of Ru; feed exactly that.
+        for _ in 0..64 {
+            for level in period {
+                events.push(detector.feed(level));
+            }
+        }
+        assert_eq!(
+            events.iter().filter(|e| **e == RuEvent::RuDetected).count(),
+            1,
+            "9.8.1.2.1 did not fire on the far end's own Ru"
+        );
+        assert!(detector.is_locked(), "the receiver was not conditioned");
+        // Where in the 384T it fires: after RU_TONE_SYMBOLS, not later -- the
+        // 384T has 288 symbols left for R-bar-u and the frame boundary.
+        let at = events.iter().position(|e| *e == RuEvent::RuDetected).unwrap();
+        assert_eq!(at + 1, RU_TONE_SYMBOLS);
+        // And no second fire inside the same Ru.
+        assert_eq!(events.iter().filter(|e| **e == RuEvent::RuDetected).count(), 1);
+    }
+
+    /// The far end's `Ru` ends without an `R-bar-u` -- measured, phase constant
+    /// to 0.3 degree over all 46.5 ms of it (docs/224 §2) -- so the transition
+    /// 9.8.1.2.2 releases `Rd` on is the end of the wave. Back to data after it
+    /// and the detector must say so, once.
+    #[test]
+    fn the_end_of_the_far_ends_ru_releases_rd_when_no_ru_bar_follows() {
+        let period = [-4683.0_f64, -33.0, 4650.0, 4683.0, 33.0, -4650.0];
+        let mut detector = RuDetector::new();
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            for level in period {
+                events.push(detector.feed(level));
+            }
+        }
+        assert!(detector.is_locked());
+        // Data mode again: no six-symbol component, and the magnitudes wander.
+        for level in data_levels(400) {
+            events.push(detector.feed(level));
+        }
+        assert_eq!(
+            events.iter().filter(|e| **e == RuEvent::RuToRuBar).count(),
+            1,
+            "the end of the far end's Ru did not release Rd"
+        );
     }
 
     /// 9.8.1.2.2: "After detecting the `Ru`-to-`R-bar-u` transition, the digital
