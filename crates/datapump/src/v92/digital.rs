@@ -4254,6 +4254,13 @@ pub(crate) struct B1uBins {
     /// the end of `B1u`'s known content), so the pairing's own honesty is
     /// visible.
     unpaired: u64,
+    /// The fewest symbols any *displaced* pairing of the same decisions got
+    /// wrong, over every displacement of `1 ... 11` symbols either way
+    /// ([`Self::TRUST_MARGIN`]). A rate is only published when the given
+    /// origin is decisively better than every other one: an instrument that
+    /// scores a displaced pairing the same as a right one cannot certify the
+    /// right one, and `docs/285` sec 2 is the call that proved it.
+    nearest_rival: u64,
     /// The direction of the level error the error is *about*: `true` when
     /// the far end is high.
     high: bool,
@@ -4262,10 +4269,15 @@ pub(crate) struct B1uBins {
 impl B1uBins {
     /// Pair every decided index with the one 8.7.1 says was sent.
     ///
-    /// `first` is the `B1u` symbol the decoder's frame 0 begins on: the
-    /// decoders `b1u_decoders` builds are fed from `skip + 1` symbols after
-    /// `B1u`'s frame 0, which is the same `skip` they seed the differential
-    /// chain and the descrambler with.
+    /// `first` is the `B1u` symbol the decoder's frame 0 begins on, in the
+    /// encoder's own numbering: `skip + 1` symbols after `B1u`'s frame 0 --
+    /// the same `skip` the decoders seed the differential chain and the
+    /// descrambler with -- **less the candidate's own `back`**, because
+    /// `b1u_readings` feeds candidate `back` from `levels[skip - back]` and
+    /// that element is `back` symbols earlier in the stream. `docs/285`
+    /// sec 2: dropping the `back` paired every decision with a symbol the
+    /// candidate's displacement away, and a winner at `back = 12` scored
+    /// 0.86 on a line whose B1u read 569 of 576 ones.
     fn measure(parameters: &Parameters, decisions: &[(u64, [i32; 4])], first: usize, high: bool) -> Self {
         let mut bins = Self { high, ..Self::default() };
         let Ok(mut encoder) = crate::v92::upstream::UpEncoder::new(parameters) else {
@@ -4279,6 +4291,24 @@ impl B1uBins {
             let full = (parameters.gain * value).clamp(0.0, 32767.0).round() as i32;
             let (code, _) = crate::v90::ucode::nearest(crate::v90::ucode::Law::Mu, full);
             usize::from(code >> 4).min(7)
+        };
+        let count = (decisions.len() * crate::v92::TRELLIS_FRAME) as u64;
+        let wrong_at = |first: usize| -> Option<(u64, u64)> {
+            let (mut wrong, mut paired) = (0u64, 0u64);
+            for (index, etas) in decisions {
+                for (position, &eta) in etas.iter().enumerate() {
+                    let Some(&sent) = sent.get(first + *index as usize * 4 + position) else {
+                        continue;
+                    };
+                    paired += 1;
+                    if eta != sent {
+                        wrong += 1;
+                    }
+                }
+            }
+            // A displacement that cannot pair the same population is not a
+            // rival reading of the same window, it is a shorter window.
+            (paired == count).then_some((wrong, paired))
         };
         for (index, etas) in decisions {
             for (position, &eta) in etas.iter().enumerate() {
@@ -4299,8 +4329,52 @@ impl B1uBins {
                 }
             }
         }
+        // `docs/285` sec 2: the pairing's own honesty. B1u is forty-eight
+        // *identical* data frames, so a whole-frame displacement is invisible
+        // to everything that reads its content -- the ones count, the rotation,
+        // the moduli -- and visible only here. The instrument therefore reads
+        // the same decisions at every displacement of one to eleven symbols
+        // either way and records the best of them: a right origin is
+        // decisively better than every displaced one, and a displaced origin
+        // has a rival that is decisively better than it. `unpaired` alone
+        // could not see this, because a displacement keeps every index in
+        // range and pairs every symbol -- which is how a call whose payload was
+        // bit-perfect reported `unpaired=0` beside `bin=87.50%`.
+        bins.nearest_rival = u64::MAX;
+        for shift in 1..crate::v92::UP_INTERVALS {
+            for displaced in [first.checked_sub(shift), Some(first + shift)] {
+                let Some(displaced) = displaced else { continue };
+                if let Some((wrong, _)) = wrong_at(displaced) {
+                    bins.nearest_rival = bins.nearest_rival.min(wrong);
+                }
+            }
+        }
         bins
     }
+
+    /// Whether the rate this pairing reports can be published.
+    ///
+    /// The origin has to be decisively better than every displaced pairing of
+    /// the same window ([`Self::TRUST_MARGIN`]), and every symbol has to have
+    /// found its partner. An instrument that cannot say which of two origins a
+    /// stream came from is not measuring the far end, it is measuring its own
+    /// alignment, and `docs/285` sec 2 is the call that read 0.875 that way.
+    fn trusted(&self) -> bool {
+        self.total > 0
+            && self.unpaired == 0
+            && self.nearest_rival != u64::MAX
+            && self.total_wrong * Self::TRUST_MARGIN <= self.nearest_rival
+    }
+
+    /// How much better than its nearest displaced rival a pairing has to be.
+    ///
+    /// Two: a right origin errs on the far end's symbols and a displaced one
+    /// errs on nearly all of them, so four is a margin a call that is merely
+    /// *noisy* still clears and a call that is *displaced* never does. A noisy
+    /// window does not become a displaced one: `docs/285` sec 2's call read
+    /// 0.875 -- chance -- against 0.000 for the right origin on the same
+    /// decisions.
+    const TRUST_MARGIN: u64 = 4;
 
     /// The population-weighted bin error rate, as a fraction.
     fn weighted(&self) -> f64 {
@@ -7469,7 +7543,14 @@ impl Modem {
         // the stream. They are a record of decisions already taken -- draining
         // them cannot move one -- and `keep_decisions` goes back off before
         // either decoder reads a symbol of the far end's data.
-        let first = self.b1u_skip + 1;
+        // `docs/285` sec 2: the decoder `b1u_readings` built for this
+        // candidate is fed from `levels[skip - back]`, so B1u's symbol at its
+        // frame 0 is `skip + 1 - back` in the encoder's numbering. Without the
+        // `- back` every decision is paired with a symbol the candidate's own
+        // displacement away, and on the bench the winner is routinely a whole
+        // data frame behind the run's end (twelve symbols, which B1u's
+        // forty-eight identical frames make invisible to its ones count).
+        let first = (self.b1u_skip + 1).saturating_sub(back);
         let high = self.rx.measured_levels().2 > 1.0;
         let mut straight = std::mem::replace(&mut chosen.straight, Decoder::new(&parameters));
         let mut probe = std::mem::replace(&mut chosen.probe, Decoder::new(&parameters));
@@ -7526,6 +7607,28 @@ impl Modem {
         let bins = if self.b1u_polarity < 0.0 { bins_probe } else { bins_straight };
         for line in bins.lines(parameters.drn) {
             self.note(line);
+        }
+        // `docs/278`'s rule -- the log prints which gate decided -- extends to
+        // "the log does not print a number it cannot stand behind": a pairing
+        // whose origin is not decisively better than a displaced one of the
+        // same window is not a measurement of the far end, and the ladder is
+        // not asked a question it would then answer with that number.
+        //
+        // Fails closed, like everything else here: with no rate the rung CPd
+        // carries is the one that stands, and no grant is issued on a pairing
+        // that could not certify its own alignment (`docs/285` sec 2).
+        if !bins.trusted() {
+            self.note(format!(
+                "V.92: BIN pairing refused: unpaired={} wrong={} of {} against a nearest displaced rival \
+                 of {} over {}-symbol shifts -- rate=n/a (pairing is not self-consistent, so the \
+                 decided B1u frame phase is not the one this window was paired from)",
+                bins.unpaired,
+                bins.total_wrong,
+                bins.total,
+                bins.nearest_rival,
+                crate::v92::UP_INTERVALS - 1,
+            ));
+            return;
         }
         let (_, _, level_gain, _) = self.rx.measured_levels();
         let lc = crate::v92::rung::lc_for(parameters.drn);
@@ -9450,6 +9553,96 @@ mod tests {
             levels.push(encoder.next_symbol(|| true).out);
         }
         levels
+    }
+
+    /// The bin instrument, on the line our own encoder builds: it reads zero,
+    /// and it reads zero only at the origin the decoder was actually fed.
+    ///
+    /// `docs/285` sec 2. The decisions are taken by a real `Decoder` fed the
+    /// far end's own B1u -- `UpEncoder::b1u()`, symbol for symbol, no channel
+    /// and no noise -- so every pair is right by construction and anything the
+    /// instrument reports is its own arithmetic. The candidate is the `back`
+    /// the boundary search actually commits to on this line: twelve symbols,
+    /// because B1u's forty-eight identical frames make the whole-frame twin
+    /// read as well as the boundary and `choose_b1u_boundary` prefers the
+    /// nearer of two. Pairing from `skip + 1` -- the origin the code used
+    /// before this ticket, which drops the candidate's `back` -- reads
+    /// **0.86** on these decisions; pairing from `skip + 1 - back`, which is
+    /// the element `b1u_readings` actually fed first, reads **0**.
+    #[test]
+    fn a_bin_pairing_reads_zero_at_the_origin_its_decoder_was_fed() {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let levels = b1u_line();
+        // The fire symbol is B1u's frame interval 0; the window starts one
+        // symbol into B1u.
+        let buffer: Vec<f64> = levels[1..B1U_SYMBOLS].iter().copied().chain(levels[1..2].iter().copied()).collect();
+        let readings = b1u_readings(&parameters, 1_000, &buffer, skip, E2U_SYMBOLS);
+        let winner = choose_b1u_boundary(&readings, false).expect("a boundary in the window");
+        let back = readings[winner].back;
+        assert_eq!(back, crate::v92::UP_INTERVALS, "the twin a data frame behind the run's end");
+        // The same decoder `b1u_readings` built for that candidate, fed the
+        // same window, drained the same way `decide_b1u_boundary` drains it.
+        let mut decoder = b1u_decoders(&parameters, skip).0;
+        for &level in &buffer[skip.saturating_sub(back)..=B1U_SYMBOLS - 1 - back] {
+            decoder.feed(level);
+        }
+        let decisions = decoder.take_decisions_indexed();
+        assert!(!decisions.is_empty(), "the window decided nothing");
+        let at_the_origin = B1uBins::measure(&parameters, &decisions, skip + 1 - back, true);
+        assert_eq!(at_the_origin.unpaired, 0, "every decided symbol found its partner");
+        assert_eq!(at_the_origin.total_wrong, 0, "a perfect line is zero wrong at its own origin");
+        assert_eq!(at_the_origin.weighted(), 0.0, "and its rate is zero");
+        assert!(at_the_origin.trusted(), "the origin is decisively better than any displaced one");
+        // The origin the code used before this ticket, on the same decisions.
+        // This is the number the bench call printed, and it is the reason the
+        // pairing's arithmetic is the finding and not the far end's line.
+        let without_back = B1uBins::measure(&parameters, &decisions, skip + 1, true);
+        assert_eq!(without_back.total, at_the_origin.total, "the same population");
+        assert!(
+            without_back.weighted() > 0.5,
+            "dropping the candidate's back must not read as a measurement: {:.4}",
+            without_back.weighted()
+        );
+        assert!(!without_back.trusted(), "and it must refuse to publish a rate");
+    }
+
+    /// A displaced pairing is refused, not scored: the instrument has to fail
+    /// on a wrong origin or it cannot certify a right one.
+    ///
+    /// `docs/285` sec 2. One symbol either way is a whole trellis position out
+    /// and eleven is a data frame less one, so these are the two shapes a wrong
+    /// origin takes. Both are in range and both pair every symbol -- which is
+    /// why `unpaired` was zero on the call that read 0.875, and why the check
+    /// cannot be a range check.
+    #[test]
+    fn a_displaced_pairing_is_refused_rather_than_scored() {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let mut encoder = UpEncoder::new(&parameters).expect("drn 1's parameters encode");
+        let sent = encoder.b1u();
+        let decisions: Vec<(u64, [i32; 4])> = (0..50u64)
+            .map(|frame| {
+                let mut etas = [0i32; 4];
+                for (position, eta) in etas.iter_mut().enumerate() {
+                    *eta = sent[skip + 1 + frame as usize * 4 + position].eta;
+                }
+                (frame, etas)
+            })
+            .collect();
+        let right = B1uBins::measure(&parameters, &decisions, skip + 1, true);
+        assert_eq!(right.total_wrong, 0);
+        assert!(right.trusted(), "the right origin is the only one that reads zero");
+        for displaced in [skip, skip + 2, skip + 1 + crate::v92::UP_INTERVALS - 1] {
+            let bins = B1uBins::measure(&parameters, &decisions, displaced, true);
+            assert_eq!(bins.unpaired, 0, "a displacement pairs everything: {displaced}");
+            assert!(bins.total > 0, "and counts everything");
+            assert!(
+                !bins.trusted(),
+                "a pairing {displaced} symbols out must be refused, not scored {:.4}",
+                bins.weighted()
+            );
+        }
     }
 
     /// The reading of the boundary at `back`, and the gate it is held to.
