@@ -878,7 +878,102 @@ fn ridges_in_use() -> Vec<f64> {
     }
 }
 
+/// One equaliser unit in the codec's int16 domain, from `[8.8.3]`'s power
+/// identity: TRN1u's `+-LU` is the receiver's `+-1`, and the far end transmits
+/// at the power `[8.8.3]` derives, which is the bench's 1609 LSB rms
+/// ([`crate::v92::codegrid::TARGET_RMS`], `docs/25` §2, docs/242 §1).
+pub const LATTICE_LSB: f64 = crate::v92::codegrid::TARGET_RMS;
+
+/// Whether the decision reference is built on the far end's code lattice.
+///
+/// On unless `V92_LATTICE=off`, which is the linear grid every call before
+/// `docs/242` read; kept so the two can be compared on one capture and so that
+/// a lattice that ever mis-decides can be taken out of the path without a build.
+fn lattice_reference() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("V92_LATTICE").ok().as_deref(),
+            Some("0") | Some("off") | Some("no") | Some("false")
+        )
+    })
+}
+
+/// One equaliser unit in the codec's int16 domain.
+///
+/// `V92_LATTICE_LSB` overrides it, which is how the far end's own operating
+/// point is *measured* rather than assumed: `[8.8.3]` fixes the power this end
+/// asks at, and which code that power lands on is the far end's own scale.
+fn lattice_unit() -> f64 {
+    static UNIT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *UNIT.get_or_init(|| {
+        std::env::var("V92_LATTICE_LSB")
+            .ok()
+            .and_then(|t| t.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(LATTICE_LSB)
+    })
+}
+
+/// The code value the far end's quantiser puts out for a reference `value`.
+///
+/// Code 0 is silence and `[8.8.3]` forbids it in a constellation
+/// ([`crate::v92::codegrid`]), so the smallest magnitude this returns is code 1's.
+pub fn on_lattice(value: f64) -> f64 {
+    if !lattice_reference() || value == 0.0 {
+        return value;
+    }
+    let unit = lattice_unit();
+    let code = crate::v92::codegrid::nearest_code((value.abs() * unit).round());
+    f64::from(crate::v92::codegrid::value(code)).copysign(value) / unit
+}
+
+/// The same over a whole reference sequence or decision table.
+pub fn lattice_levels(levels: &[f64]) -> Vec<f64> {
+    if !lattice_reference() {
+        return levels.to_vec();
+    }
+    levels.iter().map(|&level| on_lattice(level)).collect()
+}
+
 /// TRN2u's own symbols: 8.7.6's scrambled ones on Tables 28's four points.
+///
+/// The sequence is built as Tables 28 draws it and then put **on the far end's
+/// code lattice** ([`on_lattice`]): what the far end can put on the line is a
+/// G.711 code value, not the point the drawing names, and a reference that
+/// ignores that spends decision margin on points the far end cannot emit. The
+/// two middle levels are 719.6 LSB at `[8.8.3]`'s power, where the nearest
+/// mu-law code is 716, and the two outer are 2158.7 LSB, where it is 2108: 51
+/// LSB of a *signal-dependent* offset that no linear equaliser can cancel and no
+/// gain can move, because it is the codec doing its job (`docs/241` sec 5).
+///
+/// # The basis, in the standard and not in the measurement
+///
+/// `[8.8.3]`: "the digital modem shall design the modulation parameters
+/// assuming that, when the prefilter output multiplied by `G` has a mean-square
+/// value of 1, the analogue modem will transmit at the desired power"
+/// (`/tmp/v92.txt:1793`), which is what makes one equaliser unit a fixed number
+/// of codec LSB. `Table 23` bit 35 names the far end's codec type and bit 128
+/// whether its transmit constellations differ from its codec's D/A output
+/// constellations (`/tmp/v92.txt` sec 8.7.3), and the constellation it reports is
+/// a Ucode mask: "a bit set to 1 indicates that the constellation includes the
+/// PCM code represented by the corresponding Ucode". A far end with bit 128
+/// clear is code-transparent and its levels **are** code values; V.90's Table 1
+/// is that lattice in the codec's units ([`crate::v90::ucode::linear`]
+/// reproduces all 512 published values).
+///
+/// # Why this is an algorithm fix and not a tuning
+///
+/// A tuning constant moves a boundary by a number nobody can derive. This
+/// replaces the *set of permitted points* with the one the standard says the far
+/// end has: before, the reference said "the level is 2158.7 LSB", which no
+/// codeword can be; after, it says "the level is the code that decodes to
+/// 2108 LSB", which is a point the far end can emit and does. The error is still
+/// measured against those points and still reported -- nothing is masked and
+/// nothing is capped, and `V92_LATTICE=off` restores the linear grid bit for
+/// bit.
+///
+/// `phase` says which of the two bits in a symbol is the magnitude, `seed` is
 ///
 /// `phase` says which of the two bits in a symbol is the magnitude, `seed` is
 /// the differential sign the far end started from; between them the four
@@ -914,13 +1009,21 @@ fn trn2u_levels(
         levels.push(if sign == 1 { -tier } else { tier } / 5f64.sqrt());
         j += 1;
     }
-    Some(levels)
+    Some(lattice_levels(&levels))
 }
 
-/// The four TRN2u levels, in the units the equaliser's output carries.
+/// The four TRN2u levels, in the units the equaliser's output carries -- and on
+/// the far end's code lattice, for the reason [`on_lattice`] gives: the
+/// boundary a four-point decision is taken at has to be half way between the
+/// two codes the far end can emit, not between two points it cannot.
 fn four_point_levels() -> [f64; 4] {
     let size = up_signals::Trn2uSize::Four;
-    [-size.magnitude(1), -size.magnitude(0), size.magnitude(0), size.magnitude(1)]
+    let linear = [-size.magnitude(1), -size.magnitude(0), size.magnitude(0), size.magnitude(1)];
+    let mut out = [0.0f64; 4];
+    for (slot, &level) in out.iter_mut().zip(linear.iter()) {
+        *slot = on_lattice(level);
+    }
+    out
 }
 
 /// The nearest of `levels` to `value`, with the distance.
@@ -1764,7 +1867,11 @@ impl Receiver {
     /// AGC that puts the equaliser's output on the scale the levels are on, and
     /// TRN2u and B1u are transmitted at the same power (3.8, 8.7.1).
     pub fn set_data_mode(&mut self, levels: Vec<f64>) {
-        self.slicer = Slicer::Levels(levels);
+        // CPd's points, put on the far end's code lattice: the table this end
+        // slices B1u on is the set of values the far end's quantiser can put
+        // out, so a point that is not a codeword is not a decision this slicer
+        // may take (docs/242 sec 2, and `on_lattice` for the clause).
+        self.slicer = Slicer::Levels(lattice_levels(&levels));
         // Diagnostic (`V92_DATA_FB`): what to do with the fitted feedback
         // section once the data mode starts. `off` zeroes it and `scale:K`
         // multiplies it, so that "is the decision feedback equalising a second
@@ -3826,6 +3933,57 @@ pub(crate) fn reference(from: usize, length: usize, mode: Mode) -> Option<Vec<f6
 mod tests {
     use super::*;
     use crate::v92::up_signals::{ru, su};
+
+    /// **The reference sits on the far end's code lattice.**
+    ///
+    /// Two things, both of them a property of the decision reference and not of
+    /// a threshold: a TRN2u symbol decodes to a point whose value in the codec's
+    /// domain *is* a µ-law code value, and a value half way between two codes is
+    /// resolved to the nearer one rather than left in the gap.
+    ///
+    /// The numbers are the ones `docs/242` sec 2 measured: Tables 28's four
+    /// points are `+-(1, 3)/sqrt(5)` in equaliser units, which at `[8.8.3]`'s
+    /// power are 719.6 and 2158.7 LSB, and the µ-law lattice's nearest codes
+    /// decode to 716 and 2108. On `7a32cb7` the same four points came back as
+    /// 719.57 and 2158.70 -- the drawing, not the line.
+    #[test]
+    fn the_decision_reference_is_on_the_far_ends_code_lattice() {
+        assert!(lattice_reference(), "the lattice is the default; V92_LATTICE=off only for an A/B");
+        let unit = LATTICE_LSB;
+        // The two tiers of TRN2u, and no other values.
+        let inner = on_lattice(1.0 / 5f64.sqrt());
+        let outer = on_lattice(3.0 / 5f64.sqrt());
+        assert_eq!((inner * unit).round(), 716.0, "the inner tier is not on a code");
+        assert_eq!((outer * unit).round(), 2108.0, "the outer tier is not on a code");
+        for level in four_point_levels() {
+            let lsb = (level.abs() * unit).round();
+            let code = crate::v92::codegrid::nearest_code(lsb);
+            assert_eq!(f64::from(crate::v92::codegrid::value(code)), lsb, "{level} is not a code value");
+        }
+        // A midpoint between two codes resolves to the nearer of them, and a
+        // point just past the midpoint to the other: the boundary moved to the
+        // lattice and did not simply shrink towards the ideal.
+        let low = f64::from(crate::v92::codegrid::value(60));
+        let high = f64::from(crate::v92::codegrid::value(61));
+        assert!(high > low + 1.0, "codes 60 and 61 must be distinct LSB");
+        let mid = 0.5 * (low + high);
+        let near = |value: f64| (on_lattice(value / unit) * unit).round();
+        assert!(near(mid) == low || near(mid) == high, "a midpoint landed off the lattice");
+        assert_eq!(near(mid + 1.0), high, "just above the midpoint took the lower code");
+        assert_eq!(near(mid - 1.0), low, "just below the midpoint took the upper code");
+        assert_eq!(near(-(mid + 1.0)), -high, "the sign did not survive");
+        // A TRN2u symbol sequence is built out of those values only.
+        let bits = reference(0, 64, Mode::Answer).expect("a reference");
+        let levels = trn2u_levels(&bits, 32, 0, 0, false).expect("levels");
+        let allowed = [inner, outer, -inner, -outer];
+        for level in &levels {
+            assert!(
+                allowed.iter().any(|want| (want - level).abs() < 1e-12),
+                "{level} is not one of the four code values {:?}",
+                allowed
+            );
+        }
+    }
 
     /// The hunt's answer is the same at every level, and it is the same
     /// *index*: 9.5.2.1.7's Su, its half-symbol S-bar-u and the Su after it,
