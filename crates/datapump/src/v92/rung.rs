@@ -609,6 +609,11 @@ pub enum Instrument {
     Crossing,
     /// The rate of B1u symbols whose decided index differs from the sent index.
     Bin,
+    /// No rate was measured: the rung was decided on the level precondition
+    /// alone, which is the only thing there is to read before `CPd` goes out.
+    /// A grant under this instrument says exactly that and nothing about a
+    /// symbol error rate -- `docs/264` sec 2.
+    Level,
 }
 
 /// The first rung at which the bin error rate binds: `drn 9`, where LC is 32 and
@@ -629,7 +634,79 @@ impl Instrument {
         match self {
             Instrument::Crossing => "crossing",
             Instrument::Bin => "bin",
+            Instrument::Level => "level",
         }
+    }
+}
+
+/// One rung's level tolerance, two-sided and asymmetric, **measured** rather
+/// than derived: how far the far end's level may sit from `1/G` before that
+/// rung's bin error rate leaves zero.
+///
+/// This replaces `0.5 x min_gap` (`docs/253`'s choice, the decision's own
+/// half-gap), which `docs/261` sec 4 measured and found **3.1x too tight** at
+/// the top of the ladder: at `drn 15 ... 19` it asks for 8 LSB = 0.49 % where a
+/// far end 1.5 % off still reads bin 0.00 %, and from +0.5 % to +1.7 % it alone
+/// floored the ladder at `drn 14` while every bin rate on `drn 9 ... 19` read
+/// zero. A precondition that refuses rungs the instrument the ladder is built on
+/// calls clean is not a precondition, it is a second, unreconciled criterion.
+///
+/// # The numbers, and what they are
+///
+/// `docs/261` sec 4 swept the far end's level error δ on the closed loop from
+/// −3 % to +3 % on a 0.1 % grid at every rung and recorded the **first δ at
+/// which a bin error appears**. The value below is the last δ that reads
+/// 0.00 % -- one grid step inside the crossing, because the crossing itself is
+/// where the measurement says the rung *fails*:
+///
+/// | rungs | + side (first error -> allowed) | − side (first error -> allowed) |
+/// |---|---|---|
+/// | 1, 2 | > +3 % (the sweep's edge) | > −3 % (the sweep's edge) |
+/// | 3 … 8 | +2.6 % → **+2.5 %** | −2.5 % → **−2.4 %** |
+/// | 9 … 18 | +1.8 % → **+1.7 %** | −2.0 % → **−1.9 %** |
+/// | 19 | +1.8 % → **+1.7 %** | −1.5 % → **−1.4 %** |
+///
+/// * `drn 1, 2` are **bounded only by the sweep**: no level error in ±3 % moves
+///   a code at all, and 3 % is as far as the measurement goes. Granting beyond
+///   it would be a claim nothing measured, so the edge is the tolerance. **[our
+///   choice, on `docs/261` sec 2's "0.00 % from −3 % to +3 %"]**
+/// * `drn 3 … 8`'s positive crossing is **+2.6 %** (sec 2's finer grid), not the
+///   `> +3 %` of sec 4's coarser column; the finer number is the one used.
+///   **[verified, `docs/261` sec 2 and sec 3's +2.6 % row]**
+/// * `drn 9 … 18` takes the **tightest** crossing of the group (1.8 % at
+///   `drn 9 … 14, 17, 19`; 1.9 % at `drn 15, 16, 18`), so the group's allowed
+///   value is 1.7 % for every rung in it. One grid step of conservatism, spent
+///   so that the table has no rung whose grant depends on a 0.1 % distinction
+///   the sweep cannot resolve. **[our choice]**
+/// * `drn 19`'s **negative** side is the tightest number on the ladder (−1.5 %,
+///   24 LSB): going down lands the point in the next chord *below*, whose step
+///   is half. **[verified]**
+///
+/// # Why the shape is asymmetric
+///
+/// `docs/261` sec 4.2: a level error moves every design point by `δ a(η)` LSB
+/// and the far end's codec then rounds it to the nearest code. Going up the
+/// µ-law lattice the next chord's step is **double**, so a round-up moves the
+/// code more often than a round-down of the same size; going down it is half.
+/// The measurement shows exactly that -- the positive side binds at `drn 9 …
+/// 18`, the negative side at `drn 19` -- so one number either side would
+/// either refuse a level the measurement grants or grant one it refuses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tolerance {
+    /// How far **above** `1/G` the far end may sit, as a fraction of `1/G`.
+    pub plus: f64,
+    /// How far **below**, as a positive fraction of `1/G`.
+    pub minus: f64,
+}
+
+/// The measured tolerance of one rung, as fractions of `1/G` ([`Tolerance`]).
+#[must_use]
+pub fn tolerance(drn: u8) -> Tolerance {
+    match drn {
+        0..=2 => Tolerance { plus: 0.030, minus: 0.030 },
+        3..=8 => Tolerance { plus: 0.025, minus: 0.024 },
+        19 => Tolerance { plus: 0.017, minus: 0.014 },
+        _ => Tolerance { plus: 0.017, minus: 0.019 },
     }
 }
 
@@ -669,7 +746,10 @@ impl Reading {
     pub fn rate(&self, instrument: Instrument) -> f64 {
         match instrument {
             Instrument::Crossing => self.crossing,
-            Instrument::Bin => self.bin,
+            // The level-only instrument has no rate of its own; a caller that
+            // asks for one gets the binding rate's, which is the one it would
+            // have been decided on had a window existed.
+            Instrument::Bin | Instrument::Level => self.bin,
         }
     }
 
@@ -688,24 +768,29 @@ impl Reading {
         1.0 / self.gain
     }
 
-    /// How far off `1/G` the level may be before the grant stops describing the
-    /// bench's far end: half the rung's own smallest gap, on the line.
-    ///
-    /// At LC = 64 that is 8 LSB, 0.49 % of 1 627 -- the same half-gap the
-    /// decision itself turns on; at LC = 8 it is 128 LSB, because the builder's
-    /// own eight-point set has a 256 LSB minimum gap and a rung whose neighbours
-    /// are that far apart does not need its level to a tenth of a per cent. It is *our choice* (the standard fixes the level, not the tolerance
-    /// on it), and it is deliberately denominated in the rung's measured gap
-    /// rather than in a global sigma.
+    /// How far off `1/G` this rung's level may be: the tolerance **measured**
+    /// on this rung (`docs/261` sec 4, [`tolerance`]), two-sided and asymmetric.
     #[must_use]
-    pub fn level_tolerance(&self) -> f64 {
-        0.5 * self.min_gap_lsb
+    pub fn tolerance(&self) -> Tolerance {
+        tolerance(self.drn)
     }
 
-    /// Whether the far end's level is the `1/G` this end named.
+    /// The far end's level error against `1/G`, as a signed fraction of `1/G`:
+    /// positive is high.
+    #[must_use]
+    pub fn level_delta(&self) -> f64 {
+        (self.level_lsb - self.wanted_level()) / self.wanted_level()
+    }
+
+    /// Whether the far end's level is `1/G` within what the measurement gives
+    /// this rung. Two-sided and asymmetric: the high and the low side are
+    /// different numbers, because the µ-law lattice is not symmetric about a
+    /// design point (`docs/261` sec 4.2).
     #[must_use]
     pub fn level_ok(&self) -> bool {
-        (self.level_lsb - self.wanted_level()).abs() <= self.level_tolerance()
+        let delta = self.level_delta();
+        let tolerance = self.tolerance();
+        delta <= tolerance.plus && -delta <= tolerance.minus
     }
 
     /// The one-line log the ladder writes: which instrument bound, the rates it
@@ -715,23 +800,55 @@ impl Reading {
     /// read both and the switch is a statement about which one is *consulted*.
     #[must_use]
     pub fn line(&self, verdict: Verdict) -> String {
-        let instrument = verdict.instrument().unwrap_or(Instrument::for_rung(self.drn));
+        let tolerance = self.tolerance();
+        let wanted = self.wanted_level();
+        // `n/a` and not a zero: a rate nobody measured is not a clean rate, and
+        // the line has to be readable as that.
+        let (instrument, rate, resolution) = match verdict {
+            Verdict::Granted { instrument: Instrument::Level, .. }
+            | Verdict::Level { .. } => ("level".to_owned(), "n/a".to_owned(), "n/a".to_owned()),
+            _ => {
+                let instrument = verdict.instrument().unwrap_or(Instrument::for_rung(self.drn));
+                (
+                    instrument.name().to_owned(),
+                    format!("{:.4e}", self.rate(instrument)),
+                    format!("{:.2e}", self.resolution()),
+                )
+            }
+        };
+        let why = match verdict {
+            Verdict::Level { delta, plus, minus, .. } => {
+                let side = if delta > plus { "high" } else { "low" };
+                format!(
+                    "REFUSE(level {:+.2}% {side}: +{:.1}%/-{:.1}% allowed)",
+                    delta * 100.0,
+                    plus * 100.0,
+                    minus * 100.0
+                )
+            }
+            Verdict::Rate { rate, target, .. } => {
+                format!("REFUSE(rate {rate:.4e} > {:e})", target)
+            }
+            Verdict::Granted { instrument: Instrument::Level, .. } => {
+                "GRANT(level only: no rate window yet)".to_owned()
+            }
+            Verdict::Granted { .. } => "GRANT".to_owned(),
+        };
         format!(
-            "LADDER drn={} lc={} instrument={} rate={:.4e} bin={:.4e} crossing={:.4e} \
-             target={:.1e} symbols={} resolution={:.2e} level={:.1} 1/G={:.1} tol={:.1} -> {}",
+            "LADDER drn={} lc={} instrument={instrument} rate={rate} bin={:.4e} crossing={} \
+             target={:.1e} symbols={} resolution={resolution} level={:.1} 1/G={wanted:.1} \
+             delta={:+.2}% tol=+{:.1} LSB/-{:.1} LSB gap={:.0} -> {why}",
             self.drn,
             self.lc,
-            instrument.name(),
-            self.rate(instrument),
             self.bin,
-            self.crossing,
+            if self.crossing.is_finite() { format!("{:.4e}", self.crossing) } else { "n/a".to_owned() },
             TARGET,
             self.symbols,
-            self.resolution(),
             self.level_lsb,
-            self.wanted_level(),
-            self.level_tolerance(),
-            if verdict.granted() { "GRANT" } else { "REFUSE" }
+            self.level_delta() * 100.0,
+            tolerance.plus * wanted,
+            tolerance.minus * wanted,
+            self.min_gap_lsb,
         )
     }
 }
@@ -752,13 +869,17 @@ pub enum Verdict {
         rate: f64,
         target: f64,
     },
-    /// The level is not `1/G`: the reading describes a far end this end did not
-    /// ask for, so its rate is not evidence about the bench's far end either
-    /// way.
+    /// The level is not `1/G` within the tolerance **measured** for this rung
+    /// ([`tolerance`]): the reading describes a far end this end did not ask
+    /// for, so its rate is not evidence about the bench's far end either way.
+    /// The refusal carries the number that refused it -- the signed `delta` and
+    /// the two allowances -- so an honest refusal is readable as one.
     Level {
         level_lsb: f64,
         wanted: f64,
-        tolerance: f64,
+        delta: f64,
+        plus: f64,
+        minus: f64,
     },
 }
 
@@ -783,13 +904,14 @@ impl Verdict {
 ///
 /// Two conditions, in this order:
 ///
-/// 1. **the level is `1/G`** within [`Reading::level_tolerance`]. This is the
-///    precondition the grant cannot check from our side: we send `G` in CPd bits
-///    35:50 and the far end is supposed to obey it (8.8.3), but whether it did is
-///    a property of the far end. A reading taken at any other level is refused
-///    whatever its rate, because it is not a reading of the far end the grant
-///    would be about -- `docs/253` sec 3 is the case that matters (at 2 100 LSB,
-///    29 % high, `drn 19` reads 9.62 % bin and 92.8 % `B1u`).
+/// 1. **the level is `1/G`** within [`Reading::tolerance`], the tolerance
+///    `docs/261` sec 4 **measured** per rung, two-sided and asymmetric. This is
+///    the precondition the grant cannot check from our side: we send `G` in CPd
+///    bits 35:50 and the far end is supposed to obey it (8.8.3), but whether it
+///    did is a property of the far end. A reading taken at any other level is
+///    refused whatever its rate, because it is not a reading of the far end the
+///    grant would be about -- `docs/253` sec 3 is the case that matters (at
+///    2 100 LSB, 29 % high, `drn 19` reads 9.62 % bin and 92.8 % `B1u`).
 /// 2. **the binding rate is at or under [`TARGET`]**, the standard's per-symbol
 ///    error probability before the trellis. Which rate binds is
 ///    [`Instrument::for_rung`]'s answer: the crossing below [`FIRST_BIN_DRN`],
@@ -814,16 +936,30 @@ impl Verdict {
 #[must_use]
 pub fn admit(reading: &Reading) -> Verdict {
     if !reading.level_ok() {
+        let tolerance = reading.tolerance();
         return Verdict::Level {
             level_lsb: reading.level_lsb,
             wanted: reading.wanted_level(),
-            tolerance: reading.level_tolerance(),
+            delta: reading.level_delta(),
+            plus: tolerance.plus,
+            minus: tolerance.minus,
         };
+    }
+    // No rate window yet: before `CPd` there is no `B1u` to read, so the only
+    // measurement there is is the level, and the grant says so rather than
+    // reporting a zero it did not take (`docs/264` sec 2).
+    if reading.symbols == 0 {
+        return Verdict::Granted { instrument: Instrument::Level, rate: f64::NAN, target: TARGET };
     }
     let named = Instrument::for_rung(reading.drn);
     let (instrument, rate) = match named {
         // At and above the switch the crossing is saturated and is not read.
-        Instrument::Bin => (Instrument::Bin, reading.bin),
+        Instrument::Bin | Instrument::Level => (Instrument::Bin, reading.bin),
+        // A crossing nobody measured is not a crossing of zero: where the live
+        // receive path has the bin rate and not the per-chord level stream
+        // (`docs/264` sec 3), the bin rate is what is read and the line says
+        // `crossing=n/a`.
+        Instrument::Crossing if !reading.crossing.is_finite() => (Instrument::Bin, reading.bin),
         // Below it both are read, and the larger is the one that binds: a bin
         // error inside an oversized gap is an error the crossing cannot see.
         Instrument::Crossing if reading.bin > reading.crossing => (Instrument::Bin, reading.bin),
@@ -1439,19 +1575,109 @@ mod tests {
         assert!(admit(&at).granted(), "1/G at a clean rate: {at:?}");
         let high = reading(19, 2_100.0, 0.0, 0.0, 2_448);
         match admit(&high) {
-            Verdict::Level { level_lsb, wanted, tolerance } => {
+            Verdict::Level { level_lsb, wanted, delta, plus, minus } => {
                 assert_eq!(level_lsb, 2_100.0);
                 assert!((wanted - 1_627.0).abs() < 0.05, "wanted {wanted}");
-                assert!((tolerance - 8.0).abs() < 1e-9, "half of LC = 64's 16 LSB gap: {tolerance}");
+                assert!((delta - 0.2907).abs() < 1e-3, "delta {delta}");
+                assert!((plus - 0.017).abs() < 1e-12, "the measured + side: {plus}");
+                assert!((minus - 0.014).abs() < 1e-12, "the measured - side: {minus}");
             }
             other => panic!("2100 LSB is not 1/G: {other:?}"),
         }
         // And the refusal is not a rate result: the level is checked first, so a
         // clean reading at the wrong level cannot be reported as a grant.
         assert_eq!(admit(&high).instrument(), None);
-        // The tolerance itself is half the rung's own measured gap, on the line.
-        assert!((at.level_tolerance() - 8.0).abs() < 1e-9, "{}", at.level_tolerance());
-        assert!((reading(1, 1_620.1, 0.0, 0.0, 1_224).level_tolerance() - 128.0).abs() < 1e-9);
+        // The tolerance is the *measured* one, and it is no longer the design's
+        // half-gap: 0.5 x 16 LSB was 8 LSB, the measurement gives 27.7 LSB up.
+        assert!((at.tolerance().plus - 0.017).abs() < 1e-12, "{:?}", at.tolerance());
+        assert!((at.tolerance().plus * at.wanted_level() - 27.66).abs() < 0.02);
+        assert!(at.tolerance().plus * at.wanted_level() > 3.0 * 8.0, "the old rule was 3.1x too tight");
+        assert!((reading(1, 1_620.1, 0.0, 0.0, 1_224).tolerance().plus - 0.030).abs() < 1e-12);
+    }
+
+    /// **The two-sided test the replacement has to pass**, in `docs/261` sec 4's
+    /// own units: at every rung, the level the measurement calls *fatal* is
+    /// refused and the level it calls *fine* is granted.
+    ///
+    /// Fatal is the crossing minus nothing -- the first δ at which a bin error
+    /// appears; fine is one grid step (0.1 %) inside it, which is the level the
+    /// whole table of §2 reads 0.00 % at.
+    #[test]
+    fn the_measured_tolerance_refuses_what_is_fatal_and_grants_what_is_fine() {
+        // (rung, first error high, first error low, fine high, fine low)
+        let rows = [
+            // 1 and 2 have no fatal δ inside the sweep, so their row's fatal
+            // value is the tolerance itself and the *fine* check is the whole
+            // test: nothing in ±3 % moves a code at all.
+            (3, 0.026, 0.025, 0.025, 0.024),
+            (8, 0.026, 0.025, 0.025, 0.024),
+            (9, 0.018, 0.020, 0.017, 0.019),
+            (15, 0.019, 0.020, 0.017, 0.019),
+            (18, 0.019, 0.020, 0.017, 0.019),
+            (19, 0.018, 0.015, 0.017, 0.014),
+        ];
+        for (drn, fatal_high, fatal_low, fine_high, fine_low) in rows {
+            let wanted = ideal_level(drn);
+            let at = |delta: f64| reading(drn, wanted * (1.0 + delta), 0.0, 0.0, 416);
+            // Fine: granted, at a clean rate.
+            // 0.1 % of slack so that a value *at* the tolerance is not decided
+            // by the last bit of a float: the table is a grid, not an equality.
+            assert!(admit(&at(fine_high * 0.999)).granted(), "drn {drn}: +{fine_high} refused");
+            assert!(admit(&at(-fine_low * 0.999)).granted(), "drn {drn}: -{fine_low} refused");
+            // Fatal: refused on the level, with the number.
+            for delta in [fatal_high, -fatal_low] {
+                let verdict = admit(&at(delta));
+                assert!(!verdict.granted(), "drn {drn}: {delta} granted");
+                assert!(matches!(verdict, Verdict::Level { .. }), "drn {drn}: {delta} refused on {:?}", verdict.instrument());
+            }
+        }
+        // `drn 1` and `drn 2` are granted the whole swept range and no more:
+        // granting past it would be a claim the measurement does not make.
+        for drn in [1u8, 2] {
+            let wanted = ideal_level(drn);
+            assert!(admit(&reading(drn, wanted * 1.029, 0.0, 0.0, 416)).granted(), "drn {drn} at +2.9 %");
+            assert!(admit(&reading(drn, wanted * 0.971, 0.0, 0.0, 416)).granted(), "drn {drn} at -2.9 %");
+            assert!(!admit(&reading(drn, wanted * 1.035, 0.0, 0.0, 416)).granted(), "drn {drn} past the sweep");
+        }
+        // And the asymmetry is real, not decoration: drn 19's low side is
+        // tighter than its high side, drn 9's high side is tighter than its low.
+        assert!(tolerance(19).minus < tolerance(19).plus);
+        assert!(tolerance(9).plus < tolerance(9).minus);
+    }
+
+    /// **The decision this ticket exists for.** At the far end's measured 2.2 %
+    /// the level precondition grants `drn 1 ... 8` and refuses `drn 9 ... 19`,
+    /// so the highest rung the ladder grants is `drn 8` = 33 333 bit/s -- with
+    /// no rate window at all, which is what a `CPd` has to be decided on
+    /// (`docs/261` sec 3, `docs/264` sec 1).
+    #[test]
+    fn at_the_measured_two_point_two_per_cent_the_ladder_grants_drn_8() {
+        let mut highest = None;
+        let mut line = String::new();
+        for drn in 1..=UP_RATES as u8 {
+            let wanted = ideal_level(drn);
+            let reading = reading(drn, wanted * 1.022, 0.0, 0.0, 0);
+            if admit(&reading).granted() {
+                highest = Some(drn);
+                line = reading.line(admit(&reading));
+            }
+        }
+        assert_eq!(highest, Some(8), "2.2 % must buy drn 8 and no more");
+        assert_eq!(up_rate(8), 33_333);
+        // The grant is honest about *what* it was taken on.
+        assert!(line.contains("instrument=level"), "{line}");
+        assert!(line.contains("rate=n/a"), "{line}");
+        assert!(line.contains("delta=+2.20%"), "{line}");
+        assert!(line.contains("GRANT(level only"), "{line}");
+        // And the first refusal says which number refused it.
+        let refused = reading(9, ideal_level(9) * 1.022, 0.0, 0.0, 0);
+        let text = refused.line(admit(&refused));
+        assert!(text.contains("REFUSE(level +2.20% high"), "{text}");
+        assert!(text.contains("+1.7%/-1.9% allowed"), "{text}");
+        // 1.7 % buys the top rung, which is the other side of the same test:
+        // the old 0.5 x gap rule floored this at drn 14 (docs/261 sec 3).
+        assert!(admit(&reading(19, ideal_level(19) * 1.017, 0.0, 0.0, 0)).granted());
+        assert!(admit(&reading(15, ideal_level(15) * 1.017, 0.0, 0.0, 0)).granted());
     }
 
     /// A grant's honesty is its resolution: the target is `1e-7` and a 2 448
