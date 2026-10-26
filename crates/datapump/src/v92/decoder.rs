@@ -1615,6 +1615,7 @@ mod tests {
         let sent = encoder.b1u();
         let k = 1.02;
         let wrong = |decoder: &mut Decoder| -> usize {
+            decoder.keep_decisions(true);
             let mut wrong = 0;
             for symbol in &sent {
                 decoder.feed(symbol.u * k);
@@ -1630,10 +1631,20 @@ mod tests {
             }
             wrong
         };
+        // Where the threshold is, measured on this set and this stream: 1.01
+        // costs nothing and 1.02 costs 7.9 % of the codes, because the first
+        // point the shift carries past half its own gap is the 428 LSB one
+        // (gap 32) and `0.02 x 428 = 8.6` is past 16. The 64-point grid's
+        // finest steps are its lowest ones -- 24, 24, 24, 32 LSB at 24 ... 148
+        // LSB -- so a scale error bites at small `a` first and everywhere
+        // above it after that.
+        let mut near_one = Decoder::with_trellis(&parameters, TrellisMode::Slice);
+        near_one.slice_at(1.01);
+        assert_eq!(wrong(&mut near_one), 0, "1 % of scale is inside this set's gaps");
         let mut at_one = Decoder::with_trellis(&parameters, TrellisMode::Slice);
         assert_eq!(at_one.scale(), 1.0);
         let design = wrong(&mut at_one);
-        assert!(design > 0, "a stream at k must not slice right at k = 1");
+        assert_eq!(design, 33, "a stream at 1.02 must not slice right at k = 1: 33 of 416");
         let mut at_k = Decoder::with_trellis(&parameters, TrellisMode::Slice);
         at_k.slice_at(k);
         assert!((at_k.scale() - k).abs() < 1e-12);
