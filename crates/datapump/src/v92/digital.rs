@@ -5987,34 +5987,63 @@ impl Modem {
     /// The two constellations V.90 8.6.4 separates `Rd` from `Rt` by.
     ///
     /// `Rd` is "the highest power PCM codeword from the **data mode**
-    /// constellation of each data frame interval as passed in **CP**" -- which
-    /// downstream is this end's own CPd. `Rt` is the same "from the **training**
-    /// constellation ... as passed in **CPt**". Twelve intervals each, and the
-    /// two are never the same array.
+    /// constellation of each data frame interval as passed in **CP**", `Rt` the
+    /// same "from the **training** constellation ... as passed in **CPt**".
+    /// Twelve intervals each, three different level sources, and the two arrays
+    /// are never the same one.
+    ///
+    /// `Ri` is not here at all: it is "the single PCM codeword whose Ucode is
+    /// U_INFO for all data frame intervals" (`v90.txt:1844`), a codeword and
+    /// not a constellation, and it is emitted at `Source::uinfo`
+    /// (`digital.rs:2487`).
     fn renegotiation_points(&self) -> ([u8; DOWN_INTERVALS], [u8; DOWN_INTERVALS]) {
-        let law = self.source.law;
-        // Data mode, out of CPd's sets. `Sets::points` is "in increasing
-        // magnitude", so the last of a set is its highest-power codeword; the
-        // set for interval i is `index[i % 6]`, six sets serving twelve
-        // intervals (Table 30). The magnitudes are Table 1's linear scale, and
-        // `ucode::nearest` is the inverse of `ucode::linear`.
+        // Data mode, out of the constellation **we transmit**.
+        //
+        // The CP that carries the digital modem's data mode constellations is
+        // **CPu**: `v92.txt:1474` -- "The long CPu sequence contains modulation
+        // parameters for use by the digital modem in data mode" -- and 8.8.4's
+        // `Rf` reads its own level out of it by name, "the highest power PCM
+        // codeword from the data mode constellation of each data frame interval
+        // as passed in **CPu**" (`v92.txt:1961-1962`). `Rd`'s "as passed in CP"
+        // (`v90.txt:1841-1842`) is that same message under V.90's name for it.
+        //
+        // `begin_data` (`digital.rs:5254`) builds `self.downstream` out of that
+        // CPu, so the mapping read here is the one `B1d` is actually going out
+        // on. `Constellation::points()` holds Ucodes "sorted so that index 0 is
+        // the largest" (`modulus.rs:103`), so the *first* of an interval's set
+        // is its highest-power codeword -- taken from the encoder on the line
+        // rather than from a second reading of the same message.
+        //
+        // It is **not** `self.cpd`. A CPd is "modulation parameters for use by
+        // the analogue modem in data mode" (`v92.txt:1764`) -- the *upstream*
+        // constellation -- and its points are `V92_LEVELSET`'s level indices
+        // `a(eta) = 2eta + 1` (`upchoice.rs:429`), not Table 1 linear
+        // magnitudes. Reading it here and inverting it with `ucode::nearest`
+        // took the odd lattice's last index, 15 at LC 8, for a linear value and
+        // made Ucode 2 = linear 16: the -66 dBFS `Rd` of
+        // `runs-216/170104`.
         let mut data = [self.source.uinfo; DOWN_INTERVALS];
-        if let Some(sets) = self.cpd.as_ref().and_then(|cpd| cpd.sets.as_ref()) {
+        if let Some(encoder) = self.downstream.as_ref() {
+            let sets = &encoder.mapping().sets;
             for (i, slot) in data.iter_mut().enumerate() {
-                let set = sets.index[i % INTERVALS] as usize;
-                if let Some(&loudest) = sets.points.get(set).and_then(|p| p.last()) {
-                    let (ucode, _) = ucode::nearest(law, i32::from(loudest));
-                    *slot = ucode;
+                if let Some(&loudest) = sets.get(i % INTERVALS).and_then(|s| s.points().first()) {
+                    *slot = loudest;
                 }
             }
         }
-        // Training, out of CPt's own coder: `points()` is loudest first, so the
-        // last is the highest-power codeword of that interval's set.
+        // Training, out of CPt's own coder -- the encoder TRN2d, SUVd, CPd and
+        // Ed go out on, which `set_cpt` built from the far end's CPt (8.6.5).
+        // `Constellation::points()` is "sorted so that index 0 is the largest"
+        // (`modulus.rs:103`), i.e. **loudest first**, so the highest-power
+        // codeword of an interval's set is its *first* -- `.last()` is the
+        // quietest and was what this read before `docs/218`; `Rt` is not
+        // emitted on any path a bench call has reached, which is why nothing
+        // measured it.
         let mut training = [self.source.uinfo; DOWN_INTERVALS];
         if let Some(phase4) = self.source.phase4.as_ref() {
             let sets = &phase4.coder.mapping().sets;
             for (i, slot) in training.iter_mut().enumerate() {
-                if let Some(&loudest) = sets.get(i % INTERVALS).and_then(|s| s.points().last()) {
+                if let Some(&loudest) = sets.get(i % INTERVALS).and_then(|s| s.points().first()) {
                     *slot = loudest;
                 }
             }
@@ -9575,4 +9604,217 @@ mod conformance_158 {
         assert_eq!(source.symbol % INTERVALS as u64, 0, "the frame grid was rotated by silence");
     }
 
+}
+
+/// docs/218: V.90 8.6.4's three level sources, kept apart.
+///
+/// `Rd`, `Ri` and `Rt` take their levels from three different places -- the
+/// data mode constellation as passed in CP, the single codeword U_INFO, and the
+/// training constellation as passed in CPt -- and the defect this module pins
+/// was one message's numbers reaching the wrong one of them: `Rd` went out at
+/// Ucode 2, linear 16, out of this end's own CPd.
+#[cfg(test)]
+mod conformance_218 {
+    use super::*;
+
+
+// ---------------------------------------------------------------------
+// docs/218: 8.6.4's three level sources, kept apart
+// ---------------------------------------------------------------------
+
+/// Settings at a named U_INFO, which is what `Ri` is emitted at.
+fn settings_uinfo(uinfo: u8) -> Settings {
+    Settings {
+        law: Law::Mu,
+        uinfo,
+        far_md: 0,
+        round_trip: 0.0,
+        wide: true,
+        limits: FilterLimits::from_info1a(0, 0, 0),
+        habits: Habits::PROMPT,
+        probing: None,
+    }
+}
+
+/// A CPt of the shape the analogue modem sends in Phase 3: `points` Ucodes in
+/// every interval's one constellation, at the rate `drn` names.
+fn cpt_of(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
+    let mask = points.fold(0u128, |m, u| m | 1 << u);
+    Cp {
+        data_mode: false,
+        drn,
+        redundancy: crate::v90::sign::Redundancy::None,
+        trn1d_ratio: 1 << 13,
+        intervals: [0; INTERVALS],
+        constellations: vec![mask],
+        ..Cp::default()
+    }
+}
+
+/// A CPu as a far end sends one in data mode: `sets` constellations, each a
+/// dense run of Ucodes, and the interval index naming which of them each of
+/// the six constellation frames uses. `drn 18` is 38 bits a frame, which is
+/// what these masks carry.
+fn cpu_of(sets: &[std::ops::RangeInclusive<u8>], intervals: [u8; INTERVALS]) -> Cp {
+    Cp {
+        data_mode: true,
+        drn: 18,
+        intervals,
+        constellations: sets
+            .iter()
+            .map(|r| (*r.start()..=*r.end()).fold(0u128, |mask, u| mask | 1 << u))
+            .collect(),
+        ..Cp::default()
+    }
+}
+
+/// The modem in data mode on that CPu: `B1d`'s own encoder is built, so
+/// `renegotiation_points` reads the constellation on the line and not a
+/// description of one.
+fn in_data_mode(cpu: Cp) -> Modem {
+    let mut modem = Modem::default();
+    modem.cpu = Some(cpu);
+    modem.begin_data();
+    assert!(modem.downstream.is_some(), "no B1d mapping was built from that CPu");
+    modem
+}
+
+/// Every level `count` symbols of the source produce, after asking for
+/// `out` (`Source::arm_renegotiation` first where 9.8's codewords matter).
+fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
+    source.change(out);
+    (0..count).map(|_| source.next()).collect()
+}
+
+/// **`Rd`** — V.90 8.6.4 (`v90.txt:1841-1842`): "**Rd** denotes signal R
+/// using the highest power PCM codeword from the **data mode** constellation
+/// of each data frame interval as passed in **CP**".
+///
+/// The CP that carries the digital modem's data mode constellations is the
+/// CPu (`v92.txt:1474`, and 8.8.4's `Rf` reads its own level out of it by
+/// name, `v92.txt:1961-1962`), and `begin_data` builds `B1d`'s encoder out
+/// of exactly that. So the test drives a known CPu through the modem and
+/// compares `Rd` against the level table the encoder is already using.
+///
+/// This is the test the -66 dBFS `Rd` of `runs-216/170104` would have
+/// failed: it was Ucode 2, linear 16, because the level came out of this
+/// end's own CPd -- the **upstream** constellation, whose points are
+/// `V92_LEVELSET` level indices -- instead of the downstream one.
+#[test]
+fn rd_is_the_highest_power_codeword_of_the_data_mode_constellation() {
+    let intervals = [0u8, 1, 0, 1, 0, 1];
+    let cpu = cpu_of(&[3..=95, 3..=88], intervals);
+    let mut modem = in_data_mode(cpu.clone());
+    let (data, _) = modem.renegotiation_points();
+
+    // Interval by interval: the loudest Ucode of the constellation that
+    // interval transmits on, read off the CPu's own masks ...
+    let expected: Vec<u8> = (0..DOWN_INTERVALS)
+        .map(|i| *cpu.points(i % INTERVALS).last().expect("a mask with points"))
+        .collect();
+    assert_eq!(data.to_vec(), expected, "Rd is not the data mode constellation's loudest point");
+    // ... and off the level table the encoder on the line is sliced from.
+    let table: Vec<u8> = (0..DOWN_INTERVALS)
+        .map(|i| {
+            modem
+                .downstream
+                .as_ref()
+                .expect("B1d's encoder")
+                .mapping()
+                .sets[i % INTERVALS]
+                .points()
+                .iter()
+                .copied()
+                .max()
+                .expect("a set with points")
+        })
+        .collect();
+    assert_eq!(data.to_vec(), table, "Rd does not agree with the encoder B1d goes out on");
+
+    // And it reaches the line at that codeword's level: 95 is Table 1's
+    // 7932, not the 16 that went out at 24.998 s in `runs-216/170104`.
+    let law = modem.settings.law;
+    assert_eq!(ucode::linear(law, 95), 7932, "Ucode 95 is not the codeword measured on the line");
+    let training = modem.renegotiation_points().1;
+    modem.source.arm_renegotiation(data, training);
+    let levels = r_stream(&mut modem.source, Out::Rd, R_FRAMES * INTERVALS);
+    for (n, level) in levels.iter().enumerate() {
+        let want = ucode::level(law, data[n % DOWN_INTERVALS]);
+        assert!((level.abs() - want).abs() < 1e-12, "Rd symbol {n} is {level}, not {want}");
+    }
+    let loudest = levels.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!((loudest - ucode::level(law, 95)).abs() < 1e-12, "Rd's loudest symbol is {loudest}");
+    assert!((loudest - ucode::level(law, 2)).abs() > 1e-6, "Rd is still the CPd reading's Ucode 2");
+}
+
+/// **`Ri`** — V.90 8.6.4 (`v90.txt:1844`): "**Ri** denotes signal R using
+/// the single PCM codeword whose Ucode is U_INFO for all data frame
+/// intervals". A codeword, not a constellation: arming 9.8 with the loudest
+/// data mode points must not move it.
+#[test]
+fn ri_is_the_u_info_codeword_in_every_interval() {
+    let law = Law::Mu;
+    // U_INFO 78 is what this bench's far end put in its INFO1a: Table 1's
+    // linear 3772, the magnitude `Ri` was measured at in
+    // `runs-216/170104` and `runs-216/165935`.
+    assert_eq!(ucode::linear(law, 78), 3772);
+    let mut source = Source::new(&settings_uinfo(78));
+    source.change(Out::B1d);
+    let mut emitted: Vec<f64> = (0..7).map(|_| source.next()).collect();
+    assert_eq!(source.out(), Out::B1d);
+    // 9.8's codewords are armed and are **not** what Ri is made of.
+    source.arm_renegotiation([95; DOWN_INTERVALS], [88; DOWN_INTERVALS]);
+    source.ri_opener();
+    while source.out() != Out::Trn2d {
+        emitted.push(source.next());
+        assert!(emitted.len() < 1000, "Ri never ended");
+    }
+    let start = 12;
+    let ri = &emitted[start..start + R_FRAMES * INTERVALS];
+    assert_eq!(ri.len(), 384);
+    let want = ucode::level(law, 78);
+    for (i, level) in ri.iter().enumerate() {
+        assert!((level.abs() - want).abs() < 1e-12, "Ri symbol {i} is {level}, not U_INFO");
+        assert_eq!(*level > 0.0, i % INTERVALS < 3, "Ri symbol {i} is not + + + - - -");
+    }
+    let bar = &emitted[start + R_FRAMES * INTERVALS..start + R_FRAMES * INTERVALS + R_BAR_FRAMES * INTERVALS];
+    assert_eq!(bar.len(), 24, "R-bar-i is not 24T");
+    for level in bar {
+        assert!((level.abs() - want).abs() < 1e-12, "R-bar-i is {level}, not U_INFO");
+    }
+    // Three sources, three levels: U_INFO here is neither Rd's nor Rt's.
+    assert!((want - ucode::level(law, 95)).abs() > 1e-6);
+    assert!((want - ucode::level(law, 88)).abs() > 1e-6);
+}
+
+/// **`Rt`** — V.90 8.6.4 (`v90.txt:1847-1848`): "**Rt** denotes signal R
+/// using the highest power PCM codeword from the **training** constellation
+/// of each data frame interval as passed in **CPt**". CPt and CPu are not
+/// the same constellation and this end sends both, so the two arrays must
+/// differ whenever the messages do.
+#[test]
+fn rt_is_the_largest_codeword_of_the_training_constellation_not_the_data_mode_one() {
+    let law = Law::Mu;
+    let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+    assert!(modem.source.set_cpt(&cpt_of(16, 72..=88)), "CPt of 17 points at drn 16 was refused");
+    let (data, training) = modem.renegotiation_points();
+    // CPt's loudest point in every interval, and CPu's in its own.
+    assert_eq!(training, [88u8; DOWN_INTERVALS], "Rt is not CPt's loudest codeword");
+    assert_eq!(data, [95, 88, 95, 88, 95, 88, 95, 88, 95, 88, 95, 88], "Rd moved with CPt");
+    assert_ne!(data, training, "Rd and Rt came out the same array");
+    // 88 is Table 1's 6140: the level the Phase 4 modulation actually went
+    // out at in `runs-216/170104` after the opener, and **not** the data
+    // mode's 7932.
+    assert_eq!(ucode::linear(law, 88), 6140);
+
+    let mut source = modem.source;
+    source.arm_renegotiation(data, training);
+    let levels = r_stream(&mut source, Out::Rt, R_FRAMES * INTERVALS);
+    for (n, level) in levels.iter().enumerate() {
+        let want = ucode::level(law, training[n % DOWN_INTERVALS]);
+        assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} is {level}, not {want}");
+    }
+    let loudest = levels.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!((loudest - ucode::level(law, 88)).abs() < 1e-12, "Rt's loudest symbol is {loudest}");
+}
 }
