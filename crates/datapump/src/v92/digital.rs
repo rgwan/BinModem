@@ -6736,8 +6736,37 @@ impl Modem {
         self.ru_detector.reset();
         self.ru_responder_started = false;
         self.upstream_data = None;
-        self.upstream = Some(Trn2uReader::new(self.upstream_size));
-        self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+        // The reader the `E2u` is read through is the one put on the line at the
+        // far end's **`TRN2u`**, and Ed is not a place to start a new one.
+        // 8.7.6: "The scrambler shall be reset at the beginning of `TRN2u`", and
+        // 8.7.2: "`E2u` is a data frame of **scrambled**, differentially encoded
+        // zeroes ... transmitted using the corresponding `TRN2u` modulation
+        // during Training and Rate Renegotiation." So its zeroes decode to
+        // zeroes only through the descrambler state that reset began and every
+        // sequence since has advanced -- and a `Trn2uReader::new` here is a
+        // descrambler starting again at zero, mid-stream, with nothing on the far
+        // end's side to match it.
+        //
+        // Rebuilding it here was the whole of the renegotiation's `E2u` defect:
+        // measured at answer point 171 (`runs-236c/203200-f171-1`), the
+        // renegotiation's exchange completed at 36.540, the far end's `E2u` came
+        // and no run of zeroes was ever read from it, and at 38.540 this end
+        // failed the exchange with "no E2u that reads as B1u within 2 s of Ed" --
+        // the far end answering `6009521a` at 41.880. Phase 4 never exposed it
+        // because its reader is built once, at `TRN2u`'s first symbol
+        // (`begin_upstream`), and nothing between there and its `E2u` replaces
+        // it.
+        //
+        // A reader that is *not* on the line is the one case that still needs
+        // building: 9.6.1.1.1's re-entry (`data_mode_lost`) arms its own at our
+        // `TRN2d` (`reneg_out` -> `begin_upstream`), so this is a fallback for a
+        // path that reached Ed without one, not the ordinary path.
+        if self.upstream.is_none() {
+            self.upstream = Some(Trn2uReader::new(self.upstream_size));
+        }
+        if self.up_finder.is_none() {
+            self.up_finder = Some(UpFinder::new(trn2u_unit(self.upstream_size == Trn2uSize::Eight)));
+        }
         self.upstream_drop_until = 0;
         self.awaiting_e2u = true;
         self.e2u_zeroes = 0;
