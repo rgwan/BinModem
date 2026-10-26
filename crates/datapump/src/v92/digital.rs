@@ -1817,6 +1817,10 @@ pub struct Source {
     last: Vec<bool>,
     /// B1d's codewords, already mapped: one octet a symbol (V.90 8.6.1).
     codes: VecDeque<u8>,
+    /// The last codeword B1d put on the line, and its sign: what the
+    /// queue-empty arm repeats rather than emitting a level that is not a data
+    /// symbol at all (`docs/221`). Cleared whenever a signal starts.
+    last_code: Option<(u8, bool)>,
     /// How long TRN2d lasts: "at least 2040T" (9.6.1.1.1).
     trn2d_symbols: usize,
     /// Set when a Phase 4 sequence has run out of bits: see
@@ -1873,6 +1877,7 @@ impl Source {
             trn1d_symbols: (settings.habits.trn1d * FS) as usize,
             last: Vec::new(),
             codes: VecDeque::new(),
+            last_code: None,
             trn2d_symbols: TRN2D_LEAST,
             finished: None,
             phase4: None,
@@ -2142,10 +2147,19 @@ impl Source {
     /// why they are counted apart.
     fn r_codeword(&self, training: bool, positive: bool) -> f64 {
         let Some(reneg) = self.reneg.as_ref() else {
-            // No constellation to name: the clause's fallback is not defined,
-            // and a codeword invented here would be the one unrecoverable
-            // failure. U_INFO is the signal this end already sends when there
-            // is no CPt at all, and the log says so.
+            // No constellation to name, and no codeword that means "nothing".
+            // `arm_renegotiation` (`2066`) is called before either `Rd` or `Rt`
+            // is ever asked for (`5780`, `5837`), so this is a caller that
+            // skipped it -- and a U_INFO `Rd` is -18 dB below the data mode
+            // peak, the same shape as `docs/218`'s Ucode 2: a level that
+            // silently means "no answer" is a level a far end reads as a
+            // signal. Loud instead of silent, and the value unchanged so that
+            // no path a bench call reaches today moves.
+            debug_assert!(
+                false,
+                "9.8's Rd/Rt asked for before arm_renegotiation: no constellation to take \
+                 a codeword from (v90.txt:1841-1848)"
+            );
             return self.level(self.uinfo, positive);
         };
         let points = if training { &reneg.rt } else { &reneg.rd };
@@ -2177,6 +2191,9 @@ impl Source {
         if out != Out::B1d {
             self.codes.clear();
         }
+        // A signal beginning is not a repeat of the last codeword of the one
+        // before it, whatever it was.
+        self.last_code = None;
         match out {
             // "The first symbol of Sd is defined to be transmitted in data
             // frame interval 0" (V.90 8.4.4).
@@ -2418,11 +2435,27 @@ impl Source {
                             // nothing hides from a receiver that looks at the
                             // codeword itself.
                             let (u, negative) = ucode::from_octet(self.law, octet);
+                            // Kept, because `None` below is "the last codeword
+                            // again" and this is the only place that knows it.
+                            self.last_code = Some((u, !negative));
                             return self.level(u, !negative);
                         }
-                        // Nothing queued yet: the last codeword again rather
-                        // than a silence the far end would read as a cleardown.
-                        None => return self.level(self.uinfo, self.sign),
+                        // Nothing queued: the **last codeword again**, which is
+                        // what this comment said while the code sent U_INFO --
+                        // a -18 dB hole in the middle of data mode, on the one
+                        // path where every symbol is a data symbol. `None` here
+                        // is a scheduling defect (`needs_codes`, `2040`), and a
+                        // repeated data codeword is the only non-signal that
+                        // keeps the frame grid and the constellation both
+                        // right. Measured latent, not current: in
+                        // `runs-218/172503-r218b/agr-rx.raw` the data mode
+                        // window (190 000-199 988) has 3772 -- U_INFO -- in
+                        // proportion with its neighbours, so the fallback did
+                        // not fire there (`docs/221`).
+                        None => {
+                            let (u, positive) = self.last_code.unwrap_or((self.uinfo, self.sign));
+                            return self.level(u, positive);
+                        }
                     }
                 }
                 Out::Dil => {
@@ -2623,20 +2656,14 @@ impl Source {
     /// CPt". U_INFO is the fallback for a Phase 4 with no CPt, which is a
     /// Phase 4 that cannot go out on the encoder either.
     fn trn2d_point(&self) -> u8 {
-        let Some(phase4) = self.phase4.as_ref() else {
-            return self.uinfo;
-        };
-        let sets = &phase4.coder.mapping().sets;
-        let Some(first) = sets.first() else {
-            return self.uinfo;
-        };
-        // `points` is loudest first, so the first one common to all six is the
-        // loudest common one.
-        first
-            .points()
-            .iter()
-            .copied()
-            .find(|&u| sets.iter().all(|s| s.points().contains(&u)))
+        // The table, not a hand-derived maxima: `Mapping::common_loudest` is
+        // the single owner of "a codeword legal in all six of CPt's
+        // intervals", so this cannot drift from the levels Phase 4 actually
+        // emits. U_INFO is the fallback for a Phase 4 with no CPt, which is a
+        // Phase 4 that cannot go out on the encoder either.
+        self.phase4
+            .as_ref()
+            .and_then(|phase4| phase4.coder.mapping().common_loudest())
             .unwrap_or(self.uinfo)
     }
 }
@@ -9623,7 +9650,7 @@ mod conformance_218 {
 // ---------------------------------------------------------------------
 
 /// Settings at a named U_INFO, which is what `Ri` is emitted at.
-fn settings_uinfo(uinfo: u8) -> Settings {
+pub(super) fn settings_uinfo(uinfo: u8) -> Settings {
     Settings {
         law: Law::Mu,
         uinfo,
@@ -9638,7 +9665,7 @@ fn settings_uinfo(uinfo: u8) -> Settings {
 
 /// A CPt of the shape the analogue modem sends in Phase 3: `points` Ucodes in
 /// every interval's one constellation, at the rate `drn` names.
-fn cpt_of(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
+pub(super) fn cpt_of(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
     let mask = points.fold(0u128, |m, u| m | 1 << u);
     Cp {
         data_mode: false,
@@ -9655,7 +9682,7 @@ fn cpt_of(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
 /// dense run of Ucodes, and the interval index naming which of them each of
 /// the six constellation frames uses. `drn 18` is 38 bits a frame, which is
 /// what these masks carry.
-fn cpu_of(sets: &[std::ops::RangeInclusive<u8>], intervals: [u8; INTERVALS]) -> Cp {
+pub(super) fn cpu_of(sets: &[std::ops::RangeInclusive<u8>], intervals: [u8; INTERVALS]) -> Cp {
     Cp {
         data_mode: true,
         drn: 18,
@@ -9671,7 +9698,7 @@ fn cpu_of(sets: &[std::ops::RangeInclusive<u8>], intervals: [u8; INTERVALS]) -> 
 /// The modem in data mode on that CPu: `B1d`'s own encoder is built, so
 /// `renegotiation_points` reads the constellation on the line and not a
 /// description of one.
-fn in_data_mode(cpu: Cp) -> Modem {
+pub(super) fn in_data_mode(cpu: Cp) -> Modem {
     let mut modem = Modem::default();
     modem.cpu = Some(cpu);
     modem.begin_data();
@@ -9681,7 +9708,7 @@ fn in_data_mode(cpu: Cp) -> Modem {
 
 /// Every level `count` symbols of the source produce, after asking for
 /// `out` (`Source::arm_renegotiation` first where 9.8's codewords matter).
-fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
+pub(super) fn r_stream(source: &mut Source, out: Out, count: usize) -> Vec<f64> {
     source.change(out);
     (0..count).map(|_| source.next()).collect()
 }
@@ -9817,4 +9844,627 @@ fn rt_is_the_largest_codeword_of_the_training_constellation_not_the_data_mode_on
     let loudest = levels.iter().fold(0.0f64, |m, v| m.max(v.abs()));
     assert!((loudest - ucode::level(law, 88)).abs() < 1e-12, "Rt's loudest symbol is {loudest}");
 }
+}
+
+/// `docs/221`: the differential harness and the property tests behind it.
+///
+/// The claim being tested is `v92.txt:339-341`'s -- "The data signalling
+/// rates, symbol rate, scrambler and encoder for the digital modem shall be
+/// the same as those given in clause 5/V.90" -- plus its ten single-sentence
+/// imports. It is a claim about a signal **repertoire**, and it is false about
+/// the signal **stream**, so the diffable set is closed by construction:
+/// [`DIFFABLE`] names every signal the harness diffs, and every signal it does
+/// not is named in [`EXCLUSIONS`] with the clause line that excludes it. There
+/// is no unexplained skip.
+///
+/// The V.90 side of each diff is the V.90 **transmitter itself**, through
+/// `crate::v90::digital::probe` (`v90/digital.rs`, test-only), not a
+/// re-derivation of it: a re-derivation would agree with a V.92 bug that the
+/// V.90 transmitter does not have.
+///
+/// **The oracle's limits, stated where they are used.** The V.90 path is a
+/// valid oracle for codeword *ordering* (`v90.txt:654-656`, "label 0 ...
+/// largest") and for the level table (`ucode::level`, Table 1). It is **not**
+/// an oracle for constellation *legality*: neither path enforces V.90's Table
+/// 15 average-power ceiling (`v90.txt:1649-1671`) anywhere, and V.92 has no
+/// such clause at all, so no test here may conclude from "the V.90 path did
+/// the same thing" that a constellation we were handed is legal to send.
+#[cfg(test)]
+mod conformance_221 {
+    use super::conformance_218::{cpt_of, cpu_of as cpu_218, in_data_mode, r_stream, settings_uinfo};
+    use super::*;
+    use crate::v90::digital::probe::Tx as V90Tx;
+
+    /// The signals this harness diffs, and the clause each is imported by.
+    ///
+    /// One row per signal: `(name, clause)`. A signal in this table is
+    /// asserted equal, symbol for symbol, between the two transmitters.
+    pub(super) const DIFFABLE: [(&str, &str); 8] = [
+        ("Sd", "v92.txt:1445-1446 -> v90.txt:1509-1516 (8.4.4)"),
+        ("Trn1d", "v92.txt:1448-1449 -> v90.txt:1520-1525 (8.4.5)"),
+        ("Dil", "v92.txt:1349-1350 -> v90.txt:1424-1465 (8.4.1)"),
+        ("Ri", "v92.txt:1436-1437 -> v90.txt:1844 (8.6.4)"),
+        ("Rd", "v92.txt:1956 -> v90.txt:1841-1842 (8.6.4)"),
+        ("Rt", "v92.txt:1956 -> v90.txt:1847-1848 (8.6.4)"),
+        ("Trn2d", "v92.txt:2000-2001 -> v90.txt:1853-1859 (8.6.5)"),
+        ("Ed", "v92.txt:1758-1762 -> v90.txt:1741-1744 (8.6.2), FPE excluded (E7)"),
+    ];
+
+    /// The closed exception set: every signal the diff must **not** contain,
+    /// and the clause line that puts it out. A reader who wonders why `Jd` or
+    /// `SCR` is missing from [`DIFFABLE`] finds the answer here rather than a
+    /// gap.
+    pub(super) const EXCLUSIONS: [(&str, &str, &str); 9] = [
+        ("E1 Jd", "v92.txt:1371-1372 vs v90.txt:1492-1494", "bits 47/48 redefined: Jd/Jp identifier and a reserved bit, against constellation size and rate-renegotiation"),
+        ("E2 Jd-prime", "v90.txt:1503-1507", "deleted from V.92 8.6; V.90 always sends it after Jd"),
+        ("E3 Jp/Jp-prime", "v92.txt:1391-1435", "no V.90 downstream counterpart exists"),
+        ("E4 SCR", "v92.txt:1436-1444", "V.92-only downstream signal; V.90's SCR is the analogue modem's (v90.txt:1411-1415)"),
+        ("E5 Rf", "v92.txt:1957-1962", "V.92-only, 12-symbol, FPE only"),
+        ("E6 CPd/SUVd", "v92.txt:1763-1843, 1964-1998", "V.92-only; they replace V.90's MP (v90.txt:1746-1830)"),
+        ("E7 Ed transmitted during Fast Parameter Exchange", "v92.txt:1758-1762", "FPE puts Ed on the preceding data mode modulation; the diff covers the training framing only"),
+        ("E8 Ri/R-bar-i placement and Ucode 0 silence", "v92.txt:2557-2562, 2971-2975", "Ri is at the end of Phase 3 and the silence is V.92-only; Ri's *symbols* are diffed, its *position* cannot be"),
+        ("E9 power ceiling", "v92.txt 0 hits vs v90.txt:1649-1671", "no downstream average-power limit in V.92; not a signal, and not enforced by our V.90 path either"),
+    ];
+
+    /// The table is closed and every entry says why: diffed implies not
+    /// excluded, excluded implies a clause line and a reason, and no signal is
+    /// in both.
+    #[test]
+    fn the_diffable_set_and_the_exception_set_are_closed_and_disjoint() {
+        for (name, clause) in DIFFABLE {
+            assert!(clause.contains("v90.txt:"), "{name} is diffed without naming the V.90 clause");
+            assert!(
+                !EXCLUSIONS.iter().any(|(e, _, _)| {
+                    // The tag is "En signal": the signal is what follows the
+                    // number, and nothing shorter than it, so that "Ed
+                    // transmitted during Fast Parameter Exchange" does not
+                    // collide with the diffed "Ed".
+                    e.split_once(' ').map(|(_, rest)| rest).unwrap_or(e) == name
+                }),
+                "{name} is both diffed and excluded"
+            );
+        }
+        for (tag, clause, why) in EXCLUSIONS {
+            assert!(
+                clause.contains("v92.txt") || clause.contains("v90.txt"),
+                "{tag} is excluded without a clause line"
+            );
+            assert!(!why.trim().is_empty(), "{tag} is excluded without a reason");
+        }
+        // The nine of docs/219 §2, and no more: an exclusion added here to
+        // hide a disagreement must be a clause change, not an edit.
+        assert_eq!(EXCLUSIONS.len(), 9);
+        assert_eq!(DIFFABLE.len(), 8);
+    }
+
+    const TRN1D_SYMBOLS: usize = 96;
+    const SD_SYMBOLS: usize = (SD_FRAMES + SD_BAR_FRAMES) * INTERVALS;
+    const B1D_SYMBOLS: usize = B1D_FRAMES * INTERVALS;
+
+    fn settings() -> Settings {
+        settings_uinfo(78)
+    }
+
+    /// The two transmitters, started at the same place.
+    fn pair() -> (Source, V90Tx) {
+        let s = settings();
+        (Source::new(&s), V90Tx::new(s.law, s.uinfo, s.habits.trn1d))
+    }
+
+    /// **D4** `Sd` and `S-bar-d`, `v92.txt:1445-1446` -> `v90.txt:1509-1516`.
+    #[test]
+    fn d4_sd_and_sd_bar_are_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Sd);
+        assert!(v90.change("Sd"));
+        let a = (0..SD_SYMBOLS).map(|_| v92.next()).collect::<Vec<f64>>();
+        let b = v90.symbols(SD_SYMBOLS);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a, b, "8.4.4's Sd/S-bar-d differ between the two transmitters");
+    }
+
+    /// **D5** `TRN1d`, `v92.txt:1448-1449` -> `v90.txt:1520-1525`.
+    #[test]
+    fn d5_trn1d_is_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Trn1d);
+        assert!(v90.change("Trn1d"));
+        let a = (0..TRN1D_SYMBOLS).map(|_| v92.next()).collect::<Vec<f64>>();
+        let b = v90.symbols(TRN1D_SYMBOLS);
+        assert_eq!(a, b, "8.4.5's TRN1d differs between the two transmitters");
+    }
+
+    /// **D6** `Ri` and `R-bar-i`, `v92.txt:1436-1437` -> `v90.txt:1844`.
+    ///
+    /// The *symbols*, not the placement: V.92 moves `Ri` to the end of Phase 3
+    /// (`v92.txt:2557-2562`), which is E8 and is not diffable.
+    #[test]
+    fn d6_ri_and_ri_bar_are_the_same_stream_on_both_transmitters() {
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::Ri);
+        assert!(v90.change("Ri"));
+        let ri: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| v92.next()).collect();
+        assert_eq!(ri, v90.symbols(R_FRAMES * INTERVALS), "8.6.4's Ri differs");
+        let (mut v92, mut v90) = pair();
+        v92.change(Out::RiBar);
+        assert!(v90.change("RiBar"));
+        let bar: Vec<f64> = (0..R_BAR_FRAMES * INTERVALS).map(|_| v92.next()).collect();
+        assert_eq!(bar, v90.symbols(R_BAR_FRAMES * INTERVALS), "8.6.4's R-bar-i differs");
+    }
+
+    /// **D7** `Rd`, `v92.txt:1956` -> `v90.txt:1841-1842`.
+    ///
+    /// `Rt` is in [`DIFFABLE`] too but the V.90 transmitter has no `Out::Rt`
+    /// (V.90 sends `Rt` only as 9.4.1.4's `R` in Phase 3, which this test
+    /// harness does not drive), so `Rt` is diffed against the V.90 mapping --
+    /// `Mapping::from_cp(CPt)`, whose loudest point it must be -- in
+    /// [`c_8_6_4_rt_is_the_loudest_codeword_of_the_training_constellation`].
+    #[test]
+    fn d7_rd_is_the_same_stream_on_both_transmitters() {
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_218(&sets, intervals);
+            let mut modem = in_data_mode(cpu.clone());
+            let (data, training) = modem.renegotiation_points();
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rd);
+            let a: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+
+            let s = settings();
+            let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+            assert!(v90.set_cpu(&cpu));
+            assert!(v90.change("Rd"));
+            let b = v90.symbols(R_FRAMES * INTERVALS);
+            assert_eq!(a, b, "8.6.4's Rd differs from the V.90 transmitter's: {sets:?}");
+        }
+    }
+
+    /// **D1** `B1d`, `v92.txt:1755-1756` -> `v90.txt:1731-1739`.
+    ///
+    /// The V.90 transmitter maps `B1d`'s 48 data frames itself; this end takes
+    /// octets that the mapper has already chosen (3.6). So the diff hands the
+    /// V.92 side the V.90 side's own codewords and demands the same samples and
+    /// the same length, which is where a sign convention error (`from_octet`'s
+    /// inverse read as "positive") shows up on the first symbol.
+    #[test]
+    fn d1_b1d_is_the_same_stream_on_both_transmitters() {
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_218(&sets, intervals);
+            let s = settings();
+            let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+            assert!(v90.set_cpu(&cpu));
+            assert!(v90.change("B1d"));
+            let want = v90.symbols(B1D_SYMBOLS);
+            assert_eq!(want.len(), 48 * INTERVALS, "8.6.1: B1d is 48 data frames");
+
+            let mut v92 = Source::new(&s);
+            v92.change(Out::B1d);
+            for level in &want {
+                let (u, negative) = ucode::nearest(s.law, (level * 32768.0).round() as i32);
+                v92.codes.push_back(ucode::octet(s.law, u, negative));
+            }
+            let got: Vec<f64> = (0..B1D_SYMBOLS).map(|_| v92.next()).collect();
+            assert_eq!(got, want, "8.6.1's B1d differs between the two transmitters");
+        }
+    }
+
+    /// **D2** `TRN2d`, `v92.txt:2000-2001` -> `v90.txt:1853-1859`.
+    #[test]
+    fn d2_trn2d_is_the_same_stream_on_both_transmitters() {
+        let cpt = cpt_of(16, 72..=88);
+        let s = settings();
+        let mut v92 = Source::new(&s);
+        assert!(v92.set_cpt(&cpt));
+        v92.change(Out::Trn2d);
+        let a: Vec<f64> = (0..60).map(|_| v92.next()).collect();
+
+        let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+        assert!(v90.set_cpt(&cpt));
+        assert!(v90.change("Trn2d"));
+        let b = v90.symbols(60);
+        assert_eq!(a, b, "8.6.5's TRN2d differs between the two transmitters");
+    }
+
+    /// **D3** `Ed` in the training/renegotiation framing, `v92.txt:1758-1762`
+    /// -> `v90.txt:1741-1744`. E7 excludes the FPE framing.
+    #[test]
+    fn d3_ed_is_the_same_stream_on_both_transmitters_outside_fpe() {
+        let cpt = cpt_of(16, 72..=88);
+        let s = settings();
+        let d = CodeMapping::from_cp(&cpt).expect("a CPt that fits its rate").frame_bits();
+        let mut v92 = Source::new(&s);
+        assert!(v92.set_cpt(&cpt));
+        v92.change(Out::Trn2d);
+        let _: Vec<f64> = (0..60).map(|_| v92.next()).collect();
+        v92.last = vec![false; 2 * d];
+        v92.change(Out::Ed);
+        let a: Vec<f64> = (0..2 * INTERVALS).map(|_| v92.next()).collect();
+
+        let mut v90 = V90Tx::new(s.law, s.uinfo, s.habits.trn1d);
+        assert!(v90.set_cpt(&cpt));
+        assert!(v90.change("Trn2d"));
+        let _ = v90.symbols(60);
+        assert!(v90.change("Ed"));
+        let b = v90.symbols(2 * INTERVALS);
+        assert_eq!(a, b, "8.6.2's Ed differs between the two transmitters");
+    }
+
+    /// **D9** `DIL`, `v92.txt:1349-1350` -> `v90.txt:1424-1465`.
+    ///
+    /// The descriptor's symbols are built once, by `crate::v90::sequences::
+    /// Descriptor::symbols` -- the same function `v90/digital.rs:1062` fills
+    /// the V.90 transmitter with -- so the diff is that the V.92 source puts
+    /// exactly those (Ucode, sign) pairs on the line and ends the pass where
+    /// the descriptor says a segment ends.
+    #[test]
+    fn d9_dil_is_the_descriptors_own_symbols() {
+        let mut descriptor = Descriptor::none();
+        descriptor.signs = vec![true, false, true, true, false, false];
+        descriptor.training = vec![false; 6];
+        descriptor.h = [0, 2, 0, 0, 0, 0, 0, 0];
+        descriptor.refs = [0, 60, 0, 0, 0, 0, 0, 0];
+        descriptor.ucodes = vec![0, 32, 16, 0, 0, 0, 0, 0, 0];
+        let want: Vec<f64> = descriptor
+            .symbols()
+            .map(|(u, positive)| ucode::level(Law::Mu, u) * if positive { 1.0 } else { -1.0 })
+            .collect();
+        assert!(!want.is_empty(), "8.4.1: this descriptor has no DIL at all");
+        let mut source = Source::new(&settings());
+        source.dil = descriptor.symbols().collect();
+        source.change(Out::Dil);
+        let got: Vec<f64> = (0..want.len()).map(|_| source.next()).collect();
+        assert_eq!(got, want, "8.4.1's DIL symbols are not the descriptor's");
+    }
+
+    /// **D8** the `drn` table, `v92.txt:1492-1495` = `v90.txt:1580-1582`:
+    /// "drn between 0 and 22 ... Data signalling rate = (drn + 20) x 8000/6 in
+    /// CP(u) and (drn + 8) x 8000/6 in CPt". One table, two callers.
+    #[test]
+    fn d8_the_drn_table_is_v90s_unchanged() {
+        for drn in 1..=22u8 {
+            let want = (u32::from(drn) + 20) * 8000 / 6;
+            assert_eq!(crate::v90::sequences::data_rate(drn), Some(want), "drn {drn}");
+            assert_eq!(crate::v90::sequences::data_bits(drn), usize::from(drn) + 20);
+        }
+        assert_eq!(crate::v90::sequences::data_rate(0), None, "drn 0 is cleardown");
+        assert_eq!(crate::v90::sequences::data_rate(1), Some(28_000));
+        assert_eq!(crate::v90::sequences::data_rate(22), Some(56_000));
+    }
+}
+
+/// `docs/221` §2: the property tests, which catch the class whether or not a
+/// signal is diffable.
+///
+/// Every one of them compares against **the level table the code itself
+/// builds** for the constellation in force, driven by a known input, so that an
+/// index read as a codeword and a `.last()` on a loudest-first list are both
+/// mistakes a test makes red rather than mistakes a reader has to notice.
+#[cfg(test)]
+mod conformance_221_properties {
+    use super::conformance_218::{cpu_of, cpt_of, in_data_mode, settings_uinfo};
+    use super::*;
+
+    /// A CPt of six *different* constellations, one per interval: the shape
+    /// that makes "a point legal in all six" a real intersection.
+    fn cpt_six(drn: u8) -> Cp {
+        let sets: Vec<u128> = (0..INTERVALS)
+            .map(|i| (u32::from(50 - i as u8)..=95u32).fold(0u128, |m, u| m | 1 << u))
+            .collect();
+        Cp {
+            data_mode: false,
+            drn,
+            redundancy: crate::v90::sign::Redundancy::None,
+            trn1d_ratio: 1 << 13,
+            intervals: [0, 1, 2, 3, 4, 5],
+            constellations: sets,
+            ..Cp::default()
+        }
+    }
+
+    /// 5.4.4/V.90 (`v90.txt:654-656`): the mapper's "label 0 ... largest".
+    /// This is the one fact every level test below stands on, so it is asserted
+    /// once, over every mapping this end constructs, rather than assumed.
+    #[test]
+    fn c_5_4_4_label_zero_is_the_largest_pcm_code() {
+        let law = Law::Mu;
+        let cps = [
+            cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]),
+            cpu_of(&[40..=95, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+            cpt_of(16, 72..=88),
+            cpt_six(16),
+        ];
+        for cp in &cps {
+            let mapping = CodeMapping::from_cp(cp).expect("a CP that fits its own rate");
+            for (i, set) in mapping.sets.iter().enumerate() {
+                let points = set.points();
+                let first = *points.first().expect("a set with points");
+                let loudest = points.iter().copied().max_by_key(|&u| ucode::linear(law, u)).unwrap();
+                assert_eq!(first, loudest, "interval {i}: label 0 is not the largest code");
+                let quietest = points.iter().copied().min_by_key(|&u| ucode::linear(law, u)).unwrap();
+                if points.len() > 1 {
+                    assert_ne!(*points.last().unwrap(), first, "interval {i}: first and last agree");
+                    assert_eq!(quietest, *points.last().unwrap(), "interval {i}: last is not quietest");
+                }
+            }
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1841-1842`): `Rd` is "the highest power PCM codeword
+    /// from the data mode constellation of each data frame interval", and
+    /// `docs/218`'s defect was a **level index** from this end's own CPd read as
+    /// one of those codewords -- Ucode 2, linear 16, -66 dBFS.
+    ///
+    /// Driven by two CPu shapes so the property holds for the table the code
+    /// builds and not for one vector, and the regression half asserts the
+    /// emitted levels are points of that table at all.
+    #[test]
+    fn c_8_6_4_rd_is_the_loudest_codeword_of_the_data_mode_constellation() {
+        let law = Law::Mu;
+        for (sets, intervals) in [
+            (vec![3..=95u8, 3..=88u8], [0u8, 1, 0, 1, 0, 1]),
+            (vec![40..=95u8, 41..=95, 42..=95], [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cpu = cpu_of(&sets, intervals);
+            let mut modem = in_data_mode(cpu.clone());
+            let (data, training) = modem.renegotiation_points();
+            let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let loudest = *set.points().first().expect("a set with points");
+                assert_eq!(data[i], loudest, "interval {i}: Rd is not the loudest codeword");
+                assert!(
+                    set.points().contains(&data[i]),
+                    "interval {i}: Rd's codeword is not a point of the constellation in force"
+                );
+            }
+            // **Regression, docs/218**: a CPd *level index* (15 at LC 8) read as
+            // a codeword gives Ucode 15/2, whose level is nowhere near.
+            let wrong = ucode::level(law, 2);
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rd);
+            let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+            assert!(
+                !levels.iter().any(|l| (l.abs() - wrong).abs() < 1e-12),
+                "Rd went out at the CPd level index again (docs/218)"
+            );
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1847-1848`): `Rt` is the same rule against the
+    /// **training** constellation, CPt. **Regression, docs/218**: `.last()` on
+    /// `Constellation::points()` -- which is sorted loudest first -- took the
+    /// *quietest* codeword.
+    #[test]
+    fn c_8_6_4_rt_is_the_loudest_codeword_of_the_training_constellation() {
+        for cpt in [cpt_of(16, 72..=88), cpt_six(16)] {
+            let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+            assert!(modem.source.set_cpt(&cpt));
+            let (data, training) = modem.renegotiation_points();
+            let mapping = modem.source.phase4.as_ref().expect("CPt's coder").coder.mapping().clone();
+            for i in 0..DOWN_INTERVALS {
+                let set = &mapping.sets[i % INTERVALS];
+                let points = set.points();
+                assert_eq!(training[i], points[0], "interval {i}: Rt is not the loudest codeword");
+                if points.len() > 1 {
+                    assert_ne!(training[i], *points.last().unwrap(), "interval {i}: Rt is the quietest");
+                }
+            }
+            assert_ne!(data, training, "Rd and Rt came out the same array");
+            modem.source.arm_renegotiation(data, training);
+            modem.source.change(Out::Rt);
+            let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+            for (n, level) in levels.iter().enumerate() {
+                let want = ucode::level(Law::Mu, training[n % DOWN_INTERVALS]);
+                assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} is {level}, not {want}");
+            }
+        }
+    }
+
+    /// 8.6.4/V.90 (`v90.txt:1844`): `Ri` is "the single PCM codeword whose Ucode
+    /// is U_INFO for all data frame intervals". Pinned to U_INFO 78 = 3772, the
+    /// magnitude measured on the line, and kept apart from both R arrays.
+    #[test]
+    fn c_8_6_4_ri_is_the_u_info_codeword_in_every_interval() {
+        let law = Law::Mu;
+        assert_eq!(ucode::linear(law, 78), 3772, "U_INFO 78 is not Table 1's 3772");
+        let mut source = Source::new(&settings_uinfo(78));
+        // 9.8's own codewords are armed and are not what Ri is made of.
+        source.arm_renegotiation([95; DOWN_INTERVALS], [88; DOWN_INTERVALS]);
+        source.change(Out::Ri);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| source.next()).collect();
+        for (i, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, 78);
+            assert!((level.abs() - want).abs() < 1e-12, "Ri symbol {i} is {level}, not U_INFO");
+            assert_eq!(*level > 0.0, i % INTERVALS < 3, "Ri symbol {i} is not + + + - - -");
+            assert!((level.abs() - ucode::level(law, 95)).abs() > 1e-9);
+            assert!((level.abs() - ucode::level(law, 88)).abs() > 1e-9);
+        }
+    }
+
+    /// 8.4.4/V.90 (`v90.txt:1509-1516`): `Sd` is 64 data frames of
+    /// `{+W, +0, +W, -W, -0, -W}` with `W` the Ucode `16 + UINFO`, and
+    /// `S-bar-d` is the same magnitudes turned over.
+    ///
+    /// `W` comes from the clause literally and not from a constellation -- that
+    /// is what the clause says -- so what is *checked* here is that it is never
+    /// quietly moved onto one, and *recorded* is whether it happens to be a
+    /// point of the constellation in force. A `W` outside every constellation
+    /// is a compliant `Sd` and an unreadable one; requiring membership would
+    /// make a compliant transmitter fail.
+    #[test]
+    fn c_8_4_4_sd_is_w_and_zero() {
+        let law = Law::Mu;
+        for uinfo in [66u8, 70, 78, 85] {
+            let mut source = Source::new(&settings_uinfo(uinfo));
+            source.change(Out::Sd);
+            let w = ucode::level(law, 16 + uinfo);
+            let z = 0.0;
+            let pattern = [w, z, w, -w, -z, -w];
+            let sd: Vec<f64> = (0..SD_FRAMES * INTERVALS).map(|_| source.next()).collect();
+            for (i, level) in sd.iter().enumerate() {
+                let want = pattern[i % INTERVALS];
+                assert!((level - want).abs() < 1e-12, "Sd symbol {i} at U_INFO {uinfo} is {level}");
+            }
+            let bar: Vec<f64> = (0..SD_BAR_FRAMES * INTERVALS).map(|_| source.next()).collect();
+            for (i, level) in bar.iter().enumerate() {
+                let want = -pattern[i % INTERVALS];
+                assert!((level - want).abs() < 1e-12, "S-bar-d symbol {i} at U_INFO {uinfo} is {level}");
+            }
+            // W is `16 + UINFO` and never a point chosen for convenience.
+            assert_eq!(ucode::linear(law, 16 + uinfo) as f64 / 32768.0, w);
+            // Membership, recorded rather than required: `Sd` is Phase 3, so
+            // the constellation in force is CPt's.
+            let cpt = cpt_of(16, 40..=95);
+            let in_cpt = cpt.points(0).contains(&(16 + uinfo));
+            assert_eq!(
+                in_cpt,
+                (40..=95).contains(&(16 + uinfo)),
+                "W's membership of CPt disagrees with the mask, U_INFO {uinfo}"
+            );
+        }
+    }
+
+    /// 8.6.1/V.90 (`v90.txt:1731-1739`): `B1d`'s codewords are the ones the
+    /// data mode encoder produces. Every symbol of a `B1d` run must be a point
+    /// of the constellation in force **for its interval**.
+    ///
+    /// This is the property that makes a U_INFO fallback in data mode
+    /// impossible to write: U_INFO 78 is not in the CPu used here.
+    #[test]
+    fn c_8_6_1_no_b1d_symbol_outside_the_constellation_in_force() {
+        // U_INFO 78 is deliberately outside every interval here: that is what
+        // makes a U_INFO symbol in data mode visible rather than plausible.
+        let cpu = Cp {
+            data_mode: true,
+            drn: 3,
+            intervals: [0, 1, 2, 0, 1, 2],
+            constellations: [79..=95u8, 80..=95, 81..=95]
+                .iter()
+                .map(|r| r.clone().fold(0u128, |m, u| m | 1 << u))
+                .collect(),
+            ..Cp::default()
+        };
+        assert!(!cpu.points(0).contains(&78), "this CPu contains U_INFO, so it cannot catch the hole");
+        let mut modem = in_data_mode(cpu);
+        let mapping = modem.downstream.as_ref().expect("B1d's encoder").mapping().clone();
+        modem.source.change(Out::B1d);
+        // A quarter of a data frame queued and nothing else: the queue runs dry
+        // and the arm has to hold a codeword rather than invent a level.
+        let octet = ucode::octet(Law::Mu, 95, false);
+        modem.source.codes.push_back(octet);
+        for n in 0..B1D_FRAMES * INTERVALS {
+            let level = modem.source.next();
+            let interval = (modem.source.symbol as usize - 1) % INTERVALS;
+            let set = &mapping.sets[interval];
+            let legal = set
+                .points()
+                .iter()
+                .any(|&u| (ucode::level(Law::Mu, u) - level.abs()).abs() < 1e-12);
+            assert!(legal, "B1d symbol {n} is {level}, which is not a point of interval {interval}");
+        }
+    }
+
+    /// **`docs/221`'s live latent bug, `digital.rs:2425`.** `B1d`'s
+    /// queue-empty arm emitted `self.uinfo` while its own comment said "the last
+    /// codeword again": a -18 dB hole in the middle of data mode. It must hold
+    /// the last codeword.
+    #[test]
+    fn regression_docs_221_b1d_queue_empty_holds_the_last_codeword() {
+        let law = Law::Mu;
+        let mut source = Source::new(&settings_uinfo(78));
+        source.change(Out::B1d);
+        source.codes.push_back(ucode::octet(law, 95, false));
+        source.codes.push_back(ucode::octet(law, 60, true));
+        let first = source.next();
+        let second = source.next();
+        assert!((first.abs() - ucode::level(law, 95)).abs() < 1e-12);
+        assert!(second < 0.0, "the queued sign was lost");
+        assert!((second.abs() - ucode::level(law, 60)).abs() < 1e-12);
+        // The queue is dry from here: every further symbol repeats the last
+        // codeword, sign and all, and is never U_INFO.
+        for n in 0..12 {
+            let level = source.next();
+            assert!(
+                (level - second).abs() < 1e-12,
+                "symbol {n} after the queue ran dry is {level}, not the last codeword {second}"
+            );
+            assert!((level.abs() - ucode::level(law, 78)).abs() > 1e-9, "the queue fell back to U_INFO");
+        }
+    }
+
+    /// 8.6.5/V.90 (`v90.txt:1853-1859`): `TRN2d`'s codeword comes from CPt.
+    /// `trn2d_point` used to hand-derive "the loudest point common to all six
+    /// intervals"; it now asks `Mapping::common_loudest`, the owner of the
+    /// table, and this asserts the two agree on a CPt whose six sets differ.
+    #[test]
+    fn c_8_6_5_trn2d_point_is_the_tables_loudest_common_point() {
+        let cpt = cpt_six(16);
+        let mut source = Source::new(&settings_uinfo(78));
+        assert!(source.set_cpt(&cpt));
+        let mapping = source.phase4.as_ref().expect("CPt's coder").coder.mapping().clone();
+        // Independently: the loudest Ucode by `ucode::linear` present in every
+        // one of the six constellations.
+        let common: Vec<u8> = (0..=95u8)
+            .filter(|u| (0..INTERVALS).all(|i| mapping.sets[i].points().contains(u)))
+            .collect();
+        let loudest = *common
+            .iter()
+            .max_by_key(|&&u| ucode::linear(Law::Mu, u))
+            .expect("these six constellations share a point");
+        assert_eq!(source.trn2d_point(), loudest, "TRN2d's codeword is not the table's loudest common");
+        assert_eq!(mapping.common_loudest(), Some(loudest));
+        assert_ne!(loudest, 78, "the CPt of this test contains U_INFO, so the branch is untested");
+        // And it is a legal symbol in all six intervals, which is the whole
+        // reason the two-point fallback exists.
+        for i in 0..INTERVALS {
+            assert!(mapping.sets[i].points().contains(&loudest), "interval {i} cannot send it");
+        }
+    }
+
+    /// 9.8.1.1.4 / 8.6.4/V.90: `Rd` and `Rt` are "already resolved" when the
+    /// renegotiation starts -- `arm_renegotiation` (`2066`) is called at
+    /// `5780`/`5837` -- so a CPu or CPt arriving *during* the renegotiation
+    /// must not move them. Nothing tested this before `docs/221`.
+    #[test]
+    fn c_9_8_1_1_4_the_armed_r_arrays_are_frozen_against_later_messages() {
+        let law = Law::Mu;
+        let mut modem = in_data_mode(cpu_of(&[3..=95, 3..=88], [0, 1, 0, 1, 0, 1]));
+        assert!(modem.source.set_cpt(&cpt_of(16, 72..=88)));
+        let (data, training) = modem.renegotiation_points();
+        modem.source.arm_renegotiation(data, training);
+        // A second CPt and a second CPu, both narrower, arrive mid-signal.
+        assert!(modem.source.set_cpt(&cpt_of(16, 40..=60)));
+        modem.cpu = Some(cpu_of(&[70..=90u8, 71..=91u8], [0, 1, 0, 1, 0, 1]));
+        modem.begin_data();
+        modem.source.change(Out::Rd);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+        for (n, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, data[n % DOWN_INTERVALS]);
+            assert!((level.abs() - want).abs() < 1e-12, "Rd symbol {n} moved when a message arrived");
+        }
+        modem.source.change(Out::Rt);
+        let levels: Vec<f64> = (0..R_FRAMES * INTERVALS).map(|_| modem.source.next()).collect();
+        for (n, level) in levels.iter().enumerate() {
+            let want = ucode::level(law, training[n % DOWN_INTERVALS]);
+            assert!((level.abs() - want).abs() < 1e-12, "Rt symbol {n} moved when a message arrived");
+        }
+    }
+
+    /// 8.6.4/V.90: `Rd`/`Rt` with no constellation armed has no defined signal,
+    /// and `docs/221` made the silent U_INFO fallback loud (`digital.rs:2149`).
+    #[test]
+    fn c_8_6_4_rd_without_arming_is_a_loud_failure() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut source = Source::new(&settings_uinfo(78));
+        source.change(Out::Rd);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.next()));
+        assert!(result.is_err(), "a codeword meaning nothing went out quietly");
+    }
 }
