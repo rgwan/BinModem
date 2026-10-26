@@ -10631,6 +10631,122 @@ mod conformance_158 {
         assert!(modem.exchange.is_none(), "the exchange outlived the renegotiation");
     }
 
+    /// 8.7.2 with 8.7.6: the renegotiation's `E2u` is read by the descrambler
+    /// that has run **since `TRN2u`'s first symbol**, not by a new one at `Ed`.
+    ///
+    /// 8.7.2: "`E2u` is a data frame of **scrambled**, differentially encoded
+    /// zeroes. It is transmitted using the corresponding `TRN2u` modulation
+    /// during Training and **Rate Renegotiation**." 8.7.6: "The scrambler shall
+    /// be reset at the beginning of `TRN2u`." So its zeroes are only zeroes
+    /// through the state `TRN2u`'s reset began, carried through every sequence
+    /// between it and `E2u` -- and `Ed` is not a place a reader may start,
+    /// because nothing on the far end's side restarts there.
+    ///
+    /// Fails on `73d5ad1`: `finish_renegotiation` built a fresh `Trn2uReader` at
+    /// `Ed`, restarting the GPA descrambler mid-stream, so the renegotiation's
+    /// `E2u` read as white data, no data frame's worth of zeroes ever formed,
+    /// and the call ended on our own line "no E2u that reads as B1u within 2 s
+    /// of Ed" (`runs-236c/203200-f171-1`, 38.540) with the far end's
+    /// `6009521a` after it. The initial Phase 4 never exposed it: its reader is
+    /// built once, at `TRN2u`'s first symbol (`begin_upstream`), and nothing
+    /// between there and its `E2u` rebuilds it.
+    #[test]
+    fn a_renegotiations_e2u_is_read_by_the_descrambler_that_started_at_trn2u() {
+        use crate::v92::up_signals::Trn2uSender;
+        let mut modem = Modem::default();
+        // A first data mode, and the far end's Ru and R-bar-u (9.8.1.2.1).
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        // 9.8.2.1.1's fiducial: the far end's renegotiation TRN2u begins here,
+        // and 8.7.6's scrambler reset is on its first symbol.
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        let mut peer = Trn2uSender::seeded(Trn2uSize::Four, false);
+        modem.now = fiducial;
+        let first = peer.next_symbol();
+        modem.symbol(symbol_at(first));
+        assert!(modem.upstream.is_some(), "no reader on the far end's TRN2u");
+        // The renegotiation's exchange, 9.6.1.1.2 to 9.6.1.1.4's Ed, with the
+        // far end's line present the whole way: its TRN2u idles on ones, which
+        // carry no start bit and so no sequence the finder can mistake.
+        modem.cpd = Some(reneg_cpd());
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        modem.parameters = Some(
+            crate::v92::upchoice::pin_with(
+                &design,
+                1,
+                Trellis::Sixteen,
+                1e-9,
+                crate::v92::upchoice::LevelSet::Code,
+            )
+            .expect("drn 1 is pinnable")
+            .parameters,
+        );
+        let mut suv_seen = 0;
+        let mut stream: Vec<Out> = Vec::new();
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let level = peer.next_symbol();
+            modem.symbol(symbol_at(level));
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                break;
+            }
+        }
+        assert!(modem.reneg.is_none(), "the renegotiation never reached 9.6.1.1.4's Ed");
+        assert!(modem.awaiting_e2u, "Ed did not arm the search for E2u");
+        // 8.7.2: E2u is a data frame of scrambled zeroes -- twelve symbols, two
+        // bits each on TRN2u's four points -- and 8.7.1's B1u, which reads as
+        // ones, is where the run ends.
+        let frame = crate::v92::UP_INTERVALS;
+        peer.push(&vec![false; 2 * frame]);
+        peer.push(&vec![true; 2 * frame]);
+        for _ in 0..(3 * frame) {
+            modem.now += 1;
+            let level = peer.next_symbol();
+            modem.symbol(symbol_at(level));
+        }
+        assert!(
+            !modem.awaiting_e2u,
+            "8.7.2/8.7.6: the renegotiation's E2u was not read as E2u -- the descrambler that \
+             recovers its zeroes is not the one that has run since TRN2u's first symbol"
+        );
+        assert!(modem.b1u_search.is_some(), "9.6.1.1.6: E2u did not condition the receiver for B1u");
+    }
+
     /// 9.8.1.1.3: "The digital modem shall generate silence by sending PCM
     /// codewords with magnitudes represented by **Ucode 0**. It shall **retain
     /// data frame alignment** during this period of silence."
