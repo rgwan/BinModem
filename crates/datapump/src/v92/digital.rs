@@ -7416,7 +7416,20 @@ impl Modem {
     fn symbol(&mut self, symbol: Symbol) {
         // 8.7.2-8.7.6: Phase 4's upstream arrives four points to a symbol, and
         // what it carries is SUVu, CPu, E2u and then B1u's payload.
-        if self.upstream.is_some() || self.upstream_data.is_some() {
+        //
+        // A renegotiation is the one stretch where **neither** reader is on the
+        // line: `ru_ended` drops both (`upstream` and `upstream_data`) so that
+        // the far end's `TRN2u`/`SUVu` are read by `reneg_symbol`, which
+        // `symbol_upstream` routes to on `reneg`/`reneg_trn2u_from`. Gating the
+        // feed on the two readers alone therefore silences the upstream for the
+        // whole of 9.8: no `SUVu` is decoded, `Exchange::peer_suv` is never
+        // called, the tail stops at `RenegStage::Suvd` repeating `SUVd`, and the
+        // far end never gets the `CPd` 9.6.1.1.2 owes it (docs/227).
+        if self.upstream.is_some()
+            || self.upstream_data.is_some()
+            || self.reneg.is_some()
+            || self.reneg_trn2u_from.is_some()
+        {
             self.symbol_upstream(symbol);
         }
         match self.stage {
@@ -10421,6 +10434,106 @@ mod conformance_158 {
         assert!(modem.upstream.is_none());
         assert!(modem.up_finder.is_none());
         assert_eq!(TRN2U_AFTER_RU_BAR, (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64);
+    }
+
+    /// 9.8.1.2.3 -> 9.8.1.1.2 -> 9.6.1.1.2 -> 9.6.1.1.4's `Ed` -> 9.6.1.1.5's
+    /// `B1d`: a renegotiation the far end starts with `Ru` ends in data mode
+    /// again.
+    ///
+    /// Two halves, and the first is the one the bench found dead (docs/227).
+    /// `ru_ended` drops **both** upstream readers -- `upstream` and
+    /// `upstream_data` -- so that `reneg_symbol` can read the far end's
+    /// `TRN2u`/`SUVu`, but `symbol()` gated the feed on those two readers
+    /// alone. The upstream was therefore silent for the whole of 9.8: no
+    /// `SUVu` was decoded, `Exchange::peer_suv` was never called, the tail sat
+    /// at `RenegStage::Suvd` repeating `SUVd`, nothing ever answered the far
+    /// end's `CPu`, and this end never reached its own data mode -- while the
+    /// far end, having heard the `Rd` and the `SUVd`, threw `0x96212` ten
+    /// seconds later.
+    #[test]
+    fn nine_eight_one_two_three_to_nine_six_one_one_two_then_ed_then_b1d() {
+        let mut modem = Modem::default();
+        // Into data mode, then the far end's Ru and the end of it (9.8.1.2.1).
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        assert!(modem.upstream.is_none(), "a reader was built before the far end's TRN2u");
+
+        // 9.8.1.2.3 hands 9.8.1.1.2 `TRN2d`; from the fiducial on, the far
+        // end's symbols have to reach `reneg_symbol`, which builds the reader
+        // on TRN2u's first symbol (8.7.6's scrambler reset). This is the line
+        // that was dead: `symbol()` never called `symbol_upstream` during 9.8.
+        modem.now = fiducial;
+        modem.symbol(symbol_at(1.0));
+        assert!(
+            modem.upstream.is_some() && modem.up_finder.is_some(),
+            "9.8.1.1.2: the far end's TRN2u/SUVu feed is not armed -- `symbol()` \
+             did not route the symbol to `reneg_symbol`"
+        );
+
+        // The exchange itself, from 9.6.1.1.2 to 9.6.1.1.5: one CPd after the
+        // far end's SUVu, Ed after the far end's CPu and its acknowledged
+        // SUVu, and B1d after the Ed.
+        modem.cpd = Some(reneg_cpd());
+        let mut stream: Vec<Out> = Vec::new();
+        let mut suv_seen = 0;
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    // 9.8.2.1.3: the far end's first SUVu carries no
+                    // acknowledge -- it has not received our CPd yet.
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    // 9.6.2.1.2: its CPu answers a CPd.
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    // 9.6.1.1.4: it acknowledges once it has our CPd, and the
+                    // Ed follows the acknowledged SUVd.
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                // 9.6.1.1.5: `B1d` is asked for at the Ed's boundary and is on
+                // the line from the source's next symbol, so run a few more.
+                for _ in 0..(2 * INTERVALS) {
+                    let _ = modem.source.next();
+                    stream.push(modem.source.out());
+                }
+                break;
+            }
+        }
+        // `runs` counts runs and not symbols: a CPd is 480 symbols.
+        let runs: Vec<&Out> = stream.windows(1).map(|w| &w[0]).collect();
+        let first_suv = runs.iter().position(|o| **o == Out::Suvd).expect("no SUVd went out");
+        let cpd = runs.iter().position(|o| **o == Out::Cpd).expect("9.6.1.1.2: no CPd went out");
+        let ed = runs.iter().position(|o| **o == Out::Ed).expect("9.6.1.1.4: no Ed went out");
+        let b1d = runs.iter().position(|o| **o == Out::B1d).expect("9.6.1.1.5: no B1d went out");
+        assert!(first_suv < cpd, "the CPd went out before any SUVd");
+        assert!(cpd < ed, "the Ed went out before the CPd");
+        assert!(ed < b1d, "the B1d went out before the Ed");
+        assert!(modem.reneg.is_none(), "the tail did not finish at 9.6.1.1.5");
+        assert!(modem.exchange.is_none(), "the exchange outlived the renegotiation");
     }
 
     /// 9.8.1.1.3: "The digital modem shall generate silence by sending PCM
