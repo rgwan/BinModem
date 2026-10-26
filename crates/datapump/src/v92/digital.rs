@@ -3379,6 +3379,10 @@ impl RenegTail {
         let mut exchange = Exchange::new(Context::Renegotiation, round_trip, fs);
         // 9.6.1.1.3's repeats, interleaved with SUVd as 9.6.2.1.2's CPu needs.
         exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // `CPD_WAITS_FOR_PARKED_TX`: 18 ms after its `CPu` the far end's chain
+        // is mid-sequence and the acknowledgement it sets never leaves it; one
+        // window later it is parked and `a001` comes out.
+        exchange.hold_cp_for_parked_tx();
         // 9.8.1.1.2's "either SUVd or SUVu"; see [`RENEG_REQUEST_SILENCE`].
         exchange.request_silence(RENEG_REQUEST_SILENCE);
         (
@@ -5274,6 +5278,10 @@ impl Modem {
         self.begin_upstream();
         let mut exchange = Exchange::new(Context::Training, self.settings.round_trip, FS);
         exchange.repeat_between_suvs(REPEAT_CP_GAP);
+        // `CPD_WAITS_FOR_PARKED_TX`: the far end answers a `CPd` only when its
+        // own transmit chain is parked, so the one `CPd` waits one window after
+        // its `CPu` instead of chasing it.
+        exchange.hold_cp_for_parked_tx();
         self.exchange = Some(exchange);
         self.upstream_data = None;
         self.note("V.92: TRN2d done, SUVd out".into());

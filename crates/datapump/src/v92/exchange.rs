@@ -247,7 +247,36 @@ pub struct Exchange {
     silence: bool,
     /// Our E has been sent.
     finished: bool,
+    /// The sample the peer's most recent CP was received at.
+    peer_cp_at: Option<u64>,
+    /// Whether the one CP we owe waits [`Exchange::window`] after the peer's
+    /// CP, so that it lands when the peer's own transmit chain is parked.
+    /// See [`CPD_WAITS_FOR_PARKED_TX`].
+    hold_cp_for_parked_tx: bool,
 }
+
+/// Whether the `CPd` waits one repeat window after the far end's `CPu`.
+///
+/// 9.6.1.1.2 asks for "a single `CPd` sequence followed by more `SUVd`
+/// sequences" and says nothing about *when* the `CPd` goes. The Agere analogue
+/// modem answers a `CPd` only if its own transmit chain (`+0x1168c`) is parked
+/// when the `CPd` lands: `V92ClientPhase4RxWaitSUVState` sets both of its
+/// acknowledgement bits (`orb $0x80,0x119db` at `.text+0x5d43b` and
+/// `orb $0x80,0x11ac9` at `.text+0x5d447`) and then, at `.text+0x5d454`, sends
+/// the `CPu`/`SUVu` that would carry them **only** when `+0x1168c` is zero or
+/// `0x5d310` -- its "send an `SUVu`" and "send a `CPu` every 2 s" stages. Any
+/// other value skips the `SendSequence` and goes straight to `.text+0x5d46d`,
+/// which clears the chain, arms `V34RxDataSetEdDetector` and its 8 000-sample
+/// deadline. The acknowledgement then exists in its records and never on the
+/// wire, and 9.6.1.1.4's "has received a `CPu` or `SUVu` with the
+/// acknowledgement bit set" is never satisfied on this side.
+///
+/// Measured, one call, two passes: a `CPd` 378 ms after its `CPu` (chain
+/// parked) is answered `SUVu' sent a001`; a `CPd` 18 ms after its `CPu` (chain
+/// mid-sequence) is answered with nothing, and 1.000 s later it clears down
+/// with `0x96216`. One window is several sequence times and is already the
+/// bound this machine keeps for "wait for my CPu".
+pub const CPD_WAITS_FOR_PARKED_TX: bool = true;
 
 impl Exchange {
     /// A fresh exchange in `context`, with `round_trip` in seconds and `fs`
@@ -275,6 +304,8 @@ impl Exchange {
             peer_asked_silence: false,
             silence: false,
             finished: false,
+            peer_cp_at: None,
+            hold_cp_for_parked_tx: false,
         }
     }
 
@@ -311,6 +342,7 @@ impl Exchange {
     /// it in place of CPu (P4P 6.1 D4-2).
     pub fn peer_cp(&mut self, cp: PeerCp, at: u64) {
         self.got_peer_cp = true;
+        self.peer_cp_at = Some(at);
         self.heard(cp.ack, at);
     }
 
@@ -348,6 +380,15 @@ impl Exchange {
         self.peer_acked = true;
         self.repeat_cp = false;
         self.settled = true;
+    }
+
+    /// Hold the one CP we owe until one window after the peer's CP arrived.
+    ///
+    /// Armed by the digital modem on every exchange it builds for 9.6.1.1.2
+    /// and never by the analogue side, which is the side whose timing this
+    /// exists to fit: see [`CPD_WAITS_FOR_PARKED_TX`].
+    pub fn hold_cp_for_parked_tx(&mut self) {
+        self.hold_cp_for_parked_tx = CPD_WAITS_FOR_PARKED_TX;
     }
 
     /// Put SUVs between the CPs of a repeat group, `gap` symbols apart.
@@ -399,6 +440,18 @@ impl Exchange {
     /// Whether a CP may go at `now`, arming the wait-for-CP bound the first
     /// time one is held back.
     fn cp_due(&mut self, now: u64) -> bool {
+        // [`CPD_WAITS_FOR_PARKED_TX`]: neither the one CP nor a repeat of it
+        // goes within one window of the far end's `CPu`, because a `CPd` that
+        // arrives inside the far end's own sequence is acknowledged into a
+        // record that far end never sends (`.text+0x5d46d` skips its
+        // `SendSequence` when `+0x1168c` is mid-chain).
+        if self.hold_cp_for_parked_tx
+            && (self.need_single_cp || self.repeat_cp)
+            && let Some(at) = self.peer_cp_at
+            && now < at.saturating_add(self.window)
+        {
+            return false;
+        }
         if self.repeat_cp {
             // A CPd every `REPEAT_CP_GAP` symbols rather than back to back.
             // 9.6.1.1.3 says "repeated CPd sequences", and the analogue modem
@@ -528,6 +581,7 @@ impl Exchange {
         self.need_single_cp = true;
         self.wait_for_cp = false;
         self.hold_until = None;
+        self.peer_cp_at = None;
     }
 
     // -- what the owner can look at -----------------------------------------
@@ -1197,6 +1251,58 @@ mod tests {
         exchange.sequence_ended(SequenceKind::Suv, 124);
         exchange.peer_suv(PeerSuv::default(), 130);
         assert_eq!(exchange.next_sequence(148), SequenceKind::Cp);
+    }
+
+    /// 9.6.1.1.2: "a single CPd sequence followed by more SUVd sequences" --
+    /// and the `CPd` of the *repeat* group too, which 9.6.1.1.3 sends until an
+    /// acknowledged `CPu` arrives. The Agere analogue modem acknowledges a
+    /// `CPd` only when its own transmit chain (`+0x1168c`) is parked at that
+    /// instant: `V92ClientPhase4RxWaitSUVState` sets both bits
+    /// (`.text+0x5d43b`, `.text+0x5d447`) and then, at `.text+0x5d454`,
+    /// `SendSequence`s the `CPu`/`SUVu` that carries them only when `+0x1168c`
+    /// is `0` or `0x5d310`; otherwise it skips straight to `.text+0x5d46d`,
+    /// arms its `Ed` detector and starts its 8 000-sample deadline, and the
+    /// acknowledgement never reaches the line. Measured in one call: a `CPd`
+    /// 378 ms after its `CPu` is answered `SUVu' sent a001`, a `CPd` 18 ms
+    /// after it is answered with nothing and the call clears down with
+    /// `0x96216` 1.002 s later. So the `CPd` waits one window after the `CPu`
+    /// it answers ([`CPD_WAITS_FOR_PARKED_TX`]) and no `CPd` ever chases it.
+    #[test]
+    fn nine_six_one_one_two_holds_the_cpd_until_the_far_ends_chain_is_parked() {
+        let mut exchange = Exchange::new(Context::Renegotiation, 0.0, FS);
+        exchange.hold_cp_for_parked_tx();
+        exchange.repeat_between_suvs(0);
+        let window = exchange.window();
+        exchange.peer_suv(PeerSuv::default(), 0);
+        exchange.sequence_started(SequenceKind::Suv);
+        exchange.sequence_ended(SequenceKind::Suv, 12);
+        // Its CPu arrives, so the one CPd we owe carries bit 33 from here on --
+        // but it does not chase the CPu. A CPd in the next window is answered
+        // off the line.
+        exchange.peer_cp(PeerCp::default(), 100);
+        assert!(exchange.got_peer_cp());
+        assert_eq!(exchange.next_sequence(124), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(100 + window - 1), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(100 + window), SequenceKind::Cp);
+        assert!(exchange.sequence_started(SequenceKind::Cp));
+        exchange.sequence_ended(SequenceKind::Cp, 940);
+        assert!(exchange.sent_ack());
+
+        // The repeat group of 9.6.1.1.3 is held the same way: a second CPu at
+        // 2 000 ms means no repeat CPd before 2 800.
+        for at in [1_800u64, 1_900, 1_920] {
+            exchange.peer_suv(PeerSuv::default(), at);
+        }
+        assert!(exchange.repeating());
+        exchange.peer_cp(PeerCp::default(), 2_000);
+        assert_eq!(exchange.next_sequence(2_100), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(2_000 + window), SequenceKind::Cp);
+
+        // An E is never held back by the hold: 9.6.1.1.4 ends the exchange at
+        // the boundary after both halves, whenever that is.
+        exchange.peer_suv(PeerSuv { ack: true, ..PeerSuv::default() }, 2_900);
+        assert!(exchange.peer_acked());
+        assert_eq!(exchange.next_sequence(2_901), SequenceKind::E);
     }
 
     /// Table 27 bit 26, "the analogue modem wishes the digital modem to wait
