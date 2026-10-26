@@ -340,9 +340,33 @@ pub fn index_step_lsb() -> f64 {
     2.0 * super::upchoice::gain_for(REFERENCE_LC) * crate::v92::codegrid::TARGET_RMS
 }
 
+/// The **criterion** a rung's licence is taken against, by name: [`threshold`],
+/// the gap-priced form.
+///
+/// One criterion, named in one place, so that a log line and the scan cannot
+/// disagree about what decided a rung -- and so that a reader who finds a
+/// residual compared with [`sigma_max`] somewhere can see which of the two
+/// numbers the tree actually spends. `docs/276` sec 2 and `docs/277` sec 1 are
+/// the two documents that disagreed about it.
+pub const CRITERION: &str = "threshold";
+
+/// The number that is **not** a licence: [`sigma_max`], the mean-square form,
+/// printed beside a decision as a screen and labelled `not consulted`.
+pub const SCREEN: &str = "sigma_max";
+
 /// The residual, in index steps of the LC = 8 grid, that a rung actually needs:
 /// [`SIGMA_MAX`] scaled by the smallest gap a maximin set of [`points`] codes
 /// can hold, over one index step.
+///
+/// **This is the licence** -- [`CRITERION`] names it, [`ceiling_rung`] compares
+/// nothing else, and [`Sigma::ceiling_note`] and [`Reading::line`] print it
+/// beside every decision. [8.8.3] fixes `G`, the mean-square spacing; 6.4.1 and
+/// 6.4.2 then give the twelve intervals different moduli, and a decision taken
+/// against a gap has to clear half of it, so the gap is the number a rung is
+/// priced in (`docs/277` sec 1.3). [`sigma_max`] is the mean-square reading of
+/// the same rung, it is 2.7x looser at `drn 2`, and it licensed 25 333 in
+/// `docs/274` sec 2.2 after the bench had watched that rung fail -- which is why
+/// it is a screen.
 ///
 /// ```text
 /// drn   rate   points  gap(LSB)  threshold
@@ -393,13 +417,44 @@ pub fn gap_lsb(points: usize) -> Option<f64> {
 }
 
 /// The largest measurement, in index steps of the **LC = 8 grid**, that a rung
-/// whose set is `lc` points can carry.
+/// whose set is `lc` points can carry **in the mean square**.
 ///
 /// A measurement is worth more index steps on a coarser grid and fewer on a
 /// finer one, because a half-cell is `G` and `G` falls with LC: so this falls as
 /// `lc` grows and a bigger set needs a better line. The value at
 /// `lc == REFERENCE_LC` is [`SIGMA_MAX`] itself, and [`sigma_max_table`] prints
 /// the four rungs.
+///
+/// # This is a screen, not a licence
+///
+/// No rung is licensed against this function. The licence is [`threshold`] --
+/// the gap-priced form that [`ceiling_rung`] compares and that [`CRITERION`]
+/// names, printed beside every decision. `sigma_max` answers the *mean square*
+/// question `[8.8.3]` asks (`v92.txt:1785-1790`: "when the prefilter output
+/// multiplied by `G` has a mean-square value of 1, the analogue modem will
+/// transmit at the desired power"), and 6.4.1/6.4.2 give a rung's twelve
+/// intervals **different** moduli, so the mean square is not the spacing the
+/// symbols are decided against.
+///
+/// Two documents met on this function, and the wrong one decided:
+///
+/// * **`docs/274` sec 2.2** read `drn 2`'s `0.0744` against
+///   `sigma_max(LC 8) = 0.0939` and reported "0.79x PASSES". At `drn 2`'s
+///   actual boundary -- a 16-point interval, half-gap `0.1834` index steps --
+///   the *same* `0.0939` stands for `2 Q(0.18336 / 0.0938663) = 5.08e-2`
+///   (`docs/277` sec 1.1) **[verified]**: a **5.1 % symbol error rate, five
+///   decades worse than [`TARGET`]**. It is not a `1e-7` ceiling at `drn 2` at
+///   all, and `drn 2` was never carried -- `docs/266`'s c4 call returned no
+///   `CONNECT`.
+/// * **`docs/275` sec 3** then built a third criterion (`half-gap / 5.2`),
+///   6.0 dB loose at `LC <= 16` because [`gap_lsb`] is a *full* gap.
+///
+/// `docs/277` sec 1 is the reconciliation, and it is why this number is printed
+/// only as a **screen**, labelled `screen=` and `not consulted`
+/// ([`Sigma::ceiling_note`], [`Reading::line`]). The test
+/// `a_measurement_that_clears_the_screen_is_still_refused_by_the_criterion`
+/// holds a residual that passes this function and fails [`threshold`] to a
+/// refusal that names `threshold`.
 #[must_use]
 pub fn sigma_max(lc: usize) -> f64 {
     SIGMA_MAX * gain_for(lc) / gain_for(REFERENCE_LC)
@@ -523,6 +578,45 @@ impl Sigma {
     #[must_use]
     pub fn error(&self, lc: usize) -> f64 {
         symbol_error(self.at(lc))
+    }
+
+    /// The line the log carries for the ceiling this measurement gives:
+    /// **which criterion decided**, the bound it compared, what it refused, and
+    /// what the mean-square screen would have said had anybody consulted it.
+    ///
+    /// ```text
+    /// criterion=threshold(drn 2)=0.0344 measured=0.0744 (2.16x) -> drn 1;
+    /// screen=sigma_max(LC 8)=0.0939 would have PERMITTED it, and the screen is
+    /// not consulted (docs/277 sec 1)
+    /// ```
+    ///
+    /// The second half is the sentence `docs/274` sec 2.2 did not write and
+    /// `docs/277` sec 1.1 did: at `drn 2` the screen stands for a 5.1 % symbol
+    /// error rate, so a residual that clears it is not a licence. Only the first
+    /// half decides. The second is printed so that a reader can see it did not.
+    #[must_use]
+    pub fn ceiling_note(&self) -> String {
+        let ceiling = ceiling_rung(*self);
+        // The rung the scan *refused* is the one above where it stopped, which
+        // is the row whose number a reader wants: five rungs are granted and one
+        // refusal is why the ceiling is there.
+        let next = ceiling.map_or(1, |drn| (drn + 1).min(UP_RATES as u8));
+        let bound = threshold(next);
+        let screen = sigma_max(lc_for(next));
+        let screen_says =
+            if self.steps <= screen { "would have PERMITTED it" } else { "refuses it too" };
+        format!(
+            "criterion={CRITERION}(drn {next})={bound:.4} measured={:.4} ({:.2}x) -> {}; \
+             screen={SCREEN}(LC {})={screen:.4} {screen_says}, and the screen is not consulted \
+             (docs/277 sec 1)",
+            self.steps,
+            if bound > 0.0 { self.steps / bound } else { f64::INFINITY },
+            match ceiling {
+                Some(drn) => format!("drn {drn}"),
+                None => "no rung".to_owned(),
+            },
+            lc_for(next),
+        )
     }
 }
 
@@ -837,7 +931,9 @@ impl Reading {
         format!(
             "LADDER drn={} lc={} instrument={instrument} rate={rate} bin={:.4e} crossing={} \
              target={:.1e} symbols={} resolution={resolution} level={:.1} 1/G={wanted:.1} \
-             delta={:+.2}% tol=+{:.1} LSB/-{:.1} LSB gap={:.0} -> {why}",
+             delta={:+.2}% tol=+{:.1} LSB/-{:.1} LSB gap={:.0} \
+             criterion={CRITERION}(drn {})={:.4} screen={SCREEN}(LC {})={:.4}(not consulted) \
+             -> {why}",
             self.drn,
             self.lc,
             self.bin,
@@ -849,6 +945,10 @@ impl Reading {
             tolerance.plus * wanted,
             tolerance.minus * wanted,
             self.min_gap_lsb,
+            self.drn,
+            threshold(self.drn),
+            self.lc,
+            sigma_max(self.lc),
         )
     }
 }
@@ -1396,6 +1496,74 @@ mod tests {
         assert_eq!(points(2), 16, "25 333's widest interval");
         assert_eq!(points(1), 8);
         assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the mean-square model is not tighter");
+    }
+
+    /// **The defect this note exists to prevent: a rung licensed by the
+    /// mean-square form.**
+    ///
+    /// `docs/274` sec 2.2 read `drn 2`'s `0.0744` against `sigma_max(LC 8) =
+    /// 0.0939` and reported a pass, while `docs/277` sec 1.1 shows that same
+    /// `0.0939` at `drn 2`'s boundary standing for a **5.1 % symbol error
+    /// rate**. So: the screen has to be *weaker* than the licence at every rung,
+    /// a residual that clears the screen and fails [`threshold`] has to be
+    /// **refused**, and the refusal has to **name `threshold`** -- the warning
+    /// in [`points`]' comment, as an assertion rather than a comment.
+    #[test]
+    fn a_measurement_that_clears_the_screen_is_still_refused_by_the_criterion() {
+        // The screen is looser than the licence at every rung. That is exactly
+        // why it cannot be a licence: as a licence it always lets more through.
+        for drn in 1..=UP_RATES as u8 {
+            assert!(
+                sigma_max(lc_for(drn)) >= threshold(drn),
+                "drn {drn}: the screen {} is tighter than the licence {}",
+                sigma_max(lc_for(drn)),
+                threshold(drn)
+            );
+        }
+        // `docs/274` sec 2.2's own reading at `drn 2`, with the level error
+        // removed: the row it read as "0.79x PASSES".
+        let measured = Sigma::reading(0.0744, REFERENCE_LC);
+        assert!(
+            0.0744 <= sigma_max(lc_for(2)),
+            "the screen has to licence this or the test proves nothing"
+        );
+        assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the screen is not the looser form");
+        // Refused: 25 333 was never carried (`docs/266` c4 returned no CONNECT).
+        assert!(0.0744 > threshold(2), "drn 2's licence is not what the refutation rests on");
+        assert_eq!(ceiling_rung(measured), Some(1), "0.0744 was allowed past 24 000");
+        // And the refusal names the criterion, and says the screen was not
+        // consulted. This is the sentence a future reader has to be able to
+        // find in the log rather than re-derive.
+        let note = measured.ceiling_note();
+        println!("{note}");
+        assert!(note.contains(CRITERION), "the refusal does not name the criterion: {note}");
+        assert!(note.contains("threshold"), "the refusal does not name `threshold`: {note}");
+        assert!(note.contains("0.0344"), "the refusal does not carry the bound: {note}");
+        assert!(note.contains(SCREEN), "the screen is not printed: {note}");
+        assert!(note.contains("not consulted"), "the screen is not labelled unused: {note}");
+        assert!(note.contains("PERMITTED"), "the screen's own verdict is not shown: {note}");
+        assert!(note.contains("drn 1"), "the granted rung is not named: {note}");
+        // The same on a `drn 2` LADDER line, which is the log a bench reader
+        // actually sees: the criterion is printed beside the rate verdict.
+        let reading = Reading {
+            drn: 2,
+            lc: lc_for(2),
+            min_gap_lsb: 128.0,
+            level_lsb: 1.0 / gain_for(lc_for(2)),
+            gain: gain_for(lc_for(2)),
+            bin: 1e-2,
+            crossing: 0.0,
+            symbols: 416,
+        };
+        let line = reading.line(admit(&reading));
+        println!("{line}");
+        assert!(line.starts_with("LADDER drn=2"), "the line's shape moved: {line}");
+        assert!(line.contains("criterion=threshold"), "the LADDER line names no criterion: {line}");
+        assert!(line.contains("screen=sigma_max"), "the LADDER line does not label the screen: {line}");
+        assert!(
+            line.contains("not consulted"),
+            "the LADDER line does not say the screen is unused: {line}"
+        );
     }
 
     /// The wiring's own input: a design and a noise figure give an *upper* bound

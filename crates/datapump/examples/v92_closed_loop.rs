@@ -919,10 +919,19 @@ fn main() {
         let pct = if bits > 0 { 100.0 * ones as f64 / bits as f64 } else { 0.0 };
         let bins = Bins::measure(&parameters, &b1u_etas, &codewords, b1u_at, s.lu, k, &ladder, s.law);
         let resid = Residual::measure(&parameters, &codewords, b1u_at, s.lu, k);
-        let ceiling = rung::sigma_max(rung.lc);
+        // Two numbers, and only the second one licences a rung (`docs/277`
+        // sec 1): `licence` is `rung::threshold`, the gap-priced criterion the
+        // tree's ceiling is built on, and `screen` is the mean-square form,
+        // which is 2.7x looser at `drn 2` and licensed a rung the bench watched
+        // fail when `docs/274` sec 2.2 compared against it. It is printed
+        // anyway, labelled, so that a table can be read in either form and the
+        // difference is visible in the harness's own output.
+        let licence = rung::threshold(drn);
+        let screen = rung::sigma_max(rung.lc);
         println!(
             "  RESIDUAL drn={drn} lc={} n={} sigma={:.4} bias={:+.4} out={} ({:.2}%) \
-             edge={:.0} ceiling={:.4} over={:.2}x farlev={:.2}",
+             edge={:.0} licence=threshold({licence:.4}) over={:.2}x \
+             screen=sigma_max({screen:.4},not consulted) farlev={:.2}",
             rung.lc,
             resid.n,
             resid.rms(),
@@ -930,8 +939,7 @@ fn main() {
             resid.outside,
             resid.outside_pct(),
             resid.edge,
-            ceiling,
-            if ceiling > 0.0 { resid.rms() / ceiling } else { 0.0 },
+            if licence > 0.0 { resid.rms() / licence } else { f64::INFINITY },
             used.level_lsb * far,
         );
         let crossing = stats.crossing(&ladder, &rx, s.law, gap);

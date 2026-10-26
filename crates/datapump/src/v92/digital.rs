@@ -6119,11 +6119,16 @@ impl Modem {
         self.note(format!(
             "V.92: advisory (not the gate): sigma {:.4} index steps at LC {} from the four-point fit at \
              {snr_db:.1} dB ({:?}) would allow {advisory_ceiling} and mask {advisory:#07x}; the ladder \
-             granted mask {:#07x}",
+             granted mask {:#07x}; {}",
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
             decision.measured.bound(),
             decision.mask,
+            // Which criterion took the ceiling above, by name, and what the
+            // mean-square screen would have said instead (`docs/277` sec 1).
+            // A reader who compares a residual with `sigma_max` can see here
+            // that it decided nothing -- the defect `docs/274` sec 2.2 was.
+            decision.measured.ceiling_note(),
         ));
         if decision.empty {
             // The event the ceiling exists to make visible: every rung the far
