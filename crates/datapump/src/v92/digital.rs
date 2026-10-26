@@ -3763,6 +3763,43 @@ fn up_table(levelset: LevelSet, set: &[u16], k: f64) -> Vec<u16> {
     }
 }
 
+/// The levels `B1u` is sliced against, in equaliser units, ascending, deduplicated.
+///
+/// Two things decide it and they are not the same decision:
+///
+/// * the **set**, from `up_table`: the odd lattice `2 eta + 1` on
+///   [`LevelSet::Uniform`] whatever `k` says, the far end's codes `round(k a)`
+///   on [`LevelSet::Code`] -- `docs/216` and `docs/114` R4;
+/// * the **lattice**, from [`crate::v92::receiver::lattice_levels`], and only
+///   when the set is the code grid. CPd's points are G.711 code values when the
+///   far end's constellation is its codec's output (`docs/242` sec 2); on the odd
+///   lattice they are not, the far end cannot emit them and must not, and a
+///   table snapped to the nearest code is a table displaced by half a chord step:
+///   36 LSB at 1 920 LSB on drn 1's 349-LSB spacing, a fifth of the decision
+///   half-gap. That is `docs/257`'s regression: the snap was applied to
+///   every set here, it was validated only as a fit figure (36.5 -> 35.7 dB,
+///   `docs/242` sec 2) and never as a payload, and the call it broke decoded
+///   nothing in either direction.
+///
+/// The gain is CPd's `G`: the far end transmits at `G a(eta)` and 8.8.3's power
+/// identity is what makes that one number this end's equaliser unit.
+fn data_mode_levels(parameters: &Parameters, k: f64) -> Vec<f64> {
+    let mut levels: Vec<f64> = Vec::new();
+    for set in &parameters.sets {
+        for point in up_table(parameters.levelset, set, k) {
+            let level = parameters.gain * f64::from(point);
+            levels.push(level);
+            levels.push(-level);
+        }
+    }
+    if parameters.levelset == LevelSet::Code {
+        levels = crate::v92::receiver::lattice_levels(&levels);
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    levels
+}
+
 fn jp_offset() -> f64 {
     std::env::var("V92_JP_OFFSET").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0)
 }
@@ -5821,12 +5858,13 @@ impl Modem {
         let ja = self.ja.upstream_rates().unwrap_or(0);
         let ceiling = ceiling_rung(measured);
         let allowed = apply_ceiling(ja, measured);
+        let decision = RateDecision { measured, ceiling, mask: allowed, empty: false };
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
         // still gets, because the alternative is no call at all. Which of the
         // two left it there is what the log carries.
         let (mask, empty) = if allowed == 0 { (1u32, true) } else { (allowed, false) };
-        let decision = RateDecision { measured, ceiling, mask, empty };
+        let decision = RateDecision { empty, ..decision };
         let found = if empty {
             pin(&designed, 1, trellis, noise)
         } else {
@@ -5860,13 +5898,10 @@ impl Modem {
             choice.parameters.rate()
         ));
         // The scan itself, rung by rung, with the number each one was refused
-        // on. `ceiling_rung` now evaluates every rung instead of answering
-        // "drn 1" for a `Bound::Lower` without looking, so a refusal has to be
-        // readable as a comparison and not as an absence: sigma, the rung's own
-        // gap-corrected threshold, and the verdict.
+        // on.
         let scan: Vec<String> = (1..=crate::v92::UP_RATES as u8)
             .map(|drn| {
-                let budget = threshold(drn);
+                let budget = crate::v92::rung::threshold(drn);
                 let verdict = if decision.measured.steps() <= budget { "met" } else { "refused" };
                 format!(
                     "drn {drn} ({}) threshold {budget:.4} {verdict}",
@@ -5881,7 +5916,6 @@ impl Modem {
             ceiling
         ));
         if decision.empty {
-            // The event the ceiling exists to make visible.
             self.note(format!(
                 "V.92: the measurement leaves no rung of the ladder (sigma {:.4} index steps, {:.4} at LC {} is the slowest rung's budget); keeping the slowest, drn 1 at {} bit/s",
                 decision.measured.steps(),
@@ -6057,14 +6091,7 @@ impl Modem {
         // of `K` happening to be one -- `K` is not one on a mask the far end
         // fills in, and a fit against the odd lattice returns 433.75, which read
         // B1u at 327 of 576.
-        let mut levels: Vec<f64> = Vec::new();
-        for set in &parameters.sets {
-            for point in up_table(parameters.levelset, set, self.up_scale) {
-                let level = parameters.gain * f64::from(point);
-                levels.push(level);
-                levels.push(-level);
-            }
-        }
+        let levels = data_mode_levels(&parameters, self.up_scale);
         self.note(format!(
             "V.92: upstream level table at K {:.5} ({}) over {} point(s), gap {:.0} LSB",
             self.up_scale,
@@ -6072,8 +6099,6 @@ impl Modem {
             parameters.sets.first().map_or(0, Vec::len),
             crate::v92::codegrid::min_gap(parameters.sets.first().map_or(&[][..], Vec::as_slice)),
         ));
-        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         // The slicer moves to CPd's constellation and the equaliser stays: the
         // prefilter the far end runs is this end's design of it, and on a line
         // with insertion loss it is never exact.
@@ -8767,6 +8792,70 @@ mod tests {
         // set whatever the fit says, the code arm's is `round(K a(eta))`.
         assert_eq!(up_table(LevelSet::Uniform, &set, would_fit), set);
         assert_ne!(up_table(LevelSet::Code, &code.sets[0], 1.0 + code_k), code.sets[0].clone());
+    }
+
+    /// **The data mode's table is the design's set on the odd lattice, point
+    /// for point.** `docs/257` sec 2: `set_data_mode` used to put every level on
+    /// the far end's code lattice, which is right for the code grid and wrong
+    /// for `2 eta + 1`, and the snap is not a rounding -- it displaces each point
+    /// by up to half a mu-law chord step.
+    ///
+    /// The assertion is on the slicer's own table, read back through
+    /// `Receiver::data_levels`, and not on a helper's output: what broke the
+    /// `loop-260` call was the table the decoder decided against, and a test that
+    /// stops one call short of it would have passed on `54e9e1e`.
+    #[test]
+    fn the_data_mode_table_is_the_designs_set_on_the_odd_lattice() {
+        let design = crate::v92::design::Design {
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let uniform =
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform)
+                .expect("drn 1 on the odd lattice")
+                .parameters;
+        assert_eq!(uniform.levelset, LevelSet::Uniform);
+        assert_eq!(uniform.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
+        let levels = data_mode_levels(&uniform, 1.0);
+        // The eight points the far end will transmit, at CPd's own `G`: `G a(eta)`
+        // and its negation, and nothing else. This is the call `docs/256` sec 1.2
+        // made -- `levelset uniform`, `G` 0.1085, eight points.
+        for eta in uniform.sets[0].iter().copied().map(f64::from) {
+            let want = uniform.gain * eta;
+            assert!(
+                levels.iter().any(|&level| (level - want).abs() < 1e-12),
+                "drn 1 point {} is not in the table the slicer decides against",
+                eta,
+            );
+        }
+        // The live path: the slicer holds what the design emitted, unchanged.
+        let mut rx = Receiver::new();
+        rx.set_data_mode(levels.clone());
+        assert_eq!(rx.data_levels(), levels.as_slice(), "the slicer moved a point of the design's set");
+        // The mechanism, so that removing the gate fails here and not on a bench:
+        // snapping this set is not the identity, and what it moves is not small.
+        let snapped = crate::v92::receiver::lattice_levels(&levels);
+        let worst = levels
+            .iter()
+            .zip(&snapped)
+            .map(|(design, snap)| (design - snap).abs() * crate::v92::receiver::LATTICE_LSB)
+            .fold(0.0f64, f64::max);
+        let spacing = uniform.gain * 2.0 * crate::v92::receiver::LATTICE_LSB;
+        assert!(worst > 0.0, "the snap is the identity on this set; the gate is untested");
+        assert!(worst > 0.03 * spacing, "{worst} LSB of a {spacing} LSB step is not the mechanism");
+        // And the code grid's own table *is* put on the lattice, so the gate is a
+        // gate and not a removal: every point of it is a code value.
+        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code)
+            .expect("drn 1 on the grid")
+            .parameters;
+        assert_eq!(code.levelset, LevelSet::Code);
+        for level in data_mode_levels(&code, 1.0) {
+            let moved = (crate::v92::receiver::on_lattice(level) - level).abs();
+            assert!(moved < 1.0 / crate::v92::receiver::LATTICE_LSB, "{level} is off the code grid by {moved}");
+        }
     }
 
     /// docs/131 case (a): a **compliant** far end -- `Su` 144T, its 24.5T

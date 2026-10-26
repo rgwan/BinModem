@@ -1996,12 +1996,21 @@ impl Receiver {
     /// The `gain` the four-point tiers established is kept as well: it is the
     /// AGC that puts the equaliser's output on the scale the levels are on, and
     /// TRN2u and B1u are transmitted at the same power (3.8, 8.7.1).
+    /// **The table is the caller's, and this function does not move a point of
+    /// it.** It used to put every level on the far end's code lattice
+    /// (`lattice_levels`, `docs/242` sec 2) on the way in, and that is right only
+    /// for a constellation whose points *are* G.711 code values. On the odd
+    /// lattice `a(eta) = 2 eta + 1` they are not, and snapping displaces each
+    /// point by half a mu-law chord step: measured on the call's own set (drn 1,
+    /// `G` 0.1085, eight points spaced 349 LSB) the worst is **36 LSB** at
+    /// 1 920 LSB -- a tenth of the point spacing and a fifth of the decision
+    /// half-gap, added to a receiver whose far end already lands 0.59 half off
+    /// the grid (`docs/256` sec 2). `docs/257` sec 2 is the call that cost. Which
+    /// lattice a set is on is CPd's to say and `begin_b1u`'s to apply
+    /// (`digital.rs`, `data_mode_levels`): it is the level set, not this
+    /// slicer, that knows whether there is a code grid under it.
     pub fn set_data_mode(&mut self, levels: Vec<f64>) {
-        // CPd's points, put on the far end's code lattice: the table this end
-        // slices B1u on is the set of values the far end's quantiser can put
-        // out, so a point that is not a codeword is not a decision this slicer
-        // may take (docs/242 sec 2, and `on_lattice` for the clause).
-        self.slicer = Slicer::Levels(lattice_levels(&levels));
+        self.slicer = Slicer::Levels(levels);
         // Diagnostic (`V92_DATA_FB`): what to do with the fitted feedback
         // section once the data mode starts. `off` zeroes it and `scale:K`
         // multiplies it, so that "is the decision feedback equalising a second
@@ -2027,6 +2036,17 @@ impl Receiver {
             Some(step) => step,
             None => DATA_TRACKING,
         };
+    }
+
+    /// The data mode's decision table, in ascending order, or an empty slice
+    /// before [`Self::set_data_mode`] has been called. A diagnostic: it is what
+    /// the slicer is deciding against, so a test can ask whether the table is
+    /// the one CPd named instead of trusting that it is.
+    pub fn data_levels(&self) -> &[f64] {
+        match &self.slicer {
+            Slicer::Levels(levels) => levels,
+            _ => &[],
+        }
     }
 
     /// 9.5.1.1.10: "the first symbol of the second TRN1u shall be symbol 0 of
