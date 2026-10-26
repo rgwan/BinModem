@@ -583,6 +583,109 @@ pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// The cap: the highest rung the bench has carried data on
+// ---------------------------------------------------------------------------
+
+/// The highest rung the bench has been shown to **carry data**, and the cap the
+/// live rung decision is held to whatever the instruments below say.
+///
+/// This is a **measurement, not a design limit.** `docs/266` sec 4 took the
+/// ladder live on an Agere at 33 333: the level granted `drn 8`, `CPd drn 8, ack
+/// true` went out, and the far end's `B1u` did not read as `B1u` -- **443/800**
+/// and **429/800** ones on the two directions -- so there was no `E2u` within
+/// 2 s, the call fell back to `V.90`, and there was no `ATI11` to read. Forced
+/// `drn 8` reproduced it bit-identically with the ladder out of the path, and
+/// forced `drn 2` = 25 333 fails the same way (**333/608**, **314/608**). The
+/// one call that carried payload at all -- **2000/2000, mismatched 0** -- was
+/// `drn 1` = 24 000. That is the whole of the working evidence: 24 000 and
+/// nothing above it.
+///
+/// `docs/269` sec 0.2 and sec 3 say why, and say that it is not solved: above
+/// `drn 1` the twelve intervals' moduli are not all equal (K % 12 != 0), the
+/// engine's per-interval modulus assignment is the only structural difference
+/// between the rung that works and the rung that does not, and the transmitter
+/// model reproduces `drn 1` and does not reproduce `drn 2`. `drn 7` -- the other
+/// rung with no spare bit, so the other rung with twelve equal moduli -- fails
+/// too, which is why this cap is *not* "the rungs with no spare bit are fine".
+///
+/// **Do not raise this without a bench call that carries payload at the rung it
+/// raises to.** A tree that cannot carry data must not be merged as if it could,
+/// and the instruments below (`admit`, its tolerance table) are the instrument,
+/// not the licence: they measure the **level**, and the level is not what fails
+/// here. `docs/271` sec 1 is the record of this cap and of the test that holds
+/// it.
+pub const MEASURED_WORKING_MAX_DRN: u8 = 1;
+
+/// The mask [`MEASURED_WORKING_MAX_DRN`] permits: bit k for drn k + 1, every
+/// rung at or below the cap.
+#[must_use]
+pub fn measured_mask() -> u32 {
+    if MEASURED_WORKING_MAX_DRN >= UP_RATES as u8 {
+        JA_MASK_ALL
+    } else {
+        (1u32 << MEASURED_WORKING_MAX_DRN) - 1
+    }
+}
+
+/// What the live rung decision may spend: what the instruments granted, cut to
+/// [`measured_mask`].
+///
+/// Two properties the caller relies on, and both are tested rather than stated:
+///
+/// * no bit above the cap survives, for **every** input mask -- so `choose`,
+///   which can only return a rung whose bit is set in the mask it is handed
+///   (`upchoice.rs:262-265`), cannot carry a rung above the cap;
+/// * `0` can come back, and `0` means "every rung" to `choose`
+///   (`upchoice.rs:261`), so a caller must treat it as a refusal rather than
+///   hand it on -- which the live path already does by pinning `drn 1` on an
+///   empty mask (`digital.rs:6094-6099`).
+#[must_use]
+pub fn cap_to_measured(granted: u32) -> u32 {
+    granted & measured_mask()
+}
+
+/// The highest rung a mask carries, or `None` when it carries nothing.
+#[must_use]
+pub fn highest_rung(mask: u32) -> Option<u8> {
+    (1..=UP_RATES as u8)
+        .rev()
+        .find(|drn| mask & (1 << (drn - 1)) != 0)
+}
+
+/// The line the live log carries for the cap: what the instruments granted, what
+/// the cap leaves, and the measurement that fixes it.
+///
+/// It is printed on **every** ladder decision, including the ones in which
+/// nothing is taken away, so that a call's log states the cap rather than
+/// implying it only by the absence of a higher rung. The `LADDER` lines printed
+/// beside it are untouched: they still print, per rung, what each instrument
+/// says and what it *would* have granted -- this line is what says that grant is
+/// not what the call gets.
+#[must_use]
+pub fn cap_line(granted: u32) -> String {
+    let capped = cap_to_measured(granted);
+    let would = match highest_rung(granted) {
+        Some(drn) => format!("drn {drn} ({})", up_rate(drn)),
+        None => "nothing".to_string(),
+    };
+    let got = match highest_rung(capped) {
+        Some(drn) => format!("drn {drn} ({})", up_rate(drn)),
+        None => "nothing -- drn 1 is pinned".to_string(),
+    };
+    let taken = granted.count_ones() - capped.count_ones();
+    let head = format!(
+        "V.92: capped: MEASURED_WORKING_MAX_DRN = {MEASURED_WORKING_MAX_DRN} takes the live rung from {would} to {got} ({taken} rung(s) removed); "
+    );
+    let why = format!(
+        "the instruments above granted mask {granted:#07x} and granted it on the level, which is not what fails here: "
+    );
+    head + &why
+        + "the bench carries payload at 24 000 and at no rung above it, 33 333 and 25 333 both die at B1u (docs/266 sec 4), "
+        + "and the per-interval modulus assignment above drn 1 is unexplained, drn 7 included (docs/269 sec 3). "
+        + "Do not raise the cap without a bench call that carries payload at the rung it raises to"
+}
+
+// ---------------------------------------------------------------------------
 // The instrument a rung's decision binds on
 // ---------------------------------------------------------------------------
 
@@ -1678,6 +1781,71 @@ mod tests {
         // the old 0.5 x gap rule floored this at drn 14 (docs/261 sec 3).
         assert!(admit(&reading(19, ideal_level(19) * 1.017, 0.0, 0.0, 0)).granted());
         assert!(admit(&reading(15, ideal_level(15) * 1.017, 0.0, 0.0, 0)).granted());
+    }
+
+    /// **The cap this ticket exists for.** Every instrument at its most
+    /// generous -- the level exactly on the design's own `1/G`, and no `B1u`
+    /// index errors over a window long enough to resolve [`TARGET`] -- grants
+    /// all nineteen rungs, and the live decision still grants `drn 1` and
+    /// nothing above it: no bit above [`MEASURED_WORKING_MAX_DRN`] survives
+    /// `cap_to_measured` for **any** mask, and `choose` can only return a rung
+    /// whose bit is set in the mask it is handed (`upchoice.rs:262-265`).
+    ///
+    /// The instruments are kept and still say what they say; what the cap takes
+    /// away is the licence to *spend* their grant above what the bench has
+    /// carried data on (`docs/266` sec 4, `docs/269` sec 3).
+    #[test]
+    fn the_granted_rung_never_exceeds_the_measured_maximum() {
+        // The instruments, at their most generous.
+        let mut granted = 0u32;
+        for drn in 1..=UP_RATES as u8 {
+            let reading = reading(drn, ideal_level(drn), 0.0, 0.0, 2_448);
+            let verdict = admit(&reading);
+            assert!(
+                verdict.granted(),
+                "drn {drn} at the design's own level: {}",
+                reading.line(verdict)
+            );
+            granted |= 1 << (drn - 1);
+        }
+        assert_eq!(granted, JA_MASK_ALL, "every instrument grants every rung");
+        assert_eq!(highest_rung(granted), Some(UP_RATES as u8));
+        // The cap, on the same grant.
+        assert_eq!(MEASURED_WORKING_MAX_DRN, 1);
+        assert_eq!(measured_mask(), 1);
+        assert_eq!(cap_to_measured(granted), 1);
+        assert_eq!(highest_rung(cap_to_measured(granted)), Some(1));
+        // And not for one mask but for every mask there is.
+        let ceiling = (1u32 << MEASURED_WORKING_MAX_DRN) - 1;
+        for mask in 0..(1u32 << UP_RATES) {
+            assert_eq!(
+                cap_to_measured(mask) & !ceiling,
+                0,
+                "mask {mask:#07x} carried a rung above the cap"
+            );
+        }
+        // The cap is visible in the log, and it names the grant it overrides.
+        let line = cap_line(granted);
+        for wanted in [
+            "capped",
+            "MEASURED_WORKING_MAX_DRN = 1",
+            "from drn 19",
+            "to drn 1",
+            "18 rung(s) removed",
+            "mask 0x7ffff",
+            "docs/266",
+            "docs/269",
+            "Do not raise the cap",
+        ] {
+            assert!(line.contains(wanted), "{line} does not carry {wanted}");
+        }
+        // A mask at or below the cap loses nothing, and the line still prints --
+        // a call's log states the cap rather than implying it.
+        assert_eq!(cap_to_measured(1), 1);
+        assert!(cap_line(1).contains("0 rung(s) removed"), "{}", cap_line(1));
+        // And nothing granted stays nothing: the cap does not invent a rung.
+        assert_eq!(cap_to_measured(0), 0);
+        assert_eq!(highest_rung(0), None);
     }
 
     /// A grant's honesty is its resolution: the target is `1e-7` and a 2 448

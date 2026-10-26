@@ -6002,6 +6002,18 @@ impl Modem {
     /// advisory number beside the gate, so that a call shows both and neither is
     /// inferred from the other.
     ///
+    /// # The cap
+    ///
+    /// The mask this returns is **cut to
+    /// `rung::MEASURED_WORKING_MAX_DRN`** before it is returned, whatever the
+    /// ladder granted: the ladder is printed in full -- one `LADDER` line per
+    /// rung, saying what each instrument says -- and then
+    /// `rung::cap_line` says what that grant would have been and what the call
+    /// actually gets (`docs/266` sec 4: 33 333 and 25 333 do not carry data,
+    /// only 24 000 is measured working; `docs/269` sec 3: why `drn 2` fails is
+    /// open, and `drn 7` fails too). The tolerance table and `admit` are kept
+    /// exactly as they were: they are the instrument, not the licence.
+    ///
     /// # When there is no level
     ///
     /// A call whose four-point measurement never ran has no `delta` to judge, so
@@ -6044,17 +6056,30 @@ impl Modem {
                 }
                 self.note(format!("V.92: {}", reading.line(verdict)));
             }
+            // What the instruments granted, printed as it always was, and then
+            // the cap: the ladder is read in full -- one `LADDER` line per
+            // rung, and the summary line carries the mask all of them make --
+            // and the mask the call is *decided* on is that grant cut to
+            // `MEASURED_WORKING_MAX_DRN`. The instruments are the instrument;
+            // they are not the licence (`docs/266` sec 4, `docs/269` sec 3).
+            let granted = mask;
+            mask = crate::v92::rung::cap_to_measured(granted);
             self.note(format!(
                 "V.92: upstream rate: level {delta:+.2}% against 1/G (four points {inner:.3}/{outer:.3} \
-                 over {seen}), tolerance per rung from docs/261 sec 4, mask {mask:#07x}"
+                 over {seen}), tolerance per rung from docs/261 sec 4, mask {granted:#07x}"
             ));
+            self.note(crate::v92::rung::cap_line(granted));
         } else {
-            mask = apply_ceiling(ja, measured);
+            // The one branch in which the old sigma criterion still decides,
+            // and the cap binds it exactly as it binds the ladder.
+            let granted = apply_ceiling(ja, measured);
+            mask = crate::v92::rung::cap_to_measured(granted);
             self.note(
                 "V.92: no four-point level to judge (the ladder needs one); the sigma mask stands, and \
                  it is a lower bound that can only refuse"
                     .into(),
             );
+            self.note(crate::v92::rung::cap_line(granted));
         }
         (mask, RateDecision { measured, ceiling, mask, empty: false })
     }
@@ -6118,11 +6143,12 @@ impl Modem {
         };
         self.note(format!(
             "V.92: advisory (not the gate): sigma {:.4} index steps at LC {} from the four-point fit at \
-             {snr_db:.1} dB ({:?}) would allow {advisory_ceiling} and mask {advisory:#07x}; the ladder \
-             granted mask {:#07x}",
+             {snr_db:.1} dB ({:?}) would allow {advisory_ceiling} and mask {advisory:#07x}; the ladder, \
+             capped at drn {}, grants mask {:#07x}",
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
             decision.measured.bound(),
+            crate::v92::rung::MEASURED_WORKING_MAX_DRN,
             decision.mask,
         ));
         if decision.empty {
@@ -6130,8 +6156,11 @@ impl Modem {
             // end offered was refused, and the refusal is in the ladder's own
             // lines above with the number that refused it.
             self.note(format!(
-                "V.92: the level leaves no rung of the ladder; keeping the slowest, drn 1 at {} bit/s",
-                crate::v92::up_rate(1)
+                "V.92: the level refuses every rung the far end offered, drn 1 included; keeping the \
+                 slowest, drn 1 at {} bit/s (the cap is not what emptied this mask -- it can only \
+                 refuse above drn {})",
+                crate::v92::up_rate(1),
+                crate::v92::rung::MEASURED_WORKING_MAX_DRN
             ));
         }
         if let Some(drn) = self.parameters.as_ref().map(|p| p.drn) {
