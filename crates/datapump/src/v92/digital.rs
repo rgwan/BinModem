@@ -10660,6 +10660,165 @@ mod conformance_158 {
         assert!(modem.exchange.is_none(), "the exchange outlived the renegotiation");
     }
 
+    /// 9.6.1.1.5 after 9.8: **a renegotiation leaves the pump connected**, and
+    /// leaves it connected through the same door Phase 4 uses.
+    ///
+    /// This is the mirror of
+    /// [`Self::nine_eight_takes_the_digital_modem_out_of_the_connected_state`],
+    /// and the pair exists because the two halves were fixed a ticket apart.
+    /// 9.8.1.2.1 takes the data mode down (`ru_ended` latches `Status::Phase4`),
+    /// the modem above reads that as `Progress::Retraining`, withdraws the
+    /// `announce`+`ec` it was holding (`lib.rs:1966`) -- and nothing in 9.8 put
+    /// any of it back. Measured (`runs-237/204437-b1u171-1`): the renegotiation
+    /// completed at 36.540, `E2u` at 36.560, `B1u confirmed` 576/576 ones at
+    /// 36.620, and the far end logged `Fallback initiated! LAPM timeout`
+    /// 1.008 s into its data mode because no `LAPM` frame ever went downstream
+    /// again: the pump reported `Phase4` (-> `Progress::Retraining`) for the
+    /// rest of the call, so the modem above never built a stack and V.42's
+    /// clocks stayed held at zero (`lib.rs:1924`).
+    ///
+    /// Fails on `150ad56`: there the status is still `Phase4` and `B1d`'s
+    /// countdown is still zero, because `finish_renegotiation` re-armed the
+    /// `B1u` wait by hand and never re-ran `begin_data`'s body.
+    #[test]
+    fn nine_eight_leaves_the_digital_modem_connected_and_lapm_able() {
+        // A first data mode with a CPu, so both rates are real and the second
+        // `B1d` has an encoder to be rebuilt from.
+        let mask = |points: std::ops::RangeInclusive<u8>| {
+            points.fold(0u128, |m, u| m | 1 << u)
+        };
+        let cpu = Cp {
+            data_mode: true,
+            drn: 18,
+            intervals: [0, 1, 0, 1, 0, 1],
+            constellations: vec![mask(3..=95), mask(3..=88)],
+            ..Cp::default()
+        };
+        // CPd's own design, so the upstream half of the latch has a rate to
+        // report and 9.6.1.1.6's arm has something to arm on -- `begin_data`
+        // and `enter_data_mode` both read `parameters` for it.
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let parameters = crate::v92::upchoice::pin_with(
+            &design,
+            1,
+            Trellis::Sixteen,
+            1e-9,
+            crate::v92::upchoice::LevelSet::Code,
+        )
+        .expect("drn 1 is pinnable")
+        .parameters;
+        let mut modem = Modem::default();
+        modem.cpu = Some(cpu);
+        modem.parameters = Some(parameters);
+        modem.begin_data();
+        assert!(
+            matches!(modem.status(), Status::Connected { .. }),
+            "no first data mode: nothing to be un-latched from"
+        );
+        // What a fresh 9.6.1.1.5 leaves `B1d`'s countdown at, so that the
+        // re-latch is held to starting one rather than to a number.
+        let armed = modem.b1d_left;
+        assert!(armed > 0, "9.6.1.1.5: the first B1d armed no countdown at all");
+
+        // 9.8.1.2.1: Ru, then the transition that releases Rd.
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.status(),
+            Status::Phase4,
+            "9.8.1.2.1: the data mode was torn down, so the pump must not report \
+             `Connected` while the renegotiation runs"
+        );
+
+        // 9.8.1.2.3 -> 9.8.1.1.2 -> 9.6.1.1.2 -> Ed, exactly as the test above
+        // drives it: the far end's SUVu, its CPu, and its acknowledged SUVu.
+        let fiducial = modem.reneg_trn2u_from.expect("9.8.2.1.1's fiducial for the far end's TRN2u");
+        modem.now = fiducial;
+        modem.symbol(symbol_at(1.0));
+        modem.cpd = Some(reneg_cpd());
+        let mut stream: Vec<Out> = Vec::new();
+        let mut suv_seen = 0;
+        for _ in 0..(R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 6000) {
+            modem.reneg_out();
+            let now = modem.now;
+            modem.now += 1;
+            if let Some(exchange) = modem.exchange.as_mut() {
+                match suv_seen {
+                    0 if modem.source.out() == Out::Suvd => {
+                        suv_seen = 1;
+                        exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, now);
+                    }
+                    1 if stream.contains(&Out::Cpd) => {
+                        suv_seen = 2;
+                        exchange.peer_cp(PeerCp { ack: false }, now);
+                    }
+                    2 => {
+                        suv_seen = 3;
+                        exchange.peer_suv(PeerSuv { ack: true, silence: false, wait_for_cp: false }, now);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = modem.source.next();
+            stream.push(modem.source.out());
+            if modem.reneg.is_none() {
+                for _ in 0..(2 * INTERVALS) {
+                    let _ = modem.source.next();
+                    stream.push(modem.source.out());
+                }
+                break;
+            }
+        }
+        assert!(modem.reneg.is_none(), "the tail did not finish at 9.6.1.1.5");
+        assert!(
+            stream.contains(&Out::B1d),
+            "9.6.1.1.5: no B1d went out after the renegotiation's Ed"
+        );
+
+        // **The defect.** 9.6.1.1.5-6 is data mode again, so the pump says so:
+        // `v90::startup`'s `pcm::Status::Connected` arm (`startup.rs:534`) turns
+        // this into `Progress::Connected`, and that is what makes the modem
+        // above build its V.42/LAPM stack (`lib.rs:2011-2141`) and run V.42's
+        // clocks (`lib.rs:1924`) instead of holding them.
+        let Status::Connected { downstream, upstream } = modem.status() else {
+            panic!(
+                "9.6.1.1.5: after a renegotiation the pump must report `Connected` \
+                 again -- it reports {:?}, so no LAPM frame goes downstream and the \
+                 far end's T401 expires 1.008 s into its data mode",
+                modem.status()
+            );
+        };
+        assert!(downstream > 0, "the re-latch did not rebuild B1d's encoder from CPu");
+        assert_eq!(upstream, modem.parameters.as_ref().map_or(0, Parameters::rate));
+        // 8.6.1: the second `B1d` is a `B1d` -- a fresh scrambler and 48 data
+        // frames of scrambled ones the far end counts down before its data.
+        assert_eq!(
+            modem.b1d_left, armed,
+            "9.6.1.1.5: the renegotiation's B1d was not re-armed -- a fresh one \
+             starts at {armed} and this one is at {}",
+            modem.b1d_left
+        );
+        // 9.6.1.1.6: and the E2u that follows every 9.6.1.1.5 is waited for.
+        assert!(modem.awaiting_e2u, "the renegotiation's E2u is not being waited for");
+        assert!(modem.b1u_pending, "9.6.1.1.6's B1u arm is not armed after the renegotiation");
+        assert!(
+            modem.b1u_deadline.is_some_and(|d| d > modem.now),
+            "9.6.1.1.6's B1u deadline was not re-armed by the re-latch: {:?} at {}",
+            modem.b1u_deadline, modem.now
+        );
+    }
+
     /// 8.7.2 with 8.7.6: the renegotiation's `E2u` is read by the descrambler
     /// that has run **since `TRN2u`'s first symbol**, not by a new one at `Ed`.
     ///
