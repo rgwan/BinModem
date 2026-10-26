@@ -201,6 +201,9 @@ pub struct Exchange {
     context: Context,
     /// 100 ms + RTD in samples of the owner's own clock.
     window: u64,
+    /// How long the one `CPd` waits for the peer's `CPu`. Derived in
+    /// [`Exchange::new`], never a constant: see [`PEER_CP_REPEAT_SAMPLES`].
+    peer_cp_wait: u64,
     /// We have transmitted a CP or SUV with the acknowledge bit set
     /// (9.6.1.1.4's "has sent ... with the acknowledgement bit set").
     sent_ack: bool,
@@ -281,19 +284,46 @@ pub struct Exchange {
 /// bound this machine keeps for "wait for my CPu".
 pub const CPD_WAITS_FOR_PARKED_TX: bool = true;
 
-/// How long the `CPd` waits for the peer's `CPu` before going out unacknowledged:
-/// its own `CPu` repeat period (`+0x5d2d0` arms `0x3e80` = 16 000 samples) plus
-/// one window.
-pub const PEER_CP_WAIT_SAMPLES: u64 = 16_800;
+/// The far end's own `CPu` repeat period: `+0x5d2d0` arms `0x3e80` = 16 000
+/// samples = 2.0 s, so a `CPu` that was lost once is repeated within that.
+pub const PEER_CP_REPEAT_SAMPLES: u64 = 16_000;
 
 impl Exchange {
     /// A fresh exchange in `context`, with `round_trip` in seconds and `fs`
     /// the owner's own sample rate -- 8000 for the digital modem, the line
     /// rate for the analogue one.
     pub fn new(context: Context, round_trip: f64, fs: f64) -> Self {
+        let window = ((CP_REPEAT_GRACE + round_trip) * fs).round().max(0.0) as u64;
+        // The safety net behind the wait for the peer's `CPu`, and it is
+        // derived from two things that are measured rather than chosen:
+        //
+        //   * the far end's own `CPu` repeat period ([`PEER_CP_REPEAT_SAMPLES`],
+        //     `0x3e80` = 16 000 samples at `+0x5d2d0`), which is how late the
+        //     message being waited for can be by one repetition; and
+        //   * one round trip, which this call has measured and the far end
+        //     prints as `Round Trip Delay` -- the answer to the repeated `CPu`
+        //     has to be back before the `CPd` can be told it is the
+        //     acknowledged one.
+        //
+        // Anything shorter can end *between* two of the far end's `CPu`s, and
+        // then the bound is what decides a healthy call: a 16 800-sample bound
+        // (repeat + one window, no round trip) expired 20 ms before the far
+        // end's `CPu` on 3 of 3 calls at answer point 170, so the one `CPd`
+        // went out with bit 33 clear and the far end, whose exchange was never
+        // acknowledged, fell forward 1.002 s later with `0x6009521a`
+        // (runs-236/201605-g170-1: CPd 22.340, `ack false`; CPu 22.360).
+        //
+        // This is a bound on a wait that an event ends, so it is never the
+        // thing that makes a healthy call: the decoded `CPu` releases the
+        // `CPd` first, and this only says when a far end that never sends one
+        // has waited long enough.
+        let peer_cp_wait = PEER_CP_REPEAT_SAMPLES
+            + (round_trip * fs).round().max(0.0) as u64
+            + window;
         Self {
             context,
-            window: ((CP_REPEAT_GRACE + round_trip) * fs).round().max(0.0) as u64,
+            window,
+            peer_cp_wait,
             sent_ack: false,
             got_peer_cp: false,
             peer_acked: false,
@@ -327,6 +357,12 @@ impl Exchange {
     /// on complying with a "wait for my CPu".
     pub fn window(&self) -> u64 {
         self.window
+    }
+
+    /// How long the one `CPd` waits for the peer's `CPu`: one `CPu` repeat
+    /// period plus one round trip plus one window (see [`Exchange::new`]).
+    pub fn peer_cp_wait(&self) -> u64 {
+        self.peer_cp_wait
     }
 
     // -- what the peer sent --------------------------------------------------
@@ -478,7 +514,7 @@ impl Exchange {
                 // 16 000 samples) plus one window, so a far end that never
                 // sends one is not waited on for ever.
                 None if self.wait_for_peer_cp => {
-                    let bound = *self.hold_until.get_or_insert(now.saturating_add(PEER_CP_WAIT_SAMPLES));
+                    let bound = *self.hold_until.get_or_insert(now.saturating_add(self.peer_cp_wait));
                     if now <= bound {
                         return false;
                     }
@@ -1317,10 +1353,10 @@ mod tests {
         // Its CPu has not been decoded yet, so no CPd goes out: a CPd released
         // before its CP carries bit 33 clear and lands inside the sequence it
         // is answering, which is the 18 ms case. Bounded by
-        // [`PEER_CP_WAIT_SAMPLES`] so a far end that never sends one is not
-        // waited on for ever.
+        // the bound [`Exchange::peer_cp_wait`] so a far end that never sends
+        // one is not waited on for ever.
         assert_eq!(exchange.next_sequence(24), SequenceKind::Suv);
-        assert_eq!(exchange.next_sequence(PEER_CP_WAIT_SAMPLES), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(exchange.peer_cp_wait()), SequenceKind::Suv);
         exchange.peer_cp(PeerCp::default(), 100);
         assert!(exchange.got_peer_cp());
         assert_eq!(exchange.next_sequence(124), SequenceKind::Suv);
@@ -1458,4 +1494,47 @@ mod tests {
         assert!(exchange.finished());
         assert_eq!(exchange.next_sequence(36), SequenceKind::B1);
     }
+
+    /// The one `CPd` we owe answers a `CPu` that is a whole repeat period
+    /// late, and the wait for it is bounded by something derived.
+    ///
+    /// The bound is one `CPu` repeat period (0x3e80 = 16 000 samples at the
+    /// far end's `+0x5d2d0`) plus one round trip plus one window. The constant
+    /// this replaced was 16 800 -- repeat plus a window and no round trip --
+    /// and it ends *between* two of the far end's `CPu`s: on
+    /// `runs-236/201605-g170-1` the bound expired at 22.340 and the far end's
+    /// `CPu` was decoded at 22.360, so the one `CPd` went out with bit 33
+    /// clear and 1.002 s later the far end fell forward with `0x6009521a`.
+    /// A call whose pass depends on 20 ms against a 2.1 s bound is not stable.
+    #[test]
+    fn a_peer_cp_a_repeat_period_late_still_gets_the_acknowledged_cpd() {
+        // The round trip these calls measure: the far end prints 314-322 ms.
+        let mut exchange = Exchange::new(Context::Renegotiation, 0.320, FS);
+        exchange.hold_cp_for_parked_tx();
+        exchange.wait_for_peer_cp(true);
+        exchange.repeat_between_suvs(0);
+        let window = exchange.window();
+        let bound = exchange.peer_cp_wait();
+        // 16 000 + 2 560 (the round trip) + (100 ms + 320 ms) = 21 920 samples:
+        // 3 120 samples (390 ms) more than the constant this replaces, which is
+        // the lateness epsilon a `CPu` may now have and still be acknowledged.
+        assert_eq!(bound, 16_000 + 2_560 + 800 + 2_560, "the bound is derived, not chosen");
+        exchange.peer_suv(PeerSuv::default(), 0);
+        exchange.sequence_started(SequenceKind::Suv);
+        exchange.sequence_ended(SequenceKind::Suv, 12);
+        // The `CPd` is due from 24 on, and the far end's `CPu` does not arrive
+        // until 16 900 -- a full repeat period after the first one it sent.
+        assert_eq!(exchange.next_sequence(24), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(16_899), SequenceKind::Suv, "the CPd went out before its CPu");
+        exchange.peer_cp(PeerCp::default(), 16_900);
+        assert!(exchange.got_peer_cp());
+        // One window after it, so the far end's chain is parked: the first
+        // CPd is the acknowledged one.
+        assert_eq!(exchange.next_sequence(16_900 + window - 1), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(16_900 + window), SequenceKind::Cp);
+        assert!(exchange.sequence_started(SequenceKind::Cp));
+        exchange.sequence_ended(SequenceKind::Cp, 16_900 + window + 816);
+        assert!(exchange.sent_ack(), "the first CPd carried bit 33");
+    }
+
 }
