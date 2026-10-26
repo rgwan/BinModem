@@ -8786,6 +8786,335 @@ mod conformance_158 {
         );
     }
 
+    // -----------------------------------------------------------------
+    // 9.8.1.1.2 to 9.6.1.1.2: the tail (docs/215)
+    // -----------------------------------------------------------------
+
+    /// One symbol as the receiver would hand it over.
+    fn symbol_at(level: f64) -> Symbol {
+        Symbol { index: 0, raw: 0, value: level, decided: None, line: level, forward: 0.0 }
+    }
+
+    /// A CPd for drn 1, as `upchoice` would design it.
+    fn reneg_cpd() -> Cpd {
+        let design = crate::v92::design::Design {
+            filters: crate::v92::Filters { z2: vec![1.0], ..crate::v92::Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        };
+        let parameters =
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, crate::v92::upchoice::LevelSet::Code)
+                .expect("drn 1 is pinnable")
+                .parameters;
+        Cpd::from(&parameters)
+    }
+
+    /// A source, a tail and the exchange 9.8.1.1.2 hands 9.6.1.1.2 to: the
+    /// things a renegotiation's tail passes between them.
+    fn tail_rig() -> (Source, RenegTail, Exchange, Cpd) {
+        let mut source = renegotiating_source();
+        // 9.8.1.2.3 -> 9.8.1.1.2: the cap the tail's own TRN2d must respect.
+        source.bound_trn2d(TRN2D_MOST);
+        let cpd = reneg_cpd();
+        let (tail, exchange) = RenegTail::new(0.0, FS);
+        (source, tail, exchange, cpd)
+    }
+
+    /// Drive the tail and the source together, symbol by symbol, with `peer`
+    /// called on every symbol so a test can deliver an `SUVu` at the instant it
+    /// means to.
+    fn drive_tail(
+        source: &mut Source,
+        tail: &mut RenegTail,
+        exchange: &mut Exchange,
+        cpd: &Cpd,
+        symbols: usize,
+        peer: &mut dyn FnMut(u64, &mut Exchange),
+    ) -> Vec<(Out, f64)> {
+        let mut stream = Vec::with_capacity(symbols);
+        for now in 0..symbols as u64 {
+            tail.push(source, exchange, Some(cpd), now);
+            peer(now, exchange);
+            let level = source.next();
+            stream.push((source.out(), level));
+        }
+        stream
+    }
+
+    /// 9.8.1.1.2: "The digital modem shall then transmit `TRN2d` for **up to
+    /// 16008T** followed by `SUVd` sequences."
+    ///
+    /// "Up to" is a ceiling and the countdown is what makes it one: `docs/214`
+    /// §6 gap 1 was that nothing set a pending change after TRN2d, so the arm's
+    /// exit condition never fired and TRN2d ran on for ever -- no `SUVd`, no
+    /// `CPd`, nothing for the far end to answer.
+    #[test]
+    fn trn2d_is_cut_at_16008t_and_suvd_follows() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        // 9.8.1.2.2's Rd and R-bar-d first, on the source's own arms.
+        source.change(Out::Rd);
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 60,
+            &mut |_, _| {},
+        );
+        let trn2d = stream.iter().filter(|(out, _)| *out == Out::Trn2d).count();
+        assert_eq!(trn2d, 16008, "9.8.1.1.2: TRN2d is not cut at 16008T");
+        let last_trn2d = stream.iter().rposition(|(out, _)| *out == Out::Trn2d).unwrap();
+        assert_eq!(
+            stream[last_trn2d + 1].0,
+            Out::Suvd,
+            "9.8.1.1.2: TRN2d was not followed by SUVd"
+        );
+        // And the cut is on the data frame grid the SUVd after it must start on.
+        assert_eq!(
+            (last_trn2d + 1) % INTERVALS,
+            0,
+            "the SUVd after TRN2d began off the data frame boundary"
+        );
+    }
+
+    /// 9.8.1.1.2 with 9.6.1.1.2: with bit 32 clear in both directions -- "the
+    /// digital modem shall proceed according to 9.6.1.1.2 unless bit 32 is set
+    /// in either `SUVd` or `SUVu`" -- the far end's `SUVu` releases **one**
+    /// `CPd`.
+    #[test]
+    fn with_bit_32_clear_in_both_directions_one_cpd_follows_the_suvu() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        // The far end's SUVu arrives 200 symbols into the SUVd that follows
+        // TRN2d, with bit 32 clear and the acknowledge bit clear (it has not
+        // received a CPd yet: 9.8.2.1.3).
+        let mut delivered = false;
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 1200,
+            &mut |_, exchange| {
+                if !delivered && exchange.sending().is_some() {
+                    delivered = true;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 0);
+                }
+            },
+        );
+        assert!(delivered, "no SUVd went out to answer");
+        let cpds = runs(&stream, Out::Cpd);
+        assert_eq!(cpds, 1, "9.6.1.1.2: `a single CPd`, and {cpds} went out");
+        // And it went out after the SUVd that answered the SUVu, not before.
+        let first_cpd = stream.iter().position(|(out, _)| *out == Out::Cpd).unwrap();
+        assert!(
+            stream[..first_cpd].iter().any(|(out, _)| *out == Out::Suvd),
+            "the CPd went out before any SUVd"
+        );
+        assert!(tail.stage() != RenegStage::Silence, "bit 32 clear took the silence branch");
+    }
+
+    /// 9.8.1.1.3: "The digital modem shall then transmit `SUVd` sequences with
+    /// **bit 33 set**. After receiving an `SUVu` sequence with bit 33 set or
+    /// `E2u`, the digital modem shall complete sending the current `SUVd` and
+    /// then transmit `Ed` followed by silence ... It shall **retain data frame
+    /// alignment** during this period of silence."
+    ///
+    /// This is the branch 9.8.1.1.2 opens when bit 32 is set in *either*
+    /// direction, and here it is the far end's `SUVu` that sets it -- the one
+    /// place the two directions interact.
+    #[test]
+    fn suvu_bit_32_set_takes_9_8_1_1_3_s_suvd_bit_33_then_ed_then_silence() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        let total = R_FRAMES * INTERVALS + R_BAR_SYMBOLS + TRN2D_MOST + 2400;
+        let mut asked = false;
+        let mut acked = false;
+        // What the SUVd sequences on the line actually carry: bit 32 and bit
+        // 33 read back out of the sequence itself (`Suvd::from_bits`), not out
+        // of the intent.
+        let mut carried: Vec<(bool, bool)> = Vec::new();
+        let mut stream = Vec::with_capacity(total);
+        for now in 0..total as u64 {
+            if let Some(Out::Suvd) = tail.push(&mut source, &mut exchange, Some(&cpd), now) {
+                // What the sequence this just asked for carries, read back out
+                // of it (`Suvd::from_bits`) rather than out of the intent.
+                let sent = Suvd::from_bits(&source.last).expect("an SUVd was asked for but not built");
+                if !carried.contains(&(sent.silence, sent.ack)) {
+                    carried.push((sent.silence, sent.ack));
+                }
+            }
+            // 9.8.2.1.3: SUVu with bit 32 set asks for the silent period.
+            if !asked && exchange.sending().is_some() {
+                asked = true;
+                exchange.peer_suv(PeerSuv { ack: false, silence: true, wait_for_cp: false }, 0);
+            }
+            // Then "an SUVu sequence with bit 33 set", which is 9.8.1.1.3's
+            // other trigger.
+            if asked && !acked && exchange.peer_silence() {
+                acked = true;
+                exchange.peer_suv(PeerSuv { ack: true, silence: true, wait_for_cp: false }, 1);
+            }
+            let level = source.next();
+            stream.push((source.out(), level));
+        }
+        assert!(
+            carried.contains(&(true, true)),
+            "9.8.1.1.3: no SUVd went out with bit 32 and bit 33 both set: {carried:?}"
+        );
+        // SUVd with bit 33 set: the sequence in the SUVd after TRN2d that
+        // follows the far end's request.
+        let first_suvd = stream.iter().position(|(out, _)| *out == Out::Suvd).unwrap();
+        let first_ed = stream.iter().position(|(out, _)| *out == Out::Ed).expect("no Ed: 9.8.1.1.3");
+        assert!(first_ed > first_suvd, "the Ed came before any SUVd'");
+        // "complete sending the current SUVd and then transmit Ed": the Ed
+        // begins where a whole SUVd has run out, which is a data frame multiple.
+        assert_eq!(
+            first_ed % INTERVALS,
+            0,
+            "the Ed began {} symbols into a data frame, not after a whole SUVd",
+            first_ed % INTERVALS
+        );
+        // "followed by silence", Ucode 0 (9.8.1.1.3's own definition of it).
+        let after: Vec<&(Out, f64)> = stream[first_ed..].iter().collect();
+        let silent = after.iter().position(|(out, _)| *out == Out::Silence);
+        let silent = silent.unwrap_or_else(|| panic!("no silence after the Ed: {after:?}"));
+        assert!(
+            stream[first_ed + silent..first_ed + silent + 12]
+                .iter()
+                .all(|(out, level)| *out != Out::Silence || *level == 0.0),
+            "9.8.1.1.3: the silence is not Ucode 0"
+        );
+        // "It shall retain data frame alignment during this period of silence":
+        // the silence begins on a frame boundary and runs whole frames, because
+        // it occupies data frame intervals like every other signal
+        // (`Source::next`) and the Ed before it ended on a boundary.
+        let silence_start = first_ed + silent;
+        assert_eq!(
+            silence_start % INTERVALS,
+            0,
+            "the silence began {} symbols into a data frame",
+            silence_start % INTERVALS
+        );
+        let run = stream[silence_start..].iter().take_while(|(out, _)| *out == Out::Silence).count();
+        assert!(run >= INTERVALS, "the silence was shorter than a data frame: {run}");
+        assert_eq!(run % INTERVALS, 0, "the silence did not occupy whole data frames: {run}");
+        assert_eq!(tail.stage(), RenegStage::Silence, "the tail did not reach the silence");
+    }
+
+    /// 9.8.1.1.4: "If bit 32 of `SUVu` was set, the digital modem shall wait to
+    /// receive `SUVu` with bit 32 clear. After receiving `SUVu` with bit 32
+    /// clear, the digital modem shall transmit `Rt` for 384T followed by
+    /// `R-bar-t` for 24T and `SUVd`. The digital modem shall then proceed
+    /// according to 9.6.1.1.2."
+    ///
+    /// `R-bar-t` is V.90 8.6.4's "4 repetitions of the 6-symbol sequence ...
+    /// with the sign pattern – – – + + +" (`v90.txt:1835`), read off that line.
+    #[test]
+    fn suvu_bit_32_cleared_after_the_silence_releases_rt_then_r_bar_t_then_suvd() {
+        let (mut source, mut tail, mut exchange, cpd) = tail_rig();
+        source.change(Out::Rd);
+        let mut phase = 0;
+        let mut acked_at = None;
+        let stream = drive_tail(
+            &mut source,
+            &mut tail,
+            &mut exchange,
+            &cpd,
+            R_FRAMES * INTERVALS
+                + R_BAR_SYMBOLS
+                + TRN2D_MOST
+                + 2400
+                + R_FRAMES * INTERVALS
+                + R_BAR_SYMBOLS
+                + 600,
+            &mut |now, exchange| {
+                if phase == 0 && exchange.sending().is_some() {
+                    phase = 1;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: true, wait_for_cp: false }, 0);
+                } else if phase == 1 && exchange.peer_silence() {
+                    phase = 2;
+                    acked_at = Some(now);
+                    exchange.peer_suv(PeerSuv { ack: true, silence: true, wait_for_cp: false }, 1);
+                } else if phase == 2 && now >= acked_at.unwrap_or(u64::MAX) + 2 * INTERVALS as u64 {
+                    // 9.8.1.1.4's "SUVu with bit 32 clear", after the Ed and
+                    // into the silence -- and then the plain SUVu sequences of
+                    // Figures 16 and 17, which are what release the CPd.
+                    phase = 3;
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 2);
+                } else if phase == 3 {
+                    exchange.peer_suv(PeerSuv { ack: false, silence: false, wait_for_cp: false }, 3);
+                }
+            },
+        );
+        assert!(phase == 3, "the far end never sent the SUVu with bit 32 clear");
+        let rt = stream.iter().filter(|(out, _)| *out == Out::Rt).count();
+        let rt_bar = stream.iter().filter(|(out, _)| *out == Out::RtBar).count();
+        assert_eq!(rt, 384, "9.8.1.1.4: Rt is not 384T: {rt}");
+        assert_eq!(rt_bar, 24, "9.8.1.1.4: R-bar-t is not 24T: {rt_bar}");
+        // The bar's sign pattern, from `v90.txt:1835` and not from memory.
+        let bar: Vec<bool> = stream
+            .iter()
+            .filter(|(out, _)| *out == Out::RtBar)
+            .map(|(_, level)| *level > 0.0)
+            .collect();
+        let want: Vec<bool> = (0..R_BAR_FRAMES).flat_map(|_| [false, false, false, true, true, true]).collect();
+        assert_eq!(bar, want, "R-bar-t is not 8.6.4's four repetitions of – – – + + +");
+        // And the SUVd after the bar, then 9.6.1.1.2's one CPd.
+        let last_bar = stream.iter().rposition(|(out, _)| *out == Out::RtBar).unwrap();
+        assert!(
+            stream[last_bar + 1..].iter().any(|(out, _)| *out == Out::Suvd),
+            "9.8.1.1.4: the bar was not followed by SUVd"
+        );
+        assert_eq!(runs(&stream, Out::Cpd), 1, "9.6.1.1.2: not exactly one CPd after 9.8.1.1.4");
+    }
+
+    /// `docs/213` §6's missing feed: the far end's `SUVu` reader is the Phase 3
+    /// `up_finder`, and it must be fed **only** once a renegotiation is in
+    /// progress.
+    ///
+    /// Two halves, and the second is the one the whole ticket rests on. A call
+    /// with no `Ru` in it must reach the data path byte for byte as it did: the
+    /// feed is gated on the tail, the tail is only built by `ru_ended`, and
+    /// `ru_ended` is only reached from [`RuEvent::RuToRuBar`] -- which
+    /// `no_ru_in_data_mode_never_fires_the_responder` pins at zero firings over
+    /// 4000 data mode symbols.
+    #[test]
+    fn the_suvu_feed_is_armed_by_a_renegotiation_and_by_nothing_else() {
+        let mut modem = Modem::default();
+        // The data mode path: the detector runs on every symbol (it is a side
+        // channel), and four thousand of them never arm the finder.
+        for level in data_levels(4000) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_none(), "a renegotiation's tail was built with no Ru");
+        assert!(modem.reneg_trn2u_from.is_none(), "the SUVu reader was armed with no Ru");
+        assert!(modem.up_finder.is_none(), "the SUVu finder was armed in data mode");
+        assert!(modem.upstream_data.is_none(), "a decoder was invented for a call with no data mode");
+
+        // And with Ru followed by R-bar-u the same feed is armed, which is the
+        // other side of the gate.
+        for level in ru_periods(RU_LOCK_PERIODS, 40.0, false) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        for level in ru_periods(1, 40.0, true) {
+            modem.b1u_symbol(symbol_at(level));
+        }
+        assert!(modem.reneg.is_some(), "9.8.1.1.2's tail was not built on R-bar-u");
+        assert_eq!(
+            modem.reneg_trn2u_from,
+            Some(modem.now + TRN2U_AFTER_RU_BAR),
+            "the far end's TRN2u 24T after R-bar-u begins is not the fiducial"
+        );
+        // Out of data mode, and the reader is built *on* TRN2u's first symbol
+        // (8.7.6's scrambler reset), not before it.
+        assert!(modem.upstream.is_none());
+        assert!(modem.up_finder.is_none());
+        assert_eq!(TRN2U_AFTER_RU_BAR, (R_BAR_SYMBOLS - RU_BAR_DEVIATIONS) as u64);
+    }
+
     /// 9.8.1.1.3: "The digital modem shall generate silence by sending PCM
     /// codewords with magnitudes represented by **Ucode 0**. It shall **retain
     /// data frame alignment** during this period of silence."
