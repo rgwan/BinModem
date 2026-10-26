@@ -1850,6 +1850,16 @@ pub struct Source {
     /// has been read, which is the only thing that says what constellation
     /// Phase 4 goes out on (V.90 8.6.5).
     phase4: Option<Down4>,
+    /// 8.8.5: the coder a fast parameter exchange's `SUVd`, `CPd` and `Ed` go
+    /// out on -- "**During Fast Parameter Exchange it is transmitted using the
+    /// preceding data mode modulation**" (`v92.txt:1963-1966`). Built from
+    /// **CPu**, the constellation `B1d` was going out on, and not from `CPt`:
+    /// a far end in a fast parameter exchange has stayed in the data mode
+    /// modulation (9.9 has no `TRN2d` in it), so `CPt`'s coder is the wrong one.
+    data4: Option<Down4>,
+    /// [`Source::data4`] is the coder in force: a fast parameter exchange is
+    /// the procedure in flight rather than 9.8's rate renegotiation.
+    fpe: bool,
     /// 9.8's two R signals, already resolved to one codeword per downstream
     /// data frame interval: `Rd` out of the data mode constellation CPd named
     /// and `Rt` out of the training constellation CPt named (V.90 8.6.4).
@@ -1900,6 +1910,8 @@ impl Source {
             trn2d_symbols: TRN2D_LEAST,
             finished: None,
             phase4: None,
+            data4: None,
+            fpe: false,
             reneg: None,
             ri_timed: false,
         }
@@ -1955,6 +1967,33 @@ impl Source {
     ///
     /// False when CPt's rate does not fit its own constellations, which is the
     /// one thing 5.4.3 forbids and which leaves Phase 4 with nothing to send.
+    /// 8.8.5's **Fast Parameter Exchange** coder: `SUVd`, `CPd` and `Ed` are
+    /// "transmitted using the preceding data mode modulation" (`v92.txt:1963-1966`),
+    /// so they go out through `CPu`'s encoder and not `CPt`'s.
+    ///
+    /// Built afresh, which is also 9.9.1.2.3's "initialize the scrambler,
+    /// differential encoder and spectral shaping filter memory to zero"
+    /// (`v92.txt:3083-3085`) applied to the coder that is actually used: a new
+    /// `Encoder` is `Differential::new()` and `Shaper::new()`
+    /// (`crates/datapump/src/v90/encoder.rs:154-162`), and there is no reset
+    /// anywhere else (`encoder.rs:129-133`). The scrambler is `Source`'s own,
+    /// used by [`Source::phase4_codeword`] for the sequences' bits, and it is
+    /// zeroed here for the same clause.
+    pub fn begin_fpe(&mut self, cpu: &Cp) -> bool {
+        let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu) else { return false };
+        self.fpe = true;
+        self.data4 = Some(Down4 { coder: Encoder::new(mapping, self.law), samples: VecDeque::new() });
+        self.scrambler.reset();
+        true
+    }
+
+    /// Back to data mode: the fast parameter exchange is over and `CPt`'s coder
+    /// is the corresponding one again for whatever 9.6.1.1 does next.
+    pub fn end_fpe(&mut self) {
+        self.fpe = false;
+        self.data4 = None;
+    }
+
     pub fn set_cpt(&mut self, cpt: &Cp) -> bool {
         let Some(mapping) = CodeMapping::from_cp(cpt) else { return false };
         self.phase4 = Some(Down4 {
@@ -1996,7 +2035,8 @@ impl Source {
 
     /// Whether the coder still has codewords queued for the sequence in flight.
     fn phase4_queued(&self) -> bool {
-        self.phase4.as_ref().is_some_and(|p| !p.samples.is_empty())
+        let coder = if self.fpe { self.data4.as_ref() } else { self.phase4.as_ref() };
+        coder.is_some_and(|p| !p.samples.is_empty())
     }
 
     /// The next codeword of a Phase 4 signal, mapping another data frame
@@ -2010,7 +2050,11 @@ impl Source {
     /// `None` only when no CPt has been installed -- Phase 4 cannot be signalled
     /// without one, and the caller falls back to what it did before.
     fn phase4_codeword(&mut self, ones: bool) -> Option<(u8, bool)> {
-        let mut phase4 = self.phase4.take()?;
+        // 8.8.5: the same coder, whichever constellation is the "corresponding"
+        // one for the procedure in flight -- `CPt`'s during Training and Rate
+        // Renegotiation, **the preceding data mode's during Fast Parameter
+        // Exchange** (`v92.txt:1963-1966`).
+        let mut phase4 = if self.fpe { self.data4.take()? } else { self.phase4.take()? };
         let codeword = loop {
             if let Some(sample) = phase4.samples.pop_front() {
                 break sample;
@@ -2040,7 +2084,11 @@ impl Source {
                 }
             }
         };
-        self.phase4 = Some(phase4);
+        if self.fpe {
+            self.data4 = Some(phase4);
+        } else {
+            self.phase4 = Some(phase4);
+        }
         Some(codeword)
     }
 
@@ -2197,6 +2245,9 @@ impl Source {
                 self.bits.extend(self.last.clone());
                 if let Some(phase4) = self.phase4.as_mut() {
                     phase4.samples.clear();
+                }
+                if let Some(data4) = self.data4.as_mut() {
+                    data4.samples.clear();
                 }
             }
             _ => self.last.clear(),
@@ -6322,6 +6373,15 @@ impl Modem {
         // which is the boundary the clause is protecting. See
         // [`Self::reset_data_mode_memory`].
         self.reset_data_mode_memory();
+        // 8.8.5's "the preceding data mode modulation": the sequence coder for
+        // this exchange is CPu's, not CPt's. Without it the SUVd after `R-bar-f`
+        // goes out on the *training* constellation, which the far end's data
+        // mode slicer is not reading -- `docs/222` §7's gap.
+        if let Some(cpu) = self.cpu.clone() {
+            if !self.source.begin_fpe(&cpu) {
+                self.note("V.92: 8.8.5 -- no CPu mapping for the fast parameter exchange's SUVd".into());
+            }
+        }
         // 9.9.1.2.2's opener: `Rf` 384T then `R-bar-f` 24T, on the data frame
         // grid (`Source::pending_needs_frame_boundary`).
         self.source.change(Out::Rf);
@@ -6477,6 +6537,7 @@ impl Modem {
         self.e2u_zeroes = 0;
         self.b1u_pending = true;
         self.b1u_deadline = Some(self.now + (B1U_WAIT * FS) as u64);
+        self.source.end_fpe();
         self.source.change(Out::B1d);
         self.note("V.92: 9.8 rate renegotiation over -- B1d again".into());
     }
@@ -7549,7 +7610,7 @@ mod tests {
         Cp {
             data_mode: false,
             drn,
-            redundancy: Redundancy::None,
+            redundancy: crate::v90::sign::Redundancy::None,
             trn1d_ratio: 1 << 13,
             intervals: [0; INTERVALS],
             constellations: vec![mask],
@@ -10390,6 +10451,107 @@ mod conformance_222 {
 // ---------------------------------------------------------------------------
 // docs/222: 9.9.1.2, the fast parameter exchange
 // ---------------------------------------------------------------------------
+
+    fn cpt(drn: u8, points: std::ops::RangeInclusive<u8>) -> Cp {
+        let mask = points.fold(0u128, |m, u| m | 1 << u);
+        Cp {
+            data_mode: false,
+            drn,
+            redundancy: crate::v90::sign::Redundancy::None,
+            trn1d_ratio: 1 << 13,
+            intervals: [0; INTERVALS],
+            constellations: vec![mask],
+            ..Cp::default()
+        }
+    }
+
+    /// A CPu over one contiguous set of codewords -- the data mode's own
+    /// constellation, which is what `Rf` and a fast parameter exchange's `SUVd`
+    /// both have to be built from.
+    fn cpu_over(points: std::ops::RangeInclusive<u8>) -> Cp {
+        let mask = points.fold(0u128, |m, u| m | 1 << u);
+        Cp {
+            data_mode: true,
+            drn: 3,
+            intervals: [0; INTERVALS],
+            constellations: vec![mask],
+            ..Cp::default()
+        }
+    }
+
+
+/// [quoted] 8.8.5 (`v92.txt:1963-1966`): `SUVd` is sent on "the corresponding
+/// TRN2d modulation" during Training and Rate Renegotiation, but "**During Fast
+/// Parameter Exchange it is transmitted using the preceding data mode
+/// modulation**". Fails on the code before `Source::begin_fpe`: `SUVd` went out
+/// on CPt's constellation whatever procedure was in flight.
+#[test]
+fn s_8_8_5_suvd_during_a_fast_parameter_exchange_leaves_on_the_data_mode_modulation() {
+    let law = Law::Mu;
+    // CPt: the training constellation, a Phase 4 coder.
+    // CPt: a *quieter* training constellation, so that a sequence on CPt's
+    // modulation and one on CPu's cannot be confused.
+    let training = cpt(3, 64..=71);
+    // CPu: the data mode constellation B1d is going out on.
+    let data = cpu_over(88..=95);
+    let bits: Vec<bool> = (0..64).map(|i| i % 3 == 0).collect();
+
+    let loudest = |source: &mut Source| -> f64 {
+        source.send(Out::Suvd, bits.clone());
+        let stream = labelled(source, 96);
+        stream
+            .iter()
+            .filter(|(out, _)| *out == Out::Suvd)
+            .fold(0.0f64, |m, (_, level)| m.max(level.abs()))
+    };
+
+    // The data mode's loudest codeword, straight out of CPu's own mapping: the
+    // same resolution `renegotiation_points` makes for `Rf`.
+    let data_loudest = {
+        let mapping = CodeMapping::from_cp(&data).expect("CPu mapping");
+        mapping
+            .sets
+            .iter()
+            .flat_map(|set| set.points().iter().copied())
+            .map(|ucode| ucode::level(law, ucode).abs())
+            .fold(0.0f64, f64::max)
+    };
+
+    // Without a fast parameter exchange, CPt is the corresponding modulation.
+    let mut phase4 = Source::new(&settings());
+    assert!(phase4.set_cpt(&training), "CPt");
+    let without = loudest(&mut phase4);
+    let training_loudest = {
+        let mapping = CodeMapping::from_cp(&training).expect("CPt mapping");
+        mapping
+            .sets
+            .iter()
+            .flat_map(|set| set.points().iter().copied())
+            .map(|ucode| ucode::level(law, ucode).abs())
+            .fold(0.0f64, f64::max)
+    };
+    assert!(
+        (without - training_loudest).abs() < 1e-9 && (without - data_loudest).abs() > 1e-9,
+        "SUVd off the FPE path is CPt's {training_loudest}, not the data mode's {data_loudest}: {without}"
+    );
+
+    // On it, the preceding data mode modulation is -- and 9.9.1.2.3's resets.
+    let mut fpe = Source::new(&settings());
+    assert!(fpe.set_cpt(&training), "CPt");
+    assert!(fpe.begin_fpe(&data), "CPu mapping");
+    let during = loudest(&mut fpe);
+    assert!(
+        (during - data_loudest).abs() < 1e-9,
+        "8.8.5: SUVd during a fast parameter exchange is the data mode modulation, \
+         whose loudest is {data_loudest}, and it went out at {during}"
+    );
+    assert_ne!(
+        during,
+        ucode::level(law, 88),
+        "SUVd during a fast parameter exchange went out on CPt's constellation -- 8.8.5"
+    );
+    fpe.end_fpe();
+}
 
 /// 9.9.1.2.1/.2's patterns, **generated from Table 25/26's `K_i` rows**.
 #[test]
