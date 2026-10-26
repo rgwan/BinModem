@@ -802,18 +802,41 @@ const E1U_ZEROES: usize = 12;
 /// already reports the empty descriptor correctly.
 pub const ZERO_DIL_USES_SCR: bool = true;
 
-/// How long after Ed this end waits for an E2u it can *confirm* before the
-/// phase 4 exchange is declared failed, in seconds of line time.
+/// The clause's own allowance for the B1u hunt, in seconds of line time:
+/// 9.6.1.2.1 -- *"If the digital modem does not receive B1u within 20 s plus 6
+/// round-trip delays from the end of INFO1a, the digital modem shall initiate a
+/// retrain according to 9.7.1.1"* (`v92.txt:2770`). The analogue modem's
+/// symmetric half is 9.6.2.2.1 (`v92.txt:2799`).
 ///
-/// It used to be the moment the receiver was conditioned for B1u "regardless",
-/// which is the one thing a timer cannot know: B1u's frame interval 0 is a
-/// symbol of the far end's, not of this end's clock, and a receiver that
-/// conditions on its own timer reads a data frame from a boundary that never
-/// existed. Measured on `/tmp/p0corr/g712.raw`, that path delivered 14 kB of
-/// wrong bytes and dropped a V.42 that never opened; a call that cannot find
-/// B1u now fails in the open instead, where the retrain and the fallback the
-/// start-up already has can act on it.
-pub const B1U_WAIT: f64 = 2.0;
+/// **This used to be 2.0 s, counted from Ed, and that was ours, not the
+/// clause's.** The clause bounds the *whole* of Phase 3 plus Phase 4 from the
+/// end of INFO1a -- `analogue.rs`'s `START_UP` reads it the same way, and its
+/// comment says so ("the timer that covers all of Phase 3 and Phase 4"). Two
+/// seconds after Ed is a limit the standard never imposed: shorter than the
+/// clause by an order of magnitude, and on `docs/289`'s `drn 2` call it ended
+/// the hunt at 25.180 s while this end's candidates were still the wrong ones.
+///
+/// The anchor matters as much as the number. Because the clause counts from the
+/// **end of INFO1a**, an arm at Ed must spend what is *left* of the clause's
+/// budget, not a fresh one: `start_up_by` is absolute in `now` units, exactly
+/// like `ja_deadline`, whose clause (9.5.1.2.1) has the same origin. A wait
+/// restarted at Ed would exceed the clause, which is the other way to get this
+/// wrong. Renegotiation re-anchors `start_up_origin`, because 9.8's exchange is
+/// a new Phase 4 with its own reference.
+///
+/// What it is *not*: an invitation to condition the receiver on a timer. It
+/// used to do that "regardless", which is the one thing a timer cannot know:
+/// B1u's frame interval 0 is a symbol of the far end's, not of this end's clock,
+/// and a receiver that conditions on its own timer reads a data frame from a
+/// boundary that never existed. Measured on `/tmp/p0corr/g712.raw`, that path
+/// delivered 14 kB of wrong bytes and dropped a V.42 that never opened; a call
+/// that cannot find B1u still fails in the open, where the retrain and the
+/// fallback the start-up already has can act on it. A longer hunt only moves the
+/// deadline; it never invents a boundary.
+pub const B1U_WAIT: f64 = 20.0;
+
+/// 9.6.1.2.1's "plus 6 round-trip delays" (`v92.txt:2770`), in round trips.
+pub const B1U_WAIT_RTD: f64 = 6.0;
 
 /// What a candidate boundary's B1u has to read like to be one (8.7.1: "B1u
 /// consists of 48 data frames of scrambled binary ones").
@@ -4088,7 +4111,15 @@ pub struct Modem {
     b1u_pending: bool,
     /// The symbol by which B1u has to have been found, so that an E2u this end
     /// failed to read costs the call nothing rather than everything.
+    ///
+    /// Absolute in `now` units and anchored at `start_up_origin`, because
+    /// 9.6.1.2.1 counts from the end of INFO1a rather than from Ed.
     b1u_deadline: Option<u64>,
+    /// The `now` that clause 9.6.1.2.1's 20 s is counted from: zero, which is
+    /// the end of Phase 2 and so the end of INFO1a (`Modem::new` is built
+    /// there), and re-set to the `Ru` that opens a 9.8 renegotiation, whose
+    /// Phase 4 is a new exchange with its own reference.
+    start_up_origin: u64,
     /// The downstream data encoder, once CPu has said what to encode (V.90
     /// 8.6.1).
     downstream: Option<crate::v90::encoder::Encoder>,
@@ -4727,6 +4758,7 @@ impl Modem {
             awaiting_e2u: false,
             b1u_pending: false,
             b1u_deadline: None,
+            start_up_origin: 0,
             upstream_bits: 0,
             outbound: VecDeque::new(),
             recovered: Vec::new(),
@@ -5379,7 +5411,7 @@ impl Modem {
         {
             self.b1u_pending = false;
             self.b1u_deadline = None;
-            self.fail("no E2u that reads as B1u within 2 s of Ed");
+            self.fail("no E2u that reads as B1u within 9.6.1.2.1's 20 s plus 6 round-trip delays of the end of INFO1a");
         }
         // D2/D3: once enough of TRN1u has gone by, the fit is made.
         if self.stage == Stage::Training
@@ -6494,6 +6526,21 @@ impl Modem {
     ///   that many symbols through a countdown this starts.
     /// * 9.6.1.1.6's `B1u` arm -- `b1u_pending` and its 2 s deadline -- for the
     ///   `E2u` that follows every one of these entries.
+    /// 9.6.1.2.1's deadline as an absolute instant in `now` units: the end of
+    /// INFO1a (`start_up_origin`) plus *"20 s plus 6 round-trip delays"*
+    /// (`v92.txt:2770`).
+    ///
+    /// Absolute rather than relative to the arm, so that arming it late in
+    /// Phase 4 does not buy back a budget the clause already spent -- the same
+    /// shape as `ja_deadline`, whose clause has the same origin. The bound it
+    /// gives can therefore be in the past when it is armed, and that is the
+    /// clause answering, not a bug: a Phase 3 that used the whole 20 s leaves
+    /// no time for the hunt, and the retrain is then what 9.6.1.2.1 asks for.
+    fn start_up_by(&self) -> u64 {
+        self.start_up_origin
+            + ((B1U_WAIT + B1U_WAIT_RTD * self.settings.round_trip) * FS) as u64
+    }
+
     fn enter_data_mode(&mut self) {
         let upstream = self.parameters.as_ref().map_or(0, Parameters::rate);
         // The receiver is *not* reconditioned here. 9.6.1.1.6 has it done
@@ -6513,7 +6560,7 @@ impl Modem {
         // seconds later.
         let waiting = self.parameters.is_some() && self.upstream_data.is_none();
         self.b1u_pending = waiting;
-        self.b1u_deadline = waiting.then_some(self.now + (B1U_WAIT * FS) as u64);
+        self.b1u_deadline = waiting.then_some(self.start_up_by());
         let mut downstream = 0;
         if let Some(cpu) = self.cpu.as_ref()
             && let Some(mapping) = crate::v90::encoder::Mapping::from_cp(cpu)
@@ -7061,6 +7108,9 @@ impl Modem {
         self.e2u_zeroes = 0;
         self.b1u_pending = false;
         self.b1u_deadline = None;
+        // 9.8's Phase 4 is a new exchange, so 9.6.1.2.1's clock starts again
+        // here rather than at the end of this call's INFO1a.
+        self.start_up_origin = self.now;
         self.b1u_search = None;
         self.data_loss = None;
         // 9.8.1.2.1 clamps circuit 104 and takes the data mode down: from here
@@ -7952,7 +8002,7 @@ impl Modem {
         self.e2u_zeroes = 0;
         if self.b1u_deadline.is_none() {
             self.b1u_pending = true;
-            self.b1u_deadline = Some(self.now + (B1U_WAIT * FS) as u64);
+            self.b1u_deadline = Some(self.start_up_by());
         }
     }
 
@@ -8576,6 +8626,31 @@ impl Default for Modem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 9.6.1.2.1 (`v92.txt:2770`): *"If the digital modem does not receive B1u
+    /// within 20 s plus 6 round-trip delays from the end of INFO1a, the digital
+    /// modem shall initiate a retrain according to 9.7.1.1"*.
+    ///
+    /// The number was 2.0 s and counted from `Ed` until `docs/291`. Both halves
+    /// of that were ours: the clause allows 20 s, and it counts them from the
+    /// end of INFO1a rather than from the `Ed` this end sends at the end of
+    /// Phase 4. Pinned here so the self-imposed limit cannot come back quietly.
+    #[test]
+    fn b1u_hunt_is_the_clauses_twenty_seconds_from_info1a() {
+        assert_eq!(B1U_WAIT, 20.0, "9.6.1.2.1 allows 20 s, not 2 s");
+        assert_eq!(B1U_WAIT_RTD, 6.0, "9.6.1.2.1 adds 6 round-trip delays");
+        let mut zero = settings();
+        zero.round_trip = 0.0;
+        let modem = Modem::new(zero);
+        // Anchored at the end of INFO1a (`now` = 0), not at the moment it is
+        // armed: 20 s of line time, and never longer.
+        assert_eq!(modem.start_up_by(), (20.0 * FS) as u64);
+        let mut slow = settings();
+        slow.round_trip = 0.05;
+        let modem = Modem::new(slow);
+        // 20 s + 6 x 50 ms, and no more than the clause's own sum.
+        assert_eq!(modem.start_up_by(), ((20.0 + 6.0 * 0.05) * FS) as u64);
+    }
     use crate::v90::encoder::{Decoder as CodeDecoder, Frame as CodeFrame};
     use crate::v90::sequences::Layout;
     use crate::v90::sign::Redundancy;
