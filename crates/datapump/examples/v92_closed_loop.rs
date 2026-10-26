@@ -28,13 +28,12 @@
 
 use datapump::v90::ucode::{self, Law, UCODES};
 use datapump::v92::decoder::Decoder;
+use datapump::v92::design::{self, Channel};
 use datapump::v92::farend::{self, FarEndParams};
 use datapump::v92::receiver::Receiver;
 use datapump::v92::up_signals::Trn1u;
 use datapump::v92::upstream::UpEncoder;
-use datapump::v92::{
-    CONSTELLATION_FRAME, Filters, LevelSet, Parameters, Trellis, UP_INTERVALS, up_bits,
-};
+use datapump::v92::{FilterLimits, LevelSet, Parameters, Trellis, UP_INTERVALS, upchoice};
 
 /// A deterministic bit source. No crate, same stream every run.
 struct Random(u64);
@@ -54,34 +53,26 @@ impl Random {
     }
 }
 
-/// The rung's parameters, exactly as `docs/248`'s generator builds them, with
-/// the level set named instead of fixed: `docs/250` §2's gap is this argument.
+/// The rung's parameters **as the design path emits them** (`docs/252`), not as
+/// the harness would like them.
+///
+/// This is the whole of `docs/254` step 1: `G` is computed where CPd bits 35:50
+/// are computed -- `design::design` normalises the section to unit energy and
+/// `upchoice::build_with` divides the set's gain by `sqrt(sent_prefilter_energy)`
+/// -- so the number the far end is driven at below is the one on the wire, not a
+/// copy of it. The design is taken against the harness's neutral line (one tap,
+/// nothing else), so `z2` is the identity to the last Q0.15 code and the
+/// operating point this buys is `1/G` of the emitted gain.
 fn parameters(drn: u8, trellis: Trellis, levelset: LevelSet) -> Parameters {
-    let bits = up_bits(drn);
-    let each = bits / UP_INTERVALS as u32;
-    let spare = bits % UP_INTERVALS as u32;
-    let mut moduli = [0u8; UP_INTERVALS];
-    let mut levels = 1usize;
-    for i in 0..UP_INTERVALS {
-        let width = each + u32::from((i as u32) < spare);
-        let modulus = 1u8 << width;
-        moduli[i] = modulus;
-        let need = if i % 4 == 3 { usize::from(modulus) } else { usize::from(modulus).div_ceil(2) };
-        levels = levels.max(need);
-    }
-    let set = levelset.points(levels).expect("a level set for this rung");
-    let gain = levelset.gain(&set);
-    Parameters {
-        drn,
-        trellis,
-        extend_e2u: false,
-        gain,
-        moduli,
-        filters: Filters { z2: vec![1.0], ..Filters::default() },
-        sets: vec![set],
-        indices: [0; CONSTELLATION_FRAME],
-        levelset,
-    }
+    let limits = FilterLimits::from_info1a(3, 3, 3);
+    let designed = design::design(
+        &Channel { taps: vec![1.0], noise: 0.0, signal: 1.0 },
+        &limits,
+    )
+    .expect("the harness's neutral channel is designable");
+    upchoice::pin_with(&designed, drn, trellis, 0.0, levelset)
+        .unwrap_or_else(|| panic!("drn {drn} is not built by the design path"))
+        .parameters
 }
 
 /// The G.711 quantiser the central office is.
@@ -611,7 +602,8 @@ fn main() {
              eq=[{:.3},{:+.3},{:+.3}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
              rms={rms:.1} peak={peak:.0} pop1024={pop1024:.1} pop512={pop512:.1} \
              xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.3} \
-             b1u={ones}/{bits}={pct:.1}% rot={rotation}",
+             b1u={ones}/{bits}={pct:.1}% rot={rotation} \
+             G9={g9:.9} energy={energy:.6} invG={invg:.3}",
             rung.rate,
             rung.lc,
             used.eq.taps[0],
@@ -625,6 +617,9 @@ fn main() {
             bin = bins.pct(),
             adj = if bins.aligned { bins.adjacent.to_string() } else { "unaligned".to_owned() },
             kb = bins.k,
+            g9 = parameters.gain,
+            energy = datapump::v92::sent_prefilter_energy(&parameters.filters.z2),
+            invg = 1.0 / parameters.gain,
         );
         if s.chords {
             for chord in (0..8).rev() {
