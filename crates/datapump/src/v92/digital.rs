@@ -60,7 +60,7 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, threshold};
+use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung};
 use crate::v92::upchoice::{choose, pin};
 use crate::v92::{FilterLimits, LevelSet, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
@@ -5836,6 +5836,88 @@ impl Modem {
     /// known symbols, so no pre-CPd measurement can license a rung the line has
     /// not already been watched carrying. The number is *reported* either way,
     /// so a call says what the line looked like and what it was allowed.
+    /// **The ladder, on the live decision** (`docs/264` sec 2): which rungs the
+    /// level measured on this call permits, by `docs/261` sec 4's per-rung
+    /// tolerance, with every rung's verdict written to the log in
+    /// `rung::Reading::line`'s own form.
+    ///
+    /// # Why the level and not the rate
+    ///
+    /// `CPd` carries the rung (9.6.1.1.2) and goes out **before** `B1u` exists,
+    /// so at the instant this decision is taken there is no `B1u` window for the
+    /// bin error rate to be measured over. The one measurement there is, is the
+    /// level: the four-point fit's gain against the design's own four points,
+    /// which is the far end's distance from the `1/G` this end named in the
+    /// previous `CPd` (`docs/256` sec 1.2; 8.8.3 makes `1/G` the level the
+    /// design's points arrive at). So the ladder is read with `symbols = 0` --
+    /// no rate, `instrument=level` -- and `admit` says exactly that rather than
+    /// reporting a zero it did not measure.
+    ///
+    /// The residual sigma is *not* the gate. It is a `Bound::Lower` on the
+    /// data-mode residual (see `decide_upstream_rung`), it refuses rungs on
+    /// evidence that cannot justify any, and on the bench it floors the ladder
+    /// at `drn 1` whatever the level does (`docs/256` sec 3.1) -- a criterion
+    /// that answers "24 000" before it looks. It stays in the log as an
+    /// advisory number beside the gate, so that a call shows both and neither is
+    /// inferred from the other.
+    ///
+    /// # When there is no level
+    ///
+    /// A call whose four-point measurement never ran has no `delta` to judge, so
+    /// there is nothing for the tolerance to be about: the ladder is not
+    /// consulted, the sigma mask stands as it did, and the log says so. That is
+    /// the only branch in which the old criterion still decides.
+    fn upstream_ladder(&mut self, ja: u32, measured: Sigma, ceiling: Option<u8>) -> (u32, RateDecision) {
+        let (inner, outer, level_gain, seen) = self.rx.measured_levels();
+        let mut mask = 0u32;
+        if seen > 0 {
+            // The far end's distance from `1/G`, as a fraction: the four-point
+            // gain the receiver settled on is the ratio between the amplitude
+            // arriving and the design's own `1/sqrt(5)`, `3/sqrt(5)`, so one
+            // means the far end put the design's points on the line.
+            let delta = level_gain - 1.0;
+            for drn in 1..=crate::v92::UP_RATES as u8 {
+                if ja & (1 << (drn - 1)) == 0 {
+                    continue;
+                }
+                let lc = crate::v92::rung::lc_for(drn);
+                // The design's own `G` for this rung, which is the number `CPd`
+                // carries: `1/G` is then the level the tolerance is measured
+                // from, and `delta` is the same relative error at every rung.
+                let gain = crate::v92::upchoice::gain_for(lc);
+                let reading = crate::v92::rung::Reading {
+                    drn,
+                    lc,
+                    min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(drn))
+                        .unwrap_or(0.0),
+                    level_lsb: gain.recip() * (1.0 + delta),
+                    gain,
+                    bin: 0.0,
+                    crossing: 0.0,
+                    // No `B1u` yet: this is a `CPd` decision.
+                    symbols: 0,
+                };
+                let verdict = crate::v92::rung::admit(&reading);
+                if verdict.granted() {
+                    mask |= 1 << (drn - 1);
+                }
+                self.note(format!("V.92: {}", reading.line(verdict)));
+            }
+            self.note(format!(
+                "V.92: upstream rate: level {delta:+.2}% against 1/G (four points {inner:.3}/{outer:.3} \
+                 over {seen}), tolerance per rung from docs/261 sec 4, mask {mask:#07x}"
+            ));
+        } else {
+            mask = apply_ceiling(ja, measured);
+            self.note(
+                "V.92: no four-point level to judge (the ladder needs one); the sigma mask stands, and \
+                 it is a lower bound that can only refuse"
+                    .into(),
+            );
+        }
+        (mask, RateDecision { measured, ceiling, mask, empty: false })
+    }
+
     fn decide_upstream_rung(&mut self) {
         let Some(designed) = self.upstream_plan.take() else { return };
         if self.cpd_sent {
@@ -5856,9 +5938,14 @@ impl Modem {
         // sanity rule works in variances; the same reading supplies it.
         let noise = 10f64.powf(-snr_db / 10.0);
         let ja = self.ja.upstream_rates().unwrap_or(0);
+        // The ceiling the sigma reading implies. It is a **`Bound::Lower`** on
+        // the data-mode residual (the doc comment above is why), so it is not
+        // evidence a rung may be spent on: `docs/264` sec 2 keeps the number and
+        // its refusals in the log as an *advisory* and stops it from deciding.
+        // What decides is the ladder below.
         let ceiling = ceiling_rung(measured);
-        let allowed = apply_ceiling(ja, measured);
-        let decision = RateDecision { measured, ceiling, mask: allowed, empty: false };
+        let advisory = apply_ceiling(ja, measured);
+        let (allowed, decision) = self.upstream_ladder(ja, measured, ceiling);
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
         // still gets, because the alternative is no call at all. Which of the
@@ -5880,47 +5967,29 @@ impl Modem {
         };
         self.parameters = Some(choice.parameters.clone());
         self.cpd = Some(Cpd::from(&choice.parameters));
-        // The decision, in the numbers it was made on: the residual the Phase 4
-        // fit measured, the ceiling that implies, the mask that came out of the
-        // AND, and the rung. A refusal is invisible without them.
-        let ceiling = match decision.ceiling {
+        // What the sigma reading says, kept and not spent. It is a `Lower`
+        // bound on the data-mode residual, so it can refuse a rung and can never
+        // justify one; the ladder above is what decided, and this line is what
+        // keeps the two numbers comparable on one call (`docs/264` sec 2).
+        let advisory_ceiling = match ceiling {
             Some(drn) => format!("drn {drn}"),
             None => "none".to_string(),
         };
         self.note(format!(
-            "V.92: upstream rate: sigma {:.4} index steps at LC {} from the four-point fit at {snr_db:.1} dB \
-             ({:?}), ceiling {ceiling}, mask {:#07x}, chose drn {} at {} bit/s",
+            "V.92: advisory (not the gate): sigma {:.4} index steps at LC {} from the four-point fit at \
+             {snr_db:.1} dB ({:?}) would allow {advisory_ceiling} and mask {advisory:#07x}; the ladder \
+             granted mask {:#07x}",
             decision.measured.steps(),
             crate::v92::rung::REFERENCE_LC,
             decision.measured.bound(),
             decision.mask,
-            choice.parameters.drn,
-            choice.parameters.rate()
-        ));
-        // The scan itself, rung by rung, with the number each one was refused
-        // on.
-        let scan: Vec<String> = (1..=crate::v92::UP_RATES as u8)
-            .map(|drn| {
-                let budget = crate::v92::rung::threshold(drn);
-                let verdict = if decision.measured.steps() <= budget { "met" } else { "refused" };
-                format!(
-                    "drn {drn} ({}) threshold {budget:.4} {verdict}",
-                    crate::v92::up_rate(drn)
-                )
-            })
-            .collect();
-        self.note(format!(
-            "V.92: upstream rung scan at sigma {:.4} index steps: {}; highest rung met {}",
-            decision.measured.steps(),
-            scan.join("; "),
-            ceiling
         ));
         if decision.empty {
+            // The event the ceiling exists to make visible: every rung the far
+            // end offered was refused, and the refusal is in the ladder's own
+            // lines above with the number that refused it.
             self.note(format!(
-                "V.92: the measurement leaves no rung of the ladder (sigma {:.4} index steps, {:.4} at LC {} is the slowest rung's budget); keeping the slowest, drn 1 at {} bit/s",
-                decision.measured.steps(),
-                crate::v92::rung::sigma_max(crate::v92::rung::REFERENCE_LC),
-                crate::v92::rung::REFERENCE_LC,
+                "V.92: the level leaves no rung of the ladder; keeping the slowest, drn 1 at {} bit/s",
                 crate::v92::up_rate(1)
             ));
         }
