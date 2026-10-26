@@ -1210,6 +1210,66 @@ mod tests {
         out
     }
 
+    /// The decoder and the `CPd` declare one modulus array, at every rung.
+    ///
+    /// `docs/270` §1.2 established that the two cannot disagree *today*: both
+    /// are built from the one `Parameters` `upchoice::build_with` produces, and
+    /// nothing in the decode path reads a modulus from anywhere else. That is a
+    /// property of construction, and a property of construction is worth one
+    /// assertion: this locks it, so that the day a future reader gives either
+    /// consumer a second source for `M0 ... M11` the drift fails here rather
+    /// than on the bench, where it looks like a line fault. It walks drn 1..=19
+    /// on both level sets, because a rung the design refuses is a rung whose
+    /// declaration nobody ever compares (`docs/272` sec 3).
+    #[test]
+    fn the_decoder_and_the_cpd_declare_one_modulus_array() {
+        use crate::v92::decoder::Decoder;
+        use crate::v92::upchoice::{LevelSet, pin_with};
+
+        let limits = FilterLimits::from_info1a(3, 3, 3);
+        let mut channel = vec![0.0f64; 16];
+        channel[0] = 1.0;
+        for k in 1..16 {
+            channel[k] = 0.2 / k as f64;
+        }
+        let norm = channel.iter().map(|t| t * t).sum::<f64>().sqrt();
+        channel.iter_mut().for_each(|t| *t /= norm);
+        let design = crate::v92::design::design(
+            &crate::v92::design::Channel { taps: channel, noise: 0.0, signal: 1.0 },
+            &limits,
+        )
+        .expect("designable");
+        let mut seen = 0;
+        for levelset in [LevelSet::Uniform, LevelSet::Code] {
+            for drn in 1..=UP_RATES as u8 {
+                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset) else {
+                    continue;
+                };
+                let parameters = choice.parameters;
+                seen += 1;
+                let cpd = Cpd::from(&parameters);
+                assert_eq!(
+                    cpd.moduli,
+                    Some(parameters.moduli),
+                    "{} drn {drn}: the CPd declares {:?}, the parameters carry {:?}",
+                    levelset.name(),
+                    cpd.moduli,
+                    parameters.moduli
+                );
+                let decoder = Decoder::new(&parameters);
+                let declared = cpd.moduli.expect("just asserted");
+                assert_eq!(
+                    decoder.moduli(),
+                    declared,
+                    "{} drn {drn}: the decoder decodes with {:?}, the CPd declared {declared:?}",
+                    levelset.name(),
+                    decoder.moduli()
+                );
+            }
+        }
+        assert!(seen >= 19, "every rung of the ladder has to be walked, saw {seen}");
+    }
+
     /// How many information words the [`parameters`] CPd takes: the two
     /// mandatory ones, six of moduli, four filter lengths and eight
     /// coefficients, and five set headers and forty-four points.
