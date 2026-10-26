@@ -103,40 +103,73 @@ pub const FIELDS: [FieldSpec; 3] = [
     },
     FieldSpec {
         name: "eq",
-        meaning: "3-tap pre-emphasis the far end applies to `G x v(n)` before its DAC -- \
-                  the inverse of the channel's short post-cursor response",
+        meaning: "pre-emphasis the far end applies to `G x v(n)` before its DAC -- the \
+                  truncated inverse of the channel's short post-cursor response",
         unit: "dimensionless tap weights, T spaced",
-        range: "|c_k| <= 1.0 and DC gain 0.5 .. 2.0; three taps is what the measured ISI \
-                needs and what a transmitter's shaping filter has room for",
+        range: "|c_k| <= 1.0 and DC gain 0.5 .. 2.0; k taps leaves `a^k` of the post-cursor, \
+                and `k = EQ_DEPTH` is what clears the smallest half-gap we run at (docs/255)",
         field: None,
         tier: Tier::OurChoiceUnconfirmed,
     },
 ];
 
-/// What the far end's transmitter pre-applies: `y(n) = c0 x(n) + c1 x(n-1) +
-/// c2 x(n-2)`.
+/// How deep the far end's pre-emphasis is: `docs/255` S3's ceiling.
 ///
-/// Three taps because the residual ISI is one post-cursor tap (`docs/248`'s
-/// `--tap`), and the best three-tap inverse of `1 + a z^-1` is
-/// `1 - a z^-1 + a^2 z^-2`: its product with the channel is `1 + a^3 z^-3`, so
-/// a one-tap channel is cancelled down to `a^3` -- 1.4 % of the tap at
-/// `a = 0.24`, and nothing at the level the quantiser works at.
+/// The channel this loop models is one post-cursor tap (`docs/248`'s `--tap`),
+/// and the truncated inverse of `1 + a z^-1` is `1 - a z^-1 + a^2 z^-2 - ...`:
+/// a `k`-tap truncation leaves `a^k` of the post-cursor behind. Three taps
+/// leave `a^3` = 1.4 % at `a = 0.24`, which is nothing at 24 000 and is several
+/// whole code steps at 48 000, where LC 64's finest gap is 8 LSB and its half is
+/// 4 (`rung::gap_lsb`): `a^3` x the stream's 3772 LSB peak is 52 LSB. Five taps
+/// leave `a^5` = 8e-4, 3 LSB at the same peak, inside that half-gap.
+///
+/// The exact inverse is not a long FIR at all -- `1 / (1 + a z^-1)` is a stable
+/// causal recursion, because the channel's zero is at `z = -a` inside the unit
+/// circle -- so the depth is a statement about the far end's transmit filter,
+/// not about the arithmetic. It is the one number in this table with no field
+/// in the Recommendation (`docs/249` S0: `Jp` bits 18:33 and `CPd` 20/153+/35:50
+/// are the only channels to the far end's transmitter).
+pub const EQ_DEPTH: usize = 5;
+
+/// What the far end's transmitter pre-applies: `y(n) = sum_k c_k x(n-k)`.
+///
+/// `EQ_DEPTH` taps because that is what clears the smallest half-gap this end
+/// can be asked to run at, and the product with a one-tap channel is
+/// `1 + a^k z^-k`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EqTaps {
-    /// `c0, c1, c2`.
-    pub taps: [f64; 3],
+    /// `c0 .. c(EQ_DEPTH-1)`, in that order.
+    pub taps: [f64; EQ_DEPTH],
 }
 
 impl EqTaps {
     /// The extreme case the user's design rule is about: no equaliser at all.
-    pub const BYPASS: Self = Self { taps: [1.0, 0.0, 0.0] };
+    pub const BYPASS: Self = Self { taps: [1.0, 0.0, 0.0, 0.0, 0.0] };
 
-    /// The three-tap inverse of the channel `1 + a z^-1`, as the far end would
-    /// pre-apply it: `1 - a z^-1 + a^2 z^-2`, whose product with the channel is
-    /// `1 + a^3 z^-3`.
+    /// The `EQ_DEPTH`-tap inverse of the channel `1 + a z^-1`, as the far end
+    /// would pre-apply it: `1 - a z^-1 + a^2 z^-2 - a^3 z^-3 + a^4 z^-4`, whose
+    /// product with the channel is `1 + a^5 z^-5`.
+    ///
+    /// The sign alternates because the inverse is a recursion
+    /// (`y(n) = x(n) - a y(n-1)`), not a fitted polynomial.
     #[must_use]
     pub fn inverse_of(a: f64) -> Self {
-        Self { taps: [1.0, -a, a * a] }
+        let mut taps = [0.0; EQ_DEPTH];
+        for (k, tap) in taps.iter_mut().enumerate() {
+            *tap = if k % 2 == 0 { a.powi(k as i32) } else { -a.powi(k as i32) };
+        }
+        Self { taps }
+    }
+
+    /// The same inverse truncated to `depth` taps, which is what `docs/255`
+    /// sweeps to find the depth a rung needs.
+    #[must_use]
+    pub fn inverse_of_depth(a: f64, depth: usize) -> Self {
+        let mut taps = [0.0; EQ_DEPTH];
+        for (k, tap) in taps.iter_mut().enumerate().take(depth.min(EQ_DEPTH)) {
+            *tap = if k % 2 == 0 { a.powi(k as i32) } else { -a.powi(k as i32) };
+        }
+        Self { taps }
     }
 
     /// Whether the data path costs nothing: this is the predicate the
@@ -153,15 +186,15 @@ impl EqTaps {
         self.taps.iter().sum()
     }
 
-    /// The weight at non-zero lags, `c1 + c2`: `0.0` for the bypass, and the
+    /// The weight at non-zero lags, `sum c_1..`: `0.0` for the bypass, and the
     /// second number a check compares.
     #[must_use]
     pub fn forward(&self) -> f64 {
-        self.taps[1] + self.taps[2]
+        self.taps[1..].iter().sum()
     }
 
-    /// `y(n) = c0 x(n) + c1 x(n-1) + c2 x(n-2)`, causal, memory zeroed before
-    /// the first symbol (the far end starts from B1u's own reset, 8.7.1).
+    /// `y(n) = sum_k c_k x(n-k)`, causal, memory zeroed before the first symbol
+    /// (the far end starts from B1u's own reset, 8.7.1).
     #[must_use]
     pub fn filter(&self, symbols: &[f64]) -> Vec<f64> {
         if self.is_bypass() {
@@ -543,47 +576,71 @@ mod tests {
         assert!(worst < 1e-13, "the zero-residual kernel moved {worst:e}");
     }
 
-    /// `docs/255` S1.4: the loop's ceiling above `drn 10` is the *three-tap*
+    /// `docs/255` S3: the loop's ceiling above `drn 10` was the *three-tap*
     /// inverse's own residual, `a^3`, which the ideal case does not have. The
-    /// product of the pre-emphasis with the channel is `1 + a^3 z^-3`, and at
-    /// LC 64's 4-8 LSB half-gaps that is several whole code steps at the
-    /// stream's peak. The exact inverse is a stable causal recursion (the
-    /// channel's zero is at `z = -a`, inside the unit circle), so the depth is
-    /// a choice about the far end's filter, not a limit of the arithmetic.
+    /// product of a `k`-tap pre-emphasis with the channel is `1 + a^k z^-k`, and
+    /// at LC 64's 4-8 LSB half-gaps `a^3` is several whole code steps at the
+    /// stream's peak. `EQ_DEPTH` is five because that is the depth the finest
+    /// gap we run at needs; the exact inverse is a stable causal recursion (the
+    /// channel's zero is at `z = -a`, inside the unit circle), so the depth is a
+    /// statement about the far end's filter, not about the arithmetic.
     #[test]
-    fn the_three_tap_inverse_leaves_a_cubed_and_that_is_the_high_rung_ceiling() {
+    fn five_taps_clear_the_finest_half_gap_a_three_tap_inverse_leaves_over_it() {
         let a = 0.24;
-        let eq = EqTaps::inverse_of(a);
-        // The pre-emphasis convolves with the channel `1 + a z^-1`.
-        let impulse = {
-            let mut v = vec![0.0; 8];
-            v[0] = 1.0;
-            v
-        };
-        let product = {
-            let shaped = eq.filter(&impulse);
-            let mut out = vec![0.0; 8];
-            for n in 0..8 {
-                out[n] = shaped[n] + if n > 0 { a * shaped[n - 1] } else { 0.0 };
-            }
-            out
-        };
-        assert!((product[0] - 1.0).abs() < 1e-12);
-        assert!(product[1].abs() < 1e-12, "a^1 must be cancelled: {}", product[1]);
-        assert!(product[2].abs() < 1e-12, "a^2 must be cancelled: {}", product[2]);
-        assert!((product[3] - a * a * a).abs() < 1e-12, "the residual is a^3");
-        // What a^3 costs against the rung it has to fit: LC 64's finest gap is
-        // 8 LSB (`rung::gap_lsb`), its half is 4, and the stream's peak at
-        // 48 000 is 3772 LSB (`docs/254` S5). The depth that would clear it:
+        // The stream's peak at 48 000 and LC 64's finest half-gap (`docs/254`
+        // S5, `rung::gap_lsb(64) / 2`).
         let peak = 3772.0;
         let half_gap = 4.0;
-        assert!(a.powi(3) * peak > 4.0 * half_gap, "a^3 must be over the gap");
-        let mut depth = 1;
-        let mut residual = a;
-        while residual * peak > half_gap && depth < 8 {
-            residual *= a;
-            depth += 1;
+        // The residual of a k-tap pre-emphasis, from its own taps: the product
+        // with the channel `1 + a z^-1` is zero at lags 1 .. k-1 and `a^k` at k.
+        let residual = |depth: usize| -> f64 {
+            let mut channel = vec![0.0; EQ_DEPTH + 1];
+            channel[0] = 1.0;
+            channel[1] = a;
+            let shaped = EqTaps::inverse_of_depth(a, depth).taps;
+            let mut product = vec![0.0; EQ_DEPTH + 1];
+            for n in 0..EQ_DEPTH + 1 {
+                for (k, &c) in shaped.iter().enumerate() {
+                    if k <= n {
+                        product[n] += c * channel[n - k];
+                    }
+                }
+            }
+            assert!((product[0] - 1.0).abs() < 1e-12, "depth {depth}: the passband moved");
+            for (lag, &v) in product.iter().enumerate().take(depth).skip(1) {
+                assert!(v.abs() < 1e-12, "depth {depth}: lag {lag} is {v:e}, not cancelled");
+            }
+            product[depth].abs()
+        };
+        for depth in 1..=EQ_DEPTH {
+            let left = residual(depth);
+            let expected = a.powi(depth as i32);
+            assert!((left - expected).abs() < 1e-12, "depth {depth}: {left:e} against {expected:e}");
         }
-        assert_eq!(depth, 5, "five taps clear LC 64's half-gap, not three");
+        // Three taps leave a residual over the half-gap, five under it: this is
+        // the whole of docs/255 S3's ceiling and its fix.
+        assert!(residual(3) * peak > 4.0 * half_gap, "a^3 x peak must be over the gap");
+        assert!(residual(EQ_DEPTH) * peak < half_gap, "a^5 x peak must be under it");
+        // The bypass stays bit-exact whatever the depth is: the user's rule.
+        assert!(EqTaps::BYPASS.is_bypass());
+        assert!(EqTaps::inverse_of_depth(a, 1).taps[1..].iter().all(|&c| c == 0.0));
+        // Which protocol bound would bind if the depth were carried in a CPd
+        // section: none. z2 is in all four section codes of Table 18
+        // (`FilterSections` has no bit for it, `v92.txt:1186-1192`), and the
+        // smallest limits INFO1a can announce are L_tot 192 and L_max 128
+        // (`FILTER_TOTALS`, `FILTER_EACH`), so five coefficients are 5/192 and
+        // 5/128 of the two budgets. The bound that actually limits the depth is
+        // the far end's own transmit filter, which no field in `docs/249` S0
+        // names -- that is the finding, not a fit failure.
+        let smallest = crate::v92::FilterLimits::from_info1a(0, 0, 0);
+        let filters = crate::v92::Filters {
+            z1: Vec::new(),
+            p1: Vec::new(),
+            z2: EqTaps::inverse_of(a).taps.to_vec(),
+            p2: Vec::new(),
+        };
+        assert_eq!(filters.fits(&smallest), Ok(()));
+        assert_eq!(smallest.total, 192);
+        assert_eq!(smallest.most, 128);
     }
 }

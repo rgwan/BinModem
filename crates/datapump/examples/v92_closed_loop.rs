@@ -297,6 +297,11 @@ struct Settings {
     /// Whether to print the landing measured *before* the codec, which is the
     /// only form of it that can fail.
     landing: bool,
+    /// How many taps of the far end's pre-emphasis to keep: `farend::EQ_DEPTH`
+    /// unless `--depth` says otherwise. Still computed from the *estimated*
+    /// post-cursor, so the depth axis is swept without handing the loop the
+    /// answer (`docs/255` S3).
+    depth: usize,
 }
 
 /// How the chain turns the far end's fractional instant and the CO's sampling
@@ -334,6 +339,7 @@ fn parse() -> Settings {
         instant: Instant::Single,
         freeze: Vec::new(),
         landing: false,
+        depth: farend::EQ_DEPTH,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -371,6 +377,7 @@ fn parse() -> Settings {
                 s.freeze = value().split(',').map(str::to_owned).collect();
             }
             "--landing" => s.landing = true,
+            "--depth" => s.depth = value().parse().expect("depth"),
             other => panic!("unknown option {other}"),
         }
     }
@@ -646,22 +653,29 @@ fn main() {
                 let correction = e.correction(s.lu, s.lu);
                 println!(
                     "  estimate drn={drn} delay={:+.4} level={:.1} tap={:+.4} nmse={:.5} -> \
-                     params delay={:+.4} level={:.1} eq=[{:.3},{:+.3},{:+.3}]",
+                     params delay={:+.4} level={:.1} eq=[{}]",
                     e.delay,
                     e.level,
                     e.tap,
                     e.nmse,
                     correction.delay,
                     correction.level_lsb,
-                    correction.eq.taps[0],
-                    correction.eq.taps[1],
-                    correction.eq.taps[2]
+                    correction
+                        .eq
+                        .taps
+                        .iter()
+                        .map(|c| format!("{c:+.3}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
                 // docs/255's freeze-and-sweep: put the exact value back into
                 // one named component, so the run carries the others' error and
                 // nothing else's. The exact values are the truth of the line the
                 // far end is on, not the answer to the estimator's question.
                 let mut frozen = correction;
+                if s.depth != farend::EQ_DEPTH {
+                    frozen.eq = farend::EqTaps::inverse_of_depth(frozen.eq.taps[1].abs(), s.depth);
+                }
                 for name in &s.freeze {
                     match name.as_str() {
                         "delay" => frozen.delay = -s.timing,
@@ -737,16 +751,19 @@ fn main() {
         let landing = Landing::scan(s.law, &ladder, &continuous);
         println!(
             "RUNG drn={drn} rate={} lc={} points={points} gap={gap:.0} leastGap={least} \
-             eq=[{:.3},{:+.3},{:+.3}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
+             eq=[{}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
              rms={rms:.1} peak={peak:.0} \
              xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.3} \
              b1u={ones}/{bits}={pct:.1}% land={land:.3} \
              G9={g9:.9} energy={energy:.6} invG={invg:.3}",
             rung.rate,
             rung.lc,
-            used.eq.taps[0],
-            used.eq.taps[1],
-            used.eq.taps[2],
+            used.eq
+                .taps
+                .iter()
+                .map(|c| format!("{c:+.3}"))
+                .collect::<Vec<_>>()
+                .join(","),
             used.delay,
             used.level_lsb,
             parameters.gain,
