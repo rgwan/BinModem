@@ -365,6 +365,35 @@ pub fn to_signed_q(value: f64, width: u32, fraction: u32) -> u32 {
     (raw & (span - 1)) as u32
 }
 
+/// The width of one precoder/prefilter coefficient word in `CPd`, and how many
+/// of its bits are fractional: Table 30 prints `z1` and `z2` in signed Q0.15 and
+/// `p1` and `p2` in signed Q1.14, each in a sixteen-bit word.
+pub const PREFILTER_WIDTH: u32 = 16;
+/// `z2`'s Q0.15, the format 6.4.2's `v(n)` is built out of.
+pub const PREFILTER_FRACTION: u32 = 15;
+
+/// `sum z2(k)^2` over the **codes** the CPd carries, not over the design's
+/// floats.
+///
+/// 8.8.3's `E[(G v)^2] = 1` is about the prefilter the far end will run, and
+/// what it runs is the sixteen-bit words this end writes into CPd. A design's
+/// own `z2` is an ideal that the field rounds at 2^-15 a tap, so the energy a
+/// gain should be computed from is the one after that rounding -- this one. It
+/// is the quantity `upchoice` makes `G` out of, and naming it here is what stops
+/// the gain's provenance from being "the design" rather than "the wire".
+pub fn sent_prefilter_energy(z2: &[f64]) -> f64 {
+    z2.iter()
+        .map(|&tap| {
+            let code = signed_q(
+                to_signed_q(tap, PREFILTER_WIDTH, PREFILTER_FRACTION),
+                PREFILTER_WIDTH,
+                PREFILTER_FRACTION,
+            );
+            code * code
+        })
+        .sum()
+}
+
 /// What CPd bits 35:50 are divided by to give G.
 ///
 /// The field is "4 x G > 0" in "unsigned Q0.16" (Table 30), so 4G is
