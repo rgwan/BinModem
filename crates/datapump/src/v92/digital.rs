@@ -4241,9 +4241,9 @@ fn prefilter_source() -> Prefilter {
 /// frames each, 4 `i32` per frame), and one pass of 576 symbols to build the
 /// sent sequence. Nothing is added to the per-symbol path: the instrument
 /// reads what the decoder decided and never feeds it anything.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct B1uBins {
-    /// Per chord: symbols sent, and the ones decided as another index.
+    /// Per chord: symbols sent, and the ones decided as another *class*.
     sent: [u64; 8],
     wrong: [u64; 8],
     total: u64,
@@ -4261,9 +4261,52 @@ pub(crate) struct B1uBins {
     /// scores a displaced pairing the same as a right one cannot certify the
     /// right one, and `docs/285` sec 2 is the call that proved it.
     nearest_rival: u64,
+    /// `eta_decided - eta_sent` over every paired symbol, in a fixed table of
+    /// `-`[`Self::DELTA_MID`]` ..= +`[`Self::DELTA_MID`], with everything
+    /// further out in [`Self::delta_far`]. This is what separates "wrong
+    /// point" from "right point, wrong number": a difference that is a
+    /// multiple of the interval's `Mi` (of `2Mi` at `k = 3`) is two members of
+    /// one 6.4.2 class, which is the signature of a *representative* and not of
+    /// a misread symbol, while a difference of one is a read error. `docs/285`
+    /// sec 6 is the call that needed it.
+    delta: [u64; 33],
+    delta_far: u64,
+    /// The largest `|eta|` the sent sequence and the decided stream reached.
+    max_abs_sent: i32,
+    max_abs_decided: i32,
+    /// How many times `chord_of` found no level for an index and fell back to
+    /// zero, which is the only thing that can make `chord=0` a strawman.
+    chord_fallback: u64,
+    /// The number of points in the set the chords are read off (`sets[0]`),
+    /// so the fallback count above can be read against the range it needs.
+    set_points: usize,
+    /// Decisions whose index is not one the constellation holds at all.
+    decided_out_of_set: u64,
     /// The direction of the level error the error is *about*: `true` when
     /// the far end is high.
     high: bool,
+}
+
+impl Default for B1uBins {
+    fn default() -> Self {
+        Self {
+            sent: [0; 8],
+            wrong: [0; 8],
+            total: 0,
+            total_wrong: 0,
+            adjacent: 0,
+            unpaired: 0,
+            nearest_rival: 0,
+            delta: [0; 33],
+            delta_far: 0,
+            max_abs_sent: 0,
+            max_abs_decided: 0,
+            chord_fallback: 0,
+            set_points: 0,
+            decided_out_of_set: 0,
+            high: false,
+        }
+    }
 }
 
 impl B1uBins {
@@ -4284,24 +4327,66 @@ impl B1uBins {
             return bins;
         };
         let sent: Vec<i32> = encoder.b1u().iter().map(|symbol| symbol.eta).collect();
+        // **The shared representation is 6.4.2's equivalence class, not the
+        // index** (`docs/285` sec 6). "The precoder identifies Ki with an
+        // equivalence class E(Ki). The precoder selects a point u(n) from the
+        // equivalence class E(Ki). The index of the constellation point u(n)
+        // is denoted by y(n)" (v92.txt:449-451), and the class is "E(Ki) =
+        // {a(n_k) | n_k = Ki + z_k Mi, z_k an integer} for k = 0, 1, 2; {a(n_k)
+        // | n_k = 2Ki + 2 z_k Mi + (n_0 + n_1 + n_2 + Y0) mod 2, z_k an
+        // integer} for k = 3" (v92.txt:458-459). The clause fixes the class and
+        // leaves `z_k` to the precoder, so **the two indices this function used
+        // to subtract are not the same number**: the encoder's `eta` is the
+        // class member whose level is nearest `-c(n)` (`precoder.rs`,
+        // `Constellation::choose`) and the decoder's is `Bests`' cheapest index
+        // in its own residue class (`decoder.rs`, `Bests::new`), and each is
+        // *a* member. Two members of one class differ by a multiple of `Mi`
+        // (`2Mi` at k = 3) and carry the same `Ki`, which is the only thing
+        // 6.4.1 reads back out of an index (`index_to_ki`); US6414989B1 col. 14
+        // puts the licence plainly -- "the receiver need only be concerned with
+        // the coset received and may ignore which coset member was
+        // transmitted". So the comparison is `index_to_ki_class`, each interval
+        // in its own radix, which is the convention
+        // `examples/v92_b1u_class.rs` was corrected to at `b1d8223` after the
+        // `+-Mi/2` / `max(moduli)` defect of `docs/274` sec 3. The numeric
+        // difference is still kept, but only as `delta`: it says *how* the two
+        // differ, and a multiple of `Mi` is the signature of a different member
+        // and not of a misread symbol.
+        let modulus_at = |symbol: usize| parameters.modulus(crate::v92::interval(symbol as u64));
+        let position_at = |symbol: usize| crate::v92::trellis_index(symbol as u64);
+        let class_of = |eta: i32, symbol: usize| -> u8 {
+            crate::v92::precoder::index_to_ki_class(eta, modulus_at(symbol), position_at(symbol))
+        };
+        let sent_class: Vec<u8> =
+            sent.iter().enumerate().map(|(symbol, &eta)| class_of(eta, symbol)).collect();
         let set = &parameters.sets[0];
-        let chord_of = |eta: i32| -> usize {
+        let constellation = crate::v92::precoder::Constellation::new(set);
+        bins.set_points = set.len();
+        bins.max_abs_sent = sent.iter().map(|eta| eta.abs()).max().unwrap_or(0);
+        // The chord of a sent index, and whether the set had no level for it:
+        // `unwrap_or(0)` is kept (`docs/253` sec 2 reads the chords of the sent
+        // level and this instrument does not own that reading) but it is now
+        // *counted*, because a fallback is the one way `chord=0 pop=100 %` can
+        // be an artefact of the table rather than of the population.
+        let chord_of = |eta: i32| -> (usize, bool) {
             let index = if eta >= 0 { eta as usize } else { (-eta - 1) as usize };
+            let missing = index >= set.len();
             let value = f64::from(set.get(index).copied().unwrap_or(0));
             let full = (parameters.gain * value).clamp(0.0, 32767.0).round() as i32;
             let (code, _) = crate::v90::ucode::nearest(crate::v90::ucode::Law::Mu, full);
-            usize::from(code >> 4).min(7)
+            (usize::from(code >> 4).min(7), missing)
         };
         let count = (decisions.len() * crate::v92::TRELLIS_FRAME) as u64;
         let wrong_at = |first: usize| -> Option<(u64, u64)> {
             let (mut wrong, mut paired) = (0u64, 0u64);
             for (index, etas) in decisions {
                 for (position, &eta) in etas.iter().enumerate() {
-                    let Some(&sent) = sent.get(first + *index as usize * 4 + position) else {
+                    let symbol = first + *index as usize * 4 + position;
+                    if sent.get(symbol).is_none() {
                         continue;
-                    };
+                    }
                     paired += 1;
-                    if eta != sent {
+                    if class_of(eta, symbol) != sent_class[symbol] {
                         wrong += 1;
                     }
                 }
@@ -4313,17 +4398,27 @@ impl B1uBins {
         for (index, etas) in decisions {
             for (position, &eta) in etas.iter().enumerate() {
                 let symbol = first + *index as usize * 4 + position;
-                let Some(&sent) = sent.get(symbol) else {
+                let Some(&sent_eta) = sent.get(symbol) else {
                     bins.unpaired += 1;
                     continue;
                 };
-                let chord = chord_of(sent);
+                let (chord, missing) = chord_of(sent_eta);
+                if missing {
+                    bins.chord_fallback += 1;
+                }
                 bins.sent[chord] += 1;
                 bins.total += 1;
-                if eta != sent {
+                bins.count_delta(eta - sent_eta);
+                if eta.abs() > bins.max_abs_decided {
+                    bins.max_abs_decided = eta.abs();
+                }
+                if !constellation.holds(eta) {
+                    bins.decided_out_of_set += 1;
+                }
+                if class_of(eta, symbol) != sent_class[symbol] {
                     bins.wrong[chord] += 1;
                     bins.total_wrong += 1;
-                    if (eta - sent).abs() == 1 {
+                    if (eta - sent_eta).abs() == 1 {
                         bins.adjacent += 1;
                     }
                 }
@@ -4340,6 +4435,12 @@ impl B1uBins {
         // could not see this, because a displacement keeps every index in
         // range and pairs every symbol -- which is how a call whose payload was
         // bit-perfect reported `unpaired=0` beside `bin=87.50%`.
+        //
+        // `docs/285` sec 6 leaves this in the *same* representation as the
+        // number it guards: a displacement changes the interval and the trellis
+        // position of every pair, so a class comparison is compared against the
+        // class comparison a shift produces. `TRUST_MARGIN` and its verdict are
+        // untouched.
         bins.nearest_rival = u64::MAX;
         for shift in 1..crate::v92::UP_INTERVALS {
             for displaced in [first.checked_sub(shift), Some(first + shift)] {
@@ -4349,6 +4450,7 @@ impl B1uBins {
                 }
             }
         }
+
         bins
     }
 
@@ -4376,6 +4478,18 @@ impl B1uBins {
     /// decisions.
     const TRUST_MARGIN: u64 = 4;
 
+    /// How wide the `eta - sent` table is either side of zero.
+    const DELTA_MID: i32 = 16;
+
+    /// One numeric index difference into the fixed table.
+    fn count_delta(&mut self, delta: i32) {
+        if delta.abs() > Self::DELTA_MID {
+            self.delta_far += 1;
+        } else {
+            self.delta[(delta + Self::DELTA_MID) as usize] += 1;
+        }
+    }
+
     /// The population-weighted bin error rate, as a fraction.
     fn weighted(&self) -> f64 {
         if self.total == 0 {
@@ -4392,6 +4506,44 @@ impl B1uBins {
         sum
     }
 
+    /// What the comparison was handed, in the one number that says whether the
+    /// instrument is reading a population or a table: the `eta - sent`
+    /// histogram, then the set the chords are read off and the fallbacks in it.
+    ///
+    /// `docs/285` sec 6. Two wrong numbers with a delta of `+-Mi` are two
+    /// members of one class; a delta that is a constant offset per position is
+    /// a convention; a delta of one is a read error. Without this line the log
+    /// says a rate and never says which of the three it is looking at.
+    fn spread(&self, drn: u8) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut parts = Vec::new();
+        for (offset, &count) in self.delta.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            parts.push(format!("{:+}: {count}", offset as i32 - Self::DELTA_MID));
+        }
+        if self.delta_far != 0 {
+            parts.push(format!("|d| > {}: {}", Self::DELTA_MID, self.delta_far));
+        }
+        if parts.is_empty() {
+            parts.push("none".to_owned());
+        }
+        out.push(format!("V.92: BIN drn={drn} delta decided-sent: {}", parts.join(", ")));
+        out.push(format!(
+            "V.92: BIN drn={drn} set[0] {} points (indices -{} ..= {}), |eta| max sent {} decided {}, \
+             chord unwrap_or fallbacks {}, decided outside the set {}",
+            self.set_points,
+            self.set_points,
+            self.set_points as i32 - 1,
+            self.max_abs_sent,
+            self.max_abs_decided,
+            self.chord_fallback,
+            self.decided_out_of_set,
+        ));
+        out
+    }
+
     /// The one line a call carries: the population, both rates, the adjacent
     /// share, and the per-chord table behind the weighted number.
     fn lines(&self, drn: u8) -> Vec<String> {
@@ -4404,7 +4556,7 @@ impl B1uBins {
         };
         out.push(format!(
             "V.92: BIN drn={drn} symbols={} bin={pct:.2}% adj={adjacent} unpaired={} \
-             (decided index against 8.7.1's sent index, population-weighted over the \u{b5}-law chords)",
+             (decided 6.4.2 class against 8.7.1's sent class, population-weighted over the \u{b5}-law chords)",
             self.total, self.unpaired
         ));
         for chord in (0..8).rev() {
@@ -4419,6 +4571,7 @@ impl B1uBins {
                 self.wrong[chord],
             ));
         }
+        out.extend(self.spread(drn));
         out
     }
 }
@@ -9643,6 +9796,121 @@ mod tests {
                 bins.weighted()
             );
         }
+    }
+
+    /// An alias must score zero: a stream that is numerically different and
+    /// physically the same is not an error, and one that is physically
+    /// different still is.
+    ///
+    /// `docs/285` sec 6, and it is the test that separates this ticket from
+    /// `docs/285` sec 2's. That reproduction fed the pairing **our own
+    /// encoder's etas**, so `eta == sent` held by construction and only a
+    /// displacement could make it fail -- it was structurally blind to a
+    /// quantity mismatch, which is why 0.860 came out of it and why the live
+    /// 0.875 looked explained. This one carries the mismatch in: 6.4.2 gives
+    /// the precoder an equivalence class and lets it pick the member
+    /// (v92.txt:449-459), at `drn 1` every `Mi` is 8 over `LC = 8` points, so
+    /// each class at k = 0, 1, 2 has exactly two members in `-8 ..= 7` and they
+    /// differ by 8. The alias stream is the *other* member, symbol for symbol;
+    /// it is numerically different on three symbols in four and carries the
+    /// same `Ki`, hence the same bits. Zero class errors is the assertion, and
+    /// the negative control -- the same stream moved one class along -- has to
+    /// score wrong on the last symbol, or the first half is only re-asserting
+    /// the perfect-input test.
+    #[test]
+    fn a_class_alias_scores_zero_and_a_wrong_class_does_not() {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let mut encoder = UpEncoder::new(&parameters).expect("drn 1's parameters encode");
+        let sent = encoder.b1u();
+        let points = parameters.sets[0].len() as i32;
+        assert_eq!(points, 8, "drn 1's LC, so 6.4.2's range is -8 ..= 7");
+        let decisions: Vec<(u64, [i32; 4])> = (0..50u64)
+            .map(|frame| {
+                let mut etas = [0i32; 4];
+                for (position, eta) in etas.iter_mut().enumerate() {
+                    *eta = sent[skip + 1 + frame as usize * 4 + position].eta;
+                }
+                (frame, etas)
+            })
+            .collect();
+        let symbol_of = |frame: u64, position: usize| skip + 1 + frame as usize * 4 + position;
+        // The other member of each class. At k = 3 the class steps by `2Mi` and
+        // the set is one step wide, so it holds a single member and there is no
+        // alias to express there -- which is what makes the three-in-four
+        // count below a fact about 6.4.2 and not an assumption.
+        let alias_of = |symbol: usize, eta: i32| -> i32 {
+            let k = symbol % crate::v92::TRELLIS_FRAME;
+            let modulus = i32::from(parameters.modulus(symbol % crate::v92::UP_INTERVALS));
+            if k == crate::v92::TRELLIS_FRAME - 1 {
+                eta
+            } else if eta - modulus >= -points {
+                eta - modulus
+            } else {
+                eta + modulus
+            }
+        };
+        let aliased: Vec<(u64, [i32; 4])> = decisions
+            .iter()
+            .map(|(frame, etas)| {
+                let mut out = [0i32; 4];
+                for (position, eta) in out.iter_mut().enumerate() {
+                    *eta = alias_of(symbol_of(*frame, position), etas[position]);
+                }
+                (*frame, out)
+            })
+            .collect();
+        let numeric_wrong = aliased
+            .iter()
+            .flat_map(|(frame, etas)| {
+                etas.iter()
+                    .enumerate()
+                    .map(move |(position, &eta)| (symbol_of(*frame, position), eta))
+            })
+            .filter(|&(symbol, eta)| eta != sent[symbol].eta)
+            .count();
+        let physical = B1uBins::measure(&parameters, &decisions, skip + 1, true);
+        assert_eq!(physical.total_wrong, 0, "the unaliased stream is perfect");
+        assert_eq!(physical.weighted(), 0.0);
+        assert!(physical.trusted(), "and its origin is decisively better than any displaced one");
+        let alias = B1uBins::measure(&parameters, &aliased, skip + 1, true);
+        assert_eq!(alias.unpaired, 0, "every aliased symbol found its partner");
+        assert_eq!(alias.total, physical.total, "the same population");
+        assert!(
+            numeric_wrong * 4 >= alias.total as usize * 3,
+            "the alias stream is numerically different on three symbols in four: {numeric_wrong} of {}",
+            alias.total
+        );
+        assert_eq!(
+            alias.total_wrong, 0,
+            "an alias is not an error: {} of {} numerically different, deltas {:?}",
+            numeric_wrong, alias.total, alias.spread(parameters.drn)
+        );
+        assert_eq!(alias.weighted(), 0.0, "and it reads a rate of zero");
+        // The negative control: one class along, on every symbol. At k = 3 the
+        // class halves `eta`, so the step that moves a class there is two and
+        // one everywhere else.
+        let wrong_class: Vec<(u64, [i32; 4])> = decisions
+            .iter()
+            .map(|(frame, etas)| {
+                let mut out = [0i32; 4];
+                for (position, eta) in out.iter_mut().enumerate() {
+                    let symbol = symbol_of(*frame, position);
+                    let step = if symbol % crate::v92::TRELLIS_FRAME == crate::v92::TRELLIS_FRAME - 1 { 2 } else { 1 };
+                    let sent_eta = etas[position];
+                    *eta = if sent_eta + step <= points - 1 { sent_eta + step } else { sent_eta - step };
+                }
+                (*frame, out)
+            })
+            .collect();
+        let wrong = B1uBins::measure(&parameters, &wrong_class, skip + 1, true);
+        assert_eq!(wrong.unpaired, 0);
+        assert_eq!(
+            wrong.total_wrong, wrong.total,
+            "a different class is a wrong symbol on every symbol: {:?}",
+            wrong.spread(parameters.drn)
+        );
+        assert!(!wrong.trusted(), "and it is refused rather than published");
     }
 
     /// The reading of the boundary at `back`, and the gate it is held to.
