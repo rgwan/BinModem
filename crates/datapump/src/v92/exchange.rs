@@ -253,6 +253,9 @@ pub struct Exchange {
     /// CP, so that it lands when the peer's own transmit chain is parked.
     /// See [`CPD_WAITS_FOR_PARKED_TX`].
     hold_cp_for_parked_tx: bool,
+    /// Whether the CPd also waits for the peer's CPu before going out. See
+    /// [`CPD_WAITS_FOR_PARKED_TX`].
+    wait_for_peer_cp: bool,
 }
 
 /// Whether the `CPd` waits one repeat window after the far end's `CPu`.
@@ -277,6 +280,11 @@ pub struct Exchange {
 /// with `0x96216`. One window is several sequence times and is already the
 /// bound this machine keeps for "wait for my CPu".
 pub const CPD_WAITS_FOR_PARKED_TX: bool = true;
+
+/// How long the `CPd` waits for the peer's `CPu` before going out unacknowledged:
+/// its own `CPu` repeat period (`+0x5d2d0` arms `0x3e80` = 16 000 samples) plus
+/// one window.
+pub const PEER_CP_WAIT_SAMPLES: u64 = 16_800;
 
 impl Exchange {
     /// A fresh exchange in `context`, with `round_trip` in seconds and `fs`
@@ -306,6 +314,7 @@ impl Exchange {
             finished: false,
             peer_cp_at: None,
             hold_cp_for_parked_tx: false,
+            wait_for_peer_cp: false,
         }
     }
 
@@ -343,6 +352,7 @@ impl Exchange {
     pub fn peer_cp(&mut self, cp: PeerCp, at: u64) {
         self.got_peer_cp = true;
         self.peer_cp_at = Some(at);
+        self.hold_until = None;
         self.heard(cp.ack, at);
     }
 
@@ -389,6 +399,15 @@ impl Exchange {
     /// exists to fit: see [`CPD_WAITS_FOR_PARKED_TX`].
     pub fn hold_cp_for_parked_tx(&mut self) {
         self.hold_cp_for_parked_tx = CPD_WAITS_FOR_PARKED_TX;
+    }
+
+    /// Hold the one CP until the peer's CP has been decoded, bounded by
+    /// [`PEER_CP_WAIT_SAMPLES`]. Armed only for a far end this call has
+    /// already heard send a CP: a `CPd` that acknowledges a CP it has not
+    /// received carries bit 33 clear, which is half of what makes a `CPd`
+    /// land badly.
+    pub fn wait_for_peer_cp(&mut self, on: bool) {
+        self.wait_for_peer_cp = on;
     }
 
     /// Put SUVs between the CPs of a repeat group, `gap` symbols apart.
@@ -445,12 +464,27 @@ impl Exchange {
         // arrives inside the far end's own sequence is acknowledged into a
         // record that far end never sends (`.text+0x5d46d` skips its
         // `SendSequence` when `+0x1168c` is mid-chain).
-        if self.hold_cp_for_parked_tx
-            && (self.need_single_cp || self.repeat_cp)
-            && let Some(at) = self.peer_cp_at
-            && now < at.saturating_add(self.window)
-        {
-            return false;
+        if self.hold_cp_for_parked_tx && (self.need_single_cp || self.repeat_cp) {
+            match self.peer_cp_at {
+                // Its CP is in: one window, so its own transmit chain is
+                // parked when our CPd lands.
+                Some(at) if now < at.saturating_add(self.window) => return false,
+                Some(_) => {}
+                // Its CP is not in: the CPd is what acknowledges that CP, so
+                // one released before it has been decoded carries bit 33
+                // clear *and* lands inside the sequence it is answering --
+                // both of which the measurement shows. Wait for it, bounded
+                // by its own CPu repeat period (`+0x5d2d0` arms 0x3e80 =
+                // 16 000 samples) plus one window, so a far end that never
+                // sends one is not waited on for ever.
+                None if self.wait_for_peer_cp => {
+                    let bound = *self.hold_until.get_or_insert(now.saturating_add(PEER_CP_WAIT_SAMPLES));
+                    if now <= bound {
+                        return false;
+                    }
+                }
+                None => {}
+            }
         }
         if self.repeat_cp {
             // A CPd every `REPEAT_CP_GAP` symbols rather than back to back.
@@ -1271,6 +1305,7 @@ mod tests {
     fn nine_six_one_one_two_holds_the_cpd_until_the_far_ends_chain_is_parked() {
         let mut exchange = Exchange::new(Context::Renegotiation, 0.0, FS);
         exchange.hold_cp_for_parked_tx();
+        exchange.wait_for_peer_cp(true);
         exchange.repeat_between_suvs(0);
         let window = exchange.window();
         exchange.peer_suv(PeerSuv::default(), 0);
@@ -1279,6 +1314,13 @@ mod tests {
         // Its CPu arrives, so the one CPd we owe carries bit 33 from here on --
         // but it does not chase the CPu. A CPd in the next window is answered
         // off the line.
+        // Its CPu has not been decoded yet, so no CPd goes out: a CPd released
+        // before its CP carries bit 33 clear and lands inside the sequence it
+        // is answering, which is the 18 ms case. Bounded by
+        // [`PEER_CP_WAIT_SAMPLES`] so a far end that never sends one is not
+        // waited on for ever.
+        assert_eq!(exchange.next_sequence(24), SequenceKind::Suv);
+        assert_eq!(exchange.next_sequence(PEER_CP_WAIT_SAMPLES), SequenceKind::Suv);
         exchange.peer_cp(PeerCp::default(), 100);
         assert!(exchange.got_peer_cp());
         assert_eq!(exchange.next_sequence(124), SequenceKind::Suv);

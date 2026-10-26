@@ -6378,7 +6378,12 @@ impl Modem {
         // owns 9.6.1.1.2's exchange.
         self.source.bound_trn2d(TRN2D_MOST);
         self.source.change(Out::Rd);
-        let (tail, exchange) = RenegTail::new(self.settings.round_trip, FS);
+        let (tail, mut exchange) = RenegTail::new(self.settings.round_trip, FS);
+        // A far end this call has already heard send a CPu sends another; the
+        // CPd waits for it, so that it carries bit 33 and lands one window
+        // after the CP it answers rather than inside it
+        // (`CPD_WAITS_FOR_PARKED_TX`).
+        exchange.wait_for_peer_cp(self.cpu.is_some());
         self.reneg = Some(tail);
         // The exchange 9.6.1.1.2 is entered from, and the one the far end's
         // SUVu is reported to while the tail runs.
@@ -6456,7 +6461,12 @@ impl Modem {
         // name asks for; the A/B is measured and recorded, not pending.
         self.source.ri_opener();
         self.source.bound_trn2d(TRN2D_MOST);
-        let (tail, exchange) = RenegTail::new(self.settings.round_trip, FS);
+        let (tail, mut exchange) = RenegTail::new(self.settings.round_trip, FS);
+        // A far end this call has already heard send a CPu sends another; the
+        // CPd waits for it, so that it carries bit 33 and lands one window
+        // after the CP it answers rather than inside it
+        // (`CPD_WAITS_FOR_PARKED_TX`).
+        exchange.wait_for_peer_cp(self.cpu.is_some());
         self.reneg = Some(tail);
         self.exchange = Some(exchange);
         // 9.8.1.1.2's 16008T is 9.8's ceiling and not 9.6.1.1.1's 2040T floor:
