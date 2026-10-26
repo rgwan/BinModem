@@ -80,8 +80,8 @@
 //!
 //! Both ends run a convolutional code over the 4D symbol -- 6.4.4 for V.92's
 //! own encoder ("the convolutional encoders from ITU-T V.34 shall be used ...
-//! except that the 2T delays are replaced by 4T delays", v92.txt:479-482),
-//! 6.4.3 for the `2 y(k) + 1` index domain it runs in (v92.txt:470-477), and
+//! except that the 2T delays are replaced by 4T delays", v92.txt:478-482),
+//! 6.4.3 for the `2 y(k) + 1` index domain it runs in (v92.txt:470-474), and
 //! Table 30 bits 27:28 for the digital receiver's requirement on the far end
 //! (v92.txt:1810-1814). **This note used to cite "(6.5)", and V.92 has no
 //! clause 6.5**: the text goes from 6.4.4 straight to "7 Interchange circuits"
