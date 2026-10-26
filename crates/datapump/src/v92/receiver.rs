@@ -167,6 +167,40 @@ pub const HISTORY: usize = 8192;
 /// -19 dB at ninety-six: the length was not what was missing.
 pub const TRAIN_TAPS: usize = 48;
 
+/// How much of the feed-forward window sits *ahead* of the symbol it decides.
+///
+/// **This is the one structural change `docs/112 §3` says closes 46 % of
+/// σ_ch.** A causal window decides symbol `n` from samples at or before `n`,
+/// and the far end's pulse for that symbol still has energy ahead of `n`:
+/// refitted on the data mode's own symbols, a causal 48 + 16 DFE leaves 18.2
+/// LSB out of sample and a *centred* 96 + 16 leaves 0.9 (docs/112 §3). The
+/// information that pins symbol `n` is not all in the samples before it.
+///
+/// The window is kept symmetric -- half ahead, half behind -- so the tap
+/// geometry of the fit does not change, only which sample is called "now",
+/// and the alignment search inside `fit_at` still finds the far end's delay.
+/// Two consequences the rest of this file depends on:
+///
+/// * the fit solves `x[n] = sum(i) tap[i] * r[n + ahead - i]`, so its row range
+///   loses `ahead` samples at the top (`fit_at`), and the decision feedback is
+///   seeded `ahead` symbols further back;
+/// * the receiver's decision is for symbol `n = now - ahead`, so the symbol
+///   stream handed downstream is `ahead` symbols later than the line's. That
+///   latency is why the centred length is chosen a whole number of twelve:
+///   the upstream data frame is twelve symbols and the trellis phase is four,
+///   so a `ahead` that is a multiple of both leaves the frame phase alone, and
+///   the B1u acquisition skip in `digital.rs` is a symbol *count*.
+pub const fn ff_ahead(forward: usize) -> usize {
+    forward / 2
+}
+
+/// The window a pair of sections was fitted with: [`ff_ahead`] of the forward
+/// length where there is a feedback section, and a causal window where there is
+/// not (see `fit_at`).
+fn ahead_of(forward: &[f64], feedback: &[f64]) -> usize {
+    if feedback.is_empty() { 0 } else { ff_ahead(forward.len()) }
+}
+
 /// Symbols of the line a Phase 4 fit looks the sequence up with.
 pub const PROBE: usize = 512;
 
@@ -204,9 +238,19 @@ const DESIGN_SLIPS: usize = 4;
 /// far out as `train_near`'s own search can put it.
 const DESIGN_SEARCH: u64 = TRAIN_TAPS as u64;
 
-/// The feed-forward length of the Phase 4 fit, which is shorter than
-/// [`TRAIN_TAPS`] because the decisions take the rest: see [`DFE_FEEDBACK`].
-pub const DFE_FORWARD: usize = 48;
+/// The feed-forward length of the Phase 4 fit.
+///
+/// Ninety-six, centred by [`ff_ahead`]: forty-eight samples behind the decided
+/// symbol and forty-eight ahead of it. `docs/112 §3` refits the same twenty
+/// captures structure by structure on B1u's own symbols and the window is what
+/// carries the answer -- 48 causal + 16 DFE leaves 18.2 LSB out of sample,
+/// 96 centred + 16 DFE leaves 0.9, and a 96 *causal* window is 19.0, i.e. no
+/// better than 48. Nothing about the length changed the fit; the future did.
+///
+/// The extra latency this costs, `ff_ahead(96) = 48` symbols, is a whole
+/// number of twelve-symbol upstream frames, so the frame phase, the trellis
+/// phase and the B1u acquisition skip downstream are unmoved.
+pub const DFE_FORWARD: usize = 96;
 
 /// Feedback taps: how many past decisions the equaliser cancels on its own.
 ///
@@ -961,6 +1005,12 @@ pub struct Receiver {
     /// Training: the feed-forward and feedback sections of the decision
     /// feedback equaliser the fit designed.
     forward: Vec<f64>,
+    /// Samples of the feed-forward window that sit *ahead* of the symbol the
+    /// equaliser is deciding: [`ff_ahead`] of the installed length, or zero for
+    /// the causal linear fit Phase 3 is read with. It is a property of the fit
+    /// that installed the taps, so it is stored with them rather than guessed
+    /// from the length at every symbol.
+    ahead: usize,
     feedback: Vec<f64>,
     /// The levels the last few symbols were decided to, newest at the back:
     /// what the feedback section subtracts, and therefore what makes the eye
@@ -1036,6 +1086,7 @@ impl Receiver {
             phase_four: None,
             design_forward: Vec::new(),
             forward: Vec::new(),
+            ahead: 0,
             feedback: Vec::new(),
             decided: VecDeque::with_capacity(DFE_FEEDBACK + 1),
             inner: 0.0,
@@ -1289,15 +1340,16 @@ impl Receiver {
         at: usize,
         two_point: bool,
     ) -> (f64, f64, f64, f64) {
-        let rows = forward.len().saturating_sub(1);
-        let span = reference.len();
+        let ahead = ahead_of(forward, feedback);
+        let rows = forward.len().saturating_sub(1 + ahead);
+        let span = reference.len().saturating_sub(ahead);
         let (mut signal, mut noise, mut l1, mut scale, mut wrong, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let mut margin = f64::INFINITY;
         let four = four_point_levels();
         for n in rows..span {
             let mut model = 0.0;
             for (k, &tap) in forward.iter().enumerate() {
-                model += tap * self.history[at + n - k];
+                model += tap * self.history[at + n + ahead - k];
             }
             for (j, &tap) in feedback.iter().enumerate() {
                 if j + 1 > n {
@@ -2189,11 +2241,20 @@ impl Receiver {
         if span <= rows.max(1) + feedback.len() {
             return None;
         }
+        // The window those taps were fitted on, which is not the causal one
+        // wherever the section has a feedback part: see [`ff_ahead`]. Scoring a
+        // centred tap set as if it were causal scores it as noise, and the
+        // refit's accept test is exactly a comparison of two of these.
+        let ahead = ahead_of(forward, feedback);
+        let stop = span.saturating_sub(ahead);
+        if stop <= rows {
+            return None;
+        }
         let (mut signal, mut noise) = (0.0, 0.0);
-        for n in rows..span {
+        for n in rows..stop {
             let mut model = 0.0;
             for (k, &tap) in forward.iter().enumerate() {
-                model += tap * self.history[at + n - k];
+                model += tap * self.history[at + n + ahead - k];
             }
             for (j, &tap) in feedback.iter().enumerate() {
                 if j + 1 > n {
@@ -2205,7 +2266,7 @@ impl Receiver {
             noise += error * error;
             signal += reference[n] * reference[n];
         }
-        let count = (span - rows).max(1) as f64;
+        let count = (stop - rows).max(1) as f64;
         let (signal, noise) = (signal / count, noise / count);
         Some(if noise > 0.0 { 10.0 * (signal / noise).log10() } else { f64::INFINITY })
     }
@@ -2279,6 +2340,7 @@ impl Receiver {
     pub fn restore(&mut self, fitted: &Fitted) {
         self.forward.clone_from(&fitted.forward);
         self.feedback.clone_from(&fitted.feedback);
+        self.ahead = ahead_of(&fitted.forward, &fitted.feedback);
         self.decided.clear();
         self.snr_db = fitted.snr_db;
         self.trained = fitted.trained;
@@ -2576,10 +2638,11 @@ impl Receiver {
         let power: f64 = self.history.iter().rev().take(width).map(|&x| x * x).sum::<f64>() / width as f64;
         if !(power > AUDIBLE) {
             self.decided.clear();
-            let index = self.origin.map_or(self.count, |origin| self.count.saturating_sub(origin));
+            let instant = self.count.saturating_sub(self.ahead as u64);
+            let index = self.origin.map_or(instant, |origin| instant.saturating_sub(origin));
             self.events.push_back(Heard::Symbol(Symbol {
                 index,
-                raw: self.count,
+                raw: instant,
                 value: 0.0,
                 decided: None,
                 line: level,
@@ -2587,6 +2650,12 @@ impl Receiver {
             }));
             return;
         }
+        // Centred feed-forward: the tap that multiplies the newest sample is
+        // the one the fit gave lag `ahead`, so the symbol this value decides
+        // is the one `ahead` samples back -- the samples ahead of it are the
+        // point. See [`ff_ahead`], and `fit_at`'s row range, which uses the
+        // same number.
+        let ahead = self.ahead;
         let mut value = 0.0;
         for (k, &tap) in self.forward.iter().enumerate() {
             value += tap * self.history[len - 1 - k];
@@ -2647,7 +2716,10 @@ impl Receiver {
                 );
             }
         }
-        let index = self.origin.map_or(self.count, |origin| self.count.saturating_sub(origin));
+        // The instant this symbol *is*, not the instant its last sample
+        // arrived: `ahead` samples of the feed-forward window are ahead of it.
+        let instant = self.count.saturating_sub(ahead as u64);
+        let index = self.origin.map_or(instant, |origin| instant.saturating_sub(origin));
         let chosen = self.slicer.decide(shown);
         let span = self.slicer.half_span();
         if let Some((_, error)) = chosen {
@@ -2687,7 +2759,7 @@ impl Receiver {
         self.track(value, chosen.map(|(level, _)| level));
         self.events.push_back(Heard::Symbol(Symbol {
             index,
-            raw: self.count,
+            raw: instant,
             value: shown,
             decided: chosen.map(|(level, _)| level),
             line: level,
@@ -2981,11 +3053,12 @@ impl Receiver {
         }
         let _ = writeln!(file);
         let _ = writeln!(file, "# n reference model error");
-        for n in self.forward.len() - 1..reference.len() {
+        let ahead = self.ahead;
+        for n in self.forward.len().saturating_sub(1 + ahead)..reference.len().saturating_sub(ahead) {
             let mut model = 0.0;
             for (k, &tap) in self.forward.iter().enumerate() {
                 if from + n >= k {
-                    model += tap * self.history[from + n - k];
+                    model += tap * self.history[from + n + ahead - k];
                 }
             }
             for (j, &tap) in self.feedback.iter().enumerate() {
@@ -3503,7 +3576,7 @@ impl Receiver {
             Some(levels) if levels.len() >= at_skip + span => Some(levels[at_skip..at_skip + span].to_vec()),
             _ => reference_from(at_skip, span, self.reference_mode),
         };
-        let Some(reference) = reference else { return false };
+        let Some(reference) = reference else { if std::env::var_os("V92_FIT_DEBUG").is_some() { eprintln!("FITDBG no reference from {from} span {span} skip {at_skip}"); } return false; };
         let received: Vec<f64> = self.history.iter().copied().collect();
         if received.len() < from + reference.len() {
             return false;
@@ -3530,6 +3603,18 @@ impl Receiver {
         }
         let forward = forward.min(reference.len() / 8).max(1);
         let feedback = feedback.min(reference.len() / 16);
+        // The window is centred: see [`ff_ahead`]. `ahead` samples of the
+        // line *after* the symbol are the point of the whole structure, so
+        // the equations lose that many at the top of the window and the
+        // feedback section is seeded that much further back.
+        //
+        // Only where there *is* a feedback section. Phase 3 is read with the
+        // causal linear fit it has always been read with: a window that
+        // decides twenty-four symbols late is a receiver that misses Ja, and
+        // that is measured rather than argued (`docs/149`: the first cut of
+        // this change that centred every fit read "no Ja within 4.5 s" on
+        // every one of the twenty captures).
+        let ahead = if feedback > 0 { ff_ahead(forward) } else { 0 };
         let taps = forward + feedback;
         // The filter this solves for is the equaliser, not the channel: what
         // goes in is what the line brought and what comes out is the known
@@ -3547,7 +3632,12 @@ impl Receiver {
         // the feed-forward part carries what the line did before the decision
         // could be taken, the feedback part the post-cursor after it.
         let length = reference.len();
-        let rows = forward - 1;
+        let rows = forward.saturating_sub(1 + ahead);
+        let stop = length.saturating_sub(ahead);
+        if stop <= rows {
+            if std::env::var_os("V92_FIT_DEBUG").is_some() { eprintln!("FITDBG stop {stop} rows {rows} ahead {ahead} forward {forward} length {length}"); }
+            return false;
+        }
         // The normal equations, one row and column at a time: the first
         // `forward` unknowns are the line's own samples, the last `feedback`
         // are the symbols already decided. Both halves are symmetric, so each
@@ -3560,8 +3650,8 @@ impl Receiver {
         for i in 0..forward {
             for j in 0..=i {
                 let mut sum = 0.0;
-                for n in rows..length {
-                    sum += received[from + n - i] * received[from + n - j];
+                for n in rows..stop {
+                    sum += received[from + n + ahead - i] * received[from + n + ahead - j];
                 }
                 a[i * taps + j] = Complex::new(sum, 0.0);
                 a[j * taps + i] = Complex::new(sum, 0.0);
@@ -3570,29 +3660,29 @@ impl Receiver {
             // side, which is the same sequence of products either way.
             for j in 0..feedback {
                 let mut sum = 0.0;
-                for n in rows..length {
-                    sum += received[from + n - i] * reference[n - 1 - j];
+                for n in rows..stop {
+                    sum += received[from + n + ahead - i] * reference[n - 1 - j];
                 }
                 a[i * taps + forward + j] = Complex::new(sum, 0.0);
                 a[(forward + j) * taps + i] = Complex::new(sum, 0.0);
             }
             let mut sum = 0.0;
-            for n in rows..length {
-                sum += received[from + n - i] * reference[n];
+            for n in rows..stop {
+                sum += received[from + n + ahead - i] * reference[n];
             }
             b[i] = Complex::new(sum, 0.0);
         }
         for i in 0..feedback {
             for j in 0..=i {
                 let mut sum = 0.0;
-                for n in rows..length {
+                for n in rows..stop {
                     sum += reference[n - 1 - i] * reference[n - 1 - j];
                 }
                 a[(forward + i) * taps + forward + j] = Complex::new(sum, 0.0);
                 a[(forward + j) * taps + forward + i] = Complex::new(sum, 0.0);
             }
             let mut sum = 0.0;
-            for n in rows..length {
+            for n in rows..stop {
                 sum += reference[n - 1 - i] * reference[n];
             }
             b[forward + i] = Complex::new(sum, 0.0);
@@ -3632,18 +3722,20 @@ impl Receiver {
             }
         }
         let Some(solved) = solved else {
+            if std::env::var_os("V92_FIT_DEBUG").is_some() { eprintln!("FITDBG no solve forward {forward} feedback {feedback} rows {rows} stop {stop} length {length}"); }
             return false;
         };
         let solved: Vec<f64> = solved.iter().map(|value| value.re).collect();
         self.forward = solved[..forward].to_vec();
         self.feedback = solved[forward..].to_vec();
+        self.ahead = ahead_of(&self.forward, &self.feedback);
 
         // The section starts where the training left it rather than at zero:
         // the symbols it would be fed next are the ones just fitted against.
         self.decided.clear();
         for j in (1..=feedback).rev() {
-            if length > rows + j {
-                self.decided.push_back(reference[length - j]);
+            if stop > rows + j {
+                self.decided.push_back(reference[stop - j]);
             }
         }
         // What the fit leaves is the noise it was made in, measured where the
@@ -3651,10 +3743,10 @@ impl Receiver {
         // be producing.
         let mut signal = 0.0;
         let mut noise = 0.0;
-        for n in rows..length {
+        for n in rows..stop {
             let mut model = 0.0;
             for (k, &tap) in self.forward.iter().enumerate() {
-                model += tap * received[from + n - k];
+                model += tap * received[from + n + ahead - k];
             }
             for (j, &tap) in self.feedback.iter().enumerate() {
                 model += tap * reference[n - 1 - j];
@@ -3663,7 +3755,7 @@ impl Receiver {
             noise += error * error;
             signal += reference[n] * reference[n];
         }
-        let count = length.saturating_sub(rows).max(1) as f64;
+        let count = stop.saturating_sub(rows).max(1) as f64;
         let signal = signal / count;
         let noise = noise / count;
         self.snr_db = if noise > 0.0 { 10.0 * (signal / noise).log10() } else { f64::INFINITY };
