@@ -213,6 +213,11 @@ struct Settings {
     /// The level our receiver's decoder is fed at, 8.8.3's mean-square-1 point.
     target: f64,
     chords: bool,
+    /// What the slicing table is built at: `one` is the design's own codes (the
+    /// default and what every `docs/250` number used), `auto` is the far end's
+    /// own scale, `lu x G`, which is what a receiver measuring `K` off the CPu
+    /// mask would build (`docs/114` R4, `docs/253`).
+    slice: String,
     receiver: bool,
     /// `--mode sweep`: the error put on one parameter and nothing else.
     err_delay: Option<f64>,
@@ -233,6 +238,7 @@ fn parse() -> Settings {
         lu: 900.0,
         target: 900.0,
         chords: false,
+        slice: "one".to_owned(),
         receiver: false,
         err_delay: None,
         err_level: None,
@@ -261,6 +267,7 @@ fn parse() -> Settings {
             "--err-level" => s.err_level = Some(value().parse().expect("err-level")),
             "--err-tap" => s.err_tap = Some(value().parse().expect("err-tap")),
             "--chords" => s.chords = true,
+            "--slice" => s.slice = value(),
             "--receiver" => s.receiver = true,
             other => panic!("unknown option {other}"),
         }
@@ -293,7 +300,7 @@ fn transmit(
 
 /// The whole upstream stream, in `out` units, plus the ideal TRN1u slice the
 /// estimator is given.
-fn stream(s: &Settings) -> (Parameters, Vec<f64>, Vec<f64>, usize) {
+fn stream(s: &Settings) -> (Parameters, Vec<f64>, Vec<f64>, usize, Vec<i32>) {
     let parameters = parameters(s.drn, Trellis::Sixteen, s.levelset);
     let mut encoder = UpEncoder::new(&parameters).expect("feasible parameters");
     let mut random = Random::new(s.seed);
@@ -306,19 +313,27 @@ fn stream(s: &Settings) -> (Parameters, Vec<f64>, Vec<f64>, usize) {
         ideal_trn.push(symbol);
     }
     let b1u_at = out.len();
+    // The indices B1u was sent with. 6.4.2's y(n) is the number the far end's
+    // decoder has to recover, so it is what a code (bin) error is measured
+    // against -- not the level, which the codec rounds and the tap moves.
+    let mut b1u_etas = Vec::new();
     for symbol in encoder.b1u() {
         out.push(symbol.out);
+        b1u_etas.push(symbol.eta);
     }
     for _ in 0..s.frames * UP_INTERVALS {
         out.push(encoder.next_symbol(|| random.next()).out);
     }
-    (parameters, out, ideal_trn, b1u_at)
+    (parameters, out, ideal_trn, b1u_at, b1u_etas)
 }
 
 /// The B1u count in the bench's own terms: bits decoded, how many of them are
 /// ones, and the class rotation the decoder measured.
-fn b1u(parameters: &Parameters, codewords: &[i32], at: usize, lu: f64) -> (usize, usize, String) {
+fn b1u(parameters: &Parameters, codewords: &[i32], at: usize, lu: f64, k: Option<f64>) -> (usize, usize, String) {
     let mut decoder = Decoder::new(parameters);
+    if let Some(k) = k {
+        decoder.slice_at(k);
+    }
     decoder.measure_rotation_from(0);
     let mut ones = 0;
     let mut bits = 0;
@@ -331,6 +346,127 @@ fn b1u(parameters: &Parameters, codewords: &[i32], at: usize, lu: f64) -> (usize
     }
     let rotation = decoder.rotation_line().unwrap_or("-").to_owned();
     (ones, bits, rotation)
+}
+
+/// The **code (bin) error rate**: the fraction of B1u's symbols whose decided
+/// code differs from the code that was sent, per chord and weighted by each
+/// chord's population (`docs/253` §2).
+///
+/// This is the correction to the instrument, not an addition to it. The
+/// per-chord half-step crossing (`Stats::crossing`) counts a symbol only when it
+/// moves past half of *its chord's own step*, which at 64 points is 8 LSB in
+/// chord 0 and 128 LSB in chord 4 -- one number that is neither the design's gap
+/// nor the thing a slicer decides. `docs/250` §4 is what that costs: the crossing
+/// reads exactly 0.0000 % across a sweep in which `B1u` loses 41 points, because
+/// the decision that fails is the *adjacent bin*, one code step away, and never a
+/// half-step boundary. Both are kept, because they bind at different rungs: the
+/// crossing binds where the noise is a fraction of the step (drn 1 ... 8), the bin
+/// error where the gap has come down to the codec's own step (drn 14 ... 19).
+#[derive(Default, Clone, Copy)]
+struct Bins {
+    /// Per chord: the symbols sent, and the ones decided as another code.
+    sent: [u64; 8],
+    wrong: [u64; 8],
+    total: u64,
+    total_wrong: u64,
+    /// Of the errors, the ones that landed on the adjacent index -- the failure
+    /// mode a bin has and a half-step crossing does not describe.
+    adjacent: u64,
+    /// The scale the table was built at, and whether every decided frame found
+    /// its transmitted indices (a dropped frame would shift the pairing).
+    k: f64,
+    aligned: bool,
+}
+
+impl Bins {
+    /// Slice B1u with `Decoder` and compare each decided index with the one that
+    /// was sent. `k` is the table's scale: `None` leaves the design's own codes.
+    fn measure(
+        parameters: &Parameters,
+        sent_etas: &[i32],
+        codewords: &[i32],
+        at: usize,
+        lu: f64,
+        k: Option<f64>,
+        ladder: &Ladder,
+        law: Law,
+    ) -> Self {
+        let mut bins = Self { k: k.unwrap_or(1.0), aligned: true, ..Self::default() };
+        let mut decoder = Decoder::new(parameters);
+        if let Some(k) = k {
+            decoder.slice_at(k);
+        }
+        decoder.keep_decisions(true);
+        let set = &parameters.sets[0];
+        let chord_of = |eta: i32| -> usize {
+            let index = if eta >= 0 { eta as usize } else { (-eta - 1) as usize };
+            let value = f64::from(set.get(index).copied().unwrap_or(0));
+            let full = value.clamp(0.0, 32767.0).round() as i32;
+            let (code, _) = ucode::nearest(law, full);
+            ((code >> 4) as usize).min(7)
+        };
+        let _ = ladder;
+        for (n, &code) in codewords.iter().skip(at).take(UP_INTERVALS * 48).enumerate() {
+            decoder.feed(f64::from(code) / lu);
+            for (index, etas) in decoder.take_decisions_indexed() {
+                for (position, &eta) in etas.iter().enumerate() {
+                    let symbol = index as usize * 4 + position;
+                    let Some(&sent) = sent_etas.get(symbol) else {
+                        bins.aligned = false;
+                        continue;
+                    };
+                    let _ = n;
+                    let chord = chord_of(sent);
+                    bins.sent[chord] += 1;
+                    bins.total += 1;
+                    if eta != sent {
+                        bins.wrong[chord] += 1;
+                        bins.total_wrong += 1;
+                        if (eta - sent).abs() == 1 {
+                            bins.adjacent += 1;
+                        }
+                    }
+                }
+            }
+        }
+        bins
+    }
+
+    fn pct(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        100.0 * self.total_wrong as f64 / self.total as f64
+    }
+
+    /// The population-weighted bin error rate: each chord's own error rate times
+    /// the share of the symbols it carries, which is the number that is
+    /// comparable across rungs whose chord populations differ.
+    fn weighted(&self) -> f64 {
+        let mut sum = 0.0;
+        for chord in 0..8 {
+            if self.sent[chord] == 0 {
+                continue;
+            }
+            let share = self.sent[chord] as f64 / self.total.max(1) as f64;
+            sum += share * (self.wrong[chord] as f64 / self.sent[chord] as f64);
+        }
+        100.0 * sum
+    }
+
+    fn chord_pct(&self, chord: usize) -> f64 {
+        if self.sent[chord] == 0 {
+            return 0.0;
+        }
+        100.0 * self.wrong[chord] as f64 / self.sent[chord] as f64
+    }
+
+    fn chord_pop(&self, chord: usize) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        100.0 * self.sent[chord] as f64 / self.total as f64
+    }
 }
 
 fn main() {
@@ -369,7 +505,14 @@ fn main() {
             2
         };
 
-        let (parameters, out, ideal_trn, b1u_at) = stream(&Settings { drn, ..s.clone() });
+        let (parameters, out, ideal_trn, b1u_at, b1u_etas) =
+            stream(&Settings { drn, ..s.clone() });
+        // `--lu 0` is 8.8.3's own operating point: the level at which one unit
+        // of `G x v` arrives as one LSB, `1 / G`. Every design point is then a
+        // code value on the line, so the codec's quantiser is the no-op the
+        // code level set exists to make it -- which is the *only* level at
+        // which an "ideal case" is ideal (docs/253 sec 1).
+        let s = if s.lu == 0.0 { Settings { lu: 1.0 / parameters.gain, ..s.clone() } } else { s.clone() };
         let line_lsb: Vec<f64> = out.iter().map(|&v| v * s.lu).collect();
         let _ = &line_lsb;
 
@@ -444,14 +587,31 @@ fn main() {
         let out_rms = (out.iter().map(|v| v * v).sum::<f64>() / out.len() as f64).sqrt();
         let rx: Vec<f64> = codewords.iter().map(|&q| f64::from(q)).collect();
         let stats = Stats::scan(s.law, &ladder, &rx);
-        let (ones, bits, rotation) = b1u(&parameters, &codewords, b1u_at, s.lu);
+        let pct = 0.0;
+        // The far end's own scale: the line carries `G x v` at `level_lsb` LSB,
+        // so the levels arriving are `lu x G` times the design's codes.
+        // `k` is how much more the far end transmits than the receiver assumes
+        // it does: the receiver converts LSB back to `G x v` with the level it
+        // believes (`s.lu`), so a far end on a different level arrives at the
+        // slicer scaled by the ratio. In the ideal case that ratio is one, and
+        // it is `level_lsb` against `lu` in the closed loop -- 1.055 at
+        // `docs/250`'s drn 19 run, which is the LC = 64 alphabet's own
+        // half-gap's worth of scale and more.
+        let k = match s.slice.as_str() {
+            "auto" => Some(used.level_lsb / s.lu),
+            "one" => None,
+            other => Some(other.parse().expect("a scale")),
+        };
+        let (ones, bits, rotation) = b1u(&parameters, &codewords, b1u_at, s.lu, k);
         let pct = if bits > 0 { 100.0 * ones as f64 / bits as f64 } else { 0.0 };
+        let bins = Bins::measure(&parameters, &b1u_etas, &codewords, b1u_at, s.lu, k, &ladder, s.law);
         let crossing = stats.crossing(&ladder, &rx, s.law, gap);
         println!(
             "RUNG drn={drn} rate={} lc={} points={points} gap={gap:.0} leastGap={least} \
              eq=[{:.3},{:+.3},{:+.3}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
              rms={rms:.1} peak={peak:.0} pop1024={pop1024:.1} pop512={pop512:.1} \
-             xing={crossing:.4}% b1u={ones}/{bits}={pct:.1}% rot={rotation}",
+             xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.3} \
+             b1u={ones}/{bits}={pct:.1}% rot={rotation}",
             rung.rate,
             rung.lc,
             used.eq.taps[0],
@@ -462,6 +622,9 @@ fn main() {
             parameters.gain,
             pop1024 = stats.pop(7),
             pop512 = stats.pop(6),
+            bin = bins.pct(),
+            adj = if bins.aligned { bins.adjacent.to_string() } else { "unaligned".to_owned() },
+            kb = bins.k,
         );
         if s.chords {
             for chord in (0..8).rev() {
@@ -470,7 +633,7 @@ fn main() {
                 }
                 println!(
                     "  CHORD drn={drn} chord={chord} step={} k_c={} n={} pop={:.1}% \
-                     rms/half={:.3} support={:.2} half={:.0}",
+                     rms/half={:.3} support={:.2} half={:.0} bin={:.1}% nbin={}",
                     ladder.step[chord],
                     per_chord[chord],
                     stats.rows[chord].n,
@@ -478,6 +641,8 @@ fn main() {
                     stats.rms_half(chord, &ladder),
                     stats.support(chord, &ladder),
                     f64::from(ladder.step[chord]) / 2.0,
+                    bins.chord_pct(chord),
+                    bins.sent[chord],
                 );
             }
         }
