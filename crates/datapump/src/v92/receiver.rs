@@ -557,6 +557,80 @@ fn best_share(window: &[f64], template: &[f64; RU_PERIOD], steps: usize) -> f64 
 }
 
 #[cfg(test)]
+mod local_scale_tests {
+    use super::*;
+
+    /// Two chords' worth of codes, straight out of the codec's table: the
+    /// innermost, where neighbouring codes are 8 LSB apart, and one where they
+    /// are 512. The oracle is the alphabet -- `codegrid::value` -- and nothing
+    /// here measures against a formula of ours.
+    fn pair(high_code: u8, low_code: u8) -> (f64, f64) {
+        let v = |c: u8| f64::from(crate::v92::codegrid::value(c));
+        (v(low_code).min(v(high_code)), v(low_code).max(v(high_code)))
+    }
+
+    /// A sample on a point is on a point; halfway between two points is the
+    /// boundary between *those two*, and reads 1.0 whatever the chord; and the
+    /// half-gap is half of the gap between them. One decision, three numbers,
+    /// all read off the pair US7391816B2 claim 1 calls "the two constellation
+    /// points that are proximate".
+    #[test]
+    fn the_scale_is_taken_from_the_pair_the_sample_fell_between() {
+        for (high_code, low_code) in [(125u8, 126u8), (16, 17)] {
+            let (low, high) = pair(high_code, low_code);
+            let gap = high - low;
+            let slicer = Slicer::Levels(vec![low, high]);
+            let (level, fraction, half) = slicer.decide_local(low).unwrap();
+            assert_eq!(level, low);
+            assert!(fraction < 1e-12, "{fraction}");
+            assert!((half - gap / 2.0).abs() < 1e-9, "{half} against {}", gap / 2.0);
+            let (level, fraction, _) = slicer.decide_local(low + gap / 2.0).unwrap();
+            assert!(level == low || level == high);
+            assert!((fraction - 1.0).abs() < 1e-9, "{fraction}");
+            let (level, fraction, _) = slicer.decide_local(low + gap / 4.0).unwrap();
+            assert_eq!(level, low);
+            assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
+            let (level, fraction, _) = slicer.decide_local(low + 3.0 * gap / 4.0).unwrap();
+            assert_eq!(level, high);
+            assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
+        }
+    }
+
+    /// The point of the local scale, in two assertions: the same fractional
+    /// position in two chords of very different width reads the same, and the
+    /// global half-span -- the number the anchor used before `docs/244` -- reads
+    /// them apart by the ratio of the gaps, which is why a gate written on it
+    /// means a different thing in every chord.
+    #[test]
+    fn the_local_fraction_is_the_same_in_every_chord_and_the_global_one_is_not() {
+        // `codegrid::value` ascends with the code: 16/17 are a chord where
+        // neighbouring codes are 16 LSB apart, 125/126 one where they are 1024.
+        let (inner_low, inner_high) = pair(17, 16);
+        let (outer_low, outer_high) = pair(126, 125);
+        let (inner_gap, outer_gap) = (inner_high - inner_low, outer_high - outer_low);
+        assert!(outer_gap > 10.0 * inner_gap, "{outer_gap} against {inner_gap}");
+        let inner = Slicer::Levels(vec![inner_low, inner_high]);
+        let outer = Slicer::Levels(vec![outer_low, outer_high]);
+        let (_, inner_local, _) = inner.decide_local(inner_low + 0.25 * inner_gap).unwrap();
+        let (_, outer_local, _) = outer.decide_local(outer_low + 0.25 * outer_gap).unwrap();
+        assert!((inner_local - outer_local).abs() < 1e-9, "{inner_local} against {outer_local}");
+        // One set spanning both chords, judged by one global half-span: the
+        // same two samples read 64 times apart (512 / 8), which is the defect.
+        let both = Slicer::Levels(vec![inner_low, inner_high, outer_low, outer_high]);
+        let global = both.half_span();
+        assert!((global - inner_gap / 2.0).abs() < 1e-9, "{global}");
+        let inner_global = (0.25 * inner_gap) / global;
+        let outer_global = (0.25 * outer_gap) / global;
+        assert!(
+            (outer_global / inner_global - outer_gap / inner_gap).abs() < 1e-9,
+            "{} against {}",
+            outer_global / inner_global,
+            outer_gap / inner_gap
+        );
+    }
+}
+
+#[cfg(test)]
 mod reread_tests {
     use super::*;
 
@@ -733,6 +807,62 @@ impl Slicer {
             }
             Self::Levels(levels) => nearest(levels, value),
         }
+    }
+
+    /// The nearer of the two levels `value` sits between, how far it is from
+    /// that level as a fraction of **that pair's** half-gap, and the half-gap
+    /// itself.
+    ///
+    /// This is the art's upstream slicer, and it is not a refinement of
+    /// [`Self::decide`]: it is the same decision with the *local* scale taken
+    /// from the two points it decided between. US7391816B2 claim 1 [quoted]: "a
+    /// constellation mapper circuit to determine **two constellation points
+    /// that are proximate a received symbol**; an index mapper circuit to
+    /// determine a **constellation index** corresponding to the received symbol
+    /// **based on the received symbol and the two constellation points that are
+    /// proximate**". Claim 12 takes the scale from the same pair; US7321618B2
+    /// claim 2 states the arithmetic [quoted]: "linearly interpolating between
+    /// the two possible mu-law levels".
+    ///
+    /// Why the local pair is the definition and not a tuning: on a mu-law
+    /// constellation the distance between neighbouring points is not one number
+    /// (ours spans 8 ... 1024 LSB, `docs/243` sec 1.2), so "how far from the
+    /// nearest point, as a fraction of a step" has no global answer, and a
+    /// receiver that divides by one global half-span reports a different margin
+    /// in every chord. The fraction is only defined against the pair that
+    /// brackets the sample, which is true of every receiver whose alphabet is
+    /// the codec's (`v92.txt` sec 6.4.2 orders the points "in the same order as
+    /// the levels"; Table 23 is a Ucode mask). `docs/244` sec 1 measures it.
+    ///
+    /// The fraction is 0.0 on a point and 1.0 exactly on the boundary between
+    /// the pair, so a caller can ask "inside half the local gap" without knowing
+    /// which chord it is in.
+    fn decide_local(&self, value: f64) -> Option<(f64, f64, f64)> {
+        let Self::Levels(levels) = self else {
+            let (level, error) = self.decide(value)?;
+            let span = self.half_span();
+            let fraction = if span > 0.0 { (error / span).min(1.0) } else { 0.0 };
+            return Some((level, fraction, span));
+        };
+        if levels.len() < 2 || !value.is_finite() {
+            return None;
+        }
+        // The pair that brackets `value`, clamped at the ends: outside the set
+        // the outermost pair is the scale to judge it by, exactly as `decide`
+        // clamps to the outermost level.
+        let mut i = 0usize;
+        while i + 2 < levels.len() && value > levels[i + 1] {
+            i += 1;
+        }
+        let (low, high) = (levels[i], levels[i + 1]);
+        let gap = high - low;
+        if !(gap > 0.0) {
+            return None;
+        }
+        let t = ((value - low) / gap).clamp(0.0, 1.0);
+        let level = if t < 0.5 { low } else { high };
+        // `1 - |2t - 1|`: 0 on a point, 1 on the boundary.
+        Some((level, 1.0 - (2.0f64.mul_add(t, -1.0)).abs(), gap / 2.0))
     }
 
     /// Half the distance between the two closest levels: what an error has to
@@ -2999,14 +3129,20 @@ impl Receiver {
         if *OFF.get_or_init(|| std::env::var("V92_ANCHOR").ok().as_deref() == Some("off")) {
             return;
         }
-        let Some((level, error)) = self.slicer.decide(value * self.gain) else { return };
+        let Some((level, local, _half)) = self.slicer.decide_local(value * self.gain) else {
+            return;
+        };
         if level == 0.0 || value == 0.0 {
             return;
         }
         // Only the decisions worth trusting: half a level step inside the
         // boundary, which is where a symbol that the line actually carried
-        // lands.
-        if error > 0.5 * self.slicer.half_span() {
+        // lands. The step is the *local* one -- the gap between the two points
+        // the sample fell between (US7391816B2 claim 12) -- so an inner chord,
+        // whose points are 8 LSB apart, is judged on 4 LSB and an outer one on
+        // 256, which is the only reading that means the same thing in both
+        // (`docs/244` sec 3).
+        if local > 0.5 {
             return;
         }
         self.level_by_line = 0.999f64.mul_add(self.level_by_line, level * value);
