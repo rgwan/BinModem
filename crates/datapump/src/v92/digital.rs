@@ -1126,6 +1126,13 @@ fn b1u_decoders(parameters: &Parameters, skip: usize) -> (Decoder, Decoder) {
     // polarity turns out inverted therefore keeps the constant -- which is the
     // behaviour it had.
     straight.measure_rotation_from(skip + 1);
+    // `docs/264` sec 3: keep the window's decided indices. This is a *record*
+    // of the decisions the decoder has already taken -- `keep_decisions` pushes
+    // them after `decide` has returned -- so it cannot move a decision, and it
+    // is drained once, by `B1uBins::measure`, at the boundary. The decoder that
+    // goes on into data mode has it switched off again there, because the
+    // alternative is a Vec that grows for the length of the call.
+    straight.keep_decisions(true);
     // Above 24 000 B1u's frames *can* be read against 8.7.1's known content
     // instead of against 6.4.1's chain (`docs/74`), and it stops with B1u
     // because nothing after it is known. It is off unless `V92_BY_CONTENT=1`
@@ -4209,6 +4216,140 @@ fn prefilter_source() -> Prefilter {
     prefilter_for(std::env::var("V92_Z2").ok().as_deref())
 }
 
+/// **The live `bin`/`adj` instrument** (`docs/264` sec 3): the fraction of
+/// `B1u`'s symbols whose *decided index* differs from the index that was
+/// **sent**, and the share of those errors that landed one index away.
+///
+/// This is `docs/253` sec 2's statistic, on the call path instead of in an
+/// example, and it is measurable live for one reason and no other: **8.7.1
+/// makes `B1u`'s payload known** -- forty-eight data frames of scrambled
+/// ones -- so the far end's etas are a function of the clause and of the
+/// rung, not of what the far end happens to be sending. `UpEncoder::b1u`
+/// generates exactly the sequence CPd's own set will carry, and the
+/// decoder's own frame indices (`take_decisions_indexed`: "index 0 is
+/// `B1u`'s first four symbols") pair with it symbol for symbol, which is
+/// why a dropped frame cannot shift the pairing.
+///
+/// **The chords** are the µ-law chords of the *sent* level, as `docs/253`
+/// sec 2 defines them, and the rate reported is the **population-weighted**
+/// one: each chord's own error rate times the share of the symbols it
+/// carries. One global rate over a set whose chords differ by 64x in step
+/// is the number this arm is not allowed to report.
+///
+/// **Cost**: one `Vec` of decided frames, already allocated by the decoder,
+/// drained once per candidate at the boundary (thirteen candidates, ~134
+/// frames each, 4 `i32` per frame), and one pass of 576 symbols to build the
+/// sent sequence. Nothing is added to the per-symbol path: the instrument
+/// reads what the decoder decided and never feeds it anything.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct B1uBins {
+    /// Per chord: symbols sent, and the ones decided as another index.
+    sent: [u64; 8],
+    wrong: [u64; 8],
+    total: u64,
+    total_wrong: u64,
+    /// Of the errors, the ones that landed on the adjacent index.
+    adjacent: u64,
+    /// Decisions that had no sent index to pair with (the decoder read past
+    /// the end of `B1u`'s known content), so the pairing's own honesty is
+    /// visible.
+    unpaired: u64,
+    /// The direction of the level error the error is *about*: `true` when
+    /// the far end is high.
+    high: bool,
+}
+
+impl B1uBins {
+    /// Pair every decided index with the one 8.7.1 says was sent.
+    ///
+    /// `first` is the `B1u` symbol the decoder's frame 0 begins on: the
+    /// decoders `b1u_decoders` builds are fed from `skip + 1` symbols after
+    /// `B1u`'s frame 0, which is the same `skip` they seed the differential
+    /// chain and the descrambler with.
+    fn measure(parameters: &Parameters, decisions: &[(u64, [i32; 4])], first: usize, high: bool) -> Self {
+        let mut bins = Self { high, ..Self::default() };
+        let Ok(mut encoder) = crate::v92::upstream::UpEncoder::new(parameters) else {
+            return bins;
+        };
+        let sent: Vec<i32> = encoder.b1u().iter().map(|symbol| symbol.eta).collect();
+        let set = &parameters.sets[0];
+        let chord_of = |eta: i32| -> usize {
+            let index = if eta >= 0 { eta as usize } else { (-eta - 1) as usize };
+            let value = f64::from(set.get(index).copied().unwrap_or(0));
+            let full = (parameters.gain * value).clamp(0.0, 32767.0).round() as i32;
+            let (code, _) = crate::v90::ucode::nearest(crate::v90::ucode::Law::Mu, full);
+            usize::from(code >> 4).min(7)
+        };
+        for (index, etas) in decisions {
+            for (position, &eta) in etas.iter().enumerate() {
+                let symbol = first + *index as usize * 4 + position;
+                let Some(&sent) = sent.get(symbol) else {
+                    bins.unpaired += 1;
+                    continue;
+                };
+                let chord = chord_of(sent);
+                bins.sent[chord] += 1;
+                bins.total += 1;
+                if eta != sent {
+                    bins.wrong[chord] += 1;
+                    bins.total_wrong += 1;
+                    if (eta - sent).abs() == 1 {
+                        bins.adjacent += 1;
+                    }
+                }
+            }
+        }
+        bins
+    }
+
+    /// The population-weighted bin error rate, as a fraction.
+    fn weighted(&self) -> f64 {
+        if self.total == 0 {
+            return f64::NAN;
+        }
+        let mut sum = 0.0;
+        for chord in 0..8 {
+            if self.sent[chord] == 0 {
+                continue;
+            }
+            let share = self.sent[chord] as f64 / self.total as f64;
+            sum += share * (self.wrong[chord] as f64 / self.sent[chord] as f64);
+        }
+        sum
+    }
+
+    /// The one line a call carries: the population, both rates, the adjacent
+    /// share, and the per-chord table behind the weighted number.
+    fn lines(&self, drn: u8) -> Vec<String> {
+        let mut out = Vec::new();
+        let pct = 100.0 * self.weighted();
+        let adjacent = if self.total_wrong == 0 {
+            "0".to_owned()
+        } else {
+            format!("{} of {} ({:.1} %)", self.adjacent, self.total_wrong, 100.0 * self.adjacent as f64 / self.total_wrong as f64)
+        };
+        out.push(format!(
+            "V.92: BIN drn={drn} symbols={} bin={pct:.2}% adj={adjacent} unpaired={} \
+             (decided index against 8.7.1's sent index, population-weighted over the \u{b5}-law chords)",
+            self.total, self.unpaired
+        ));
+        for chord in (0..8).rev() {
+            if self.sent[chord] == 0 {
+                continue;
+            }
+            out.push(format!(
+                "V.92: BIN drn={drn} chord={chord} pop={:.1}% n={} bin={:.2}% nwrong={}",
+                100.0 * self.sent[chord] as f64 / self.total.max(1) as f64,
+                self.sent[chord],
+                100.0 * self.wrong[chord] as f64 / self.sent[chord] as f64,
+                self.wrong[chord],
+            ));
+        }
+        out
+    }
+}
+
+
 /// What the rate ladder decided, in the numbers it decided on.
 ///
 /// A rung being *refused* is a pass in this design, and it looks like
@@ -7288,7 +7429,22 @@ impl Modem {
             return;
         };
         let (back, origin) = (readings[winner].back, readings[winner].origin);
-        let chosen = readings.swap_remove(winner);
+        let mut chosen = readings.swap_remove(winner);
+        // `docs/264` sec 3: the window's decided indices, both polarities, taken
+        // here because both decoders are still in hand and not yet committed to
+        // the stream. They are a record of decisions already taken -- draining
+        // them cannot move one -- and `keep_decisions` goes back off before
+        // either decoder reads a symbol of the far end's data.
+        let first = self.b1u_skip + 1;
+        let high = self.rx.measured_levels().2 > 1.0;
+        let mut straight = std::mem::replace(&mut chosen.straight, Decoder::new(&parameters));
+        let mut probe = std::mem::replace(&mut chosen.probe, Decoder::new(&parameters));
+        straight.keep_decisions(false);
+        probe.keep_decisions(false);
+        let bins_straight = B1uBins::measure(&parameters, &straight.take_decisions_indexed(), first, high);
+        let bins_probe = B1uBins::measure(&parameters, &probe.take_decisions_indexed(), first, high);
+        chosen.straight = straight;
+        chosen.probe = probe;
         if let Some(file) = b1u_bits_file()
             && let Ok(mut file) = file.lock()
         {
@@ -7328,6 +7484,39 @@ impl Modem {
         // it now runs on the chosen candidate's window instead of on the
         // window the run's end happened to open.
         self.decide_b1u_polarity();
+        // `docs/264` sec 3: the `bin`/`adj` table, on the window that was just
+        // read, through the polarity the call settled on -- and then the ladder
+        // asked the same question again with the rate it could not have had
+        // before `CPd`: the grant is confirmed or refused *by the instrument*,
+        // in the ladder's own line, on the same call.
+        let bins = if self.b1u_polarity < 0.0 { bins_probe } else { bins_straight };
+        for line in bins.lines(parameters.drn) {
+            self.note(line);
+        }
+        let (_, _, level_gain, _) = self.rx.measured_levels();
+        let lc = crate::v92::rung::lc_for(parameters.drn);
+        let gain = crate::v92::upchoice::gain_for(lc);
+        let reading = crate::v92::rung::Reading {
+            drn: parameters.drn,
+            lc,
+            min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(parameters.drn)).unwrap_or(0.0),
+            level_lsb: gain.recip() * level_gain,
+            gain,
+            bin: bins.weighted(),
+            // The live receive path keeps the decided index, not the level
+            // stream the crossing is measured on: `n/a`, not zero.
+            crossing: f64::NAN,
+            symbols: bins.total,
+        };
+        let verdict = crate::v92::rung::admit(&reading);
+        self.note(format!("V.92: B1u confirms the ladder: {}", reading.line(verdict)));
+        if !verdict.granted() {
+            self.note(
+                "V.92: the rung CPd carries is refused by B1u's own bin rate -- the number is above"
+                    .to_owned()
+                    + " and it is what the next renegotiation has to act on",
+            );
+        }
     }
 
     /// Which way up B1u came, from the two readings [`Self::decide_b1u_boundary`] took.
