@@ -4309,19 +4309,63 @@ impl Default for B1uBins {
     }
 }
 
+/// `V92_B1U_DUMP`: the decisions `B1uBins::measure` is about to pair, with the
+/// four `Parameters` facts `sent` is rebuilt from, so that a live call's
+/// grading can be re-derived offline instead of re-run (`docs/287`).
+///
+/// Off unless the variable holds a path, and then one plain-text block per
+/// `measure` call (one per polarity): `first`, `gain`, `moduli`, `set`, then
+/// one `index position eta` triple per decided symbol. A diagnostic, so it may
+/// not move a decision: it reads what the decoder already decided, after the
+/// drain and never before it.
+fn dump_decisions(parameters: &Parameters, decisions: &[(u64, [i32; 4])], first: usize) {
+    let Some(path) = std::env::var_os("V92_B1U_DUMP") else { return };
+    use std::io::Write as _;
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let set: Vec<String> = parameters.sets.first().map(|set| set.iter().map(|point| point.to_string()).collect()).unwrap_or_default();
+    let _ = writeln!(file, "first {first}");
+    let _ = writeln!(file, "gain {}", parameters.gain);
+    let _ = writeln!(file, "moduli {}", parameters.moduli.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" "));
+    let _ = writeln!(file, "set {}", set.join(" "));
+    for (index, etas) in decisions {
+        for (position, &eta) in etas.iter().enumerate() {
+            let _ = writeln!(file, "{index} {position} {eta}");
+        }
+    }
+    let _ = file.flush();
+}
+
 impl B1uBins {
     /// Pair every decided index with the one 8.7.1 says was sent.
     ///
     /// `first` is the `B1u` symbol the decoder's frame 0 begins on, in the
-    /// encoder's own numbering: `skip + 1` symbols after `B1u`'s frame 0 --
-    /// the same `skip` the decoders seed the differential chain and the
-    /// descrambler with -- **less the candidate's own `back`**, because
-    /// `b1u_readings` feeds candidate `back` from `levels[skip - back]` and
-    /// that element is `back` symbols earlier in the stream. `docs/285`
-    /// sec 2: dropping the `back` paired every decision with a symbol the
-    /// candidate's displacement away, and a winner at `back = 12` scored
-    /// 0.86 on a line whose B1u read 569 of 576 ones.
+    /// encoder's own numbering, and it has three terms:
+    ///
+    /// ```text
+    /// first = skip + 1 + B - back
+    /// ```
+    ///
+    /// `skip + 1` is where `b1u_decoders` puts the decoder relative to the
+    /// boundary the candidate claims (the same `skip` that seeds the
+    /// differential chain and the descrambler); `back` is the candidate's own
+    /// claim -- `b1u_readings` feeds candidate `back` from `levels[skip -
+    /// back]`; and `B` is how far before the run's end `B1u`'s frame 0 really
+    /// is, which is the far end's E2u overrun and is **not** the candidate's
+    /// `back` unless the search's winner is the true boundary.
+    ///
+    /// The call site hands `skip + 1 - back`, which is this expression with
+    /// `B = 0` -- the clause's anchor, "B1u's frame interval 0 is the symbol
+    /// after E2u's last one" (8.7.2), and *not* a measured fact: `begin_b1u`
+    /// records the run overrunning E2u by two symbols on one Agere capture. The
+    /// two terms are therefore only consistent when the far end agrees with the
+    /// clause, and `docs/287` is the analysis of what happens when it does not:
+    /// a wrong `B` displaces the pairing by whole data frames, which is the one
+    /// displacement 8.7.1's content cannot see and the one `nearest_rival`'s
+    /// sweep (`1 .. UP_INTERVALS`, i.e. 1 to 11) never tests.
     fn measure(parameters: &Parameters, decisions: &[(u64, [i32; 4])], first: usize, high: bool) -> Self {
+        dump_decisions(parameters, decisions, first);
         let mut bins = Self { high, ..Self::default() };
         let Ok(mut encoder) = crate::v92::upstream::UpEncoder::new(parameters) else {
             return bins;
@@ -9758,6 +9802,134 @@ mod tests {
             without_back.weighted()
         );
         assert!(!without_back.trusted(), "and it must refuse to publish a rate");
+    }
+
+    /// The window `b1u_readings` is handed, on a line whose run ends
+    /// `overrun` symbols after `B1u`'s frame interval 0.
+    ///
+    /// `levels[k]` is the symbol `end + 1 + k` (`collect_b1u`), and `B1u`'s
+    /// symbol `s` is at `end + 1 + k` when `s = k + 1 + B`, so the window is
+    /// `levels[1 + B .. 1 + B + B1U_SYMBOLS]`. `b1u_line` is long enough for
+    /// `B` up to a whole data frame.
+    fn b1u_window(overrun: usize) -> Vec<f64> {
+        let levels = b1u_line();
+        levels[1 + overrun..1 + overrun + B1U_SYMBOLS].to_vec()
+    }
+
+    /// The decisions a committed candidate's own decoder takes off a window.
+    fn b1u_window_decisions(buffer: &[f64], back: usize) -> Vec<(u64, [i32; 4])> {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let mut decoder = b1u_decoders(&parameters, skip).0;
+        for &level in &buffer[skip.saturating_sub(back)..=B1U_SYMBOLS - 1 - back] {
+            decoder.feed(level);
+        }
+        decoder.take_decisions_indexed()
+    }
+
+    /// **The instrument is exact at one offset and at chance at every other,
+    /// and the whole-frame offsets are outside the sweep that looks for a
+    /// rival.**
+    ///
+    /// `docs/287` sec 2. The window is `B1u` itself with the run ending on
+    /// `B1u`'s frame interval 0 (`B = 0`, the clause's anchor), the search
+    /// commits the twin a data frame behind the run's end (12, the candidate
+    /// whose own ones count is highest), and the same decisions are graded at
+    /// every origin from `skip - 23` to `skip + 25`. The result is not a
+    /// gradient: **one offset reads zero and all forty-eight others read
+    /// 163-183 of 200**, which is 1 in 8 -- the size of 6.4.2's class alphabet
+    /// at `Mi = 8`, i.e. no information at all. Two things follow, and both are
+    /// asserted below rather than argued:
+    ///
+    /// * the only other offset that can ever read zero is a whole number of
+    ///   data frames away, because 12 is a multiple of the twelve-symbol frame
+    ///   and of the four-symbol trellis frame, so it does not move `modulus_at`
+    ///   or `position_at` -- it only rewrites *which* sent frame is compared;
+    /// * `nearest_rival` looks at `1 .. UP_INTERVALS`, i.e. one to eleven
+    ///   symbols, and no offset in that range is better than chance. The
+    ///   instrument's own self-consistency check therefore cannot see the one
+    ///   error that produces 7 in 8, and `docs/287` sec 3 is the consequence.
+    #[test]
+    fn the_class_comparison_is_exact_at_one_offset_and_chance_at_every_other() {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let buffer = b1u_window(0);
+        let readings = b1u_readings(&parameters, 1_000, &buffer, skip, E2U_SYMBOLS);
+        let winner = choose_b1u_boundary(&readings, false).expect("a boundary in the window");
+        let back = readings[winner].back;
+        assert_eq!(back, crate::v92::UP_INTERVALS, "the twin a whole data frame back");
+        let decisions = b1u_window_decisions(&buffer, back);
+        assert_eq!(decisions.len() * 4, 200, "fifty trellis frames of decisions");
+        // The offset the decoder was really fed at, from the three terms of
+        // `first`: skip + 1 + B - back, with B = 0 on this line.
+        let exact = skip + 1 - back;
+        assert_eq!(B1uBins::measure(&parameters, &decisions, exact, true).total_wrong, 0);
+        for delta in -24i64..=24 {
+            let first = (exact as i64 + delta) as usize;
+            let bins = B1uBins::measure(&parameters, &decisions, first, true);
+            assert_eq!(bins.total, 200, "every offset pairs the same population");
+            if delta == 0 {
+                continue;
+            }
+            // One whole frame the other way is chance like everything else;
+            // only `delta = 0` is exact.
+            assert!(
+                bins.total_wrong * 4 >= bins.total * 3,
+                "an origin {} symbols out must read at chance, not {:.3}",
+                delta,
+                bins.weighted()
+            );
+        }
+        // And the sweeps `nearest_rival` runs, which is where the 7-in-8 fault
+        // lives and which never reaches a whole data frame.
+        let mut nearest = u64::MAX;
+        for shift in 1..crate::v92::UP_INTERVALS {
+            for first in [exact.checked_sub(shift), Some(exact + shift)] {
+                let Some(first) = first else { continue };
+                nearest = nearest.min(B1uBins::measure(&parameters, &decisions, first, true).total_wrong);
+            }
+        }
+        assert!(
+            nearest * 4 >= 200 * 3,
+            "no rival inside 1 .. 11 is better than chance ({nearest} of 200 wrong)"
+        );
+    }
+
+    /// **8.7.1's content pins the frame phase and nothing else**: a whole data
+    /// frame of displacement reads as ones as well as the boundary does, so the
+    /// far end's E2u overrun `B` -- the third term of `first` -- is not
+    /// observable from `B1u`.
+    ///
+    /// `docs/287` sec 3. Same line, two candidate boundaries: the run's end
+    /// itself and the twin twelve symbols further back. Both read as ones
+    /// (540 and 569 of 576), and both are accepted by the gate; a candidate one
+    /// symbol out reads 285, which is chance. So the known content says
+    /// `B = 0 (mod 12)` and cannot say `B = 0`, and any receiver that
+    /// regenerates B1u itself can only place frame 0 relative to a phase.
+    #[test]
+    fn b1u_s_content_pins_the_frame_phase_and_not_the_frame_index() {
+        let parameters = b1u_parameters();
+        let skip = B1U_ACQUIRE_FRAMES * crate::v92::UP_INTERVALS - 1;
+        let buffer = b1u_window(0);
+        let readings = b1u_readings(&parameters, 1_000, &buffer, skip, E2U_SYMBOLS);
+        let at = |back: usize| {
+            readings
+                .iter()
+                .find(|reading| reading.back == back)
+                .map(|reading| (reading.best(), reads_as_b1u(reading)))
+                .expect("every candidate in the set is read")
+        };
+        let (run_end, run_end_accepted) = at(0);
+        let (twin, twin_accepted) = at(crate::v92::UP_INTERVALS);
+        let (phase_out, phase_out_accepted) = at(1);
+        assert!(run_end * 4 >= 576 * 3, "the run's end reads as B1u: {run_end} of 576");
+        assert!(twin * 4 >= 576 * 3, "and so does a whole data frame back: {twin} of 576");
+        assert!(
+            phase_out * 4 < 576 * 3,
+            "a symbol out of phase does not: {phase_out} of 576"
+        );
+        assert!(run_end_accepted || twin_accepted, "at least one twin is a boundary");
+        assert!(!phase_out_accepted, "a wrong frame phase is never a boundary");
     }
 
     /// A displaced pairing is refused, not scored: the instrument has to fail
