@@ -31,6 +31,7 @@ use datapump::v92::decoder::Decoder;
 use datapump::v92::design::{self, Channel};
 use datapump::v92::farend::{self, FarEndParams};
 use datapump::v92::receiver::Receiver;
+use datapump::v92::rung::{self, Reading};
 use datapump::v92::up_signals::Trn1u;
 use datapump::v92::upstream::UpEncoder;
 use datapump::v92::{FilterLimits, LevelSet, Parameters, Trellis, UP_INTERVALS, upchoice};
@@ -621,6 +622,26 @@ fn main() {
             energy = datapump::v92::sent_prefilter_energy(&parameters.filters.z2),
             invg = 1.0 / parameters.gain,
         );
+        // docs/254 step 2: the rung's decision, taken on the instrument that
+        // binds at that rung -- the crossing below drn 9, the bin error rate at
+        // and above it -- with the level precondition printed beside it,
+        // because a grant is conditional on a far end obeying the `G` we send.
+        let min_gap = if s.levelset == LevelSet::Code {
+            f64::from(least)
+        } else {
+            rung::gap_lsb(points).unwrap_or(f64::from(least))
+        };
+        let reading = Reading {
+            drn,
+            lc: rung.lc,
+            min_gap_lsb: min_gap,
+            level_lsb: used.level_lsb,
+            gain: parameters.gain,
+            bin: bins.pct() / 100.0,
+            crossing: crossing / 100.0,
+            symbols: bins.total,
+        };
+        println!("  {}", reading.line(rung::admit(&reading)));
         if s.chords {
             for chord in (0..8).rev() {
                 if stats.rows[chord].n == 0 {

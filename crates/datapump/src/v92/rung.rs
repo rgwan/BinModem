@@ -583,6 +583,260 @@ pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// The instrument a rung's decision binds on
+// ---------------------------------------------------------------------------
+
+/// Which measured statistic a rung's decision is taken against.
+///
+/// `docs/250` sec 4 and `docs/253` sec 2 are the measurement: the per-chord
+/// **half-step crossing** reads exactly 0.0000 % across a sweep in which `B1u`
+/// loses 41 points, because the event it counts is a displacement of half a
+/// chord's step -- 4 to 128 LSB -- while the event that actually happens at a
+/// 64-point set is a move of **8 LSB** to the adjacent code (3 to 16 times
+/// smaller). The **code (bin) error rate** -- the fraction of B1u symbols whose
+/// *decided index* differs from the sent one -- fires at the right size, and it
+/// is the same quantity the standard's target error probability is about.
+///
+/// Below [`FIRST_BIN_DRN`] the design's gap is 128 ... 320 LSB, 8 ... 20 times
+/// the codec's own step, the two statistics agree (both read zero), and the
+/// crossing is the sharper one because it resolves a fraction of a step rather
+/// than a whole code. Above it the gap has fallen to 64 ... 16 LSB, the crossing
+/// is saturated, and the bin rate is the only instrument with resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instrument {
+    /// The population-weighted per-chord rate of symbols that moved past half
+    /// of their chord's own step.
+    Crossing,
+    /// The rate of B1u symbols whose decided index differs from the sent index.
+    Bin,
+}
+
+/// The first rung at which the bin error rate binds: `drn 9`, where LC is 32 and
+/// the design's gap is 64 LSB -- four times the 16 LSB step of the chord where
+/// the innermost points sit (`docs/253` sec 2's table).
+pub const FIRST_BIN_DRN: u8 = 9;
+
+impl Instrument {
+    /// The instrument a rung's decision binds on.
+    #[must_use]
+    pub fn for_rung(drn: u8) -> Instrument {
+        if drn >= FIRST_BIN_DRN { Instrument::Bin } else { Instrument::Crossing }
+    }
+
+    /// The name the log carries.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Instrument::Crossing => "crossing",
+            Instrument::Bin => "bin",
+        }
+    }
+}
+
+/// One measured ladder reading: the rung it was taken on, the far end's level,
+/// the `G` our own CPd names, and both rates.
+///
+/// The two rates are *measured*, not modelled: the bin rate pairs each decided
+/// index with the index that was sent (`Decoder::take_decisions_indexed`), so a
+/// dropped frame cannot shift the pairing, and the crossing is taken over the
+/// same B1u window. The population is carried because a rate over 361 symbols
+/// and a rate over 2 448 are not the same evidence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reading {
+    /// The rung the reading was measured on, `drn 1 ... 19`.
+    pub drn: u8,
+    /// That rung's LC.
+    pub lc: usize,
+    /// The smallest gap between neighbours inside a chord of the rung's own set,
+    /// in LSB, taken from the set itself -- the code grid the far end's codec
+    /// rounds to -- and not from a tabulated maximin, and not from 349.
+    pub min_gap_lsb: f64,
+    /// The level the far end actually transmitted at, LSB.
+    pub level_lsb: f64,
+    /// The `G` the CPd we sent names (bits 35:50).
+    pub gain: f64,
+    /// Symbols whose decided index differed from the sent one, over the window.
+    pub bin: f64,
+    /// Symbols that crossed half their chord's own step, over the same window.
+    pub crossing: f64,
+    /// How many symbols the two rates were measured over.
+    pub symbols: u64,
+}
+
+impl Reading {
+    /// The rate the rung's instrument reads.
+    #[must_use]
+    pub fn rate(&self, instrument: Instrument) -> f64 {
+        match instrument {
+            Instrument::Crossing => self.crossing,
+            Instrument::Bin => self.bin,
+        }
+    }
+
+    /// The finest non-zero rate this window can report: one symbol, over the
+    /// population. A zero bin count does not prove a rate of zero, it proves a
+    /// rate below this number, and a grant has to say so.
+    #[must_use]
+    pub fn resolution(&self) -> f64 {
+        if self.symbols == 0 { f64::INFINITY } else { 1.0 / self.symbols as f64 }
+    }
+
+    /// The level the far end must be at for the design's own numbers to arrive
+    /// as the levels they are: `1/G` (`docs/253` sec 1.2, 8.8.3).
+    #[must_use]
+    pub fn wanted_level(&self) -> f64 {
+        1.0 / self.gain
+    }
+
+    /// How far off `1/G` the level may be before the grant stops describing the
+    /// bench's far end: half the rung's own smallest gap, on the line.
+    ///
+    /// At LC = 64 that is 8 LSB, 0.49 % of 1 627 -- the same half-gap the
+    /// decision itself turns on; at LC = 8 it is 128 LSB, because the builder's
+    /// own eight-point set has a 256 LSB minimum gap and a rung whose neighbours
+    /// are that far apart does not need its level to a tenth of a per cent. It is *our choice* (the standard fixes the level, not the tolerance
+    /// on it), and it is deliberately denominated in the rung's measured gap
+    /// rather than in a global sigma.
+    #[must_use]
+    pub fn level_tolerance(&self) -> f64 {
+        0.5 * self.min_gap_lsb
+    }
+
+    /// Whether the far end's level is the `1/G` this end named.
+    #[must_use]
+    pub fn level_ok(&self) -> bool {
+        (self.level_lsb - self.wanted_level()).abs() <= self.level_tolerance()
+    }
+
+    /// The one-line log the ladder writes: which instrument bound, the rates it
+    /// read, the resolution of that measurement, and the level precondition.
+    ///
+    /// Both rates are printed even when only one binds, because the low rungs
+    /// read both and the switch is a statement about which one is *consulted*.
+    #[must_use]
+    pub fn line(&self, verdict: Verdict) -> String {
+        let instrument = verdict.instrument().unwrap_or(Instrument::for_rung(self.drn));
+        format!(
+            "LADDER drn={} lc={} instrument={} rate={:.4e} bin={:.4e} crossing={:.4e} \
+             target={:.1e} symbols={} resolution={:.2e} level={:.1} 1/G={:.1} tol={:.1} -> {}",
+            self.drn,
+            self.lc,
+            instrument.name(),
+            self.rate(instrument),
+            self.bin,
+            self.crossing,
+            TARGET,
+            self.symbols,
+            self.resolution(),
+            self.level_lsb,
+            self.wanted_level(),
+            self.level_tolerance(),
+            if verdict.granted() { "GRANT" } else { "REFUSE" }
+        )
+    }
+}
+
+/// What the ladder decided for one rung, and why.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verdict {
+    /// The binding rate is at or under the target: the rung is granted, *on the
+    /// far end being at `1/G`*, which the line beside it states.
+    Granted {
+        instrument: Instrument,
+        rate: f64,
+        target: f64,
+    },
+    /// The binding rate is over the target.
+    Rate {
+        instrument: Instrument,
+        rate: f64,
+        target: f64,
+    },
+    /// The level is not `1/G`: the reading describes a far end this end did not
+    /// ask for, so its rate is not evidence about the bench's far end either
+    /// way.
+    Level {
+        level_lsb: f64,
+        wanted: f64,
+        tolerance: f64,
+    },
+}
+
+impl Verdict {
+    /// Whether the rung is granted.
+    #[must_use]
+    pub fn granted(&self) -> bool {
+        matches!(self, Verdict::Granted { .. })
+    }
+
+    /// The instrument that bound, when a rate was the reason.
+    #[must_use]
+    pub fn instrument(&self) -> Option<Instrument> {
+        match self {
+            Verdict::Granted { instrument, .. } | Verdict::Rate { instrument, .. } => Some(*instrument),
+            Verdict::Level { .. } => None,
+        }
+    }
+}
+
+/// Decide one rung from one measured reading.
+///
+/// Two conditions, in this order:
+///
+/// 1. **the level is `1/G`** within [`Reading::level_tolerance`]. This is the
+///    precondition the grant cannot check from our side: we send `G` in CPd bits
+///    35:50 and the far end is supposed to obey it (8.8.3), but whether it did is
+///    a property of the far end. A reading taken at any other level is refused
+///    whatever its rate, because it is not a reading of the far end the grant
+///    would be about -- `docs/253` sec 3 is the case that matters (at 2 100 LSB,
+///    29 % high, `drn 19` reads 9.62 % bin and 92.8 % `B1u`).
+/// 2. **the binding rate is at or under [`TARGET`]**, the standard's per-symbol
+///    error probability before the trellis. Which rate binds is
+///    [`Instrument::for_rung`]'s answer: the crossing below [`FIRST_BIN_DRN`],
+///    the bin error rate at and above it. Two-sided: over the target is a
+///    refusal, at or under it a grant.
+///
+/// **The low rungs keep the crossing *and* the bin rate.** A crossing measures a
+/// displacement of half the chord's own step; a symbol that moves one *code* --
+/// which at `drn 1` is 8 to 128 LSB, inside a 256 LSB gap -- is a bin error that
+/// no crossing can see. So below [`FIRST_BIN_DRN`] the bin rate is a second,
+/// necessary check and the instrument that binds is the one whose rate is the
+/// larger; above it the crossing is *not consulted at all*, because there it is
+/// saturated (it reads zero while the bin rate is 9 %) and carries no
+/// information. The decision's own line quotes whichever rate fired and both
+/// numbers are printed beside it.
+///
+/// **What a grant is worth is its resolution.** [`TARGET`] is `1e-7`; the B1u
+/// window is 416 symbols, which cannot see a rate below `2.4e-3`. So a grant
+/// with no errors means "no error in this window", which is `1/symbols` and not
+/// `TARGET` -- [`Reading::resolution`] is printed beside every decision for that
+/// reason.
+#[must_use]
+pub fn admit(reading: &Reading) -> Verdict {
+    if !reading.level_ok() {
+        return Verdict::Level {
+            level_lsb: reading.level_lsb,
+            wanted: reading.wanted_level(),
+            tolerance: reading.level_tolerance(),
+        };
+    }
+    let named = Instrument::for_rung(reading.drn);
+    let (instrument, rate) = match named {
+        // At and above the switch the crossing is saturated and is not read.
+        Instrument::Bin => (Instrument::Bin, reading.bin),
+        // Below it both are read, and the larger is the one that binds: a bin
+        // error inside an oversized gap is an error the crossing cannot see.
+        Instrument::Crossing if reading.bin > reading.crossing => (Instrument::Bin, reading.bin),
+        Instrument::Crossing => (Instrument::Crossing, reading.crossing),
+    };
+    if rate <= TARGET {
+        Verdict::Granted { instrument, rate, target: TARGET }
+    } else {
+        Verdict::Rate { instrument, rate, target: TARGET }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reading a level stream
 // ---------------------------------------------------------------------------
 
@@ -1074,6 +1328,154 @@ mod tests {
         let ratio = b.at(16) / a.at(8);
         println!("32 000's residual against 24 000's, in index steps: {ratio:.3}");
         assert!((3.0..3.3).contains(&ratio), "{ratio}");
+    }
+
+    /// One reading, with the level named and the gain the reciprocal of the
+    /// level the design's points are meant to arrive at (`1/G`).
+    fn reading(drn: u8, level_lsb: f64, bin: f64, crossing: f64, symbols: u64) -> Reading {
+        let lc = lc_for(drn);
+        Reading {
+            drn,
+            lc,
+            min_gap_lsb: crate::v92::codegrid::min_gap(
+                &crate::v92::codegrid::grid(points(drn)).expect("the builder's set"),
+            ),
+            level_lsb,
+            gain: 1.0 / ideal_level(drn),
+            bin,
+            crossing,
+            symbols,
+        }
+    }
+
+    /// The level at which the design's own codes arrive as the levels they are,
+    /// to the figures `docs/253` sec 1.2 computed. Written out rather than
+    /// derived from `gain_for` so the test is against a181's reported numbers.
+    fn ideal_level(drn: u8) -> f64 {
+        match lc_for(drn) {
+            8 => 1620.1,
+            16 => 1640.3,
+            32 => 1607.1,
+            _ => 1627.0,
+        }
+    }
+
+    /// The instrument switch: the crossing binds at `drn 1 ... 8`, the bin error
+    /// rate from `drn 9`. `drn 9` is where the design's gap has come down to
+    /// 64 LSB and the failing decision is the adjacent code, which the crossing
+    /// -- a displacement of half a chord's step -- cannot resolve.
+    #[test]
+    fn the_bin_error_rate_binds_from_drn_9_and_the_crossing_below_it() {
+        for drn in 1..=UP_RATES as u8 {
+            let want = if drn >= FIRST_BIN_DRN { Instrument::Bin } else { Instrument::Crossing };
+            assert_eq!(Instrument::for_rung(drn), want, "drn {drn}");
+        }
+        assert_eq!(Instrument::for_rung(8), Instrument::Crossing);
+        assert_eq!(Instrument::for_rung(9), Instrument::Bin);
+        // The two names are what the log prints, so they are pinned.
+        assert_eq!(Instrument::Crossing.name(), "crossing");
+        assert_eq!(Instrument::Bin.name(), "bin");
+    }
+
+    /// The switch is a decision and not a decoration. `docs/253` sec 2's own
+    /// case -- a clean crossing and a 0.2 % bin rate -- is refused at `drn 9`
+    /// on the bin rate. And the crossing is *not consulted* above `drn 8`: the
+    /// same crossing rate that refuses at `drn 8` is granted at `drn 9` when the
+    /// bin rate is clean, because there the crossing is saturated.
+    #[test]
+    fn the_bin_rate_binds_at_drn_9_and_the_crossing_is_not_read_above_it() {
+        let nine = reading(9, ideal_level(9), 2e-3, 0.0, 2_448);
+        match admit(&nine) {
+            Verdict::Rate { instrument, rate, target } => {
+                assert_eq!(instrument, Instrument::Bin);
+                assert_eq!(rate, 2e-3);
+                assert_eq!(target, TARGET);
+            }
+            other => panic!("drn 9 at 0.2 % bin: {other:?}"),
+        }
+        // The same reading one rung lower: the bin rate still refuses, because
+        // the low rungs keep the bin rate as a second, necessary check.
+        let eight = reading(8, ideal_level(8), 2e-3, 0.0, 2_448);
+        assert_eq!(admit(&eight).instrument(), Some(Instrument::Bin));
+        assert!(!admit(&eight).granted());
+        // A crossing over the target with a clean bin rate is the switch's two
+        // sides: refused at 8, granted at 9.
+        let eight_cross = reading(8, ideal_level(8), 0.0, 2e-3, 2_448);
+        assert!(matches!(
+            admit(&eight_cross),
+            Verdict::Rate { instrument: Instrument::Crossing, .. }
+        ));
+        let nine_cross = reading(9, ideal_level(9), 0.0, 2e-3, 2_448);
+        assert!(admit(&nine_cross).granted(), "the crossing is not read at drn 9");
+        assert_eq!(admit(&nine_cross).instrument(), Some(Instrument::Bin));
+    }
+
+    /// Two-sided, at the boundary: a rate exactly at the target grants, one part
+    /// in `10^9` over it refuses. The comparison is the rate against the
+    /// standard's target and nothing else.
+    #[test]
+    fn the_rate_is_compared_with_the_target_on_both_sides() {
+        let at = reading(19, ideal_level(19), TARGET, 0.0, 2_448);
+        assert!(admit(&at).granted(), "at the target");
+        let over = reading(19, ideal_level(19), TARGET * 1.000_000_001, 0.0, 2_448);
+        assert!(!admit(&over).granted(), "over the target");
+        assert!(matches!(admit(&over), Verdict::Rate { instrument: Instrument::Bin, .. }));
+        // And the low-rung instrument is two-sided the same way.
+        let low_at = reading(1, ideal_level(1), 0.0, TARGET, 1_224);
+        assert!(admit(&low_at).granted());
+        let low_over = reading(1, ideal_level(1), 0.0, TARGET * 2.0, 1_224);
+        assert_eq!(admit(&low_over).instrument(), Some(Instrument::Crossing));
+        assert!(!admit(&low_over).granted());
+    }
+
+    /// The discriminator this ticket creates: `drn 19` is refused when the far
+    /// end's level is not `1/G`, **even when its rate is clean**, because the
+    /// reading then describes a far end we did not ask for. `docs/253` sec 3's
+    /// `--lu 2100` is that case: 29 % high, and its own 9.62 % bin rate is a
+    /// second, independent refusal.
+    #[test]
+    fn drn_19_is_refused_when_the_far_end_is_not_at_one_over_g() {
+        let at = reading(19, 1_627.0, 0.0, 0.0, 2_448);
+        assert!(admit(&at).granted(), "1/G at a clean rate: {at:?}");
+        let high = reading(19, 2_100.0, 0.0, 0.0, 2_448);
+        match admit(&high) {
+            Verdict::Level { level_lsb, wanted, tolerance } => {
+                assert_eq!(level_lsb, 2_100.0);
+                assert!((wanted - 1_627.0).abs() < 0.05, "wanted {wanted}");
+                assert!((tolerance - 8.0).abs() < 1e-9, "half of LC = 64's 16 LSB gap: {tolerance}");
+            }
+            other => panic!("2100 LSB is not 1/G: {other:?}"),
+        }
+        // And the refusal is not a rate result: the level is checked first, so a
+        // clean reading at the wrong level cannot be reported as a grant.
+        assert_eq!(admit(&high).instrument(), None);
+        // The tolerance itself is half the rung's own measured gap, on the line.
+        assert!((at.level_tolerance() - 8.0).abs() < 1e-9, "{}", at.level_tolerance());
+        assert!((reading(1, 1_620.1, 0.0, 0.0, 1_224).level_tolerance() - 128.0).abs() < 1e-9);
+    }
+
+    /// A grant's honesty is its resolution: the target is `1e-7` and a 2 448
+    /// symbol window cannot see below `4.1e-4`, so "no errors" is evidence of a
+    /// rate under `1/symbols` and not of the target. The line prints both, and
+    /// the line names the instrument and the level precondition.
+    #[test]
+    fn a_grant_states_its_resolution_and_which_instrument_bound() {
+        let clean = reading(19, 1_627.0, 0.0, 0.0, 2_448);
+        let verdict = admit(&clean);
+        assert!(verdict.granted());
+        assert!(clean.resolution() > TARGET, "{} is coarser than {TARGET:e}", clean.resolution());
+        assert!((clean.resolution() - 1.0 / 2_448.0).abs() < 1e-12);
+        let line = clean.line(verdict);
+        for wanted in ["instrument=bin", "rate=0.0000e0", "symbols=2448", "resolution=4.08e-4", "1/G=1627.0", "GRANT"] {
+            assert!(line.contains(wanted), "{line} does not carry {wanted}");
+        }
+        let refused = reading(19, 2_100.0, 0.0, 0.0, 2_448);
+        assert!(refused.line(admit(&refused)).contains("REFUSE"));
+        // A rate the instrument cannot resolve is not a grant: one error in the
+        // window is `4.1e-4`, four thousand times the target.
+        let one = reading(19, 1_627.0, 1.0 / 2_448.0, 0.0, 2_448);
+        assert!(!admit(&one).granted());
+        assert!(matches!(admit(&one), Verdict::Rate { instrument: Instrument::Bin, .. }));
     }
 
     /// A stream with no `score` lines, or one that is not a level stream at all,
