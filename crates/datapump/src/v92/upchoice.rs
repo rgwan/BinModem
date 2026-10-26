@@ -649,7 +649,7 @@ mod tests {
     /// `scale^2` quiet and the far end transmitted `scale^2` low. The emulation
     /// at the end of this test is that pairing, and it must not measure 1.
     #[test]
-    fn the_gain_sent_belongs_to_the_filter_sent() {
+    fn the_gain_sent_belongs_to_the_filter_sent_and_names_a181s_operating_point() {
         let set_gain = |parameters: &Parameters| parameters.levelset.gain(&parameters.sets[0]);
         for (label, design) in [
             ("least squares", design_for(0.0)),
@@ -680,6 +680,40 @@ mod tests {
                     set_gain(&parameters) / energy,
                 );
             }
+        }
+
+        // `docs/254` §2: the level a far end must transmit at is `1/G`, and the `G`
+        // this API emits names a number **0.03 ... 0.08 LSB below** `docs/253`
+        // §1.2's computed `1620.1 / 1640.3 / 1607.1 / 1627.0`. The whole of the
+        // difference is one Q0.15 code: `1.0` is not representable in a signed
+        // Q0.15 word (its largest value is `32767/32768`), so the sent section's
+        // energy comes out just under one -- 0.999976 for this test's 16-tap
+        // channel, 0.999939 for the harness's identity section -- and the emitted
+        // gain is that much larger than `1/sqrt(ms(a))`. a181's numbers are the
+        // *design's* -- the clause's gain for a section of exactly unit energy --
+        // and these are the *wire's*. Both are right about different objects, and
+        // the difference is at most 0.08 LSB, 1 % of the half gap at LC = 64,
+        // which is why it cannot move a decision.
+        let design = design_for(0.0);
+        for (drn, a181) in [(1u8, 1620.1), (7, 1640.3), (13, 1607.1), (19, 1627.0)] {
+            let parameters = pin_with(&design, drn, Trellis::Sixteen, 0.0, LevelSet::Code)
+                .expect("the code grid builds every rung")
+                .parameters;
+            let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
+            assert!(
+                energy <= 1.0 && energy > 1.0 - 1e-4,
+                "drn {drn}: the sent section's energy is {energy}, not unit to a Q0.15 code",
+            );
+            // The design's number, recomputed from the set a181 used.
+            let computed = 1.0 / codegrid::gain_for(&parameters.sets[0]);
+            assert!((computed - a181).abs() < 0.05, "drn {drn}: {computed} against a181's {a181}");
+            // The wire's number: what the emitted `G` names.
+            let measured = 1.0 / parameters.gain;
+            assert!(
+                (measured - computed).abs() < 0.1,
+                "drn {drn}: the emitted 1/G is {measured}, a181 computed {computed}",
+            );
+            assert!(measured < computed, "drn {drn}: the sent section is one code short of unit");
         }
 
         // The pairing that shipped on f8ac825: the unit prefilter's gain beside a
