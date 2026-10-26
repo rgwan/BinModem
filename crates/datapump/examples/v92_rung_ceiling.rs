@@ -73,8 +73,8 @@ fn main() -> std::process::ExitCode {
             failed = true;
             continue;
         };
-        let ceiling = ceiling_rung(measured, lc_for);
-        let mask = apply_ceiling(0, measured, lc_for);
+        let ceiling = ceiling_rung(measured);
+        let mask = apply_ceiling(0, measured);
         let at = |drn: u8| {
             let rung = Rung::of(drn).expect("a rung");
             (rung, measured.error(rung.lc))

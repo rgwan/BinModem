@@ -60,7 +60,7 @@ use crate::v92::sequences::{
 };
 use crate::v34::probe::Reading;
 use crate::v92::up_signals::{Trn2uReader, Trn2uSize, TwoPointReader};
-use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, lc_for};
+use crate::v92::rung::{Bound, Sigma, apply_ceiling, ceiling_rung, threshold};
 use crate::v92::upchoice::{choose, pin};
 use crate::v92::{FilterLimits, LevelSet, Parameters, PeerCp, PeerSuv, SequenceKind, Trellis};
 
@@ -5802,8 +5802,8 @@ impl Modem {
         // sanity rule works in variances; the same reading supplies it.
         let noise = 10f64.powf(-snr_db / 10.0);
         let ja = self.ja.upstream_rates().unwrap_or(0);
-        let ceiling = ceiling_rung(measured, lc_for);
-        let allowed = apply_ceiling(ja, measured, lc_for);
+        let ceiling = ceiling_rung(measured);
+        let allowed = apply_ceiling(ja, measured);
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
         // still gets, because the alternative is no call at all. Which of the
@@ -5841,6 +5841,27 @@ impl Modem {
             decision.mask,
             choice.parameters.drn,
             choice.parameters.rate()
+        ));
+        // The scan itself, rung by rung, with the number each one was refused
+        // on. `ceiling_rung` now evaluates every rung instead of answering
+        // "drn 1" for a `Bound::Lower` without looking, so a refusal has to be
+        // readable as a comparison and not as an absence: sigma, the rung's own
+        // gap-corrected threshold, and the verdict.
+        let scan: Vec<String> = (1..=crate::v92::UP_RATES as u8)
+            .map(|drn| {
+                let budget = threshold(drn);
+                let verdict = if decision.measured.steps() <= budget { "met" } else { "refused" };
+                format!(
+                    "drn {drn} ({}) threshold {budget:.4} {verdict}",
+                    crate::v92::up_rate(drn)
+                )
+            })
+            .collect();
+        self.note(format!(
+            "V.92: upstream rung scan at sigma {:.4} index steps: {}; highest rung met {}",
+            decision.measured.steps(),
+            scan.join("; "),
+            ceiling
         ));
         if decision.empty {
             // The event the ceiling exists to make visible.

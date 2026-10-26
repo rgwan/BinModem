@@ -295,6 +295,95 @@ pub fn lc_for(drn: u8) -> usize {
 // The ceiling
 // ---------------------------------------------------------------------------
 
+/// The largest interval modulus a rung's twelve intervals ask for: how many
+/// positive points the *worst* interval of 6.4.1's even-ish spread needs.
+///
+/// `lc_for` answers "how many points is the set", which is the same number only
+/// when `K/12` is exact -- the four rungs this bench has run (36/48/60/72 bits,
+/// three to six a interval, LC 8/16/32/64). One rung further up the ladder, 6.4.1
+/// gives the first `K % 12` intervals one bit more, and a 32-point interval
+/// needs a code-grid gap of 64 LSB where an 8-point one has 320. Pricing
+/// 25 333 at LC = 8 is how a model that says 0.0939 licenses a rung the bench
+/// watched fail ([`threshold`], `docs/240` sec 3c).
+#[must_use]
+pub fn points(drn: u8) -> usize {
+    if !(1..=UP_RATES as u8).contains(&drn) {
+        return 0;
+    }
+    let bits = up_bits(drn);
+    let each = bits / UP_INTERVALS as u32;
+    let spare = bits % UP_INTERVALS as u32;
+    let mut widest = 1usize;
+    for i in 0..UP_INTERVALS {
+        let width = each + u32::from((i as u32) < spare);
+        widest = widest.max(1usize << width);
+    }
+    widest
+}
+
+/// One index step of the LC = 8 grid in the codec's LSB: `2 G` at
+/// [`REFERENCE_LC`], times [`codegrid::TARGET_RMS`] (`docs/241` sec 0: 349 LSB).
+///
+/// This is the denominator `docs/240` sec 3c's gap correction is taken against,
+/// and it is the clause's own number: `[8.8.3]` fixes `G`, and the far end's
+/// power identity fixes what one unit of it is in LSB.
+#[must_use]
+pub fn index_step_lsb() -> f64 {
+    2.0 * super::upchoice::gain_for(REFERENCE_LC) * crate::v92::codegrid::TARGET_RMS
+}
+
+/// The residual, in index steps of the LC = 8 grid, that a rung actually needs:
+/// [`SIGMA_MAX`] scaled by the smallest gap a maximin set of [`points`] codes
+/// can hold, over one index step.
+///
+/// ```text
+/// drn   rate   points  gap(LSB)  threshold
+///   1  24000      8      320      0.0861
+///   2  25333     16      128      0.0344
+///   7  32000     16      128      0.0344
+///  13  40000     32       64      0.0172
+///  19  48000     64       16      0.0043
+/// ```
+///
+/// `sigma_max(lc)` answers a different question -- what the *mean square* of a
+/// `lc`-point set buys -- and for a rung whose set is carried by an interval one
+/// bit wider than `K/12` it is nearly three times too generous. A decision taken
+/// against a gap has to clear half of it, so the gap is the number the criterion
+/// is denominated in, and this is the only threshold [`ceiling_rung`] compares
+/// with. It is *tighter* than `sigma_max` everywhere except the LC = 8 rung the
+/// bench has measured, which is the conservative direction (`docs/240` sec 3c).
+#[must_use]
+pub fn threshold(drn: u8) -> f64 {
+    let points = points(drn);
+    if points < 2 {
+        return 0.0;
+    }
+    gap_lsb(points).map_or(0.0, |gap| SIGMA_MAX * gap / index_step_lsb())
+}
+
+/// The smallest gap a *maximin* set of `points` positive µ-law codes holds, in
+/// the codec's LSB, at the power `[8.8.3]` sets (`docs/116` sec 7, re-derived in
+/// `docs/240` sec 3c's gap column).
+///
+/// Taken from that column rather than searched here, because the search this
+/// crate has ([`crate::v92::codegrid::grid`]) is greedy from the bottom and
+/// finds 256 LSB at eight points where a maximin set holds 320 -- a 20 % tighter
+/// reading of the same rung, which is a modelling difference and not a
+/// measurement. The four counts the ladder's twelve intervals actually ask for
+/// (8, 16, 32, 64 -- 6.4.1's `2^(K/12)` with the spare bits on the first
+/// intervals) are the ones tabulated; anything else is searched.
+#[must_use]
+pub fn gap_lsb(points: usize) -> Option<f64> {
+    let tabulated = match points {
+        8 => Some(320.0),
+        16 => Some(128.0),
+        32 => Some(64.0),
+        64 => Some(16.0),
+        _ => None,
+    };
+    tabulated.or_else(|| crate::v92::codegrid::grid(points).map(|set| crate::v92::codegrid::min_gap(&set)))
+}
+
 /// The largest measurement, in index steps of the **LC = 8 grid**, that a rung
 /// whose set is `lc` points can carry.
 ///
@@ -443,11 +532,19 @@ impl Sigma {
 /// faster than that; a measurement that already refuses the slowest rung refuses
 /// everything.
 #[must_use]
-pub fn ceiling_rung(measured: Sigma, lc_of: impl Fn(u8) -> usize) -> Option<u8> {
-    if measured.bound == Bound::Lower {
-        return (measured.steps <= sigma_max(lc_of(1))).then_some(1);
-    }
-    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= sigma_max(lc_of(drn)))
+pub fn ceiling_rung(measured: Sigma) -> Option<u8> {
+    // **Scan and decide, for every bound.** The scan used to be skipped for a
+    // `Bound::Lower`: the number was spent at drn 1 without asking any rung its
+    // own question, so a measurement that carried 25 333 by 2.5x could not say
+    // so, and the log carried a ceiling that was a constant rather than a
+    // reading. What makes the scan safe is not the bound but the threshold: it
+    // is the *gap*-corrected requirement (`docs/240` sec 3c), which for every
+    // rung above drn 1 is two to twenty times tighter than `sigma_max` would be,
+    // and it is refused the moment the measurement does not clear it. So this is
+    // not "allow more": at today's 0.0690 every rung above drn 1 is still
+    // refused, and the refusal is now a number in the log rather than a
+    // short-circuit (see `digital::decide_upstream_rung`).
+    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold(drn))
 }
 
 /// The mask of rungs at or below `ceiling`, in the layout of Table 20's Ja mask:
@@ -472,9 +569,9 @@ pub fn ceiling_mask(ceiling: Option<u8>) -> u32 {
 /// apply_ceiling(ja, m) & ja == apply_ceiling(ja, m)
 /// ```
 #[must_use]
-pub fn apply_ceiling(ja: u32, measured: Sigma, lc_of: impl Fn(u8) -> usize) -> u32 {
+pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
     let allowed = if ja == 0 { JA_MASK_ALL } else { ja };
-    allowed & ceiling_mask(ceiling_rung(measured, lc_of))
+    allowed & ceiling_mask(ceiling_rung(measured))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +802,7 @@ mod tests {
         for step in 0..=240 {
             let steps = 10f64.powf(-4.0 + 4.0 * f64::from(step) / 120.0);
             let measured = Sigma::absolute(2.0 * gain_for(REFERENCE_LC) * steps, Bound::Reading);
-            let ceiling = ceiling_rung(measured, lc_for).unwrap_or(0);
+            let ceiling = ceiling_rung(measured).unwrap_or(0);
             assert!(
                 ceiling <= previous,
                 "the ceiling rose from {previous} to {ceiling} at sigma {steps:e}"
@@ -717,27 +814,38 @@ mod tests {
         assert_eq!(seen.last(), Some(&0), "a dirty enough one must permit nothing");
     }
 
-    /// Each rung's boundary is where `SIGMA_MAX` and its own `G` put it: a
-    /// measurement just inside the bound carries the rung, and one just outside
-    /// does not.
+    /// Each rung's boundary is where its own **gap-corrected** threshold puts
+    /// it: a measurement just inside carries the rung, one just outside does
+    /// not. The number is `SIGMA_MAX` scaled by the smallest gap of a maximin
+    /// code set of [`points`] points (`docs/240` sec 3c), not `sigma_max(lc)`:
+    /// 25 333 is carried by a 16-point interval and 0.0939 would be a model of a
+    /// set the rung does not have.
     #[test]
-    fn each_rung_s_boundary_is_where_the_target_puts_it() {
-        for (drn, lc) in [(1u8, 8usize), (7, 16), (13, 32), (19, 64)] {
-            let inside = Sigma::reading(sigma_max(lc) * 0.999, REFERENCE_LC);
-            let outside = Sigma::reading(sigma_max(lc) * 1.001, REFERENCE_LC);
-            let permitted = ceiling_rung(inside, lc_for).expect("a rung");
+    fn each_rung_s_boundary_is_where_its_own_threshold_puts_it() {
+        for (drn, lc) in [(1u8, 8usize), (2, 16), (7, 16), (13, 32), (19, 64)] {
+            let bound = threshold(drn);
+            assert!(bound > 0.0, "drn {drn} has no threshold");
+            let inside = Sigma::reading(bound * 0.999, REFERENCE_LC);
+            let outside = Sigma::reading(bound * 1.001, REFERENCE_LC);
+            let permitted = ceiling_rung(inside).expect("a rung");
             assert!(permitted >= drn, "drn {drn} was refused at 0.1 % inside its bound: {permitted}");
-            let refused = ceiling_rung(outside, lc_for);
+            let refused = ceiling_rung(outside);
             assert!(
                 refused.is_none_or(|ceiling| ceiling < drn),
                 "drn {drn} was still permitted at 0.1 % outside its bound: {refused:?}"
             );
-            // And the predicted error at the boundary is the target, on that
-            // rung's own grid.
-            let at_boundary = Sigma::reading(sigma_max(lc), REFERENCE_LC).error(lc);
+            // The predicted error at the boundary is at or under the target on
+            // the rung's own worst interval, and the gap correction only ever
+            // tightens the mean-square model -- which is the direction the
+            // threshold exists to be wrong in.
+            let at_boundary = Sigma::reading(bound, REFERENCE_LC).error(points(drn));
             assert!(
-                (at_boundary / TARGET - 1.0).abs() < 0.02,
+                at_boundary <= TARGET * 1.001,
                 "drn {drn}: {at_boundary:e} at its boundary against a target of {TARGET:e}"
+            );
+            assert!(
+                bound <= sigma_max(points(drn)),
+                "drn {drn}: threshold {bound:.4} is looser than the mean-square model"
             );
         }
     }
@@ -748,12 +856,12 @@ mod tests {
     #[test]
     fn the_24_000_measurement_carries_24_000_and_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_24, 8);
-        let ceiling = ceiling_rung(measured, lc_for).expect("the measured arm carries a rung");
+        let ceiling = ceiling_rung(measured).expect("the measured arm carries a rung");
         assert!(ceiling >= 1, "24 000 was refused");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_24} index-step residual");
         // The two rungs, explicitly, through the mask: drn 1 survives, drn 7
         // does not, and no rung above 7 does either.
-        let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+        let mask = apply_ceiling(JA_MASK_ALL, measured);
         assert_eq!(mask & (1 << 0), 1 << 0, "24 000 was masked out");
         assert_eq!(mask & (1 << 6), 0, "32 000 survived the ceiling");
         assert_eq!(mask & !((1 << 7) - 1), 0, "a rung above 32 000 survived");
@@ -765,7 +873,7 @@ mod tests {
     #[test]
     fn the_32_000_measurement_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_32, 16);
-        let ceiling = ceiling_rung(measured, lc_for).expect("the fallback is still a rung");
+        let ceiling = ceiling_rung(measured).expect("the fallback is still a rung");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_32} index-step residual");
         assert!(ceiling >= 1, "the measurement refuses even 24 000, which the call went on to use");
         // On the reference grid the same absolute residual is half as many
@@ -782,15 +890,28 @@ mod tests {
         for step in 0..40 {
             let steps = 0.005 * f64::from(step);
             let measured = Sigma::reading(steps, REFERENCE_LC);
-            let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+            let mask = apply_ceiling(JA_MASK_ALL, measured);
             for drn in 1..=UP_RATES as u8 {
                 let permitted = mask & (1 << (drn - 1)) != 0;
-                let error = measured.error(lc_for(drn));
+                // The rung's own worst interval, which is what the scan prices.
+                let error = measured.error(points(drn));
+                let budget = threshold(drn);
+                // The permission *is* the scan's comparison, and it is at least
+                // as strict as the error probability -- the gap correction only
+                // tightens -- so a permitted rung never misses the target and a
+                // refused one is refused on a number that is not looser than
+                // the model.
                 assert_eq!(
                     permitted,
-                    error <= TARGET * 1.001,
-                    "drn {drn} at sigma {steps}: permitted {permitted} with a predicted {error:e}"
+                    steps <= budget,
+                    "drn {drn} at sigma {steps}: permitted {permitted} against {budget:.4}"
                 );
+                if permitted {
+                    assert!(
+                        error <= TARGET * 1.001,
+                        "drn {drn} at sigma {steps} was permitted with a predicted {error:e}"
+                    );
+                }
             }
         }
     }
@@ -808,9 +929,9 @@ mod tests {
                 for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
                     let measured = Sigma { bound, ..Sigma::reading(steps, REFERENCE_LC) };
                     let allowed = if mask == 0 { JA_MASK_ALL } else { mask };
-                    let out = apply_ceiling(mask, measured, lc_for);
+                    let out = apply_ceiling(mask, measured);
                     assert_eq!(out & !allowed, 0, "mask {mask:#b} at sigma {steps} grew to {out:#b}");
-                    assert!(out & !ceiling_mask(ceiling_rung(measured, lc_for)) == 0);
+                    assert!(out & !ceiling_mask(ceiling_rung(measured)) == 0);
                     if out & !mask != 0 {
                         // Only possible through the zero-means-every-rung rule.
                         assert_eq!(mask, 0);
@@ -825,19 +946,58 @@ mod tests {
         assert!(rose > 0, "the zero-mask case was not exercised");
     }
 
-    /// A lower bound on the residual is optimistic, so it is spent at the
-    /// slowest rung: it can never justify anything faster, and a lower bound
-    /// that already refuses 24 000 refuses everything.
+    /// **The rule the scan exists for, both ways.**
+    ///
+    /// Above a rung's threshold that rung is *refused* and the granted `drn` is
+    /// what it was before the scan existed -- today's 0.0690 measures drn 1 and
+    /// nothing higher, and the ladder must not move on it. Below the threshold
+    /// the rung rises to the highest one whose threshold the measurement meets,
+    /// which is the scan doing what the short-circuit could not do at all.
     #[test]
-    fn a_lower_bound_only_reaches_the_slowest_rung() {
-        let clean = Sigma::lower(1e-6, 8);
-        assert_eq!(ceiling_rung(clean, lc_for), Some(1), "a lower bound justified more than the slowest rung");
-        let dirty = Sigma::lower(1.0, 8);
-        assert_eq!(ceiling_rung(dirty, lc_for), None);
-        // The same numbers read as a reading or as an upper bound go all the
-        // way up the ladder, which is the difference the bound makes.
-        assert_eq!(ceiling_rung(Sigma::reading(1e-6, 8), lc_for), Some(UP_RATES as u8));
-        assert_eq!(ceiling_rung(Sigma::absolute(0.0, Bound::Upper), lc_for), Some(UP_RATES as u8));
+    fn the_scan_refuses_above_a_threshold_and_grants_below_it() {
+        // The ticket's two-sided rule, named after it: `drn 2` = 25 333 has a
+        // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
+        let above = Sigma::lower(0.0690, REFERENCE_LC);
+        assert_eq!(ceiling_rung(above), Some(1), "0.0690 was allowed past drn 1");
+        assert!(0.0690 > threshold(2), "the threshold the refutation rests on moved");
+        println!("drn 2 threshold {} at 0.0690 -> {:?}", threshold(2), ceiling_rung(above));
+
+        // Just inside it, drn 2 is carried -- and so is every rung at or under
+        // the same threshold, which is the highest rung the measurement meets.
+        let below = Sigma::lower(0.0344 * 0.999, REFERENCE_LC);
+        let granted = ceiling_rung(below).expect("0.0339 must carry a rung");
+        assert!(granted >= 2, "drn 2 was refused at 0.0339: {granted}");
+        let expected = (1..=UP_RATES as u8).rev().find(|&drn| 0.0344 * 0.999 <= threshold(drn));
+        assert_eq!(Some(granted), expected, "the scan did not take the highest rung met");
+        println!("0.0339 -> drn {granted} ({})", up_rate(granted));
+
+        // A bound does not change the scan any more: the same number is the same
+        // rung whether it is called a reading or a lower bound. What the bound
+        // still does is travel in the log (`docs/242` sec 4).
+        for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
+            let measured = Sigma { bound, ..Sigma::reading(0.0344 * 0.999, REFERENCE_LC) };
+            assert_eq!(ceiling_rung(measured), Some(granted), "{bound:?} read differently");
+        }
+        let dirty = Sigma::lower(1.0, REFERENCE_LC);
+        assert_eq!(ceiling_rung(dirty), None, "a measurement that refuses 24 000 must refuse all");
+    }
+
+    /// The thresholds reproduce `docs/240` sec 3c's verified column, which is
+    /// what stops a later reader from rounding the rung above 24 000 back to the
+    /// mean-square model.
+    #[test]
+    fn the_thresholds_are_the_gap_corrected_ones() {
+        for (drn, want) in [(1u8, 0.0861), (2, 0.0344), (7, 0.0344), (13, 0.0172), (19, 0.0043)] {
+            let got = threshold(drn);
+            assert!((got - want).abs() < 5e-4, "drn {drn}: {got:.4} against {want}");
+        }
+        // 349 LSB is one index step at LC 8 (`docs/241` sec 0).
+        assert!((index_step_lsb() - 349.0).abs() < 1.0, "{}", index_step_lsb());
+        // 25 333's worst interval is 16 points, and an 8-point reading of the
+        // same rung would be 2.7x too generous.
+        assert_eq!(points(2), 16, "25 333's widest interval");
+        assert_eq!(points(1), 8);
+        assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the mean-square model is not tighter");
     }
 
     /// The wiring's own input: a design and a noise figure give an *upper* bound
@@ -858,7 +1018,7 @@ mod tests {
         let mut previous = u8::MAX;
         for exp in (0..12).rev() {
             let noise = 10f64.powi(-exp);
-            let ceiling = ceiling_rung(Sigma::from_design(&design, noise), lc_for).unwrap_or(0);
+            let ceiling = ceiling_rung(Sigma::from_design(&design, noise)).unwrap_or(0);
             assert!(ceiling <= previous, "noise {noise:e} gave {ceiling} after {previous}");
             previous = ceiling;
         }
@@ -878,8 +1038,8 @@ mod tests {
         for (text, lc, recorded) in [TWENTY_FOUR, THIRTY_TWO] {
             let measured = sigma_from_stream(text, lc).expect("a score run");
             assert_eq!(measured.bound(), Bound::Reading);
-            let ceiling = ceiling_rung(measured, lc_for).expect("the slowest rung survives both");
-            let mask = apply_ceiling(JA_MASK_ALL, measured, lc_for);
+            let ceiling = ceiling_rung(measured).expect("the slowest rung survives both");
+            let mask = apply_ceiling(JA_MASK_ALL, measured);
             println!(
                 "recorded at drn {recorded} (LC {lc}): sigma {:.4} index steps, {:.4} on the LC = 8 grid, \
                  ceiling drn {ceiling}, mask {mask:#b}",
@@ -920,7 +1080,7 @@ mod tests {
         let clean = format!("1 {g:.17} score\n2 {:.17} score\n3 {:.17} score\n", -3.0 * g, 5.0 * g);
         let clean = sigma_from_stream(&clean, REFERENCE_LC).expect("a score run");
         assert!(clean.steps() < 1e-12, "{}", clean.steps());
-        assert_eq!(ceiling_rung(clean, lc_for), Some(UP_RATES as u8));
+        assert_eq!(ceiling_rung(clean), Some(UP_RATES as u8));
         // And the mode is what selects the window: the same levels as `data` are
         // not a measurement.
         assert!(sigma_from_stream("1 0.5 data\n", 8).is_none());
