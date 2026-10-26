@@ -5282,6 +5282,18 @@ impl Modem {
         // own transmit chain is parked, so the one `CPd` waits one window after
         // its `CPu` instead of chasing it.
         exchange.hold_cp_for_parked_tx();
+        // And it waits for the `CPu` itself, which is the same thing one step
+        // earlier: the `CPd` is what acknowledges the far end's `CPu`
+        // (9.6.1.1.2's bit 33), so a `CPd` released before that `CPu` has been
+        // decoded carries the bit clear *and* lands inside the sequence it is
+        // answering. The renegotiation's exchange already waits; the initial
+        // Phase 4 did not, and its `CPd` therefore went out unacknowledged
+        // whenever the far end's `CPu` was decoded a moment too late -- on 3
+        // of 3 calls at answer point 170 it was 20 ms too late (CPd 22.340,
+        // `ack false`; `CPu` 22.360), and the far end fell forward with
+        // `0x6009521a` 1.002 s after data mode. The wait is bounded by
+        // [`Exchange::peer_cp_wait`].
+        exchange.wait_for_peer_cp(true);
         self.exchange = Some(exchange);
         self.upstream_data = None;
         self.note("V.92: TRN2d done, SUVd out".into());
