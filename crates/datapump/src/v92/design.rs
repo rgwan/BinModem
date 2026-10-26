@@ -1107,6 +1107,8 @@ pub fn from_reading(reading: &Reading, limits: &FilterLimits) -> Result<(Design,
         least = least.min(tone.z_db);
     }
 
+    // No `p2`: this is a zero-phase FIR shaper and there is no pole to place.
+    // See `Filters::p2` and `docs/252` §2 -- `LP2 = 0` is declared, not left out.
     let filters = Filters { z1: Vec::new(), p1: Vec::new(), z2: taps, p2: Vec::new() };
     filters.fits(limits)?;
     let predicted = Predicted {

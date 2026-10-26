@@ -707,6 +707,47 @@ mod tests {
         assert!((fixed - 1.0).abs() < 0.05, "the corrected gain measured {fixed:.4}");
     }
 
+    /// `p2` is absent by decision, and the decision has a clause and a bound.
+    ///
+    /// 6.4.2 (`v92.txt:463-466`) prints `v(n) = sum x(n-kappa) z2(kappa) +
+    /// sum v(n-kappa) p2(kappa)`, so `LP2 > 0` is a recursive prefilter and
+    /// `LP2 = 0` an FIR one. Both designers here produce an FIR section, so
+    /// every CPd this end emits declares `LP2 = 0` -- Table 30's "p2(1) :
+    /// p2(LP2) (if LP2 > 0)" makes that a legal length rather than a gap -- and
+    /// nothing may put a `p2` on the wire without a designer behind it. The
+    /// bound on the field, should one ever exist, is INFO1a bits 12:17: the
+    /// section must have been offered (bits 12:13, codes 2 and 3 name `p2`) and
+    /// `LP2` counts in `Ltot <= 192/256/320/384` and `Lmax <= 128/192/256/320`.
+    #[test]
+    fn a_prefilter_without_a_feedback_section_is_declared_not_omitted() {
+        let design = design_for(0.0);
+        for drn in 1..=UP_RATES as u8 {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                continue;
+            };
+            assert!(parameters.filters.p2.is_empty(), "drn {drn}: an undesigned p2 reached the wire");
+        }
+        let reading = reading_design();
+        assert!(reading.filters.p2.is_empty(), "the reading's shaper is FIR");
+        // The bound the field would be held to: a p2 the far end did not offer
+        // is refused before the wire, and one that fits is only refused by the
+        // lengths INFO1a announced.
+        let offered = FilterLimits::from_info1a(0, 0, 0); // p1 and z2 only
+        let mut with_p2 = Filters { z2: vec![1.0], p2: vec![0.25], ..Filters::default() };
+        assert!(with_p2.fits(&offered).is_err(), "a p2 nobody offered was accepted");
+        with_p2.p2.truncate(1);
+        assert!(with_p2.fits(&plan()).is_ok(), "a single p2 is inside Ltot and Lmax");
+        // The section would also change `v`: a pole on the prefilter's own
+        // output is a different `v`, hence a different 8.8.3 gain. That is why
+        // the absence is a decision and not a default -- see the module docs of
+        // `Filters::p2`.
+        let mut state = 0.0f64;
+        for _ in 0..32 {
+            state = 1.0 + 0.25 * state;
+        }
+        assert!(state > 1.3, "a p2 of 0.25 raises the section's steady-state output to {state}");
+    }
+
     /// A design from the L1/L2 probing of a G.712-like loop: the path a call
     /// actually takes (`Prefilter::Reading` is the default).
     fn reading_design() -> Design {

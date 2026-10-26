@@ -491,8 +491,30 @@ pub struct Filters {
     pub p1: Vec<f64>,
     /// z2(0..LZ2-1), the prefilter's feed-forward section.
     pub z2: Vec<f64>,
-    /// p2(1..LP2), the prefilter's feedback section. Empty unless INFO1a
-    /// bit 13 offered it.
+    /// p2(1..LP2), the prefilter's feedback section: 6.4.2's
+    /// `v(n) = sum{x z2} + sum{v(n-kappa) p2(kappa)}` makes it a *pole* section
+    /// on the prefilter's own output, so `p2 != []` is a recursive prefilter
+    /// and `p2 == []` an FIR one.
+    ///
+    /// **Our designs are FIR, so `LP2 = 0` in everything this end sends, and
+    /// that is a choice with a bound rather than an omission** (`docs/252` §2).
+    /// Table 30 prints `p2(1) : p2(LP2)` "if LP2 > 0", so a zero length is a
+    /// legal way to spend no coefficients; and the far end only accepts one at
+    /// all if INFO1a bits 12:13 (`v92.txt:1186-1192`) named it -- code 0 "p1 and
+    /// z2", 1 "+ z1", 2 "p1, p2 and z2", 3 all four. The bound on `LP2` itself
+    /// is Table 18 bits 14:17 (`v92.txt:1194-1197`): it counts in
+    /// `Ltot = LZ1 + LP1 + LZ2 + LP2 <= 192/256/320/384` and in
+    /// `Lmax = max{...} <= 128/192/256/320`, which is exactly what
+    /// [`FilterLimits`] and [`Filters::fits`] enforce.
+    ///
+    /// Why zero for us: both designers produce an FIR section -- [`crate::v92
+    /// ::design::design`] a least-squares inverse truncated at `LZ2`, and
+    /// [`crate::v92::design::from_reading`] a symmetric zero-phase Type-I shaper
+    /// -- and neither fits a rational response. A `p2` would buy a longer
+    /// effective inverse out of the same coefficient budget only where the
+    /// exact inverse's tail is geometric, which a truncated LS inverse's is not
+    /// and a magnitude-only shaper's is not at all. Spending the budget on `LZ2`
+    /// instead is the same trade with no recursion for the far end to get wrong.
     pub p2: Vec<f64>,
 }
 
