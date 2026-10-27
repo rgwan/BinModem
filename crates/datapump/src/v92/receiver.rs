@@ -232,6 +232,27 @@ const PROBE_MATCHED: f64 = 0.45;
 /// the first guess the Phase 4 design starts from.
 pub const CHANNEL_DELAY: usize = 13;
 
+/// How far either side of [`CHANNEL_DELAY`] the Phase 4 fit solves its own
+/// alignment, in the receiver's own symbol instants.
+///
+/// The fit's answer is a function of `lag + origin` and of nothing else, so an
+/// origin counted a few tens of instants out and a line whose delay differs
+/// from the constant are the same number to the least-squares problem. `docs/297`
+/// left that sum to a single fixed term and read `1.3 dB` on a window that
+/// peaks at `18.75`; the search here is what turns the constant into the
+/// measurement, and the cliff either side of it is steep enough -- from 18.8 dB
+/// to 0.42 dB in a hundred and fifty instants, measured -- that a coarse pass
+/// over this range cannot miss the plateau.
+const LAG_SCAN: i64 = 96;
+
+/// The coarse pass's step: the plateau is some ninety instants wide, so a
+/// sixteenth of the range lands inside it on every call measured.
+const LAG_STEP_COARSE: i64 = 16;
+
+/// The fine pass, around the coarse winner, and its step.
+const LAG_FINE: i64 = 8;
+const LAG_STEP_FINE: i64 = 2;
+
 /// Samples either side of [`CHANNEL_DELAY`] the Phase 4 design searches for the
 /// alignment, and symbols either side of the anchor it correlates to find where
 /// TRN1u begins.
@@ -1335,6 +1356,11 @@ pub struct Receiver {
     /// on the same window: `(held, fitted)`. A diagnostic, so a call's log can
     /// say what was thrown away rather than only that something was.
     last_on_window: Option<(f64, f64)>,
+    /// The alignment the last TRN2u fit was solved at, what the window's own
+    /// best alignment reads, and how many alignments were tried:
+    /// `(solved lag, peak dB, tried)`. A diagnostic, so a call can print the
+    /// two decibels that separate a fit from a residual.
+    last_alignment: Option<(i64, f64, usize)>,
     count: u64,
     slicer: Slicer,
     /// Decisions recently made, for the error watch.
@@ -1389,6 +1415,7 @@ impl Receiver {
             trained_at: 0,
             origin: None,
             last_on_window: None,
+            last_alignment: None,
             count: 0,
             slicer: Slicer::TwoPoint,
             wrong: 0,
@@ -2017,6 +2044,14 @@ impl Receiver {
     #[must_use]
     pub fn last_fit_pair(&self) -> Option<(f64, f64)> {
         self.last_on_window
+    }
+
+    /// The alignment the last TRN2u fit was solved at, what the best alignment
+    /// on that window reads, and how many alignments were tried. `None` where
+    /// no alignment was legal. See [`Self::train_on_trn2u`].
+    #[must_use]
+    pub fn last_alignment(&self) -> Option<(i64, f64, usize)> {
+        self.last_alignment
     }
 
     /// Whether there is an equaliser behind the slicer.
@@ -3741,15 +3776,87 @@ impl Receiver {
         if origin as usize > p || offset + window > levels.len() {
             return false;
         }
-        // One least-squares fit, at the channel's own decision lag. The
-        // window starts at `p`; the reference is the sequence `offset` symbols
-        // in, less the lag.
+        // The alignment is **solved**, not assumed.
+        //
+        // `origin` and the alignment enter this fit only as the single quantity
+        // `lag + origin`: `skip = start - lag - origin` is the only place
+        // either of them appears, so the least-squares problem has one answer
+        // for the *sum* and none at all for the split. Holding the split at
+        // `CHANNEL_DELAY` therefore makes every error in the counted origin
+        // look like a worse channel instead of a wrong number, which is exactly
+        // `docs/297` section 2.3's residual -- 1.3 dB where the call's own
+        // capture peaks at 18.75 dB -- and it is the same shape as `docs/287`'s
+        // dropped `back`: a constant standing where a measurement belongs.
+        //
+        // The clause fixes the two halves differently, so only one of them is
+        // ours to solve:
+        //
+        // * the **symbol instant** is 8.7.6's (`v92.txt:1717-1723`): TRN2u's
+        //   scrambler is reset at its first symbol and nowhere else, so the
+        //   frame boundary *is* the E1u boundary and is known -- that is
+        //   `origin`, measured by counting the E1u symbols, and it is not
+        //   solved here;
+        // * the **channel delay** is nowhere in the clause as a number. V.92
+        //   lets the digital modem *measure* the round trip (9.4.1.1.4,
+        //   `v92.txt:2391-2394`) and states no one-way delay of thirteen of
+        //   anything.
+        //
+        // So the alignment is what the fit solves, and the four points on the
+        // window are the instrument that solves it. Coarse then fine: the
+        // residual against the alignment is a plateau with a cliff rather than
+        // a spike, and a search that costs seconds in the middle of TRN2d is
+        // the stall `docs/297` removed.
         let start = p;
         let span = window.min(length - start);
-        let lag = CHANNEL_DELAY.min(offset);
-        let skip = start as i64 - lag as i64 - origin as i64;
-        // What the filter this would replace reads **on this window**, before
-        // it is replaced and before `levels` is handed to the fit.
+        let mut best: Option<(Fitted, i64)> = None;
+        let mut peak: Option<(f64, i64)> = None;
+        let mut tried = 0usize;
+        let mut lags: Vec<i64> = (-LAG_SCAN..=LAG_SCAN)
+            .step_by(LAG_STEP_COARSE as usize)
+            .map(|slip| CHANNEL_DELAY as i64 + slip)
+            .collect();
+        for pass in 0..2 {
+            let this = std::mem::take(&mut lags);
+            for lag in this {
+                let skip = start as i64 - lag - origin as i64;
+                if skip < 0 || skip as usize + span > levels.len() {
+                    continue;
+                }
+                self.restore(&before);
+                self.pending_levels = Some(levels.clone());
+                if !self.fit_at(start, span, skip as u64, sections.0, sections.1) {
+                    self.pending_levels = None;
+                    continue;
+                }
+                let snr = self.snr_db;
+                tried += 1;
+                if peak.is_none_or(|(seen, _)| snr > seen) {
+                    peak = Some((snr, lag));
+                }
+                if best.as_ref().is_none_or(|(seen, _)| snr > seen.snr()) {
+                    best = Some((self.fitted(), lag));
+                }
+            }
+            if pass == 0 {
+                let Some((_, at)) = peak else { break };
+                lags = (-LAG_FINE..=LAG_FINE)
+                    .step_by(LAG_STEP_FINE as usize)
+                    .map(|slip| at + slip)
+                    .collect();
+            }
+        }
+        self.restore(&before);
+        // A maximum on the boundary of the search is not a maximum: it says
+        // the window's peak is outside the range the alignment was solved over,
+        // and what was found instead is a residual that happens to have the
+        // fit's shape. The winner is still reported (`last_alignment`), so a
+        // call that hits this says where the search stopped instead of
+        // presenting the residual as a design.
+        let edge = LAG_SCAN - LAG_STEP_COARSE;
+        let reached = best.as_ref().map(|(found, lag)| (found.snr(), *lag));
+        let accept = best.take().filter(|(_, lag)| (lag - CHANNEL_DELAY as i64).abs() < edge);
+        // What the filter this would replace reads **on this window, against
+        // the reference the solved alignment named**, before it is replaced.
         //
         // `before.snr()` is the figure the incumbent was fitted at, and for
         // this call it is a two-point `TRN1u` fit's: a different constellation,
@@ -3765,42 +3872,51 @@ impl Receiver {
         // window against this reference* (`score_against`, the same measurement
         // the second-TRN1u refit's accept test uses), so both figures are
         // decibels on the same four points, the same window and the same
-        // reference, and the 3 dB margin means one thing on both. When there is
-        // no incumbent to score the fallback is the old figure, which is what
+        // reference, and the margin means one thing on both. When there is no
+        // incumbent to score the fallback is the old figure, which is what
         // every untrained receiver wants.
         let held = {
+            let align = reached.map_or(CHANNEL_DELAY as i64, |(_, lag)| lag);
+            let skip = start as i64 - align - origin as i64;
             let ahead = ahead_of(&self.forward, &self.feedback);
             let rows = self.forward.len().saturating_sub(1 + ahead);
-            levels
-                .get(skip.max(0) as usize..(skip.max(0) as usize).saturating_add(span))
-                .filter(|reference| reference.len() == span)
-                .and_then(|reference| {
-                    self.score_against(reference, &self.forward, &self.feedback, start, rows)
-                })
-        };
-        let mut best: Option<Fitted> = None;
-        if skip >= 0 && skip as usize + span <= levels.len() {
-            self.pending_levels = Some(levels);
-            if self.fit_at(start, span, skip as u64, sections.0, sections.1) {
-                best = Some(self.fitted());
+            if skip < 0 {
+                None
             } else {
-                self.pending_levels = None;
+                let skip = skip as usize;
+                levels
+                    .get(skip..skip.saturating_add(span))
+                    .filter(|reference| reference.len() == span)
+                    .and_then(|reference| {
+                        self.score_against(reference, &self.forward, &self.feedback, start, rows)
+                    })
             }
-        }
-        self.last_on_window = held.zip(best.as_ref().map(|found| found.snr()));
+        };
+        let fitted = accept.as_ref().map(|(found, _)| found.snr());
+        self.last_on_window = held.zip(fitted);
+        // The alignment the fit was solved at, what the window's own best
+        // reads, and how many alignments were tried: the two decibels that tell
+        // a fit from a residual, and the count that says the search happened.
+        self.last_alignment = reached
+            .zip(peak)
+            .map(|((_, lag), (seen, _))| (lag, seen, tried));
         if std::env::var_os("V92_REFIT_TRACE").is_some() {
             eprintln!(
-                "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {:?} \
-                 held {held:?} before {:.1}",
-                best.as_ref().map(Fitted::snr),
+                "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {fitted:?} \
+                 at {reached:?} peak {peak:?} over {tried} held {held:?} before {:.1}",
                 before.snr()
             );
         }
-        let floor = match held {
-            Some(held) => held - 3.0,
-            None => before.snr() - 3.0,
+        let floor = match (held, peak) {
+            // A fit more than 3 dB below the best alignment the same search
+            // found is a residual, whatever the incumbent reads. That is what
+            // `docs/297`'s 1.3 dB was, and no accept test that knows only the
+            // incumbent's figure can tell a residual from a poor filter.
+            (_, Some((seen, _))) => held.map_or(seen, |held| held.max(seen)) - 3.0,
+            (Some(held), None) => held - 3.0,
+            (None, None) => before.snr() - 3.0,
         };
-        match best.filter(|found| found.snr() > floor) {
+        match accept.map(|(found, _)| found).filter(|found| found.snr() > floor) {
             Some(mut found) => {
                 self.restore(&before);
                 // Which way up the line's TRN2u arrived, decided against the
@@ -5104,6 +5220,73 @@ mod tests {
             took && fitted > held,
             "the fit was refused: it measures {fitted:.1} dB against {held:.1} dB for \
              the filter it would replace, on the same window and the same reference"
+        );
+    }
+
+    /// The fit's alignment is solved, and a residual is not called a fit.
+    ///
+    /// `origin` and the alignment enter `train_on_trn2u`'s least-squares problem
+    /// only as `lag + origin`, so with `lag` held at `CHANNEL_DELAY` an origin
+    /// counted too late is indistinguishable from a slower channel, and the fit
+    /// reports the penalty as if it were the line. Measured on the 297 call:
+    /// `1.3 dB`, `fitted`, where the same window peaks at `18.75 dB`.
+    ///
+    /// Two things are asserted. With the sequence where the origin says it is,
+    /// the alignment is *searched* (`tried`) and the fit lands on the window's
+    /// own peak. With the origin 140 instants late -- past the reach of the
+    /// centred forward section -- the window's own best is `0.5 dB`, and that
+    /// is a residual: it must not be installed however much better it reads
+    /// than the two-point filter it would replace.
+    #[test]
+    fn the_trn2u_fit_solves_the_alignment_and_refuses_a_residual() {
+        let symbols = 3000usize;
+        let bits = reference_from(0, 2 * symbols + 4, Mode::Answer).expect("a reference");
+        let levels = trn2u_levels(&bits, symbols, 0, 0, false).expect("the four-point sequence");
+        let build = |shift: u64| {
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                ((seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64
+                    - 0.5)
+                    * 0.05
+            };
+            let mut rx = Receiver::new();
+            for index in 0..levels.len() {
+                rx.feed(levels[index] + next());
+                while rx.heard().is_some() {}
+            }
+            rx.forward = vec![0.5; DFE_FORWARD];
+            rx.feedback = vec![0.0; DFE_FEEDBACK];
+            rx.snr_db = 34.8;
+            let _ = rx.train_on_trn2u(TRAIN_WINDOW, shift);
+            rx
+        };
+        // Where the caller's origin is right, the fit is the window's own best.
+        let rx = build(0);
+        let (_, peak, tried) = rx.last_alignment().expect("an alignment was solved");
+        let (_, fitted) = rx.last_fit_pair().expect("the pair the accept test used");
+        assert!(tried > 8, "the alignment was not searched: {tried} alignment(s) tried");
+        assert!(
+            rx.phase_four.is_some() && fitted > peak - 3.0,
+            "the fit is {fitted:.1} dB against {peak:.1} dB for the window's own best \
+             alignment: a residual, and it was installed anyway"
+        );
+        // Where the origin is 140 instants late, nothing on this window is a
+        // fit: 0.5 dB is a residual, and it used to be installed because it
+        // beat the two-point design's own figure on the same window.
+        let rx = build(140);
+        let (_, peak, _) = rx.last_alignment().expect("an alignment was solved");
+        assert!(
+            peak < 6.0,
+            "the late-origin window reads {peak:.1} dB, which is not the residual this test \
+             is about"
+        );
+        assert!(
+            rx.phase_four.is_none(),
+            "a {peak:.1} dB residual was installed as the phase 4 fit: the accept test compares \
+             it with the design and with nothing that says what a four-point fit is worth"
         );
     }
 

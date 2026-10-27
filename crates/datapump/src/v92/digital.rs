@@ -5036,14 +5036,21 @@ impl Modem {
                 // figure and the design's own, side by side, so the call says
                 // which constellation each was measured on instead of leaving
                 // the reader to guess whether the two are comparable.
-                let held = self
+                // The figure, the alignment it was solved at, the window's own
+                // best and the design's own figure, all four on one line: a
+                // residual cannot be read as a fit when the peak it is measured
+                // against is printed beside it (`docs/298` section 3).
+                let design = self
                     .rx
                     .last_fit_pair()
-                    .map(|(held, _)| format!(", against {held:.1} dB for the design on the same window"))
-                    .unwrap_or_default();
+                    .map_or(f64::NAN, |(held, _)| held);
                 self.note(format!(
-                    "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB{held}",
-                    self.rx.snr_db()
+                    "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB at \
+                     alignment {} (peak {:.1} dB), against {design:.1} dB for the design on the \
+                     same window",
+                    self.rx.snr_db(),
+                    self.alignment_line(),
+                    self.peak_db()
                 ));
                 // The measurement that chooses the upstream rung exists from
                 // here: the receiver's own residual on a four-point stream with
@@ -5053,12 +5060,15 @@ impl Modem {
                 self.decide_upstream_rung();
             } else {
                 self.upstream_drop_until = self.upstream_drop_until.min(self.now);
-                let pair = self
-                    .rx
-                    .last_fit_pair()
-                    .map(|(held, fitted)| format!(" (the design reads {held:.1} dB on the window, the fit {fitted:.1})"))
-                    .unwrap_or_default();
-                self.note(format!("V.92: no phase 4 fit on TRN2u{pair}"));
+                let design = self.rx.last_fit_pair().map_or(f64::NAN, |(held, _)| held);
+                self.note(format!(
+                    "V.92: no phase 4 fit on TRN2u: the best alignment reads {:.1} dB against \
+                     {:.1} dB for the window's own best (solved alignment {}, design \
+                     {design:.1} dB on the same window)",
+                    self.rx.last_fit_pair().map_or(f64::NAN, |(_, fitted)| fitted),
+                    self.peak_db(),
+                    self.alignment_line()
+                ));
             }
         }
         // 9.5.1.1.7-9.5.1.1.8: Jp waits for the phase the receiver has to work
@@ -5893,6 +5903,28 @@ impl Modem {
         self.begin_upstream_at(from);
     }
 
+    /// What the last TRN2u fit solved its alignment at, in the receiver's own
+    /// symbol instants, out of how many alignments were tried.
+    ///
+    /// A fit is only a fit at the alignment the four points themselves pick:
+    /// `docs/297` printed `1.3 dB` on a window that peaks at `18.75` dB and
+    /// called it `fitted`, which is a residual read as a success. The number is
+    /// printed on the same line as the decibels so that the split between
+    /// `origin` and the channel delay is visible rather than absorbed by
+    /// `CHANNEL_DELAY`.
+    fn alignment_line(&self) -> String {
+        self.rx
+            .last_alignment()
+            .map(|(lag, _, tried)| format!("{lag} of {tried}"))
+            .unwrap_or_else(|| "at no alignment".to_owned())
+    }
+
+    /// The best any alignment on the same window reads, in decibels: the figure
+    /// a residual is measured against.
+    fn peak_db(&self) -> f64 {
+        self.rx.last_alignment().map_or(f64::NAN, |(_, peak, _)| peak)
+    }
+
     /// [`Self::begin_upstream`] with 8.7.6's fiducial named by the caller.
     ///
     /// `from` is the absolute symbol index of TRN2u's **first** symbol, which
@@ -5938,6 +5970,21 @@ impl Modem {
             self.note(format!(
                 "V.92: upstream four points measure {inner:.3}/{outer:.3}, gain {gain:.3} over {seen}"
             ));
+        }
+        // 9.6.1.2.1 is not conditioned on anything this end receives: "If the
+        // digital modem does not receive B1u within 20 s plus 6 round-trip
+        // delays from the end of INFO1a, the digital modem shall initiate a
+        // retrain". The arm it had was `enter_data_mode`'s and
+        // `abandon_b1u`'s, and both need an upstream sequence to have been
+        // decoded -- so a Phase 4 whose reader decodes nothing at all has no
+        // deadline and waits for ever, which is what `docs/298` section 1
+        // found: `TRN2d done, SUVd out` and no further line until the
+        // harness's own connect timeout. Armed here, from `start_up_by`'s
+        // absolute origin, a silent reader becomes the retrain the clause asks
+        // for instead of a call that says nothing.
+        if self.b1u_deadline.is_none() {
+            self.b1u_pending = true;
+            self.b1u_deadline = Some(self.start_up_by());
         }
         self.note("V.92: upstream reader on TRN2u".into());
     }
@@ -11625,6 +11672,52 @@ mod conformance_158 {
             raw + 1,
             "the origin is {} symbols from the symbol the E1u bit arrived on",
             modem.trn2u_from as i64 - raw as i64
+        );
+    }
+
+    /// 9.6.1.2.1 does not wait for anything this end receives.
+    ///
+    /// "If the digital modem does not receive B1u within 20 s plus 6 round-trip
+    /// delays from the end of INFO1a, the digital modem shall initiate a
+    /// retrain" -- a bound on the *start-up*, not on the exchange. The arm this
+    /// end had was `enter_data_mode`'s and `abandon_b1u`'s, and both need an
+    /// upstream sequence to have been decoded, so a Phase 4 whose reader
+    /// decodes nothing at all has no deadline: `docs/298` section 1's call sat
+    /// at `SUVd out` from 16.560 until the harness's own connect timeout, with
+    /// `9.6.1.2.1` never armed and the retrain it asks for never sent.
+    #[test]
+    fn phase_four_arms_96121_from_the_end_of_info1a() {
+        let mut modem = Modem::default();
+        modem.cpt = Some(Cp { drn: 16, constellations: Vec::new(), ..Cp::default() });
+        modem.cp_len = 12;
+        modem.cp_pos = 0;
+        modem.e1u_zeroes = 0;
+        modem.since_cpt = 0;
+        modem.stage = Stage::Ri;
+        modem.start_up_origin = 500;
+        let ahead = 48u64;
+        for step in 0..24u64 {
+            if modem.upstream.is_some() {
+                break;
+            }
+            let raw = 2000 + step;
+            modem.now = raw + ahead;
+            let mut symbol = symbol_at(1.0);
+            symbol.raw = raw;
+            symbol.decided = Some(1.0);
+            modem.symbol(symbol);
+        }
+        assert!(modem.upstream.is_some(), "the upstream reader never started");
+        assert!(
+            modem.b1u_pending,
+            "9.6.1.2.1's wait was not armed when Phase 4's reader opened: nothing the far \
+             end sends can arm it, and a reader that decodes nothing leaves the call with \
+             no bound at all"
+        );
+        assert_eq!(
+            modem.b1u_deadline,
+            Some(modem.start_up_by()),
+            "9.6.1.2.1 is counted from the end of INFO1a, not from the arm"
         );
     }
 
