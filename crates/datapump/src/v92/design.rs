@@ -1247,7 +1247,7 @@ mod tests {
             sets: vec![(0..64).map(|index| (2 * index + 1) as u16).collect()],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        };
+        law: None, };
         let mut encoder = UpEncoder::new(&parameters).expect("feasible");
         let mut decoder = Decoder::new(&parameters);
         let mut seed = 0x1234_5678_u64;
@@ -1320,7 +1320,7 @@ mod tests {
         let channel = Channel { taps: taps.clone(), noise: 1e-6, signal: 1.0 };
         let design = design(&channel, &limits(3, 3, 3)).expect("designable");
         let drn = 1u8;
-        let choice = crate::v92::upchoice::choose(&design, 1e-6, 1 << (drn - 1), Trellis::Sixteen)
+        let choice = crate::v92::upchoice::choose(&design, 1e-6, 1 << (drn - 1), Trellis::Sixteen, Some(crate::v90::ucode::Law::Mu))
             .expect("the slowest rung carries this line");
         let parameters = choice.parameters;
         let mut encoder = UpEncoder::new(&parameters).expect("feasible");

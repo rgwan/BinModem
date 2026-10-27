@@ -58,6 +58,7 @@
 
 use super::codegrid;
 use super::design::Design;
+use crate::v90::ucode::Law;
 use super::{
     CONSTELLATION_FRAME, CONSTELLATION_POINTS, GAIN_LARGEST, Parameters, Trellis, UP_INTERVALS, UP_RATES,
     up_bits,
@@ -223,7 +224,13 @@ impl LevelSet {
         }
     }
 
-    /// One constellation set's `levels` positive points.
+    /// One constellation set's `levels` positive points, on the alphabet the
+    /// far end declared.
+    ///
+    /// `law` is `[Table 23]` bit 35 through [`codegrid::law_if`]: `None` means
+    /// no `CPu` has named a law yet, and on the code arm that is a refusal and
+    /// not a µ-law declaration (docs/313 sec 2) -- the points of a code set are
+    /// code values *of a law*, and there is no law-free code value.
     ///
     /// `uniform` cannot fail for any `levels` [`build`] admits. `code` fails only
     /// for a count the grid cannot hold at all (`levels + 1 > UCODES`, or none
@@ -233,10 +240,16 @@ impl LevelSet {
     /// `[8.8.3]`'s power ceiling can do and not a refusal. A comment here used
     /// to say `build` "returns `None` and the ladder steps down" at 48 000; that
     /// was false, and it is the trap `docs/310` sec 0.3 recorded.
-    pub fn points(self, levels: usize) -> Option<Vec<u16>> {
+    pub fn points(self, law: Option<Law>, levels: usize) -> Option<Vec<u16>> {
         match self {
+            // The odd lattice is `2 eta + 1` in *index units*: a level set and
+            // not an alphabet, so it builds under either law and neither is
+            // read. The law still enters every consumer of this set that turns
+            // an index into a level (`receiver::on_lattice`), which is why the
+            // parameter is here rather than dropped.
             LevelSet::Uniform => Some((0..levels).map(|index| (2 * index + 1) as u16).collect()),
-            LevelSet::Code => codegrid::grid(levels),
+            // A code set is code values of one law. No law declared, no set.
+            LevelSet::Code => codegrid::grid(law?, levels),
         }
     }
 
@@ -284,9 +297,9 @@ pub fn shipped() -> LevelSet {
 /// built at that count, which [`LevelSet::Code`] answers with `None` only when the
 /// grid cannot hold it.
 #[must_use]
-pub fn declared_gain(levels: usize) -> Option<f64> {
+pub fn declared_gain(law: Option<Law>, levels: usize) -> Option<f64> {
     let set = levelset();
-    Some(set.gain(&set.points(levels)?))
+    Some(set.gain(&set.points(law, levels)?))
 }
 
 /// The smallest adjacent gap of the set this call declares at `levels`, in LSB.
@@ -295,9 +308,24 @@ pub fn declared_gain(levels: usize) -> Option<f64> {
 /// far end can actually emit, in the currency a licence is spent in
 /// ([`rung::priced_gap_lsb`](super::rung::priced_gap_lsb) is the caller).
 #[must_use]
-pub fn declared_gap_lsb(levels: usize) -> Option<f64> {
-    let points = levelset().points(levels)?;
+pub fn declared_gap_lsb(law: Option<Law>, levels: usize) -> Option<f64> {
+    declared_gap_of(levelset(), law, levels)
+}
+
+/// [`declared_gap_lsb`] with the level set named, so that a caller pricing one
+/// arm while another ships (the licence table, docs/313 sec 4) does not have to
+/// move the environment to ask its question.
+#[must_use]
+pub fn declared_gap_of(levelset: LevelSet, law: Option<Law>, levels: usize) -> Option<f64> {
+    let points = levelset.points(law, levels)?;
     Some(codegrid::min_gap(&points))
+}
+
+/// [`declared_gain`] with the level set named, for the same reason.
+#[must_use]
+pub fn declared_gain_of(levelset: LevelSet, law: Option<Law>, levels: usize) -> Option<f64> {
+    let points = levelset.points(law, levels)?;
+    Some(levelset.gain(&points))
 }
 
 /// `V92_LEVELSET`'s value for this call.
@@ -355,7 +383,7 @@ pub struct Choice {
 ///
 /// `ja` is the mask of rates the analogue modem's Ja allowed (bit k for drn
 /// k + 1); a zero mask means "every rung".
-pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<Choice> {
+pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis, law: Option<Law>) -> Option<Choice> {
     // What the receiver sees, on the scale the levels are in: the design's own
     // residual ISI, and the channel's noise carried through the prefilter's
     // scaling.
@@ -370,7 +398,7 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
         if mask & (1 << (drn - 1)) == 0 {
             continue;
         }
-        let Some(parameters) = build(design, drn, trellis) else { continue };
+        let Some(parameters) = build(design, drn, trellis, law) else { continue };
         // 6.4.2's class feasibility and Table 30's fields, before the spacing
         // is looked at: a rung whose moduli the sets cannot carry is not a
         // rung at all.
@@ -408,8 +436,8 @@ pub fn choose(design: &Design, noise: f64, ja: u32, trellis: Trellis) -> Option<
 ///
 /// It cannot become a default by accident: neither caller searches at another
 /// rung on the strength of a better line assumed rather than measured.
-pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64) -> Option<Choice> {
-    pin_with(design, drn, trellis, noise, levelset())
+pub fn pin(design: &Design, drn: u8, trellis: Trellis, noise: f64, law: Option<Law>) -> Option<Choice> {
+    pin_with(design, drn, trellis, noise, levelset(), law)
 }
 
 /// [`pin`] with the level set named rather than read from the environment.
@@ -423,8 +451,9 @@ pub fn pin_with(
     trellis: Trellis,
     noise: f64,
     levelset: LevelSet,
+    law: Option<Law>,
 ) -> Option<Choice> {
-    let parameters = build_with(design, drn, trellis, levelset)?;
+    let parameters = build_with(design, drn, trellis, levelset, law)?;
     parameters.fits().ok()?;
     let carried = design.scale * design.scale * noise.max(0.0);
     let sigma = (design.residual * design.residual + carried).sqrt();
@@ -438,12 +467,18 @@ pub fn pin_with(
 ///
 /// The set comes from `V92_LEVELSET` ([`LEVELSET_VAR`]); everything else -- the
 /// moduli, the class arithmetic, the gain's clause -- is the same either way.
-fn build(design: &Design, drn: u8, trellis: Trellis) -> Option<Parameters> {
-    build_with(design, drn, trellis, levelset())
+fn build(design: &Design, drn: u8, trellis: Trellis, law: Option<Law>) -> Option<Parameters> {
+    build_with(design, drn, trellis, levelset(), law)
 }
 
 /// [`build`] with the level set named rather than read from the environment.
-fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) -> Option<Parameters> {
+fn build_with(
+    design: &Design,
+    drn: u8,
+    trellis: Trellis,
+    levelset: LevelSet,
+    law: Option<Law>,
+) -> Option<Parameters> {
     let bits = up_bits(drn);
     // 6.4.1: K bits over twelve intervals, as evenly as they go. The spare bits
     // go to the intervals that come first, which is where the mixed radix
@@ -480,7 +515,7 @@ fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) ->
     // `uniform` is `a(eta) = 2 eta + 1`, the set every call before this one
     // asked for; it is still buildable by name, and above LC 16 it is a set the
     // far end cannot emit (`LevelSet`'s own comment has the collision counts).
-    let set = levelset.points(levels)?;
+    let set = levelset.points(law, levels)?;
     // 8.8.3: "The digital modem shall design the modulation parameters assuming
     // that, when the prefilter output multiplied by G has a mean-square value
     // of 1, the analogue modem will transmit at the desired power." Read as an
@@ -541,7 +576,45 @@ fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) ->
         // the environment again at the receiver is what let it stay armed in
         // the uniform arm (see `Parameters::levelset`).
         levelset,
+        law,
     })
+}
+
+/// The same declaration, on a law that has now been declared.
+///
+/// `CPd` is *designed* in Phase 3 from the second TRN1u and only *released*
+/// after the far end's `CPu` has been decoded (9.6.1.1.2's bit 33 acknowledges
+/// it, and `CPD_WAITS_FOR_PARKED_TX` is the same ordering one step later), so
+/// the phase that builds the set can run before bit 35 arrives (docs/313 sec
+/// 2). This is the minimum wiring that closes that gap: the same `levels`, the
+/// same `moduli`, the same filters, the gain re-derived from the set the law
+/// actually names, and `None` when the new law cannot build the set at all.
+///
+/// The uniform arm is bit-identical under either law -- its points are index
+/// units -- so a call that ships it cannot be moved by this.
+#[must_use]
+pub fn relaw(parameters: &Parameters, law: Law) -> Option<Parameters> {
+    if parameters.law == Some(law) {
+        return Some(parameters.clone());
+    }
+    let levels = parameters.sets.first().map_or(0, Vec::len);
+    if levels == 0 {
+        return None;
+    }
+    let set = parameters.levelset.points(Some(law), levels)?;
+    let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
+    if !(energy > 0.0) || !energy.is_finite() {
+        return None;
+    }
+    let gain = parameters.levelset.gain(&set) / energy.sqrt();
+    if !(gain > 0.0) || gain > GAIN_LARGEST || gain * crate::v92::GAIN_SCALE < 1.0 {
+        return None;
+    }
+    let mut out = parameters.clone();
+    out.sets = vec![set];
+    out.gain = gain;
+    out.law = Some(law);
+    Some(out)
 }
 
 /// The upper tail of the standard normal, Q(x), from the complement of the
@@ -659,7 +732,7 @@ mod tests {
     /// The declared set with its points carried onto the line in LSB.
     fn on_the_line(levels: usize) -> Vec<f64> {
         let scale = lsb_per_point(levels);
-        DECLARED.points(levels).expect("the declared set").iter().map(|&p| scale * f64::from(p)).collect()
+        DECLARED.points(Some(Law::Mu), levels).expect("the declared set").iter().map(|&p| scale * f64::from(p)).collect()
     }
 
     /// The rms of levels in LSB, which is the power the set puts on the line.
@@ -688,7 +761,7 @@ mod tests {
             let lc = crate::v92::rung::lc_for(drn);
             let levels = on_the_line(lc);
             let mut distinct: Vec<u8> =
-                levels.iter().map(|&level| codegrid::nearest_code(level)).collect();
+                levels.iter().map(|&level| codegrid::nearest_code(Law::Mu, level)).collect();
             distinct.sort_unstable();
             distinct.dedup();
             let shared = lc - distinct.len();
@@ -735,7 +808,7 @@ mod tests {
             let levels = on_the_line(lc);
             let floor_lsb = levels
                 .iter()
-                .map(|&level| (level - f64::from(codegrid::value(codegrid::nearest_code(level)))).abs())
+                .map(|&level| (level - f64::from(codegrid::value_in(Law::Mu, codegrid::nearest_code(Law::Mu, level)))).abs())
                 .fold(0.0f64, f64::max);
             let floor = floor_lsb / step;
             println!(
@@ -754,7 +827,7 @@ mod tests {
                 bad.push(format!(
                     "drn {drn} (LC {lc}): {floor_lsb:.2} LSB ({floor:.4} index steps) off the code \
                      grid, against a licence of {:.4}",
-                    crate::v92::rung::threshold(drn)
+                    crate::v92::rung::threshold(Law::Mu, drn)
                 ));
             }
         }
@@ -774,7 +847,7 @@ mod tests {
     #[test]
     fn the_uniform_arm_is_still_the_lattice_it_was_by_name() {
         let design = design_for(1e-9);
-        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform).expect("drn 1 builds");
+        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu)).expect("drn 1 builds");
         // LC = 8 at 24 000, and the points are the odd lattice itself.
         assert_eq!(parameters.sets.len(), 1);
         assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
@@ -791,7 +864,7 @@ mod tests {
         // Every other rung of the ladder, by value: LC = 16, 32 and 64 are the
         // same lattice one octave up, and the gain follows the set.
         for (drn, lc) in [(1u8, 8usize), (7, 16), (13, 32), (19, 64)] {
-            let parameters = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform)
+            let parameters = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu))
                 .unwrap_or_else(|| panic!("drn {drn} is buildable on the odd lattice"));
             let wanted: Vec<u16> = (0..lc).map(|index| (2 * index + 1) as u16).collect();
             assert_eq!(parameters.sets[0], wanted, "drn {drn}: not the odd lattice");
@@ -814,7 +887,7 @@ mod tests {
         assert_eq!(shipped(), LevelSet::Uniform, "the shipped set is the odd lattice again");
         assert_eq!(LevelSet::named(Some("code")), Some(LevelSet::Code), "the grid has to stay reachable");
         assert_eq!(resolve(Some("code")), LevelSet::Code, "and resolved, not only named");
-        let pinned = pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform).expect("pinnable");
+        let pinned = pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform, Some(crate::v90::ucode::Law::Mu)).expect("pinnable");
         assert_eq!(pinned.parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
     }
 
@@ -829,14 +902,14 @@ mod tests {
     #[test]
     fn the_code_level_set_is_the_far_end_s_g711_grid() {
         let design = design_for(1e-9);
-        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Code).expect("drn 1 builds");
-        let grid = codegrid::grid(8).expect("the grid holds eight points");
+        let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Code, Some(Law::Mu)).expect("drn 1 builds");
+        let grid = codegrid::grid(Law::Mu, 8).expect("the grid holds eight points");
         assert_eq!(parameters.sets[0], grid, "not the grid the module builds");
         // Every point is a code value: the µ-law decode of the code it is
         // nearest to. That is what "emits `_DEC[code]` values" means.
         for &point in &grid {
-            let code = codegrid::nearest_code(f64::from(point));
-            assert_eq!(codegrid::value(code), point, "code {code} decodes to {point}");
+            let code = codegrid::nearest_code(Law::Mu, f64::from(point));
+            assert_eq!(codegrid::value_in(Law::Mu, code), point, "code {code} decodes to {point}");
         }
         // 8.8.3 on the set's own mean square: 1/sqrt(ms), which at LC = 8 is
         // the codec's scale and not the lattice's. Divided by the sent
@@ -888,7 +961,7 @@ mod tests {
         assert_eq!(resolve(Some("kode")), LevelSet::Uniform);
         assert_eq!(resolve(None), LevelSet::Uniform);
         let design = design_for(1e-9);
-        let parameters = build_with(&design, 1, Trellis::Sixteen, resolve(Some("kode"))).expect("drn 1");
+        let parameters = build_with(&design, 1, Trellis::Sixteen, resolve(Some("kode")), Some(Law::Mu)).expect("drn 1");
         assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15], "a typo moved the wire");
     }
 
@@ -913,7 +986,7 @@ mod tests {
             ("the reading", reading_design()),
         ] {
             for drn in [1u8, 5, 11, 15, UP_RATES as u8] {
-                let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+                let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu)) else {
                     continue;
                 };
                 // What the far end runs and what it multiplies by: the codes and
@@ -953,7 +1026,7 @@ mod tests {
         // which is why it cannot move a decision.
         let design = design_for(0.0);
         for (drn, a181) in [(1u8, 1620.1), (7, 1640.3), (13, 1607.1), (19, 1627.0)] {
-            let parameters = pin_with(&design, drn, Trellis::Sixteen, 0.0, LevelSet::Code)
+            let parameters = pin_with(&design, drn, Trellis::Sixteen, 0.0, LevelSet::Code, Some(Law::Mu))
                 .expect("the code grid builds every rung")
                 .parameters;
             let energy = crate::v92::sent_prefilter_energy(&parameters.filters.z2);
@@ -978,7 +1051,7 @@ mod tests {
         // it is `1/scale^2` -- at the design's own `scale` of 12.586 that is
         // 1/158, i.e. 22 dB of transmit power missing from the far end.
         let design = design_for(0.0);
-        let shipped = build_with(&design, 5, Trellis::Sixteen, LevelSet::Uniform).expect("a rung");
+        let shipped = build_with(&design, 5, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu)).expect("a rung");
         let mut shrunk = shipped.clone();
         for tap in &mut shrunk.filters.z2 {
             *tap /= 2.5;
@@ -1036,7 +1109,7 @@ mod tests {
         // The rungs never move either bit: a CPd built from any rung carries 0.
         let design = design_for(0.0);
         for drn in 1..=UP_RATES as u8 {
-            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu)) else {
                 continue;
             };
             assert!(!parameters.extend_e2u, "drn {drn}: CPd bit 29 was set");
@@ -1058,7 +1131,7 @@ mod tests {
     fn a_prefilter_without_a_feedback_section_is_declared_not_omitted() {
         let design = design_for(0.0);
         for drn in 1..=UP_RATES as u8 {
-            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform) else {
+            let Some(parameters) = build_with(&design, drn, Trellis::Sixteen, LevelSet::Uniform, Some(Law::Mu)) else {
                 continue;
             };
             assert!(parameters.filters.p2.is_empty(), "drn {drn}: an undesigned p2 reached the wire");
@@ -1150,7 +1223,7 @@ mod tests {
     #[test]
     fn the_e2u_length_and_the_bit_this_end_sends_agree() {
         let design = design_for(1e-9);
-        let parameters = pin(&design, 1, Trellis::Sixteen, 1e-9).expect("drn 1 is pinnable").parameters;
+        let parameters = pin(&design, 1, Trellis::Sixteen, 1e-9, Some(Law::Mu)).expect("drn 1 is pinnable").parameters;
         assert_eq!(parameters.extend_e2u, EXTEND_E2U, "CPd bit 29 is the constant the receiver counts from");
         assert_eq!(E2U_SYMBOLS, UP_INTERVALS + usize::from(EXTEND_E2U));
         assert_eq!(
@@ -1168,7 +1241,7 @@ mod tests {
         let mut seen = Vec::new();
         for noise in [1e-9, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2] {
             let design = design_for(noise);
-            let Some(choice) = choose(&design, noise, 0, Trellis::ThirtyTwo) else {
+            let Some(choice) = choose(&design, noise, 0, Trellis::ThirtyTwo, Some(Law::Mu)) else {
                 seen.push((noise, 0));
                 continue;
             };
@@ -1190,7 +1263,7 @@ mod tests {
     fn every_rung_it_can_return_is_feasible() {
         for drn in 1..=UP_RATES as u8 {
             let design = design_for(0.0);
-            let Some(parameters) = build(&design, drn, Trellis::Sixteen) else { continue };
+            let Some(parameters) = build(&design, drn, Trellis::Sixteen, Some(Law::Mu)) else { continue };
             parameters.fits().unwrap_or_else(|error| panic!("drn {drn}: {error}"));
             assert_eq!(parameters.bits(), up_bits(drn));
             assert!(parameters.product() >= 1u128 << up_bits(drn), "drn {drn}: the moduli cannot hold K bits");
@@ -1210,8 +1283,8 @@ mod tests {
     #[test]
     fn pinning_the_slowest_rung_changes_nothing() {
         let design = design_for(1e-9);
-        let chosen = choose(&design, 1e-9, 1, Trellis::Sixteen).expect("drn 1 is always offered");
-        let pinned = pin(&design, 1, Trellis::Sixteen, 1e-9).expect("drn 1 is pinnable");
+        let chosen = choose(&design, 1e-9, 1, Trellis::Sixteen, Some(Law::Mu)).expect("drn 1 is always offered");
+        let pinned = pin(&design, 1, Trellis::Sixteen, 1e-9, Some(Law::Mu)).expect("drn 1 is pinnable");
         assert_eq!(chosen.parameters, pinned.parameters);
         assert_eq!(chosen.sigma, pinned.sigma);
     }
@@ -1228,7 +1301,7 @@ mod tests {
         for (rate, drn, modulus, lc) in
             [(24_000u32, 1u8, 8usize, 8usize), (32_000, 7, 16, 16), (40_000, 13, 32, 32), (48_000, 19, 64, 64)]
         {
-            let choice = pin(&design, drn, Trellis::Sixteen, 1e-9).expect("a buildable rung");
+            let choice = pin(&design, drn, Trellis::Sixteen, 1e-9, Some(Law::Mu)).expect("a buildable rung");
             let parameters = &choice.parameters;
             assert_eq!(parameters.rate(), rate);
             assert_eq!(up_bits(drn), 12 * modulus.ilog2(), "{rate}: K against the modulus");
@@ -1264,9 +1337,9 @@ mod tests {
     fn the_ja_mask_is_obeyed() {
         let design = design_for(1e-9);
         let only = 3u8;
-        let choice = choose(&design, 1e-9, 1u32 << (only - 1), Trellis::Sixteen).expect("one rung was offered");
+        let choice = choose(&design, 1e-9, 1u32 << (only - 1), Trellis::Sixteen, Some(Law::Mu)).expect("one rung was offered");
         assert_eq!(choice.parameters.drn, only);
-        assert!(choose(&design, 1e-9, 1u32 << 0, Trellis::Sixteen).is_some(), "drn 1 is always offered");
+        assert!(choose(&design, 1e-9, 1u32 << 0, Trellis::Sixteen, Some(Law::Mu)).is_some(), "drn 1 is always offered");
     }
 
     /// The residual the precoder could not cancel is noise as far as the choice
@@ -1284,9 +1357,238 @@ mod tests {
         // a broken one, which is the case that should lose a rung or two
         // rather than everything.
         let poor = Design { residual: 0.03, ..clean.clone() };
-        let a = choose(&clean, 1e-7, 0, Trellis::Sixteen).expect("a clean design");
-        let b = choose(&poor, 1e-7, 0, Trellis::Sixteen).expect("a poor design still carries something");
+        let a = choose(&clean, 1e-7, 0, Trellis::Sixteen, Some(Law::Mu)).expect("a clean design");
+        let b = choose(&poor, 1e-7, 0, Trellis::Sixteen, Some(Law::Mu)).expect("a poor design still carries something");
         assert!(b.parameters.drn < a.parameters.drn, "ISI cost nothing: {} against {}", b.parameters.drn, a.parameters.drn);
         assert!(b.sigma > a.sigma);
     }
+    /// The two companding laws `[Table 23]` bit 35 can name, both ways
+    /// (docs/313 sec 1).
+    const LAWS: [Law; 2] = [Law::Mu, Law::A];
+
+    /// **Both laws build a legal declaration** (docs/313 sec 1).
+    ///
+    /// For every rung of the 6.1 ladder and for each G.711 law: the declared set
+    /// has `lc` **distinct** codes, its own residual floor is `0.0000` -- the far
+    /// end's quantiser is a no-op on every point -- and no point is the zero
+    /// point. **[quoted]** `[8.8.3]` (`/tmp/v92.txt:1785-1786`): "Constellations
+    /// shall not contain the zero point." That clause names no law, so it holds
+    /// for both: under µ-law code 0 decodes to 0 and is refused by
+    /// `nearest_code`'s search starting at 1; under A-law code 0 decodes to 8 and
+    /// is refused anyway, because it is the silence codeword and not a level a
+    /// constellation may hold.
+    #[test]
+    fn both_laws_build_a_legal_declaration() {
+        let mut bad: Vec<String> = Vec::new();
+        for law in LAWS {
+            for drn in 1..=UP_RATES as u8 {
+                let lc = crate::v92::rung::lc_for(drn);
+                let Some(set) = LevelSet::Code.points(Some(law), lc) else {
+                    bad.push(format!("{law:?} drn {drn} (LC {lc}): the grid built no set"));
+                    continue;
+                };
+                if set.len() != lc {
+                    bad.push(format!("{law:?} drn {drn}: LC {lc} but {} points", set.len()));
+                }
+                if set.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    bad.push(format!("{law:?} drn {drn}: the set is not ascending"));
+                }
+                // The zero point, and the floor.
+                let mut floor = 0.0f64;
+                let mut distinct: Vec<u8> = Vec::with_capacity(set.len());
+                for &point in &set {
+                    let code = codegrid::nearest_code(law, f64::from(point));
+                    let decoded = codegrid::value_in(law, code);
+                    if point == 0 || code == 0 || decoded == 0 {
+                        bad.push(format!(
+                            "{law:?} drn {drn}: point {point} is the zero point (code {code} decodes to {decoded})"
+                        ));
+                    }
+                    floor = floor.max((f64::from(point) - f64::from(decoded)).abs());
+                    distinct.push(code);
+                }
+                distinct.sort_unstable();
+                distinct.dedup();
+                if distinct.len() != lc {
+                    bad.push(format!(
+                        "{law:?} drn {drn}: {} distinct codes for LC {lc}", distinct.len()
+                    ));
+                }
+                if floor != 0.0 {
+                    bad.push(format!("{law:?} drn {drn}: residual floor {floor:.4} LSB"));
+                }
+                // `[8.8.3]`'s power ceiling is the search's constraint, and it is
+                // the one number the law does *not* change: both laws decode
+                // into the same int16 domain.
+                let rms = codegrid::mean_square(&set).sqrt();
+                println!(
+                    "drn {drn:2} LC {lc:3} N {:3} {law:?}: {} codes, gap {:3.0} LSB, rms {rms:7.1} \
+                     ({:+.1}% of TARGET_RMS), floor {floor:.4}",
+                    2 * lc,
+                    distinct.len(),
+                    codegrid::min_gap(&set),
+                    100.0 * (rms / codegrid::TARGET_RMS - 1.0),
+                );
+                if rms > codegrid::TARGET_RMS * (1.0 + codegrid::POWER_SLACK) {
+                    bad.push(format!("{law:?} drn {drn}: rms {rms:.1} is over the power ceiling"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the declaration is not legal under both laws:\n{}", bad.join("\n"));
+    }
+
+    /// **The two laws are not the same declaration**, and each one is on its own
+    /// alphabet (docs/313 sec 1).
+    ///
+    /// The assertion that catches a half-wired parameterisation is the second
+    /// half of each rung: every point of a set built under `law` must round-trip
+    /// through **that** law's code table (`value_in(law, nearest_code(law, p)) ==
+    /// p`) and must **not** be a code value of the other law. A `grid` that
+    /// ignored its `law` argument would produce one set twice and fail both.
+    ///
+    /// **The minimum gap is the figure that coincides**, and that is a
+    /// measurement rather than a wiring failure: at LC 8, 16, 32 and 64 the two
+    /// G.711 ladders hold the same smallest step, so `min_gap` and the licence
+    /// built from it are equal while the *sets* are not -- A-law puts its first
+    /// point at 328 and its last at 2 496 where µ-law puts 324 and 2 492, and the
+    /// declared `G` differs with the mean square. Off the ladder the two gaps
+    /// separate, which is what the last block shows: the law does reach the
+    /// search, and the coincidence at six counts is a property of the two
+    /// ladders (docs/313 sec 4).
+    #[test]
+    fn the_two_laws_are_not_the_same_alphabet() {
+        let mut same_gap: Vec<u8> = Vec::new();
+        for drn in 1..=UP_RATES as u8 {
+            let lc = crate::v92::rung::lc_for(drn);
+            let mu = LevelSet::Code.points(Some(Law::Mu), lc).expect("a mu set");
+            let a = LevelSet::Code.points(Some(Law::A), lc).expect("an A set");
+            assert_ne!(mu, a, "drn {drn} (LC {lc}): the same points under both laws -- one side is not going through the law");
+            assert_ne!(
+                LevelSet::Code.gain(&mu),
+                LevelSet::Code.gain(&a),
+                "drn {drn}: the declared G is the same number under both laws"
+            );
+            for (law, other, set) in [(Law::Mu, Law::A, &mu), (Law::A, Law::Mu, &a)] {
+                let mut foreign = 0;
+                for &point in set.iter() {
+                    let code = codegrid::nearest_code(law, f64::from(point));
+                    assert_eq!(
+                        codegrid::value_in(law, code),
+                        point,
+                        "drn {drn}: {point} is not a {law:?} code value"
+                    );
+                    let across = codegrid::nearest_code(other, f64::from(point));
+                    if codegrid::value_in(other, across) != point {
+                        foreign += 1;
+                    }
+                }
+                assert!(
+                    foreign > 0,
+                    "drn {drn}: every point of the {law:?} set is also a {other:?} code value, so the two alphabets were not told apart"
+                );
+            }
+            if codegrid::min_gap(&mu) == codegrid::min_gap(&a) {
+                same_gap.push(drn);
+            }
+        }
+        println!("the two laws' minimum gaps coincide at drn {same_gap:?}");
+        // Off the ladder the gaps separate: the law is reaching `grid`.
+        let mut separated = Vec::new();
+        for lc in 2..=72usize {
+            if let (Some(mu), Some(a)) = (codegrid::grid(Law::Mu, lc), codegrid::grid(Law::A, lc))
+                && codegrid::min_gap(&mu) != codegrid::min_gap(&a)
+            {
+                separated.push((lc, codegrid::min_gap(&mu), codegrid::min_gap(&a)));
+            }
+        }
+        println!("off the ladder the gaps separate at {separated:?}");
+        assert!(
+            !separated.is_empty(),
+            "no set size distinguishes the two laws: `grid` is not reading its argument"
+        );
+    }
+
+    /// **A path that cannot name the law refuses** rather than declaring µ-law
+    /// (docs/313 sec 1, sec 2).
+    #[test]
+    fn a_path_that_cannot_name_the_law_refuses() {
+        let design = design_for(1e-9);
+        assert!(LevelSet::Code.points(None, 8).is_none(), "a code set with no law was built anyway");
+        assert!(
+            build_with(&design, 1, Trellis::Sixteen, LevelSet::Code, None).is_none(),
+            "an undeclared law produced a code declaration"
+        );
+        assert!(codegrid::law_if(None).is_none() && codegrid::law_if(Some(false)) == Some(Law::Mu));
+        for law in LAWS {
+            assert!(
+                build_with(&design, 1, Trellis::Sixteen, LevelSet::Code, Some(law)).is_some(),
+                "{law:?} cannot build drn 1"
+            );
+        }
+        // The uniform arm is a level set in index units and needs no law; naming
+        // one still does not change it.
+        let no_law = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform, None).expect("the lattice");
+        for law in LAWS {
+            let named = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform, Some(law)).expect("the lattice");
+            assert_eq!(named.sets, no_law.sets, "{law:?} moved the odd lattice");
+            assert_eq!(named.gain, no_law.gain, "{law:?} moved the odd lattice's G");
+        }
+        // A declaration can be re-derived on a law that arrives later, and the
+        // re-derivation is a different declaration rather than the old set.
+        let mu = build_with(&design, 1, Trellis::Sixteen, LevelSet::Code, Some(Law::Mu)).expect("mu drn 1");
+        let a = crate::v92::upchoice::relaw(&mu, Law::A).expect("A drn 1");
+        assert_eq!(a.law, Some(Law::A));
+        assert_ne!(a.sets, mu.sets, "the re-derived declaration kept the mu set");
+        assert_ne!(a.gain, mu.gain, "the re-derived declaration kept the mu G");
+        assert_eq!(a.moduli, mu.moduli, "the re-derivation moved the modulus encoder");
+        assert_eq!(crate::v92::upchoice::relaw(&mu, Law::Mu).map(|p| p.sets), Some(mu.sets));
+    }
+
+    /// **The licence numbers, per law** (docs/313 sec 4).
+    ///
+    /// The criterion is `threshold = SIGMA_MAX * gap / index_step` (docs/277
+    /// sec 1.3), and the licence in LSB is `SIGMA_MAX * gap`. `docs/311`'s
+    /// figures -- 256 LSB, 0.0688, 24.0 LSB at `drn 1` -- are the µ-law column;
+    /// this test prints the A-law column beside it.
+    #[test]
+    fn the_licence_numbers_per_law() {
+        println!("law  drn  LC  min_gap  priced_gap_lsb  threshold  licence_LSB  declared_G");
+        let mut rows: Vec<(Law, u8, f64, f64, f64, f64)> = Vec::new();
+        for law in LAWS {
+            for drn in [1u8, 2, 8, 13, 14, 19] {
+                let lc = crate::v92::rung::lc_for(drn);
+                let set = LevelSet::Code.points(Some(law), lc).expect("a declared set");
+                let gap = codegrid::min_gap(&set);
+                let priced = crate::v92::rung::priced_gap(LevelSet::Code, law, drn);
+                let threshold = crate::v92::rung::threshold_of(LevelSet::Code, law, drn);
+                let licence = threshold * crate::v92::rung::index_step_lsb();
+                let gain = LevelSet::Code.gain(&set);
+                println!(
+                    "{law:?} {drn:2} {lc:3} {gap:8.0} {priced:14.0} {threshold:8.4} {licence:10.1} {gain:10.6}"
+                );
+                assert!((priced - gap).abs() < 1e-9, "drn {drn}: the priced gap is not the set's");
+                assert!(
+                    (licence - crate::v92::rung::SIGMA_MAX * gap).abs() < 1e-9,
+                    "drn {drn}: the licence is not SIGMA_MAX x the gap"
+                );
+                rows.push((law, drn, gap, threshold, licence, gain));
+            }
+        }
+        // The published figure, reproduced from the declaration: 256 LSB /
+        // 0.0688 / 24.0 LSB at drn 1, under either law's alphabet.
+        for law in LAWS {
+            let row = rows.iter().find(|row| row.0 == law && row.1 == 1).expect("drn 1");
+            assert!((row.2 - 256.0).abs() < 1e-9, "{law:?} drn 1 gap {}", row.2);
+            assert!((row.3 - 0.0688).abs() < 5e-4, "{law:?} drn 1 threshold {}", row.3);
+            assert!((row.4 - 24.0).abs() < 0.1, "{law:?} drn 1 licence {}", row.4);
+        }
+        // The gain is where the two laws part at every rung, so a table of
+        // licences alone would not show which alphabet a call declared.
+        for drn in [1u8, 2, 8, 13, 14, 19] {
+            let mu = rows.iter().find(|row| row.0 == Law::Mu && row.1 == drn).expect("mu");
+            let a = rows.iter().find(|row| row.0 == Law::A && row.1 == drn).expect("A");
+            assert_ne!(mu.5, a.5, "drn {drn}: the declared G is the same under both laws");
+        }
+    }
+
 }

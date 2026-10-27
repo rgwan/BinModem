@@ -26,10 +26,17 @@ pub const UCODES: usize = 128;
 /// A national matter rather than a negotiated one -- 1 leaves the digital
 /// modem's network interface "considered to be national matters and hence not
 /// specified herein" -- so it is configuration, not something to discover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// **There is no `Default`** (docs/313 sec 2). `#[derive(Default)]` with
+/// `#[default] Mu` made µ-law the answer for every caller that had not said
+/// anything, which is the one value that is right on one network and wrong
+/// everywhere else: a declaration built from it would be a µ declaration on an
+/// A-law line with nothing in the diff to say so. A caller now names the law in
+/// the type it hands over (`Option<Law>` on the parameters, `None` until the far
+/// end declares), and the declaration path refuses rather than falls back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Law {
     /// North America and Japan.
-    #[default]
     Mu,
     /// Most of the rest of the world.
     A,

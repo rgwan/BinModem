@@ -608,6 +608,16 @@ pub struct Parameters {
     /// answer is the one the design was built with, and no path below `feed`
     /// reads an environment variable to find it.
     pub levelset: LevelSet,
+    /// The companding law [`sets`](Self::sets) are code values *of*:
+    /// `[Table 23]` bit 35 as the far end declared it in its `CPu`, carried on
+    /// the parameters rather than read again where it is used (docs/313 sec 2).
+    ///
+    /// `None` is a state and not a stand-in for µ-law: it means no `CPu` has
+    /// named a law on this call yet. The paths that need one (the code grid, the
+    /// receiver's code → level map, a rung's licence) refuse to produce a
+    /// µ-law answer without it, because "not yet declared" and "declared µ-law"
+    /// are different facts and only one of them is a declaration.
+    pub law: Option<crate::v90::ucode::Law>,
 }
 
 impl Parameters {
@@ -1111,7 +1121,7 @@ mod tests {
             sets: vec![(1..=16u16).map(|p| p * 100).collect()],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        };
+        law: None, };
         // K = 36 bits, M = 8^12 = 2^36, so the frame fits exactly; N = 32 is
         // 4 x M0, which leaves room at k = 3 as well.
         assert_eq!(params.bits(), 36);

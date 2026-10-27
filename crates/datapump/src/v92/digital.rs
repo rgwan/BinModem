@@ -3823,7 +3823,7 @@ fn data_mode_levels(parameters: &Parameters, k: f64) -> Vec<f64> {
         }
     }
     if parameters.levelset == LevelSet::Code {
-        levels = crate::v92::receiver::lattice_levels(&levels);
+        levels = crate::v92::receiver::lattice_levels(parameters.law, &levels);
     }
     levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     levels.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
@@ -4448,7 +4448,15 @@ impl B1uBins {
             let missing = index >= set.len();
             let value = f64::from(set.get(index).copied().unwrap_or(0));
             let full = (parameters.gain * value).clamp(0.0, 32767.0).round() as i32;
-            let (code, _) = crate::v90::ucode::nearest(crate::v90::ucode::Law::Mu, full);
+            // The chord is a *codec* chord, so it is read through the law the
+            // far end declared and not through a constant (docs/313 sec 2): a
+            // chord boundary is a G.711 segment boundary and the two laws draw
+            // them in different places. With no bit 35 yet there is no chord to
+            // name, and that is counted rather than guessed.
+            let Some(law) = parameters.law else {
+                return (0, true);
+            };
+            let (code, _) = crate::v90::ucode::nearest(law, full);
             (usize::from(code >> 4).min(7), missing)
         };
         let count = (decisions.len() * crate::v92::TRELLIS_FRAME) as u64;
@@ -6275,8 +6283,15 @@ impl Modem {
         // A build that cannot make the slowest rung cannot make any of them, and
         // a design that is legal in no field of Table 30 at all is answered with
         // the identity rather than with silence (see `upstream_design`'s note).
-        let build_floor = |designed: &Design| pin(designed, SLOWEST_DRN, trellis, 0.0);
-        let mut floor = if let Some(drn) = pinned { pin(&designed, drn, trellis, 0.0) } else { build_floor(&designed) };
+        // **The law is not known here yet** (docs/313 sec 2): this runs on the
+        // second TRN1u, and `CPu` bit 35 is decoded in Phase 4. The declaration
+        // is built with `None` -- which the code arm refuses and the uniform arm
+        // does not need -- and re-derived by `CpFamily::Cpu` below, before the
+        // `CPd` is released.
+        let law = self.declared_law();
+        let build_floor = |designed: &Design| pin(designed, SLOWEST_DRN, trellis, 0.0, law);
+        let mut floor =
+            if let Some(drn) = pinned { pin(&designed, drn, trellis, 0.0, law) } else { build_floor(&designed) };
         if floor.is_none() && degraded.is_none() {
             let residual = designed.residual_db();
             degraded = Some("no rung of the 6.1 ladder carries what the design leaves");
@@ -6429,6 +6444,19 @@ impl Modem {
     /// the only branch in which the old criterion still decides.
     fn upstream_ladder(&mut self, ja: u32, measured: Sigma, ceiling: Option<u8>) -> (u32, RateDecision) {
         let (inner, outer, level_gain, seen) = self.rx.measured_levels();
+        // A rung's licence is `SIGMA_MAX` times the **gap of the declared set**
+        // over an index step (docs/313 sec 2, `rung::threshold`), and a gap is a
+        // number about an alphabet: with no law declared there is no set and so
+        // no licence, and the honest answer is the slowest rung rather than a
+        // µ-law price for an A-law line.
+        let Some(law) = self.declared_law() else {
+            self.note(
+                "V.92: the far end has not declared a companding law (Table 23 bit 35, CPu) yet, so \
+                 no rung can be priced; the slowest rung stands"
+                    .into(),
+            );
+            return (0, RateDecision { measured, ceiling, mask: 0, empty: true });
+        };
         let mut mask = 0u32;
         if seen > 0 {
             // The far end's distance from `1/G`, as a fraction: the four-point
@@ -6452,7 +6480,7 @@ impl Modem {
                 // units). The *verdict* does not move: `level_lsb` is built from
                 // the same gain, so `delta` -- and the tolerance it is compared
                 // with -- is the same number either way.
-                let gain = crate::v92::upchoice::declared_gain(lc)
+                let gain = crate::v92::upchoice::declared_gain(Some(law), lc)
                     .unwrap_or_else(|| crate::v92::upchoice::gain_for(lc));
                 let reading = crate::v92::rung::Reading {
                     drn,
@@ -6463,6 +6491,7 @@ impl Modem {
                     crossing: 0.0,
                     // No `B1u` yet: this is a `CPd` decision.
                     symbols: 0,
+                    law,
                 };
                 let verdict = crate::v92::rung::admit(&reading);
                 if verdict.granted() {
@@ -6486,7 +6515,19 @@ impl Modem {
         } else {
             // The one branch in which the old sigma criterion still decides,
             // and the cap binds it exactly as it binds the ladder.
-            let granted = apply_ceiling(ja, measured);
+            let granted = match self.declared_law() {
+                Some(law) => apply_ceiling(law, ja, measured),
+                // No bit 35 yet: no licence, so nothing is granted by a price
+                // this end has not been given (docs/313 sec 2).
+                None => {
+                    self.note(
+                        "V.92: no CPu bit 35, so no rung is priced; the mask is left empty for the \
+                         slowest-rung floor"
+                            .into(),
+                    );
+                    0
+                }
+            };
             mask = crate::v92::rung::cap_to_measured(granted);
             self.note(
                 "V.92: no four-point level to judge (the ladder needs one); the sigma mask stands, and \
@@ -6523,8 +6564,16 @@ impl Modem {
         // evidence a rung may be spent on: `docs/264` sec 2 keeps the number and
         // its refusals in the log as an *advisory* and stops it from deciding.
         // What decides is the ladder below.
-        let ceiling = ceiling_rung(measured);
-        let advisory = apply_ceiling(ja, measured);
+        // The law the far end declared, if it has: the ceiling and the advisory
+        // are prices of a declared set, so with no declaration there is none
+        // (`ceiling: None`, and the advisory keeps the Ja mask) rather than a
+        // µ-law ceiling applied to an undeclared line.
+        let law = self.declared_law();
+        let ceiling = law.and_then(|law| ceiling_rung(law, measured));
+        let advisory = match law {
+            Some(law) => apply_ceiling(law, ja, measured),
+            None => ja,
+        };
         let (allowed, decision) = self.upstream_ladder(ja, measured, ceiling);
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
@@ -6533,9 +6582,10 @@ impl Modem {
         let (mask, empty) = if allowed == 0 { (1u32, true) } else { (allowed, false) };
         let decision = RateDecision { empty, ..decision };
         let found = if empty {
-            pin(&designed, 1, trellis, noise)
+            pin(&designed, 1, trellis, noise, law)
         } else {
-            choose(&designed, noise, mask, trellis).or_else(|| pin(&designed, 1, trellis, noise))
+            choose(&designed, noise, mask, trellis, law)
+                .or_else(|| pin(&designed, 1, trellis, noise, law))
         };
         let Some(choice) = found else {
             self.note(
@@ -6568,7 +6618,9 @@ impl Modem {
             // mean-square screen would have said instead (`docs/277` sec 1).
             // A reader who compares a residual with `sigma_max` can see here
             // that it decided nothing -- the defect `docs/274` sec 2.2 was.
-            decision.measured.ceiling_note(),
+            law.map_or("criterion=none (no CPu bit 35, no licence)".to_owned(), |law| {
+                decision.measured.ceiling_note(law)
+            }),
         ));
         if decision.empty {
             // The event the ceiling exists to make visible: every rung the far
@@ -7988,6 +8040,17 @@ impl Modem {
             ));
             return;
         }
+        // A rung's licence is a number about a declared alphabet, so a `B1u`
+        // reading taken before the far end has named one is not priced at all
+        // (docs/313 sec 2) rather than priced as µ-law.
+        let Some(law) = parameters.law else {
+            self.note(
+                "V.92: B1u confirms the ladder: no CPu bit 35 yet, so the rung has no licence to \
+                 confirm; nothing is priced and nothing moves"
+                    .into(),
+            );
+            return;
+        };
         let (_, _, level_gain, _) = self.rx.measured_levels();
         let lc = crate::v92::rung::lc_for(parameters.drn);
         let gain = crate::v92::upchoice::gain_for(lc);
@@ -8001,6 +8064,9 @@ impl Modem {
             // stream the crossing is measured on: `n/a`, not zero.
             crossing: f64::NAN,
             symbols: bins.total,
+            // A `B1u` reading is priced on the law the declaration is on, which
+            // is the negotiated one.
+            law,
         };
         let verdict = crate::v92::rung::admit(&reading);
         self.note(format!("V.92: B1u confirms the ladder: {}", reading.line(verdict)));
@@ -8179,6 +8245,14 @@ impl Modem {
                         cp.codec.as_ref().map_or(0, Vec::len)
                     ));
                 }
+                // **The law arrives here, and the declaration may already have
+                // been built without it** (docs/313 sec 2): `CPd` is designed on
+                // the second TRN1u, and released only after this sequence. So
+                // the declaration is re-derived on the law bit 35 names while it
+                // has not gone out, and a bit 35 that arrives after the `CPd` is
+                // a finding rather than a silent re-use.
+                let law = crate::v92::codegrid::law(cp.a_law);
+                self.relaw_declaration(law);
                 self.cpu = Some(cp);
                 if let Some(exchange) = self.exchange.as_mut() {
                     exchange.peer_cp(PeerCp { ack }, now);
@@ -8204,6 +8278,63 @@ impl Modem {
     /// slicer's levels once, at `begin_b1u`, and this end's own levels are what
     /// is used when there is no mask to read or when bit 128 says the mask is
     /// not about the far end's transmit path.
+    /// The companding law the far end has declared, from `CPu` bit 35.
+    ///
+    /// `None` before a `CPu` has been decoded, and that is a state the
+    /// declaration path handles rather than hides: `CPd` is *designed* in Phase 3
+    /// from the second TRN1u and released only after this bit has arrived, so the
+    /// phase that picks the set can run with no law to pick it on (docs/313
+    /// sec 2). Nothing below substitutes µ-law for `None`.
+    fn declared_law(&self) -> Option<crate::v90::ucode::Law> {
+        self.cpu.as_ref().map(|cp| crate::v92::codegrid::law(cp.a_law))
+    }
+
+    /// Re-derive the provisional declaration on the law the far end has just
+    /// declared, if it has not been sent yet.
+    ///
+    /// Nothing about the rung, the moduli, the filters or the level set moves:
+    /// the set is rebuilt on the declared alphabet and `G` follows it
+    /// ([`crate::v92::upchoice::relaw`]). On the uniform arm the set is `2 eta +
+    /// 1` in index units, so this is bit-identical and the shipped arm cannot be
+    /// moved by it.
+    fn relaw_declaration(&mut self, law: crate::v90::ucode::Law) {
+        // The receiver's code lattice and four-point reference are on the same
+        // law: it is the alphabet of the far end's transmitter, which is what
+        // both of them are reference points on.
+        self.rx.set_law(Some(law));
+        let Some(parameters) = self.parameters.as_ref() else { return };
+        if parameters.law == Some(law) {
+            return;
+        }
+        let levelset = parameters.levelset;
+        let levels = parameters.sets.first().map_or(0, Vec::len);
+        if self.cpd_sent {
+            self.note(format!(
+                "V.92: CPu bit 35 declares {law:?} after the CPd went out on {levelset:?} at LC {levels}; \
+                 the declaration on the wire stands, and this is the finding (docs/313 sec 2)"
+            ));
+            return;
+        }
+        match crate::v92::upchoice::relaw(parameters, law) {
+            Some(rebuilt) => {
+                let set = rebuilt.sets.first().cloned().unwrap_or_default();
+                let gain = rebuilt.gain;
+                self.parameters = Some(rebuilt.clone());
+                self.cpd = Some(Cpd::from(&rebuilt));
+                self.note(format!(
+                    "V.92: CPu bit 35 declares {law:?}; the provisional declaration is re-derived on it \
+                     ({levelset:?} at LC {levels}, G {gain:.6}, points {} .. {})",
+                    set.first().copied().unwrap_or(0),
+                    set.last().copied().unwrap_or(0)
+                ));
+            }
+            None => self.note(format!(
+                "V.92: CPu bit 35 declares {law:?} and the {levelset:?} declaration cannot be built on \
+                 that alphabet; the provisional declaration stands and no code set is claimed"
+            )),
+        }
+    }
+
     fn read_code_grid(&mut self, cp: &Cp, first: bool) {
         let Some(parameters) = self.parameters.as_ref() else {
             self.up_scale = 1.0;
@@ -9165,7 +9296,7 @@ mod tests {
             let channel = Channel::estimate(&[1.0, -1.0, 1.0, 1.0, -1.0, 1.0], &[1.0, -1.0, 1.0, 1.0, -1.0, 1.0], 4)
                 .expect("a flat channel");
             let designed = design(&channel, &settings.limits).expect("designable");
-            choose(&designed, 1e-6, 1, Trellis::Sixteen).expect("the slowest rung").parameters
+            choose(&designed, 1e-6, 1, Trellis::Sixteen, Some(crate::v90::ucode::Law::Mu)).expect("the slowest rung").parameters
         };
         assert_eq!(parameters.drn, 1);
         let cpd = Cpd::from(&parameters);
@@ -9445,8 +9576,7 @@ mod tests {
             1,
             Trellis::Sixteen,
             1e-9,
-            crate::v92::upchoice::LevelSet::Code,
-        )
+            crate::v92::upchoice::LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
         .expect("drn 1 is pinnable")
         .parameters;
         let mut modem = Modem::default();
@@ -9479,7 +9609,7 @@ mod tests {
         let mut modem = modem_with_cpd();
         let set = modem.parameters.clone().expect("a CPd").sets[0].clone();
         // The mask a code-transparent far end would report for this design.
-        let codes: Vec<u8> = set.iter().map(|&point| codegrid::nearest_code(f64::from(point))).collect();
+        let codes: Vec<u8> = set.iter().map(|&point| codegrid::nearest_code(crate::v90::ucode::Law::Mu, f64::from(point))).collect();
 
         modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, true)));
         let notes = modem.clone().take_notes().join("\n");
@@ -9524,7 +9654,7 @@ mod tests {
             // times k: the mask is a list of Ucodes, so the fit has to see them
             // as codes and not as levels.
             let mut codes: Vec<u8> =
-                set.iter().map(|&point| codegrid::nearest_code(k * f64::from(point))).collect();
+                set.iter().map(|&point| codegrid::nearest_code(crate::v90::ucode::Law::Mu, k * f64::from(point))).collect();
             codes.dedup();
             modem.cpu = None;
             modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, false)));
@@ -9571,7 +9701,7 @@ mod tests {
         use crate::v92::sequences::CpFamily;
         let mut modem = modem_with_cpd();
         let set = modem.parameters.clone().expect("a CPd").sets[0].clone();
-        assert_eq!(set, codegrid::grid(8).expect("the grid"), "not the code declaration");
+        assert_eq!(set, codegrid::grid(crate::v90::ucode::Law::Mu, 8).expect("the grid"), "not the code declaration");
         assert_eq!(*set.last().expect("eight points"), 2492, "the declaration's outermost point");
         let downstream: [u8; 32] = [
             16, 32, 40, 48, 52, 56, 60, 64, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 80,
@@ -9638,12 +9768,12 @@ mod tests {
         // The mask's codes, as Ucodes: the far end's own values 256 ... 2000.
         let codes: Vec<u8> = [256.0, 512.0, 768.0, 1024.0, 1280.0, 1536.0, 1792.0, 2000.0]
             .iter()
-            .map(|&value| codegrid::nearest_code(value))
+            .map(|&value| codegrid::nearest_code(crate::v90::ucode::Law::Mu, value))
             .collect();
 
         // (1) The uniform table, at the fitted K and at one, is the design's own
         // set -- unchanged, and unchanged by `K`.
-        let uniform = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform)
+        let uniform = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform, Some(crate::v90::ucode::Law::Mu))
             .expect("drn 1 on the odd lattice")
             .parameters;
         assert_eq!(uniform.levelset, LevelSet::Uniform);
@@ -9655,7 +9785,7 @@ mod tests {
         // And the same call in the code arm *is* moved by it, so the loop above
         // is a statement about the level set and not about `scaled` being the
         // identity on these points.
-        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code)
+        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
             .expect("drn 1 on the grid")
             .parameters;
         assert_ne!(up_table(LevelSet::Code, &set, FITTED), set, "the code arm ignored K");
@@ -9663,7 +9793,7 @@ mod tests {
         // (2) The read path. A uniform call and a code call, the same CPu.
         let read = |levelset| {
             let parameters =
-                crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, levelset)
+                crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, levelset, Some(crate::v90::ucode::Law::Mu))
                     .expect("drn 1")
                     .parameters;
             let mut modem = Modem::default();
@@ -9684,7 +9814,7 @@ mod tests {
         // number the regression sliced at: eight points of `2 eta + 1` against
         // codes that run 256 to 2000 is a slope in the hundreds, and it is not
         // one. This is the value the uniform arm must refuse to look at.
-        let values: Vec<u16> = codes.iter().map(|&code| codegrid::value(code)).collect();
+        let values: Vec<u16> = codes.iter().map(|&code| codegrid::value_in(crate::v90::ucode::Law::Mu, code)).collect();
         assert!(values.iter().all(|&value| value > 0), "the mask must decode to levels");
         let would_fit = codegrid::estimate_from_mask(&set, &values).expect("the mask fits something");
         assert!(would_fit > 100.0, "the mask no longer fits big: {would_fit}");
@@ -9719,7 +9849,7 @@ mod tests {
             delay: 0,
         };
         let uniform =
-            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform)
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform, Some(crate::v90::ucode::Law::Mu))
                 .expect("drn 1 on the odd lattice")
                 .parameters;
         assert_eq!(uniform.levelset, LevelSet::Uniform);
@@ -9742,7 +9872,7 @@ mod tests {
         assert_eq!(rx.data_levels(), levels.as_slice(), "the slicer moved a point of the design's set");
         // The mechanism, so that removing the gate fails here and not on a bench:
         // snapping this set is not the identity, and what it moves is not small.
-        let snapped = crate::v92::receiver::lattice_levels(&levels);
+        let snapped = crate::v92::receiver::lattice_levels(Some(crate::v90::ucode::Law::Mu), &levels);
         let worst = levels
             .iter()
             .zip(&snapped)
@@ -9753,12 +9883,12 @@ mod tests {
         assert!(worst > 0.03 * spacing, "{worst} LSB of a {spacing} LSB step is not the mechanism");
         // And the code grid's own table *is* put on the lattice, so the gate is a
         // gate and not a removal: every point of it is a code value.
-        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code)
+        let code = crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
             .expect("drn 1 on the grid")
             .parameters;
         assert_eq!(code.levelset, LevelSet::Code);
         for level in data_mode_levels(&code, 1.0) {
-            let moved = (crate::v92::receiver::on_lattice(level) - level).abs();
+            let moved = (crate::v92::receiver::on_lattice(Some(Law::Mu), level) - level).abs();
             assert!(moved < 1.0 / crate::v92::receiver::LATTICE_LSB, "{level} is off the code grid by {moved}");
         }
     }
@@ -10147,7 +10277,7 @@ mod tests {
             sets: vec![vec![1, 3, 5, 7, 9, 11, 13, 15]],
             indices: [0; crate::v92::CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        }
+        law: None, }
     }
 
     /// B1u as the far end transmits it (8.7.1: forty-eight data frames of
@@ -11823,7 +11953,7 @@ mod conformance_158 {
             delay: 0,
         };
         let parameters =
-            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, crate::v92::upchoice::LevelSet::Code)
+            crate::v92::upchoice::pin_with(&design, 1, Trellis::Sixteen, 1e-9, crate::v92::upchoice::LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
                 .expect("drn 1 is pinnable")
                 .parameters;
         Cpd::from(&parameters)
@@ -12336,8 +12466,7 @@ mod conformance_158 {
             1,
             Trellis::Sixteen,
             1e-9,
-            crate::v92::upchoice::LevelSet::Code,
-        )
+            crate::v92::upchoice::LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
         .expect("drn 1 is pinnable")
         .parameters;
         let mut modem = Modem::default();
@@ -12505,8 +12634,7 @@ mod conformance_158 {
                 1,
                 Trellis::Sixteen,
                 1e-9,
-                crate::v92::upchoice::LevelSet::Code,
-            )
+                crate::v92::upchoice::LevelSet::Code, Some(crate::v90::ucode::Law::Mu))
             .expect("drn 1 is pinnable")
             .parameters,
         );

@@ -63,42 +63,63 @@ pub const TARGET_RMS: f64 = 1609.0;
 /// is what `K` measures rather than what this constant guesses.
 pub const POWER_SLACK: f64 = 0.02;
 
-/// The linear value of a positive µ-law code, in the codec's int16 domain.
-///
-/// `code` is the Ucode of `[8.7.3]`'s mask, 0 ... 127, which for µ-law is the
-/// magnitude index `m` of `docs/103` §1 (`0xFF - m` is the byte). Every value
-/// comes from G.711 through [`ucode::linear`], whose own test reproduces all
-/// 512 published Table 1/V.90 values -- no table is copied here.
-pub fn value(code: u8) -> u16 {
-    ucode::linear(Law::Mu, code & 0x7f).clamp(0, i32::from(u16::MAX)) as u16
-}
-
 /// The law `[Table 23]` bit 35 names: "0 = µ-law; 1 = A-law".
+///
+/// **The one place a bit becomes a law** (docs/313 sec 2). Bit 35 of `CPu` is
+/// the far end's "Codec type" (`v90::sequences::Cp::a_law`, read from
+/// information bit 16 at `v90/sequences.rs:682`, absolute bit 35), and no
+/// function below this line may invent a law of its own.
 pub fn law(a_law: bool) -> Law {
     if a_law { Law::A } else { Law::Mu }
 }
 
-/// The linear value of `code` under `law`, for the mask a far end reports.
+/// [`law`] for a bit this end does not have yet: no bit, no law.
+///
+/// The declaration path carries `Option<Law>` and refuses on `None`
+/// ([`crate::v92::upchoice::build_with`]), because *the far end has not
+/// declared* and *the far end declared µ-law* are different states: a
+/// declaration built on the second when the truth is the first is a declaration
+/// on the wrong alphabet, and the alphabet it would pick is the one this
+/// network happens to use (docs/313 sec 2).
+pub fn law_if(a_law: Option<bool>) -> Option<Law> {
+    a_law.map(law)
+}
+
+/// The linear value of a positive code under `law`, in the codec's int16
+/// domain: the single code → level entry point.
+///
+/// `code` is the Ucode of `[8.7.3]`'s mask, 0 ... 127; under µ-law that is the
+/// magnitude index `m` of `docs/103` §1 (`0xFF - m` is the byte). Every value
+/// comes from G.711 through [`ucode::linear`], whose own test reproduces all
+/// 512 published Table 1/V.90 values -- no table is copied here.
+///
+/// **The law is an argument and never a default** (docs/313 sec 2): the
+/// µ-law-only `value(code)` this replaced is gone rather than kept as a
+/// convenience, so every remaining µ assumption in the tree names `Law::Mu` at
+/// its own call site and shows up in a diff.
 pub fn value_in(law: Law, code: u8) -> u16 {
     ucode::linear(law, code & 0x7f).clamp(0, i32::from(u16::MAX)) as u16
 }
 
-/// The code whose linear value is nearest `target`, 1 ... 127.
+/// The code of alphabet `law` whose linear value is nearest `target`, 1 ... 127.
 ///
 /// Code 0 is silence and `[8.8.3]` forbids it in a constellation ("the
 /// constellation shall not include the zero point", `/tmp/v92.txt:1793`), so
-/// the search starts at 1 and the answer is never the zero point.
-pub fn nearest_code(target: f64) -> u8 {
+/// the search starts at 1 and the answer is never the zero point. Under A-law
+/// code 0 decodes to 8 and not to 0 -- A-law has no exact zero -- but it is
+/// still the silence codeword and still excluded, so the zero point stays out
+/// of the set under both laws (docs/313 sec 1).
+pub fn nearest_code(law: Law, target: f64) -> u8 {
     let (mut low, mut high) = (1u8, (UCODES - 1) as u8);
     while low < high {
         let middle = low + (high - low) / 2;
-        if f64::from(value(middle)) < target { low = middle + 1 } else { high = middle }
+        if f64::from(value_in(law, middle)) < target { low = middle + 1 } else { high = middle }
     }
     // `low` is the first code at or above the target; its predecessor may be
     // nearer.
     if low > 1 {
-        let below = f64::from(value(low - 1));
-        let above = f64::from(value(low));
+        let below = f64::from(value_in(law, low - 1));
+        let above = f64::from(value_in(law, low));
         if (target - below).abs() <= (above - target).abs() {
             return low - 1;
         }
@@ -109,17 +130,26 @@ pub fn nearest_code(target: f64) -> u8 {
 /// The step a `levels`-point uniform ladder has when its mean square is
 /// [`TARGET_RMS`]: a uniform alphabet at `+-1, +-3, ...` has a mean square of
 /// `((2 LC)^2 - 1) / 3`.
+///
+/// **No law argument, and that is a measurement**: `+-1, +-3, ...` is the odd
+/// lattice in *index units*, the same points under either companding law, and
+/// [`TARGET_RMS`] is `[8.8.3]`'s power in the codec's int16 domain -- the
+/// domain both G.711 laws decode into (A-law's loudest code is 32 256, µ-law's
+/// 32 124, `v90::ucode`'s own table test). So this is a number about the set's
+/// power and not about its alphabet, and it takes the law nowhere (docs/313
+/// sec 2, "what does not take the law").
 pub fn ladder_step(levels: usize) -> f64 {
     let span = 2.0 * levels as f64;
     2.0 * TARGET_RMS / ((span * span - 1.0) / 3.0).max(1.0).sqrt()
 }
 
-/// The `levels` positive points of this end's constellation, as µ-law code
-/// values (docs/114 R1).
+/// The `levels` positive points of this end's constellation, as **code values
+/// of the far end's `law`** (docs/114 R1, docs/313 sec 2).
 ///
 /// The criterion is `docs/103` §3's, unchanged: maximise the smallest adjacent
-/// gap over a set of distinct µ-law codes with no zero point, subject to the
-/// set's mean square being no more than the power the line carries. What
+/// gap over a set of distinct codes **of the law the far end declared** with no
+/// zero point, subject to the set's mean square being no more than the power
+/// the line carries. What
 /// changes is that the criterion's *search space* is the far end's, because the
 /// far end can only emit codes -- so the answer is a code set, and the far
 /// end's quantiser is a no-op on it instead of a half-cell error on it.
@@ -139,7 +169,7 @@ pub fn ladder_step(levels: usize) -> f64 {
 /// That is the 48 000 rung's problem and not this function's: `docs/103` §3
 /// shows no 64-point set on the grid has a usable gap, and what comes back here
 /// (gap 16 LSB) is the best the grid can do rather than a design to certify.
-pub fn grid(levels: usize) -> Option<Vec<u16>> {
+pub fn grid(law: Law, levels: usize) -> Option<Vec<u16>> {
     if levels == 0 || levels + 1 > UCODES {
         return None;
     }
@@ -147,7 +177,7 @@ pub fn grid(levels: usize) -> Option<Vec<u16>> {
     let (mut low, mut high) = (1.0f64, 2.0 * ladder_step(levels));
     for _ in 0..64 {
         let gap = 0.5 * (low + high);
-        match snapped(levels, gap) {
+        match snapped(law, levels, gap) {
             Some(points) if mean_square(&points).sqrt() <= TARGET_RMS * (1.0 + POWER_SLACK) => {
                 inside = Some(points);
                 low = gap;
@@ -158,21 +188,21 @@ pub fn grid(levels: usize) -> Option<Vec<u16>> {
     inside
 }
 
-/// One greedy pass of [`grid`]: `levels` codes, each at least `gap` LSB above
-/// the one below where the grid allows it.
-fn snapped(levels: usize, gap: f64) -> Option<Vec<u16>> {
+/// One greedy pass of [`grid`]: `levels` codes of `law`, each at least `gap` LSB
+/// above the one below where that law's grid allows it.
+fn snapped(law: Law, levels: usize, gap: f64) -> Option<Vec<u16>> {
     let mut points = Vec::with_capacity(levels);
     let mut floor = 0u16;
     for _ in 0..levels {
         let want = f64::from(floor) + gap.max(1.0);
-        let mut code = nearest_code(want);
-        while value(code) <= floor {
+        let mut code = nearest_code(law, want);
+        while value_in(law, code) <= floor {
             if code >= (UCODES - 1) as u8 {
                 return None;
             }
             code += 1;
         }
-        floor = value(code);
+        floor = value_in(law, code);
         points.push(floor);
     }
     Some(points)
@@ -199,6 +229,11 @@ pub fn mean_square(points: &[u16]) -> f64 {
 
 /// `G` from `[8.8.3]`: the gain that makes `ms(v G) = 1` for these points.
 ///
+/// No law argument: `G` is the reciprocal square root of the mean square of the
+/// **points it is handed**, so a set built on the A-law grid takes the A-law
+/// `G` and a set built on the µ-law grid the µ-law one, without this function
+/// knowing either name (docs/313 sec 4's gain column is that difference).
+///
 /// For a unit prefilter `v` *is* `a(eta)`, so the reciprocal square root of the
 /// set's mean square is the only value the clause allows. It is not a free
 /// parameter and must not be used to move the grid (docs/114 R8).
@@ -209,6 +244,10 @@ pub fn gain_for(points: &[u16]) -> f64 {
 
 /// The receiver's decision table for these codes at far-code-to-this-end
 /// scale `k`: `round(k a(eta))` per point (docs/114 R4).
+///
+/// No law argument: `k` carries the alphabet's scale and the points carry the
+/// alphabet, so multiplying and rounding is law-free; what *is* law-dependent,
+/// the points, is the caller's (`Parameters::sets`, built by [`grid`]).
 ///
 /// A level that arrives as `k` times a code value is sliced against the same
 /// `k`, so a `k` away from one costs spacing and not noise: the thresholds move
@@ -232,6 +271,10 @@ pub fn scaled(points: &[u16], k: f64) -> Vec<u16> {
 
 /// `k` from a set of received levels and the codes they are known to be, by
 /// least squares through the origin: `k = sum(y c) / sum(c^2)` (docs/114 R2).
+///
+/// No law argument: both arguments are already numbers, and the law entered
+/// them where they were decoded ([`value_in`] with the law the mask was read
+/// under).
 ///
 /// `None` when there is nothing to fit, or when the codes carry no power.
 pub fn estimate(levels: &[f64], codes: &[f64]) -> Option<f64> {
@@ -343,7 +386,7 @@ mod tests {
             (127, 32124),
         ];
         for (code, expected) in published {
-            assert_eq!(value(code), expected, "code {code}");
+            assert_eq!(value_in(Law::Mu, code), expected, "code {code}");
         }
     }
 
@@ -352,8 +395,8 @@ mod tests {
     #[test]
     fn every_code_is_a_fixed_point_of_the_quantiser() {
         for code in 1..UCODES as u8 {
-            let decoded = f64::from(value(code));
-            assert_eq!(nearest_code(decoded), code, "code {code} does not survive a round trip");
+            let decoded = f64::from(value_in(Law::Mu, code));
+            assert_eq!(nearest_code(Law::Mu, decoded), code, "code {code} does not survive a round trip");
         }
     }
 
@@ -362,13 +405,13 @@ mod tests {
     #[test]
     fn every_rung_s_set_is_a_set_of_codes() {
         for levels in [1usize, 4, 5, 8, 10, 16, 20, 32, 39, 48, 64] {
-            let points = grid(levels).unwrap_or_else(|| panic!("{levels}: the grid ran out"));
+            let points = grid(Law::Mu, levels).unwrap_or_else(|| panic!("{levels}: the grid ran out"));
             assert_eq!(points.len(), levels, "{levels}: LC");
             assert!(points[0] > 0, "{levels}: the zero point");
             assert!(points.windows(2).all(|pair| pair[0] < pair[1]), "{levels}: not ascending");
             for &point in &points {
-                let code = nearest_code(f64::from(point));
-                assert_eq!(value(code), point, "{levels}: {point} is not a code value");
+                let code = nearest_code(Law::Mu, f64::from(point));
+                assert_eq!(value_in(Law::Mu, code), point, "{levels}: {point} is not a code value");
             }
         }
     }
@@ -378,7 +421,7 @@ mod tests {
     #[test]
     fn the_gain_brings_the_code_ladder_to_unit_power() {
         for levels in [4usize, 8, 16, 32, 64] {
-            let points = grid(levels).expect("a set");
+            let points = grid(Law::Mu, levels).expect("a set");
             let gain = gain_for(&points);
             assert!((gain * gain * mean_square(&points) - 1.0).abs() < 1e-12, "{levels}");
             // Table 30 bits 35:50 carry 4 x G in unsigned Q0.16, and both ends
@@ -395,7 +438,7 @@ mod tests {
     #[test]
     fn the_set_reaches_the_power_the_line_carries() {
         for levels in [8usize, 16, 32] {
-            let points = grid(levels).expect("a set");
+            let points = grid(Law::Mu, levels).expect("a set");
             let rms = mean_square(&points).sqrt();
             let step = ladder_step(levels);
             assert!((rms - TARGET_RMS).abs() < step * 1.5, "{levels}: rms {rms} against {TARGET_RMS}");
@@ -407,7 +450,7 @@ mod tests {
     /// thresholds.
     #[test]
     fn the_table_follows_k() {
-        let points = grid(8).expect("a set");
+        let points = grid(Law::Mu, 8).expect("a set");
         assert_eq!(scaled(&points, 1.0), points, "k = 1 must be the design itself");
         for k in [0.98, 0.5, 1.03] {
             let table = scaled(&points, k);
@@ -455,12 +498,12 @@ mod tests {
             wrong
         };
         // 24 000: 2 % is invisible to the slicer and 10 % is not.
-        let coarse = grid(8).expect("a set");
+        let coarse = grid(Law::Mu, 8).expect("a set");
         assert_eq!(slice(&coarse, &scaled(&coarse, 0.90), 0.90), 0, "a table at k must slice its own stream");
         assert_eq!(slice(&coarse, &coarse, 0.98), 0, "24 000 swallows 2 %");
         assert!(slice(&coarse, &coarse, 0.90) > 0, "24 000 does not swallow 10 %");
         // 48 000: 2 % is already enough to move a symbol to its neighbour.
-        let fine = grid(64).expect("a set");
+        let fine = grid(Law::Mu, 64).expect("a set");
         assert_eq!(slice(&fine, &scaled(&fine, 0.98), 0.98), 0, "a table at k must slice its own stream");
         assert!(slice(&fine, &fine, 0.98) > 0, "48 000 has to be sliced at k, not at 1");
     }
@@ -469,7 +512,7 @@ mod tests {
     /// it recovers a known scale exactly.
     #[test]
     fn the_estimate_recovers_a_known_scale() {
-        let points = grid(16).expect("a set");
+        let points = grid(Law::Mu, 16).expect("a set");
         let codes: Vec<f64> = points.iter().map(|&p| f64::from(p)).collect();
         for k in [1.0, 0.98, 0.41, 2.5] {
             let levels: Vec<f64> = codes.iter().map(|c| k * c).collect();
@@ -483,11 +526,11 @@ mod tests {
     /// fell in one code cell.
     #[test]
     fn the_mask_estimate_recovers_the_far_end_s_scale() {
-        let points = grid(32).expect("a set");
+        let points = grid(Law::Mu, 32).expect("a set");
         for k in [1.0f64, 0.98, 1.03] {
             let mut report: Vec<u16> = points
                 .iter()
-                .map(|&point| value(nearest_code(k * f64::from(point))))
+                .map(|&point| value_in(Law::Mu, nearest_code(Law::Mu, k * f64::from(point))))
                 .filter(|&code| code > 0)
                 .collect();
             report.dedup();

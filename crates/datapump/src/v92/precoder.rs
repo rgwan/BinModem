@@ -884,7 +884,7 @@ mod tests {
             sets: vec![set],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        }
+        law: None, }
     }
 
     /// A prefilter that passes x straight through: z2 = [1], nothing else.

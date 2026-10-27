@@ -858,7 +858,7 @@ mod tests {
             sets: vec![(1..=72).map(|p| p * 100).collect()],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        };
+        law: None, };
         parameters.fits().expect("the parameters are self-consistent");
         let moduli = Moduli12::from(&parameters);
         assert_eq!(moduli.values(), &MIXED);

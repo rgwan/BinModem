@@ -269,7 +269,7 @@ mod tests {
             sets: vec![(0..levels).map(|index| (2 * index + 1) as u16).collect()],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        }
+        law: None, }
     }
 
     /// A deterministic bit source, so the tests do not pull in a crate for it.

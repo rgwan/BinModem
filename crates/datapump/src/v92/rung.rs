@@ -201,7 +201,8 @@
 //! than a floor the rung follows it up.
 //!
 use super::design::Design;
-use super::upchoice::gain_for;
+use super::upchoice::{LevelSet, gain_for};
+use crate::v90::ucode::Law;
 use super::{JA_MASK_ALL, UP_INTERVALS, UP_RATES, up_bits, up_rate};
 
 /// The grid a measurement is normalised to: index steps of the LC = 8 set, the
@@ -407,8 +408,15 @@ pub const SCREEN: &str = "sigma_max";
 /// with. It is *tighter* than `sigma_max` everywhere except the LC = 8 rung the
 /// bench has measured, which is the conservative direction (`docs/240` sec 3c).
 #[must_use]
-pub fn threshold(drn: u8) -> f64 {
-    SIGMA_MAX * priced_gap_lsb(drn) / index_step_lsb()
+pub fn threshold(law: Law, drn: u8) -> f64 {
+    threshold_of(level_set(), law, drn)
+}
+
+/// [`threshold`] with the level set named, for the licence table (docs/313
+/// sec 4).
+#[must_use]
+pub fn threshold_of(levelset: LevelSet, law: Law, drn: u8) -> f64 {
+    SIGMA_MAX * priced_gap(levelset, law, drn) / index_step_lsb()
 }
 
 /// The positive-point count of the set a rung **carries**, as a type [`lc_for`]
@@ -470,7 +478,16 @@ impl CarriedPoints {
 /// the set) is **not** the number [`gap_lsb`]'s positive-point table is indexed
 /// by.
 #[must_use]
-pub fn priced_gap_lsb(drn: u8) -> f64 {
+pub fn priced_gap_lsb(law: Law, drn: u8) -> f64 {
+    priced_gap(level_set(), law, drn)
+}
+
+/// [`priced_gap_lsb`] with the level set named as well as the law, so that a
+/// caller can price an arm that is not the one this build ships -- the licence
+/// table of docs/313 sec 4 does exactly that, and the delivered `CPd` prices
+/// itself through `Reading`'s own fields.
+#[must_use]
+pub fn priced_gap(levelset: LevelSet, law: Law, drn: u8) -> f64 {
     let set = CarriedPoints::of(drn);
     if set.count() < 2 {
         return 0.0;
@@ -488,12 +505,27 @@ pub fn priced_gap_lsb(drn: u8) -> f64 {
     // the snapping is a maximin code set of that size -- which is the number
     // every call before this change was priced at, kept so the old arm's log
     // stays comparable with its own history.
-    match super::upchoice::levelset() {
-        super::upchoice::LevelSet::Code => {
-            super::upchoice::declared_gap_lsb(set.count()).unwrap_or_else(|| gap_lsb(set).unwrap_or(0.0))
-        }
-        super::upchoice::LevelSet::Uniform => gap_lsb(set).unwrap_or(0.0),
+    match (levelset, law) {
+        (LevelSet::Code, law) => super::upchoice::declared_gap_of(levelset, Some(law), set.count())
+            .unwrap_or_else(|| gap_lsb(set).unwrap_or(0.0)),
+        // **The maximin table is a µ-law table** and there is no A-law column
+        // of it (`docs/116` sec 7 tabulates µ-law codes). A µ number applied to
+        // an A-law declaration would be exactly the wrong-law constant this
+        // ticket removes, so the A-law uniform arm is priced from the A-law
+        // grid's own set instead -- the same greedy search the code arm uses,
+        // which `gap_lsb`'s own comment measures 20 % tighter than a maximin
+        // set, i.e. the conservative direction (docs/313 sec 4).
+        (LevelSet::Uniform, Law::Mu) => gap_lsb(set).unwrap_or(0.0),
+        (LevelSet::Uniform, Law::A) => super::upchoice::declared_gap_of(LevelSet::Code, Some(Law::A), set.count())
+            .unwrap_or_else(|| gap_lsb(set).unwrap_or(0.0)),
     }
+}
+
+/// The level set a decision inside this module prices, which is the one the
+/// build ships (`docs/312` sec 1). Named once, so that a reader counting
+/// environment reads finds one.
+fn level_set() -> LevelSet {
+    super::upchoice::levelset()
 }
 
 /// The smallest gap a *maximin* set of `points` positive µ-law codes holds, in
@@ -527,7 +559,10 @@ pub fn gap_lsb(points: CarriedPoints) -> Option<f64> {
         64 => Some(16.0),
         _ => None,
     };
-    tabulated.or_else(|| crate::v92::codegrid::grid(count).map(|set| crate::v92::codegrid::min_gap(&set)))
+    tabulated.or_else(|| {
+        crate::v92::codegrid::grid(crate::v90::ucode::Law::Mu, count)
+            .map(|set| crate::v92::codegrid::min_gap(&set))
+    })
 }
 
 /// The largest measurement, in index steps of the **LC = 8 grid**, that a rung
@@ -709,13 +744,13 @@ impl Sigma {
     /// error rate, so a residual that clears it is not a licence. Only the first
     /// half decides. The second is printed so that a reader can see it did not.
     #[must_use]
-    pub fn ceiling_note(&self) -> String {
-        let ceiling = ceiling_rung(*self);
+    pub fn ceiling_note(&self, law: Law) -> String {
+        let ceiling = ceiling_rung(law, *self);
         // The rung the scan *refused* is the one above where it stopped, which
         // is the row whose number a reader wants: five rungs are granted and one
         // refusal is why the ceiling is there.
         let next = ceiling.map_or(1, |drn| (drn + 1).min(UP_RATES as u8));
-        let bound = threshold(next);
+        let bound = threshold(law, next);
         let screen = sigma_max(lc_for(next));
         let screen_says =
             if self.steps <= screen { "would have PERMITTED it" } else { "refuses it too" };
@@ -748,7 +783,7 @@ impl Sigma {
 /// faster than that; a measurement that already refuses the slowest rung refuses
 /// everything.
 #[must_use]
-pub fn ceiling_rung(measured: Sigma) -> Option<u8> {
+pub fn ceiling_rung(law: Law, measured: Sigma) -> Option<u8> {
     // **Scan and decide, for every bound.** The scan used to be skipped for a
     // `Bound::Lower`: the number was spent at drn 1 without asking any rung its
     // own question, so a measurement that carried 25 333 by 2.5x could not say
@@ -760,7 +795,7 @@ pub fn ceiling_rung(measured: Sigma) -> Option<u8> {
     // not "allow more": at today's 0.0690 every rung above drn 1 is still
     // refused, and the refusal is now a number in the log rather than a
     // short-circuit (see `digital::decide_upstream_rung`).
-    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold(drn))
+    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold(law, drn))
 }
 
 /// The mask of rungs at or below `ceiling`, in the layout of Table 20's Ja mask:
@@ -785,9 +820,9 @@ pub fn ceiling_mask(ceiling: Option<u8>) -> u32 {
 /// apply_ceiling(ja, m) & ja == apply_ceiling(ja, m)
 /// ```
 #[must_use]
-pub fn apply_ceiling(ja: u32, measured: Sigma) -> u32 {
+pub fn apply_ceiling(law: Law, ja: u32, measured: Sigma) -> u32 {
     let allowed = if ja == 0 { JA_MASK_ALL } else { ja };
-    allowed & ceiling_mask(ceiling_rung(measured))
+    allowed & ceiling_mask(ceiling_rung(law, measured))
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1156,11 @@ pub struct Reading {
     pub crossing: f64,
     /// How many symbols the two rates were measured over.
     pub symbols: u64,
+    /// The companding law the rung is priced on: `[Table 23]` bit 35 as the far
+    /// end declared it, carried on the reading rather than read again where the
+    /// line is printed (docs/313 sec 2). The licence is a number about a set on
+    /// an alphabet, so a line without one cannot state it.
+    pub law: Law,
 }
 
 impl Reading {
@@ -1237,9 +1277,9 @@ impl Reading {
             // caller supplied: `docs/306` sec 2 found the LADDER line printing a
             // gap while `threshold` used another, so the printed field is now
             // the criterion's own function (`docs/308` sec 2).
-            priced_gap_lsb(self.drn),
+            priced_gap_lsb(self.law, self.drn),
             self.drn,
-            threshold(self.drn),
+            threshold(self.law, self.drn),
             self.lc,
             sigma_max(self.lc),
         )
@@ -1570,7 +1610,7 @@ mod tests {
     fn lc_for_agrees_with_the_builder() {
         let design = design_for(0.0);
         for drn in 1..=UP_RATES as u8 {
-            let Some(choice) = pin(&design, drn, Trellis::Sixteen, 1e-9) else { continue };
+            let Some(choice) = pin(&design, drn, Trellis::Sixteen, 1e-9, Some(Law::Mu)) else { continue };
             assert_eq!(choice.parameters.drn, drn);
             assert_eq!(
                 choice.parameters.sets[0].len(),
@@ -1593,7 +1633,7 @@ mod tests {
         for step in 0..=240 {
             let steps = 10f64.powf(-4.0 + 4.0 * f64::from(step) / 120.0);
             let measured = Sigma::absolute(2.0 * gain_for(REFERENCE_LC) * steps, Bound::Reading);
-            let ceiling = ceiling_rung(measured).unwrap_or(0);
+            let ceiling = ceiling_rung(Law::Mu, measured).unwrap_or(0);
             assert!(
                 ceiling <= previous,
                 "the ceiling rose from {previous} to {ceiling} at sigma {steps:e}"
@@ -1619,13 +1659,13 @@ mod tests {
         // modulus (`docs/306` sec 2.2).
         for (drn, lc) in [(1u8, 8usize), (2, 8), (7, 16), (13, 32), (19, 64)] {
             assert_eq!(lc, lc_for(drn), "drn {drn}: the set moved");
-            let bound = threshold(drn);
+            let bound = threshold(Law::Mu, drn);
             assert!(bound > 0.0, "drn {drn} has no threshold");
             let inside = Sigma::reading(bound * 0.999, REFERENCE_LC);
             let outside = Sigma::reading(bound * 1.001, REFERENCE_LC);
-            let permitted = ceiling_rung(inside).expect("a rung");
+            let permitted = ceiling_rung(Law::Mu, inside).expect("a rung");
             assert!(permitted >= drn, "drn {drn} was refused at 0.1 % inside its bound: {permitted}");
-            let refused = ceiling_rung(outside);
+            let refused = ceiling_rung(Law::Mu, outside);
             assert!(
                 refused.is_none_or(|ceiling| ceiling < drn),
                 "drn {drn} was still permitted at 0.1 % outside its bound: {refused:?}"
@@ -1652,12 +1692,12 @@ mod tests {
     #[test]
     fn the_24_000_measurement_carries_24_000_and_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_24, 8);
-        let ceiling = ceiling_rung(measured).expect("the measured arm carries a rung");
+        let ceiling = ceiling_rung(Law::Mu, measured).expect("the measured arm carries a rung");
         assert!(ceiling >= 1, "24 000 was refused");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_24} index-step residual");
         // The two rungs, explicitly, through the mask: drn 1 survives, drn 7
         // does not, and no rung above 7 does either.
-        let mask = apply_ceiling(JA_MASK_ALL, measured);
+        let mask = apply_ceiling(Law::Mu, JA_MASK_ALL, measured);
         assert_eq!(mask & (1 << 0), 1 << 0, "24 000 was masked out");
         assert_eq!(mask & (1 << 6), 0, "32 000 survived the ceiling");
         assert_eq!(mask & !((1 << 7) - 1), 0, "a rung above 32 000 survived");
@@ -1669,7 +1709,7 @@ mod tests {
     #[test]
     fn the_32_000_measurement_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_32, 16);
-        let ceiling = ceiling_rung(measured).expect("the fallback is still a rung");
+        let ceiling = ceiling_rung(Law::Mu, measured).expect("the fallback is still a rung");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_32} index-step residual");
         assert!(ceiling >= 1, "the measurement refuses even 24 000, which the call went on to use");
         // On the reference grid the same absolute residual is half as many
@@ -1686,13 +1726,13 @@ mod tests {
         for step in 0..40 {
             let steps = 0.005 * f64::from(step);
             let measured = Sigma::reading(steps, REFERENCE_LC);
-            let mask = apply_ceiling(JA_MASK_ALL, measured);
+            let mask = apply_ceiling(Law::Mu, JA_MASK_ALL, measured);
             for drn in 1..=UP_RATES as u8 {
                 let permitted = mask & (1 << (drn - 1)) != 0;
                 // The rung's own set, which is what the scan prices
                 // (`docs/306` sec 2: `lc_for`, not the interval's modulus).
                 let error = measured.error(lc_for(drn));
-                let budget = threshold(drn);
+                let budget = threshold(Law::Mu, drn);
                 // The permission *is* the scan's comparison, and it is at least
                 // as strict as the error probability -- the gap correction only
                 // tightens -- so a permitted rung never misses the target and a
@@ -1726,9 +1766,9 @@ mod tests {
                 for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
                     let measured = Sigma { bound, ..Sigma::reading(steps, REFERENCE_LC) };
                     let allowed = if mask == 0 { JA_MASK_ALL } else { mask };
-                    let out = apply_ceiling(mask, measured);
+                    let out = apply_ceiling(Law::Mu, mask, measured);
                     assert_eq!(out & !allowed, 0, "mask {mask:#b} at sigma {steps} grew to {out:#b}");
-                    assert!(out & !ceiling_mask(ceiling_rung(measured)) == 0);
+                    assert!(out & !ceiling_mask(ceiling_rung(Law::Mu, measured)) == 0);
                     if out & !mask != 0 {
                         // Only possible through the zero-means-every-rung rule.
                         assert_eq!(mask, 0);
@@ -1761,17 +1801,17 @@ mod tests {
         // The ticket's two-sided rule, named after it: `drn 3` = 26 666 has a
         // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
         let above = Sigma::lower(0.0690, REFERENCE_LC);
-        assert_eq!(ceiling_rung(above), Some(2), "0.0690 was allowed past drn 2");
-        assert!(0.0690 > threshold(3), "the threshold the refusal rests on moved");
-        assert!(0.0690 <= threshold(2), "drn 2's licence is not the 8-point one");
-        println!("drn 3 threshold {} at 0.0690 -> {:?}", threshold(3), ceiling_rung(above));
+        assert_eq!(ceiling_rung(Law::Mu, above), Some(2), "0.0690 was allowed past drn 2");
+        assert!(0.0690 > threshold(Law::Mu, 3), "the threshold the refusal rests on moved");
+        assert!(0.0690 <= threshold(Law::Mu, 2), "drn 2's licence is not the 8-point one");
+        println!("drn 3 threshold {} at 0.0690 -> {:?}", threshold(Law::Mu, 3), ceiling_rung(Law::Mu, above));
 
         // Just inside it, drn 2 is carried -- and so is every rung at or under
         // the same threshold, which is the highest rung the measurement meets.
         let below = Sigma::lower(0.0344 * 0.999, REFERENCE_LC);
-        let granted = ceiling_rung(below).expect("0.0339 must carry a rung");
+        let granted = ceiling_rung(Law::Mu, below).expect("0.0339 must carry a rung");
         assert!(granted >= 2, "drn 2 was refused at 0.0339: {granted}");
-        let expected = (1..=UP_RATES as u8).rev().find(|&drn| 0.0344 * 0.999 <= threshold(drn));
+        let expected = (1..=UP_RATES as u8).rev().find(|&drn| 0.0344 * 0.999 <= threshold(Law::Mu, drn));
         assert_eq!(Some(granted), expected, "the scan did not take the highest rung met");
         println!("0.0339 -> drn {granted} ({})", up_rate(granted));
 
@@ -1780,10 +1820,10 @@ mod tests {
         // still does is travel in the log (`docs/242` sec 4).
         for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
             let measured = Sigma { bound, ..Sigma::reading(0.0344 * 0.999, REFERENCE_LC) };
-            assert_eq!(ceiling_rung(measured), Some(granted), "{bound:?} read differently");
+            assert_eq!(ceiling_rung(Law::Mu, measured), Some(granted), "{bound:?} read differently");
         }
         let dirty = Sigma::lower(1.0, REFERENCE_LC);
-        assert_eq!(ceiling_rung(dirty), None, "a measurement that refuses 24 000 must refuse all");
+        assert_eq!(ceiling_rung(Law::Mu, dirty), None, "a measurement that refuses 24 000 must refuse all");
     }
 
     /// The thresholds reproduce `docs/240` sec 3c's verified column **as
@@ -1811,7 +1851,7 @@ mod tests {
             (14, 0.0172),
             (19, 0.0043),
         ] {
-            let got = threshold(drn);
+            let got = threshold(Law::Mu, drn);
             assert!((got - want).abs() < 5e-4, "drn {drn}: {got:.4} against {want}");
         }
         // 349 LSB is one index step at LC 8 (`docs/241` sec 0).
@@ -1824,14 +1864,14 @@ mod tests {
         assert_eq!(widest_modulus(1), 8);
         assert_eq!(lc_for(2), 8, "the set the builder carries at 25 333");
         assert_eq!(
-            threshold(2),
-            threshold(1),
+            threshold(Law::Mu, 2),
+            threshold(Law::Mu, 1),
             "25 333 carries the same 8-point set 24 000 does, so it is priced the same"
         );
         // The mean-square screen is still the looser form at every rung, but at
         // `drn 2` it is looser by 1.09x and not by the 2.7x the modulo-based
         // price made it look (`docs/306` sec 2).
-        assert!(sigma_max(lc_for(2)) > threshold(2), "the mean-square model is not the looser form");
+        assert!(sigma_max(lc_for(2)) > threshold(Law::Mu, 2), "the mean-square model is not the looser form");
     }
 
     /// **LD-1, `docs/306` sec 2: the criterion must price the set the builder
@@ -1854,7 +1894,7 @@ mod tests {
             let carried = lc_for(drn);
             let gap = gap_lsb(CarriedPoints::of(drn)).expect("a gap for a set the ladder asks for");
             let want = SIGMA_MAX * gap / index_step_lsb();
-            let got = threshold(drn);
+            let got = threshold(Law::Mu, drn);
             assert!(
                 (got - want).abs() < 1e-9,
                 "drn {drn}: the set the builder carries is {carried} points, worth {gap} LSB = \
@@ -1891,7 +1931,7 @@ mod tests {
             );
             let modulo_price = SIGMA_MAX * modulo_gap / index_step_lsb();
             let set_price = SIGMA_MAX * set_gap / index_step_lsb();
-            let got = threshold(drn);
+            let got = threshold(Law::Mu, drn);
             // Derived from `lc_for`: the gap of the set the builder carries.
             assert!(
                 (got - set_price).abs() < 1e-9,
@@ -1904,8 +1944,8 @@ mod tests {
             );
         }
         // The number the licence moves to, at the rung the record is about.
-        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
-        assert!((threshold(1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
+        assert!((threshold(Law::Mu, 2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(Law::Mu, 2));
+        assert!((threshold(Law::Mu, 1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
     }
 
     /// **The invariant `docs/306` sec 2 is about, stated as `6.4.2` states it**
@@ -1983,10 +2023,10 @@ mod tests {
         // why it cannot be a licence: as a licence it always lets more through.
         for drn in 1..=UP_RATES as u8 {
             assert!(
-                sigma_max(lc_for(drn)) >= threshold(drn),
+                sigma_max(lc_for(drn)) >= threshold(Law::Mu, drn),
                 "drn {drn}: the screen {} is tighter than the licence {}",
                 sigma_max(lc_for(drn)),
-                threshold(drn)
+                threshold(Law::Mu, drn)
             );
         }
         // A residual inside the screen and outside the licence, worked at
@@ -1994,29 +2034,29 @@ mod tests {
         //
         // **Why not `drn 2` any more.** `docs/274` sec 2.2's row was `0.0744`
         // read against `sigma_max(LC 8) = 0.0939`; the wrong pricing put it
-        // outside `threshold(2) = 0.0344`, and `docs/306` sec 2 moved that
+        // outside `threshold(Law::Mu, 2) = 0.0344`, and `docs/306` sec 2 moved that
         // licence to `0.0861`, which `0.0744` is now **inside**. The window
         // between the screen and the licence at `drn 2` narrowed from 2.7x to
         // 1.09x, and every residual in it -- `(0.0861, 0.0939]` -- also fails
-        // `threshold(1)`, because 25 333 and 24 000 now carry the *same* 8-point
+        // `threshold(Law::Mu, 1)`, because 25 333 and 24 000 now carry the *same* 8-point
         // set. So the screen/refusal pair is demonstrated one rung up, where the
         // gap is 1.36x: `0.0400` clears `sigma_max(16) = 0.0469` and fails
-        // `threshold(7) = 0.0344`. What 32 000 was refused on is unchanged; what
+        // `threshold(Law::Mu, 7) = 0.0344`. What 32 000 was refused on is unchanged; what
         // changed is that `drn 2` is no longer the example (`docs/308` sec 5).
         let measured = Sigma::reading(0.0400, REFERENCE_LC);
         assert!(
             0.0400 <= sigma_max(lc_for(7)),
             "the screen has to licence this or the test proves nothing"
         );
-        assert!(sigma_max(lc_for(7)) > threshold(7), "the screen is not the looser form");
+        assert!(sigma_max(lc_for(7)) > threshold(Law::Mu, 7), "the screen is not the looser form");
         // Refused: 32 000 was measured failing and the call fell back to 24 000
         // (`docs/266` c4, `the_32_000_measurement_refuses_32_000`).
-        assert!(0.0400 > threshold(7), "drn 7's licence is not what the refusal rests on");
-        assert_eq!(ceiling_rung(measured), Some(2), "0.0400 was allowed past 25 333");
+        assert!(0.0400 > threshold(Law::Mu, 7), "drn 7's licence is not what the refusal rests on");
+        assert_eq!(ceiling_rung(Law::Mu, measured), Some(2), "0.0400 was allowed past 25 333");
         // And the refusal names the criterion, and says the screen was not
         // consulted. This is the sentence a future reader has to be able to
         // find in the log rather than re-derive.
-        let note = measured.ceiling_note();
+        let note = measured.ceiling_note(Law::Mu);
         println!("{note}");
         assert!(note.contains(CRITERION), "the refusal does not name the criterion: {note}");
         assert!(note.contains("threshold"), "the refusal does not name `threshold`: {note}");
@@ -2035,7 +2075,7 @@ mod tests {
             bin: 1e-2,
             crossing: 0.0,
             symbols: 416,
-        };
+        law: crate::v90::ucode::Law::Mu, };
         let line = reading.line(admit(&reading));
         println!("{line}");
         assert!(line.starts_with("LADDER drn=2"), "the line's shape moved: {line}");
@@ -2065,7 +2105,7 @@ mod tests {
         let mut previous = u8::MAX;
         for exp in (0..12).rev() {
             let noise = 10f64.powi(-exp);
-            let ceiling = ceiling_rung(Sigma::from_design(&design, noise)).unwrap_or(0);
+            let ceiling = ceiling_rung(Law::Mu, Sigma::from_design(&design, noise)).unwrap_or(0);
             assert!(ceiling <= previous, "noise {noise:e} gave {ceiling} after {previous}");
             previous = ceiling;
         }
@@ -2085,8 +2125,8 @@ mod tests {
         for (text, lc, recorded) in [TWENTY_FOUR, THIRTY_TWO] {
             let measured = sigma_from_stream(text, lc).expect("a score run");
             assert_eq!(measured.bound(), Bound::Reading);
-            let ceiling = ceiling_rung(measured).expect("the slowest rung survives both");
-            let mask = apply_ceiling(JA_MASK_ALL, measured);
+            let ceiling = ceiling_rung(Law::Mu, measured).expect("the slowest rung survives both");
+            let mask = apply_ceiling(Law::Mu, JA_MASK_ALL, measured);
             println!(
                 "recorded at drn {recorded} (LC {lc}): sigma {:.4} index steps, {:.4} on the LC = 8 grid, \
                  ceiling drn {ceiling}, mask {mask:#b}",
@@ -2127,7 +2167,7 @@ mod tests {
             bin,
             crossing,
             symbols,
-        }
+        law: crate::v90::ucode::Law::Mu, }
     }
 
     /// The level at which the design's own codes arrive as the levels they are,
@@ -2403,7 +2443,7 @@ mod tests {
     /// argument and it has to be mechanical rather than stated:
     ///
     /// * the **licence** moves -- the recorded `drn 2` residual `0.0744` (26.0
-    ///   LSB) is inside the corrected `threshold(2) = 0.0861`, so `ceiling_rung`
+    ///   LSB) is inside the corrected `threshold(Law::Mu, 2) = 0.0861`, so `ceiling_rung`
     ///   returns `Some(2)` where the old `0.0344` returned `Some(1)`;
     /// * the **effective rung** does not -- `cap_to_measured` cuts that grant to
     ///   `drn 1`, for this residual and for every residual on a dense grid of
@@ -2417,9 +2457,9 @@ mod tests {
         assert_eq!(MEASURED_WORKING_MAX_DRN, 1, "the cap is the safety argument, and it is 1");
         let measured = Sigma::reading(0.0744, REFERENCE_LC);
         // The licence: inside the corrected 8-point figure.
-        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
-        assert!(0.0744 <= threshold(2), "0.0744 is not inside drn 2's corrected licence");
-        let licensed = ceiling_rung(measured).expect("0.0744 licenses a rung now");
+        assert!((threshold(Law::Mu, 2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(Law::Mu, 2));
+        assert!(0.0744 <= threshold(Law::Mu, 2), "0.0744 is not inside drn 2's corrected licence");
+        let licensed = ceiling_rung(Law::Mu, measured).expect("0.0744 licenses a rung now");
         assert_eq!(licensed, 2, "the corrected licence is drn 2, and that is the change");
         // The rung: the same grant, cut to the cap.
         assert_eq!(
@@ -2432,10 +2472,10 @@ mod tests {
         // cap, whatever it grants.
         for step in 0..=400 {
             let steps = 0.0005 * f64::from(step);
-            let granted = ceiling_mask(ceiling_rung(Sigma::reading(steps, REFERENCE_LC)));
+            let granted = ceiling_mask(ceiling_rung(Law::Mu, Sigma::reading(steps, REFERENCE_LC)));
             assert_eq!(
                 highest_rung(cap_to_measured(granted)),
-                if steps <= threshold(1) { Some(1) } else { None },
+                if steps <= threshold(Law::Mu, 1) { Some(1) } else { None },
                 "sigma {steps} spent a rung above the cap"
             );
         }
@@ -2521,7 +2561,7 @@ mod tests {
         let clean = format!("1 {g:.17} score\n2 {:.17} score\n3 {:.17} score\n", -3.0 * g, 5.0 * g);
         let clean = sigma_from_stream(&clean, REFERENCE_LC).expect("a score run");
         assert!(clean.steps() < 1e-12, "{}", clean.steps());
-        assert_eq!(ceiling_rung(clean), Some(UP_RATES as u8));
+        assert_eq!(ceiling_rung(Law::Mu, clean), Some(UP_RATES as u8));
         // And the mode is what selects the window: the same levels as `data` are
         // not a measurement.
         assert!(sigma_from_stream("1 0.5 data\n", 8).is_none());

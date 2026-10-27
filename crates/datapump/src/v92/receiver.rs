@@ -627,7 +627,7 @@ mod local_scale_tests {
     /// are 512. The oracle is the alphabet -- `codegrid::value` -- and nothing
     /// here measures against a formula of ours.
     fn pair(high_code: u8, low_code: u8) -> (f64, f64) {
-        let v = |c: u8| f64::from(crate::v92::codegrid::value(c));
+        let v = |c: u8| f64::from(crate::v92::codegrid::value_in(crate::v90::ucode::Law::Mu, c));
         (v(low_code).min(v(high_code)), v(low_code).max(v(high_code)))
     }
 
@@ -642,17 +642,17 @@ mod local_scale_tests {
             let (low, high) = pair(high_code, low_code);
             let gap = high - low;
             let slicer = Slicer::Levels(vec![low, high]);
-            let (level, fraction, half) = slicer.decide_local(low).unwrap();
+            let (level, fraction, half) = slicer.decide_local(Some(crate::v90::ucode::Law::Mu), low).unwrap();
             assert_eq!(level, low);
             assert!(fraction < 1e-12, "{fraction}");
             assert!((half - gap / 2.0).abs() < 1e-9, "{half} against {}", gap / 2.0);
-            let (level, fraction, _) = slicer.decide_local(low + gap / 2.0).unwrap();
+            let (level, fraction, _) = slicer.decide_local(Some(crate::v90::ucode::Law::Mu), low + gap / 2.0).unwrap();
             assert!(level == low || level == high);
             assert!((fraction - 1.0).abs() < 1e-9, "{fraction}");
-            let (level, fraction, _) = slicer.decide_local(low + gap / 4.0).unwrap();
+            let (level, fraction, _) = slicer.decide_local(Some(crate::v90::ucode::Law::Mu), low + gap / 4.0).unwrap();
             assert_eq!(level, low);
             assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
-            let (level, fraction, _) = slicer.decide_local(low + 3.0 * gap / 4.0).unwrap();
+            let (level, fraction, _) = slicer.decide_local(Some(crate::v90::ucode::Law::Mu), low + 3.0 * gap / 4.0).unwrap();
             assert_eq!(level, high);
             assert!((fraction - 0.5).abs() < 1e-9, "{fraction}");
         }
@@ -673,8 +673,8 @@ mod local_scale_tests {
         assert!(outer_gap > 10.0 * inner_gap, "{outer_gap} against {inner_gap}");
         let inner = Slicer::Levels(vec![inner_low, inner_high]);
         let outer = Slicer::Levels(vec![outer_low, outer_high]);
-        let (_, inner_local, _) = inner.decide_local(inner_low + 0.25 * inner_gap).unwrap();
-        let (_, outer_local, _) = outer.decide_local(outer_low + 0.25 * outer_gap).unwrap();
+        let (_, inner_local, _) = inner.decide_local(Some(crate::v90::ucode::Law::Mu), inner_low + 0.25 * inner_gap).unwrap();
+        let (_, outer_local, _) = outer.decide_local(Some(crate::v90::ucode::Law::Mu), outer_low + 0.25 * outer_gap).unwrap();
         assert!((inner_local - outer_local).abs() < 1e-9, "{inner_local} against {outer_local}");
         // One set spanning both chords, judged by one global half-span: the
         // same two samples read 64 times apart (512 / 8), which is the defect.
@@ -849,11 +849,11 @@ pub enum Slicer {
 
 impl Slicer {
     /// The nearest level to `value`, and how far from it that was.
-    fn decide(&self, value: f64) -> Option<(f64, f64)> {
+    fn decide(&self, law: Option<crate::v90::ucode::Law>, value: f64) -> Option<(f64, f64)> {
         match self {
             Self::TwoPoint => Some((if value >= 0.0 { 1.0 } else { -1.0 }, (value.abs() - 1.0).abs())),
             Self::FourPoint => {
-                let levels = four_point_levels();
+                let levels = four_point_levels(law);
                 nearest(&levels, value)
             }
             Self::EightPoint => {
@@ -899,9 +899,9 @@ impl Slicer {
     /// The fraction is 0.0 on a point and 1.0 exactly on the boundary between
     /// the pair, so a caller can ask "inside half the local gap" without knowing
     /// which chord it is in.
-    fn decide_local(&self, value: f64) -> Option<(f64, f64, f64)> {
+    fn decide_local(&self, law: Option<crate::v90::ucode::Law>, value: f64) -> Option<(f64, f64, f64)> {
         let Self::Levels(levels) = self else {
-            let (level, error) = self.decide(value)?;
+            let (level, error) = self.decide(law, value)?;
             let span = self.half_span();
             let fraction = if span > 0.0 { (error / span).min(1.0) } else { 0.0 };
             return Some((level, fraction, span));
@@ -1107,25 +1107,35 @@ fn lattice_unit() -> f64 {
     })
 }
 
-/// The code value the far end's quantiser puts out for a reference `value`.
+/// The code value the far end's quantiser puts out for a reference `value`,
+/// under the companding `law` the far end declared.
 ///
 /// Code 0 is silence and `[8.8.3]` forbids it in a constellation
 /// ([`crate::v92::codegrid`]), so the smallest magnitude this returns is code 1's.
-pub fn on_lattice(value: f64) -> f64 {
-    if !lattice_reference() || value == 0.0 {
+///
+/// **`None` refuses to snap**: a code is a code *of a law*, and a table built on
+/// µ-law for a far end that has not declared one is the defect docs/313 sec 2
+/// removes. Before a `CPu` bit 35 the reference stays on the linear grid, which
+/// is what every call before the code lattice used, and nothing downstream is
+/// told a law it was not given.
+pub fn on_lattice(law: Option<crate::v90::ucode::Law>, value: f64) -> f64 {
+    let Some(law) = law.filter(|_| lattice_reference()) else {
+        return value;
+    };
+    if value == 0.0 {
         return value;
     }
     let unit = lattice_unit();
-    let code = crate::v92::codegrid::nearest_code((value.abs() * unit).round());
-    f64::from(crate::v92::codegrid::value(code)).copysign(value) / unit
+    let code = crate::v92::codegrid::nearest_code(law, (value.abs() * unit).round());
+    f64::from(crate::v92::codegrid::value_in(law, code)).copysign(value) / unit
 }
 
 /// The same over a whole reference sequence or decision table.
-pub fn lattice_levels(levels: &[f64]) -> Vec<f64> {
-    if !lattice_reference() {
+pub fn lattice_levels(law: Option<crate::v90::ucode::Law>, levels: &[f64]) -> Vec<f64> {
+    if law.is_none() || !lattice_reference() {
         return levels.to_vec();
     }
-    levels.iter().map(|&level| on_lattice(level)).collect()
+    levels.iter().map(|&level| on_lattice(law, level)).collect()
 }
 
 /// TRN2u's own symbols: 8.7.6's scrambled ones on Tables 28's four points.
@@ -1176,6 +1186,7 @@ fn trn2u_levels(
     phase: usize,
     seed: usize,
     differential_magnitude: bool,
+    law: Option<crate::v90::ucode::Law>,
 ) -> Option<Vec<f64>> {
     let mut levels = Vec::with_capacity(length);
     let mut sign = seed as i64;
@@ -1201,19 +1212,19 @@ fn trn2u_levels(
         levels.push(if sign == 1 { -tier } else { tier } / 5f64.sqrt());
         j += 1;
     }
-    Some(lattice_levels(&levels))
+    Some(lattice_levels(law, &levels))
 }
 
 /// The four TRN2u levels, in the units the equaliser's output carries -- and on
 /// the far end's code lattice, for the reason [`on_lattice`] gives: the
 /// boundary a four-point decision is taken at has to be half way between the
 /// two codes the far end can emit, not between two points it cannot.
-fn four_point_levels() -> [f64; 4] {
+fn four_point_levels(law: Option<crate::v90::ucode::Law>) -> [f64; 4] {
     let size = up_signals::Trn2uSize::Four;
     let linear = [-size.magnitude(1), -size.magnitude(0), size.magnitude(0), size.magnitude(1)];
     let mut out = [0.0f64; 4];
     for (slot, &level) in out.iter_mut().zip(linear.iter()) {
-        *slot = on_lattice(level);
+        *slot = on_lattice(law, level);
     }
     out
 }
@@ -1229,6 +1240,14 @@ fn nearest(levels: &[f64], value: f64) -> Option<(f64, f64)> {
 /// The digital modem's upstream receiver.
 #[derive(Debug, Clone)]
 pub struct Receiver {
+    /// The companding law the far end declared (`CPu` bit 35), or `None`
+    /// before it has.
+    ///
+    /// This is the law the code lattice is built on: a code is a code *of a
+    /// law*, so before one is declared the reference stays on the linear grid
+    /// (docs/313 sec 2). It is set from the negotiated parameters, never from a
+    /// constant.
+    law: Option<crate::v90::ucode::Law>,
     /// The polynomial the training reference is generated with: `Answer`
     /// (GPA) for what an analogue modem sends, `Call` (GPC) for a digital
     /// modem's own downstream training (6.3/V.92).
@@ -1377,8 +1396,17 @@ impl Default for Receiver {
 
 impl Receiver {
     #[must_use]
+    /// The law the far end declared, from the negotiated parameters: what the
+    /// code lattice and the four-point reference are snapped on. `None` until
+    /// a `CPu` bit 35 has arrived, and `None` means the linear grid rather than
+    /// a assumed micro-law (docs/313 sec 2).
+    pub fn set_law(&mut self, law: Option<crate::v90::ucode::Law>) {
+        self.law = law;
+    }
+
     pub fn new() -> Self {
         Self {
+            law: None,
             reference_mode: Mode::Answer,
             history: VecDeque::with_capacity(HISTORY),
             fe: fe_from_env(),
@@ -1638,7 +1666,7 @@ impl Receiver {
     /// nothing here has to resolve it.
     fn trn2u_known(&self, length: usize) -> Option<Vec<f64>> {
         let bits = reference_from(0, 2 * length + 4, self.reference_mode)?;
-        trn2u_levels(&bits, length, 0, 0, false)
+        trn2u_levels(&bits, length, 0, 0, false, self.law)
     }
 
     /// What a set of taps reads on a window against the *known* levels behind
@@ -1665,7 +1693,7 @@ impl Receiver {
         let span = reference.len().saturating_sub(ahead);
         let (mut signal, mut noise, mut l1, mut scale, mut wrong, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let mut margin = f64::INFINITY;
-        let four = four_point_levels();
+        let four = four_point_levels(self.law);
         for n in rows..span {
             let mut model = 0.0;
             for (k, &tap) in forward.iter().enumerate() {
@@ -3171,7 +3199,7 @@ impl Receiver {
         // arrived: `ahead` samples of the feed-forward window are ahead of it.
         let instant = self.count.saturating_sub(ahead as u64);
         let index = self.origin.map_or(instant, |origin| instant.saturating_sub(origin));
-        let chosen = self.slicer.decide(shown);
+        let chosen = self.slicer.decide(self.law, shown);
         let span = self.slicer.half_span();
         if let Some((_, error)) = chosen {
             if error > span {
@@ -3343,7 +3371,7 @@ impl Receiver {
         if *OFF.get_or_init(|| std::env::var("V92_ANCHOR").ok().as_deref() == Some("off")) {
             return;
         }
-        let Some((level, local, _half)) = self.slicer.decide_local(value * self.gain) else {
+        let Some((level, local, _half)) = self.slicer.decide_local(self.law, value * self.gain) else {
             return;
         };
         if level == 0.0 || value == 0.0 {
@@ -3767,7 +3795,7 @@ impl Receiver {
         // sign bit second and differential (`phase = 0`,
         // `differential_magnitude = false`); the seed is a global sign the
         // least-squares fit absorbs.
-        let Some(levels) = trn2u_levels(&bits, length, 0, 0, false) else {
+        let Some(levels) = trn2u_levels(&bits, length, 0, 0, false, self.law) else {
             return false;
         };
         let base = self.history_base();
@@ -4418,30 +4446,30 @@ mod tests {
         assert!(lattice_reference(), "the lattice is the default; V92_LATTICE=off only for an A/B");
         let unit = LATTICE_LSB;
         // The two tiers of TRN2u, and no other values.
-        let inner = on_lattice(1.0 / 5f64.sqrt());
-        let outer = on_lattice(3.0 / 5f64.sqrt());
+        let inner = on_lattice(Some(crate::v90::ucode::Law::Mu), 1.0 / 5f64.sqrt());
+        let outer = on_lattice(Some(crate::v90::ucode::Law::Mu), 3.0 / 5f64.sqrt());
         assert_eq!((inner * unit).round(), 716.0, "the inner tier is not on a code");
         assert_eq!((outer * unit).round(), 2108.0, "the outer tier is not on a code");
-        for level in four_point_levels() {
+        for level in four_point_levels(Some(crate::v90::ucode::Law::Mu)) {
             let lsb = (level.abs() * unit).round();
-            let code = crate::v92::codegrid::nearest_code(lsb);
-            assert_eq!(f64::from(crate::v92::codegrid::value(code)), lsb, "{level} is not a code value");
+            let code = crate::v92::codegrid::nearest_code(crate::v90::ucode::Law::Mu, lsb);
+            assert_eq!(f64::from(crate::v92::codegrid::value_in(crate::v90::ucode::Law::Mu, code)), lsb, "{level} is not a code value");
         }
         // A midpoint between two codes resolves to the nearer of them, and a
         // point just past the midpoint to the other: the boundary moved to the
         // lattice and did not simply shrink towards the ideal.
-        let low = f64::from(crate::v92::codegrid::value(60));
-        let high = f64::from(crate::v92::codegrid::value(61));
+        let low = f64::from(crate::v92::codegrid::value_in(crate::v90::ucode::Law::Mu, 60));
+        let high = f64::from(crate::v92::codegrid::value_in(crate::v90::ucode::Law::Mu, 61));
         assert!(high > low + 1.0, "codes 60 and 61 must be distinct LSB");
         let mid = 0.5 * (low + high);
-        let near = |value: f64| (on_lattice(value / unit) * unit).round();
+        let near = |value: f64| (on_lattice(Some(crate::v90::ucode::Law::Mu), value / unit) * unit).round();
         assert!(near(mid) == low || near(mid) == high, "a midpoint landed off the lattice");
         assert_eq!(near(mid + 1.0), high, "just above the midpoint took the lower code");
         assert_eq!(near(mid - 1.0), low, "just below the midpoint took the upper code");
         assert_eq!(near(-(mid + 1.0)), -high, "the sign did not survive");
         // A TRN2u symbol sequence is built out of those values only.
         let bits = reference(0, 64, Mode::Answer).expect("a reference");
-        let levels = trn2u_levels(&bits, 32, 0, 0, false).expect("levels");
+        let levels = trn2u_levels(&bits, 32, 0, 0, false, Some(crate::v90::ucode::Law::Mu)).expect("levels");
         let allowed = [inner, outer, -inner, -outer];
         for level in &levels {
             assert!(
@@ -5189,7 +5217,7 @@ mod tests {
     #[test]
     fn the_trn2u_fit_is_accepted_on_its_own_window() {
         let bits = reference_from(0, 2 * 3000 + 4, Mode::Answer).expect("a reference");
-        let levels = trn2u_levels(&bits, 3000, 0, 0, false).expect("the four-point sequence");
+        let levels = trn2u_levels(&bits, 3000, 0, 0, false, Some(crate::v90::ucode::Law::Mu)).expect("the four-point sequence");
         // A deterministic noise at the inner level's own size: this is a line
         // whose four-point fit is *not* going to beat a two-point figure.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -5241,7 +5269,7 @@ mod tests {
     fn the_trn2u_fit_solves_the_alignment_and_refuses_a_residual() {
         let symbols = 3000usize;
         let bits = reference_from(0, 2 * symbols + 4, Mode::Answer).expect("a reference");
-        let levels = trn2u_levels(&bits, symbols, 0, 0, false).expect("the four-point sequence");
+        let levels = trn2u_levels(&bits, symbols, 0, 0, false, Some(crate::v90::ucode::Law::Mu)).expect("the four-point sequence");
         let build = |shift: u64| {
             let mut seed = 0x9e37_79b9_7f4a_7c15u64;
             let mut next = || {

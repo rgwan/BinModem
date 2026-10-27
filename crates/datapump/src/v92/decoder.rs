@@ -1650,7 +1650,7 @@ mod tests {
             sets: vec![(0..64).map(|index| (2 * index + 1) as u16).collect()],
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
-        }
+        law: None, }
     }
 
     /// A deterministic bit source.
@@ -1763,7 +1763,7 @@ mod tests {
     #[test]
     fn a_stream_at_k_needs_the_table_at_k() {
         let mut parameters = parameters(19, Trellis::Sixteen);
-        parameters.sets = vec![codegrid::grid(64).expect("a 64-point code set")];
+        parameters.sets = vec![codegrid::grid(crate::v90::ucode::Law::Mu, 64).expect("a 64-point code set")];
         parameters.moduli = [64u8; UP_INTERVALS];
         parameters.levelset = crate::v92::LevelSet::Code;
         let point = |eta: i32| -> f64 {

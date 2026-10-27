@@ -791,6 +791,12 @@ impl TryFrom<&Cpd> for Parameters {
         let filters = cpd.filters.clone().ok_or("the CPd carries no precoder or prefilter coefficients")?;
         let sets = cpd.sets.clone().ok_or("the CPd carries no constellation sets")?;
         Ok(Self {
+            // A received `CPd` says nothing about a companding law: bit 35 of
+            // Table 23 is in `CPu`, which is the *other* direction. So this
+            // side of the call has no law to record here, and `None` is what
+            // keeps a μ-law declaration from arriving by default (docs/313
+            // sec 2).
+            law: None,
             drn: cpd.drn,
             trellis: cpd.trellis,
             extend_e2u: cpd.extend_e2u,
@@ -1242,7 +1248,7 @@ mod tests {
         let mut seen = 0;
         for levelset in [LevelSet::Uniform, LevelSet::Code] {
             for drn in 1..=UP_RATES as u8 {
-                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset) else {
+                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset, Some(crate::v90::ucode::Law::Mu)) else {
                     continue;
                 };
                 let parameters = choice.parameters;
@@ -1300,7 +1306,7 @@ mod tests {
             sets: vec![(1..=24).map(|k| k * 400).collect(), (1..=20).map(|k| k * 500).collect()],
             indices: [0, 1, 0, 1, 0, 1],
             levelset: crate::v92::LevelSet::Uniform,
-        }
+        law: None, }
     }
 
     /// Every field this end emits satisfies Table 30, at every rung of the
@@ -1350,7 +1356,7 @@ mod tests {
         .expect("designable");
         for levelset in [LevelSet::Uniform, LevelSet::Code] {
             for drn in 1..=UP_RATES as u8 {
-                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset) else {
+                let Some(choice) = pin_with(&design, drn, Trellis::Sixteen, 0.0, levelset, Some(crate::v90::ucode::Law::Mu)) else {
                     continue;
                 };
                 let parameters = choice.parameters;
