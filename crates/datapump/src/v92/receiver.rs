@@ -1371,6 +1371,17 @@ pub struct Receiver {
     /// what the feedback section subtracts, and therefore what makes the eye
     /// open far enough for four points.
     decided: VecDeque<f64>,
+    /// The same symbols *before* they were quantised: the slicer's own input,
+    /// newest at the back, on the same scale `decided` is on.
+    ///
+    /// It exists because a decision is only a symbol **on the alphabet it was
+    /// taken against**, and `docs/339` sec 2 needs the symbol back when the
+    /// alphabet changes under a history that is kept: a data-mode re-entry
+    /// hands the feedback section sixteen entries that were sliced through
+    /// CPd's table, and re-reading them on CPd's table keeps that table's
+    /// quantising error rather than the far end's symbols. See
+    /// [`Self::rebuild_decided_on`].
+    decided_shown: VecDeque<f64>,
     /// What the four-point stream's inner tier actually measures, as a mean of
     /// `|value|` over the symbols decided as inner and as outer. The ideal is
     /// `1/sqrt(5)` and `3/sqrt(5)`; the line's own numbers are what the
@@ -1463,6 +1474,7 @@ impl Receiver {
             ahead: 0,
             feedback: Vec::new(),
             decided: VecDeque::with_capacity(DFE_FEEDBACK + 1),
+            decided_shown: VecDeque::with_capacity(DFE_FEEDBACK + 1),
             inner: 0.0,
             outer: 0.0,
             measured: 0,
@@ -2136,6 +2148,7 @@ impl Receiver {
             // decision taken against another constellation is not this one's
             // symbol: TRN1u's `+-LU` is not TRN2u's `+-LU/sqrt(5)`. Hold the
             // feedback section off for the few symbols that clears.
+            self.decided_shown.clear();
             self.decided.clear();
         }
         self.slicer = slicer;
@@ -2143,6 +2156,53 @@ impl Receiver {
         self.inner = 0.0;
         self.outer = 0.0;
         self.gain = 1.0;
+    }
+
+    /// Re-read a kept feedback history on the alphabet the section was fitted
+    /// on, which is the state it was in before the first data mode.
+    ///
+    /// **What the sixteen entries mean at a re-entry.** `set_data_mode` keeps
+    /// them when the point set is the same (`docs/334` sec 2), and they are
+    /// then read by the feedback law below as if they were data-mode symbols.
+    /// They are not. They are the decisions taken on the symbols *before* the
+    /// entry, and between two data modes those symbols are 9.9.1.2's
+    /// renegotiation: `TRN2u` (Table 28, `+-1, +-3` over `sqrt(5)`, i.e.
+    /// `+-0.4472, +-1.3416`) and `E2u` (a run of zeros). Before the first data
+    /// mode they were sliced on that alphabet; between the two they are sliced
+    /// through **CPd's data table**, which is a different lattice and has no
+    /// zero in it.
+    ///
+    /// **Measured, at the re-entry of
+    /// `/tmp/agr-v90-interop/160841-331-code-drn2`** (`docs/339` sec 2): the
+    /// kept entries come out `+-0.2006, +-0.4036, +-0.6116, +-1.2256,
+    /// +-1.3841, +-1.5425` -- CPd's points, six magnitudes -- where the first
+    /// install's queue holds `+-0.4432, +-1.3047`, which is Table 28's two.
+    /// So a `TRN2u` symbol of `1.3047` was recorded as `1.3841` (+6 %), one of
+    /// `0.4432` as `0.4036` (-9 %), and the two entries of `+-0.2006` are
+    /// `E2u`'s zeros recorded as CPd's innermost point -- a decision the far
+    /// end never made.
+    ///
+    /// **The repair is a rebuild, not a clear.** Clearing is `docs/334` sec
+    /// 2's mistake (226.8 LSB in the first 96); keeping is 75.6 and 81.6. The
+    /// slicer's own input is kept beside each decision (`decided_shown`), so
+    /// the *symbols* are still there and only their quantising was wrong; the
+    /// alphabet to read them back on is the one this section was fitted
+    /// against -- `train_on_trn2u` fits it against `TRN2u`'s known symbols,
+    /// and Table 28 is `Trn2uSize::Four`, which is [`four_point_levels`].
+    /// Nothing here is tuned: the alphabet is the fit's own, and the values
+    /// come from the pre-install state rather than from the install-time one.
+    fn rebuild_decided_on_fit_alphabet(&mut self) {
+        let fit = Slicer::FourPoint;
+        for (decided, &shown) in self.decided.iter_mut().zip(self.decided_shown.iter()) {
+            if let Some((level, _)) = fit.decide(self.law, shown) {
+                *decided = level / self.gain;
+            }
+        }
+        // The pair stays a pair, so that a second rebuild reads the same
+        // symbols rather than the first rebuild's answer twice-removed.
+        for (shown, &level) in self.decided_shown.iter_mut().zip(self.decided.iter()) {
+            *shown = level * self.gain;
+        }
     }
 
     /// Recondition the slicer for B1u (9.6.1.1.6), and keep the equaliser.
@@ -2205,7 +2265,15 @@ impl Receiver {
             }
         }
         if !reused {
+            self.decided_shown.clear();
             self.decided.clear();
+        } else if std::env::var("V92_DM_HIST").as_deref() != Ok("keep") {
+            // `docs/339` sec 2: the same table, but not the same symbols --
+            // the entries were sliced through it on the renegotiation's
+            // `TRN2u`/`E2u`, which are not on it. Rebuild rather than keep;
+            // `V92_DM_HIST=keep` restores the pre-`docs/339` behaviour so the
+            // same binary can show both, and it is a diagnostic, not a mode.
+            self.rebuild_decided_on_fit_alphabet();
         }
         self.measured = 0;
         self.anchor_gain = self.gain;
@@ -2823,6 +2891,7 @@ impl Receiver {
         self.forward.clone_from(&fitted.forward);
         self.feedback.clone_from(&fitted.feedback);
         self.ahead = ahead_of(&fitted.forward, &fitted.feedback);
+        self.decided_shown.clear();
         self.decided.clear();
         self.snr_db = fitted.snr_db;
         self.trained = fitted.trained;
@@ -3163,6 +3232,7 @@ impl Receiver {
         let input: Vec<f64> = self.history.iter().rev().take(width).copied().collect();
         let power = ac_energy(&input) / width as f64;
         if !(power > AUDIBLE) {
+            self.decided_shown.clear();
             self.decided.clear();
             let instant = self.count.saturating_sub(self.ahead as u64);
             let index = self.origin.map_or(instant, |origin| instant.saturating_sub(origin));
@@ -3273,8 +3343,10 @@ impl Receiver {
             _ => 0.0,
         };
         self.decided.push_back(back);
+        self.decided_shown.push_back(shown);
         while self.decided.len() > DFE_FEEDBACK {
             self.decided.pop_front();
+            self.decided_shown.pop_front();
         }
         // The receiver's data-mode equaliser: a decision-directed step on the
         // feed-forward section, which is what follows the far end's clock and
@@ -4203,6 +4275,7 @@ impl Receiver {
         }
         self.restore(&four);
         self.trained = true;
+        self.decided_shown.clear();
         self.decided.clear();
         true
     }
@@ -4219,6 +4292,7 @@ impl Receiver {
         let Some(four) = self.phase_four.take() else { return false };
         self.restore(&four);
         self.trained = true;
+        self.decided_shown.clear();
         self.decided.clear();
         true
     }
@@ -4449,10 +4523,12 @@ impl Receiver {
 
         // The section starts where the training left it rather than at zero:
         // the symbols it would be fed next are the ones just fitted against.
+        self.decided_shown.clear();
         self.decided.clear();
         for j in (1..=feedback).rev() {
             if stop > rows + j {
                 self.decided.push_back(reference[stop - j]);
+                self.decided_shown.push_back(reference[stop - j] * self.gain);
             }
         }
         // What the fit leaves is the noise it was made in, measured where the
@@ -6141,5 +6217,52 @@ mod su_scale_probe {
         // taken against the old one is not this one's symbol.
         rx.set_data_mode(vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.60]);
         assert_eq!(rx.decided.len(), 0, "another table, and the history survived");
+    }
+
+    /// **The kept history is re-read on the alphabet the section was fitted
+    /// on, not on the table that happens to be in force.**
+    ///
+    /// `docs/339` sec 2, measured on a call: the sixteen entries a same-table
+    /// re-entry keeps are the decisions taken on the renegotiation's
+    /// `TRN2u`/`E2u` symbols, and those symbols are on Table 28's four points
+    /// (`+-1, +-3` over `sqrt(5)`) while the slicer is on CPd's data table.
+    /// Slicing `1.3416` through the data table records `1.55`, and `E2u`'s zero
+    /// records `0.41` -- a point the far end never sent. Keeping those is
+    /// 75.6 LSB in the first 96 symbols of the re-entry and 81.6 in the second;
+    /// clearing them is 226.8.
+    ///
+    /// Red on `e0ef2ec`: `the kept history was never re-read on the fit's
+    /// alphabet / left: Some(1.55) / right: Some(1.34164078...)`. Green after.
+    #[test]
+    fn a_data_mode_reentry_reads_the_kept_history_on_the_fits_alphabet() {
+        let levels: Vec<f64> = vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.55];
+        let mut rx = Receiver::new();
+        rx.forward = vec![1.0, 0.0];
+        rx.set_data_mode(levels.clone());
+        rx.trained = true;
+        // `TRN2u`'s own two magnitudes, Table 28, over `sqrt(5)`; fed through
+        // the data table they are not symbols at all, which is the point.
+        let inner = 1.0 / 5f64.sqrt();
+        let outer = 3.0 / 5f64.sqrt();
+        for k in 0..40 {
+            rx.feed(if k % 2 == 0 { outer } else { -inner });
+            while rx.heard().is_some() {}
+        }
+        assert_eq!(rx.decided.len(), DFE_FEEDBACK, "the history never filled");
+        // The mangling is visible before the re-entry: through the data table
+        // Table 28's `1.3416` is recorded as the data point `1.55`.
+        let before = rx.decided.back().copied().unwrap();
+        assert!(
+            (before.abs() - inner).abs() > 0.1,
+            "the data table recorded Table 28's symbol unchanged ({before:.4}), so this test cannot fail"
+        );
+        rx.set_data_mode(levels);
+        let fit = four_point_levels(None);
+        for (j, &entry) in rx.decided.iter().enumerate() {
+            assert!(
+                fit.iter().any(|&level| (level - entry).abs() < 1e-9),
+                "the kept history was never re-read on the fit's alphabet: entry {j} is {entry:.9},                  and Table 28's points are {fit:?} (docs/339 sec 2)"
+            );
+        }
     }
 }
