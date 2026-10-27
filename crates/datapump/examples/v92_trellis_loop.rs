@@ -56,6 +56,12 @@ fn parameters(drn: u8, levels: usize, trellis: Trellis) -> Parameters {
         sets: vec![(0..levels).map(|index| (2 * index + 1) as u16).collect()],
         indices: [0; CONSTELLATION_FRAME],
         levelset: datapump::v92::LevelSet::Uniform,
+        // No `CPu` has named a companding law on this run, and none can: this
+        // model builds the odd lattice `a(eta) = 2 eta + 1` itself, so its set
+        // is levels in index units and not G.711 codes. `None` is the state
+        // "no law declared" (`docs/313` sec 1), which is the truth here -- it is
+        // not a µ-law default, and `LevelSet::Uniform` needs no law.
+        law: None,
     }
 }
 

@@ -212,6 +212,12 @@ fn b1u_levels(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Op
         },
         indices: [0; CONSTELLATION_FRAME],
         levelset: LevelSet::Uniform,
+        // No `CPu` has named a companding law on this run, and none can: this
+        // model builds the odd lattice `a(eta) = 2 eta + 1` itself, so its set
+        // is levels in index units and not G.711 codes. `None` is the state
+        // "no law declared" (`docs/313` sec 1), which is the truth here -- it is
+        // not a µ-law default, and `LevelSet::Uniform` needs no law.
+        law: None,
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
     encoder.reset_all();
@@ -269,6 +275,12 @@ fn b1u_etas(trace: &Trace, gain: f64, frames: usize, trellis: Trellis, cpd: Opti
         },
         indices: [0; CONSTELLATION_FRAME],
         levelset: LevelSet::Uniform,
+        // No `CPu` has named a companding law on this run, and none can: this
+        // model builds the odd lattice `a(eta) = 2 eta + 1` itself, so its set
+        // is levels in index units and not G.711 codes. `None` is the state
+        // "no law declared" (`docs/313` sec 1), which is the truth here -- it is
+        // not a µ-law default, and `LevelSet::Uniform` needs no law.
+        law: None,
     };
     let Ok(mut encoder) = UpEncoder::new(&parameters) else { return Vec::new() };
     encoder.reset_all();

@@ -23,14 +23,34 @@
 //! symbol error probability that implies, the highest rung permitted and the
 //! Ja mask with the ceiling applied. Nothing here sends anything to a bench.
 
+use datapump::v90::ucode::Law;
 use datapump::v92::rung::{Rung, apply_ceiling, ceiling_rung, lc_for, sigma_from_stream};
 use datapump::v92::{UP_RATES, ja_mask_drns};
 
 fn main() -> std::process::ExitCode {
     let mut recorded: Option<u8> = None;
+    // **Which alphabet the stream is priced on.** `sigma_from_stream` measures a
+    // residual against the odd lattice, and the licence's gap table is the
+    // µ-law maximin table (`rung::threshold` -> `rung::gap_lsb`), so µ-law is the
+    // column these streams have always been priced in and the one the module
+    // comment's 0.0513 / 0.1602 were taken on. It is an *argument* now and not a
+    // constant (docs/313 sec 1): a caller with an A-law capture says so with
+    // `--law a`, and nothing here falls back to µ-law silently.
+    let mut law = Law::Mu;
     let mut streams: Vec<(String, usize)> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--law" {
+            law = match args.next().as_deref() {
+                Some("mu" | "u") => Law::Mu,
+                Some("a" | "A") => Law::A,
+                other => {
+                    eprintln!("--law wants `mu` or `a`, not {other:?}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            continue;
+        }
         if arg == "--recorded" {
             let Some(drn) = args.next().and_then(|value| value.parse::<u8>().ok()) else {
                 eprintln!("--recorded wants a drn");
@@ -73,8 +93,8 @@ fn main() -> std::process::ExitCode {
             failed = true;
             continue;
         };
-        let ceiling = ceiling_rung(measured);
-        let mask = apply_ceiling(0, measured);
+        let ceiling = ceiling_rung(law, measured);
+        let mask = apply_ceiling(law, 0, measured);
         let at = |drn: u8| {
             let rung = Rung::of(drn).expect("a rung");
             (rung, measured.error(rung.lc))

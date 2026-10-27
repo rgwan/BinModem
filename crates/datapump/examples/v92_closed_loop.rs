@@ -65,14 +65,20 @@ impl Random {
 /// copy of it. The design is taken against the harness's neutral line (one tap,
 /// nothing else), so `z2` is the identity to the last Q0.15 code and the
 /// operating point this buys is `1/G` of the emitted gain.
-fn parameters(drn: u8, trellis: Trellis, levelset: LevelSet) -> Parameters {
+///
+/// The law is an argument because it is a property of the *declaration*: on the
+/// code grid `sets` are G.711 code values and there is no set to build without
+/// one (`docs/313` sec 1, `LevelSet::Code::points`). The harness always has one
+/// -- `--law` defaults to µ-law -- and passes it here rather than letting the
+/// builder assume it.
+fn parameters(drn: u8, trellis: Trellis, levelset: LevelSet, law: Law) -> Parameters {
     let limits = FilterLimits::from_info1a(3, 3, 3);
     let designed = design::design(
         &Channel { taps: vec![1.0], noise: 0.0, signal: 1.0 },
         &limits,
     )
     .expect("the harness's neutral channel is designable");
-    upchoice::pin_with(&designed, drn, trellis, 0.0, levelset)
+    upchoice::pin_with(&designed, drn, trellis, 0.0, levelset, Some(law))
         .unwrap_or_else(|| panic!("drn {drn} is not built by the design path"))
         .parameters
 }
@@ -450,7 +456,7 @@ fn transmit(
 /// The whole upstream stream, in `out` units, plus the ideal TRN1u slice the
 /// estimator is given.
 fn stream(s: &Settings) -> (Parameters, Vec<f64>, Vec<f64>, usize, Vec<i32>) {
-    let parameters = parameters(s.drn, Trellis::Sixteen, s.levelset);
+    let parameters = parameters(s.drn, Trellis::Sixteen, s.levelset, s.law);
     let mut encoder = UpEncoder::new(&parameters).expect("feasible parameters");
     let mut random = Random::new(s.seed);
     let mut out = Vec::new();
@@ -753,9 +759,16 @@ fn main() {
     );
     for drn in rungs {
         let rung = datapump::v92::rung::Rung::of(drn).expect("a rung");
-        let gap = datapump::v92::rung::gap_lsb(datapump::v92::rung::points(drn)).unwrap_or(0.0);
-        let params = parameters(drn, Trellis::Sixteen, s.levelset);
-        let points = datapump::v92::rung::points(drn);
+        // The gap the criterion prices this rung at (docs/306 sec 2, LD-1): the
+        // declaration's own set, priced by the one function that prices it, so
+        // this column and the LADDER line cannot disagree.
+        let gap = datapump::v92::rung::priced_gap_lsb(s.law, drn);
+        let params = parameters(drn, Trellis::Sixteen, s.levelset, s.law);
+        // **The modulus, not the point count.** Named `widest_modulus` since
+        // LD-1 because `points` is the name that licensed reading it as the
+        // set's size; at drn 2, 8 and 14 it is twice that, so the printed
+        // column is labelled `modulus=` for the same reason.
+        let modulus = datapump::v92::rung::widest_modulus(drn);
         // The alphabet's own structure: how many codes each chord carries, and
         // the smallest gap between neighbours inside a chord.
         let mut per_chord = [0usize; 8];
@@ -926,7 +939,7 @@ fn main() {
         // fail when `docs/274` sec 2.2 compared against it. It is printed
         // anyway, labelled, so that a table can be read in either form and the
         // difference is visible in the harness's own output.
-        let licence = rung::threshold(drn);
+        let licence = rung::threshold(s.law, drn);
         let screen = rung::sigma_max(rung.lc);
         println!(
             "  RESIDUAL drn={drn} lc={} n={} sigma={:.4} bias={:+.4} out={} ({:.2}%) \
@@ -945,7 +958,7 @@ fn main() {
         let crossing = stats.crossing(&ladder, &rx, s.law, gap);
         let landing = Landing::scan(s.law, &ladder, &continuous);
         println!(
-            "RUNG drn={drn} rate={} lc={} points={points} gap={gap:.0} leastGap={least} \
+            "RUNG drn={drn} rate={} lc={} modulus={modulus} gap={gap:.0} leastGap={least} \
              eq=[{}] delay={:+.4} level={:.1} G={:.5} out_rms={out_rms:.4} \
              rms={rms:.1} peak={peak:.0} \
              xing={crossing:.4}% bin={bin:.2}% adj={adj} k={kb:.4} farlev={flev:.2} \
@@ -975,20 +988,20 @@ fn main() {
         // binds at that rung -- the crossing below drn 9, the bin error rate at
         // and above it -- with the level precondition printed beside it,
         // because a grant is conditional on a far end obeying the `G` we send.
-        let min_gap = if s.levelset == LevelSet::Code {
-            f64::from(least)
-        } else {
-            rung::gap_lsb(points).unwrap_or(f64::from(least))
-        };
+        // No `min_gap_lsb` on the reading (LD-1 deleted it): a single step is a
+        // summary statistic and not the boundary set, so a decision taken
+        // against it is taken against nothing. `leastGap=` above carries it as
+        // the diagnostic it is, and `Reading` carries the law the licence is a
+        // number about (`docs/313` sec 2).
         let reading = Reading {
             drn,
             lc: rung.lc,
-            min_gap_lsb: min_gap,
             level_lsb: used.level_lsb * far,
             gain: parameters.gain,
             bin: bins.pct() / 100.0,
             crossing: crossing / 100.0,
             symbols: bins.total,
+            law: s.law,
         };
         println!("  {}", reading.line(rung::admit(&reading)));
         if s.chords {

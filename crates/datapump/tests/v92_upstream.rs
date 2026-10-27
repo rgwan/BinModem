@@ -84,7 +84,11 @@ fn upstream(noise: f64, trellis: Trellis) -> (Option<u8>, usize, usize, f64) {
     }
     let plan = FilterLimits::from_info1a(3, 3, 3);
     let plan = design(&channel, &plan).expect("the loop is designable");
-    let Some(choice) = choose(&plan, noise, 0, trellis) else {
+    // No `CPu` names a law in a unit test, and `level_set()` here is the odd
+    // lattice, which is levels in index units and needs none (`docs/313` sec 1).
+    // `None` is "no law declared", not a µ-law default: the code arm would
+    // refuse this, and the uniform arm does not read it.
+    let Some(choice) = choose(&plan, noise, 0, trellis, None) else {
         return (None, 0, 0, plan.residual_db());
     };
     let parameters: Parameters = choice.parameters;
