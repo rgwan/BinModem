@@ -4967,6 +4967,26 @@ impl Modem {
         // first symbol, and the exchange that has to be read has not started.
         if self.upstream.is_some() && self.rx.symbols() >= self.four_at {
             self.four_at = u64::MAX;
+            // The origin `begin_upstream` took is where *this* end put the
+            // reader on the line, which is an event of ours: the far end's
+            // `TRN2u` begins when its transmitter comes on, and 9.6.2.1.1 puts
+            // no signal of ours between the two (`docs/294` section 1). Where
+            // the reader started early or late, the reference the fit reads is
+            // a different stretch of 8.7.6's sequence and the fit describes
+            // nothing -- which is the `no phase 4 fit on TRN2u` both HSF
+            // attempts printed. The onset is measured on the history the fit
+            // is about to read (`Receiver::signal_onset`), and it is used
+            // nowhere else.
+            if let Some(onset) = self.rx.signal_onset() {
+                if onset != self.trn2u_from {
+                    self.note(format!(
+                        "V.92: TRN2u began at {onset}, {} symbols from the reader's origin {}",
+                        onset as i64 - self.trn2u_from as i64,
+                        self.trn2u_from
+                    ));
+                    self.trn2u_from = onset;
+                }
+            }
             // The **second** measurement, on the four-point training, taken
             // just before the fit that will inherit it: same window, same
             // reference, so what the aim maximises is what the data mode is

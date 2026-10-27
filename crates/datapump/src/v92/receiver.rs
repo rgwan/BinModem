@@ -155,6 +155,16 @@ const ACQUIRE_STEPS: usize = 4;
 /// is a quarter of it.
 pub const HISTORY: usize = 8192;
 
+/// A run of identical samples this long cannot be `TRN2u`: sixteen upstream
+/// data frames of one point, from a sequence that picks one of four points a
+/// symbol ([`Receiver::signal_onset`]). It is the far end's idle output.
+const SIGNAL_RUN: usize = 192;
+
+/// Two samples are the same level if they differ by less than this, in the
+/// units the history holds (LSB). A quiet far end delivers an exact constant
+/// through the converter, so anything above float rounding is a signal.
+const SIGNAL_FLAT: f64 = 1e-6;
+
 /// Feed-forward taps the training fit takes.
 ///
 /// The feed-forward section is what inverts the line. A V.92 upstream carries
@@ -2103,6 +2113,51 @@ impl Receiver {
         self.count.saturating_sub(self.history.len() as u64)
     }
 
+    /// Where the signal the history is carrying begins: the first symbol
+    /// after the longest run of one repeated sample, when that run is longer
+    /// than any four-point sequence can hold.
+    ///
+    /// Phase 4's upstream has one physical fiducial: the moment the analogue
+    /// modem's transmitter comes on. 8.7.6 resets TRN2u's scrambler at its
+    /// first symbol, so the fit's reference is only right if the origin is
+    /// that symbol, and the clause puts nothing downstream of the far end
+    /// between the two -- 9.6.2.1.1 conditions its receiver and transmits,
+    /// without a timing relation to any signal of ours. So the onset is
+    /// measured, not predicted, and the measure is the one thing the far end's
+    /// own output guarantees: before `TRN2u` it is idle (`docs/293` section 3.2,
+    /// a constant -1), and `TRN2u` is scrambled ones on Table 28's four points,
+    /// so a run of `SIGNAL_RUN` identical samples cannot be part of it.
+    ///
+    /// `SIGNAL_RUN` is sixteen upstream data frames (8.7.1: twelve symbols each)
+    /// and not a fitted length: the probability that 192 consecutive `TRN2u`
+    /// symbols land on one point is `4^-191`, so the run is the far end's idle
+    /// output or nothing. When there is no such run the origin is left as it
+    /// was, which is what every call whose far end was still transmitting
+    /// phase 3 into this window does.
+    #[must_use]
+    pub fn signal_onset(&self) -> Option<u64> {
+        let base = self.history_base();
+        let n = self.history.len();
+        if n < SIGNAL_RUN {
+            return None;
+        }
+        let mut best = 0usize;
+        let mut after = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let mut j = i + 1;
+            while j < n && (self.history[j] - self.history[i]).abs() <= SIGNAL_FLAT {
+                j += 1;
+            }
+            if j - i > best {
+                best = j - i;
+                after = j;
+            }
+            i = j;
+        }
+        (best >= SIGNAL_RUN && after < n).then(|| base + after as u64)
+    }
+
     /// How much of the line at `at` repeats exactly one six-symbol period
     /// later: +1 for a sequence that is one period of six, about 0 for anything
     /// with no six-symbol structure.
@@ -2720,6 +2775,14 @@ impl Receiver {
         if !power.is_finite() || power <= AUDIBLE {
             return false;
         }
+        // A constant window is not a signal either, and power cannot say so:
+        // a DC of -1 has power and no shape. `recognise` anchors its template
+        // on the first window that matches itself, and a template taken from a
+        // constant matches every later constant window exactly -- so a far
+        // end's idle output reads as Su, which is what `docs/294` section 2
+        // found at `12.740` in the HSF call. Shape is the variance about the
+        // window's own mean; Ru, Su and their reversals all have it and a
+        // quiet line has none.
         // Thirty decibels under the line's own level is not a signal. Before
         // `LEVEL_SYMBOLS` of line has been seen there is no level to divide by
         // and the window stands on the floor alone.
@@ -4871,6 +4934,87 @@ mod tests {
         rx.set_slicer(Slicer::FourPoint);
         rx
     }
+
+    /// The same line, with the far end's transmitter idle for `idle` symbols
+    /// first: a constant -1, exactly what `docs/293` section 3.2 measured before
+    /// HSF's `TRN2u` began.
+    fn trn2u_after_idle_line(delay: f64, idle: usize, symbols: usize) -> Receiver {
+        let mut channel = Vec::with_capacity(25);
+        for k in 0..25i64 {
+            let t = k as f64 - delay;
+            let arg = std::f64::consts::PI * 2.0 * 0.95 * t;
+            let sinc = if arg.abs() < 1e-12 { 2.0 * 0.95 } else { arg.sin() / arg * 2.0 * 0.95 };
+            let window = 0.54 - 0.46 * (std::f64::consts::PI * (t - 12.0) / 13.0).cos();
+            channel.push(sinc * window);
+        }
+        let bits = reference_from(0, 2 * symbols + 4, Mode::Answer).unwrap();
+        let mut sigma = 0i64;
+        let mut sent = Vec::with_capacity(idle + symbols);
+        for _ in 0..idle {
+            sent.push(-1.0);
+        }
+        for j in 0..symbols {
+            if bits.get(2 * j + 1).is_some_and(|&b| b < 0.0) {
+                sigma ^= 1;
+            }
+            let tier = if bits.get(2 * j).is_some_and(|&b| b < 0.0) { 3.0 } else { 1.0 };
+            sent.push(if sigma == 1 { -tier } else { tier } / 5f64.sqrt());
+        }
+        let mut rx = Receiver::new();
+        rx.fe = Some(FracDelay::new(HISTORY));
+        let mut past: VecDeque<f64> = VecDeque::new();
+        for &symbol in &sent {
+            past.push_front(symbol);
+            if past.len() > channel.len() {
+                past.pop_back();
+            }
+            let mut seen = 0.0;
+            for (k, &tap) in channel.iter().enumerate() {
+                seen += tap * past.get(k).copied().unwrap_or(0.0);
+            }
+            rx.feed(seen);
+            while rx.heard().is_some() {}
+        }
+        rx.set_slicer(Slicer::FourPoint);
+        rx
+    }
+
+    /// The Phase 4 fit lands on `TRN2u` from the origin the transmitter's onset
+    /// gives it, and does not from the origin this end's own reader took.
+    ///
+    /// This is `docs/294` section 1's mechanism, at the size it was measured:
+    /// HSF's `TRN2u` began 624 and 680 symbols away from where this end put the
+    /// reader, and the fit failed in both attempts with the reference 8.7.6's
+    /// sequence read `that many` symbols off. The origin here is the onset the
+    /// far end's own idle output marks, not a searched-for number: it comes out
+    /// of `signal_onset`, which reads the history the fit reads.
+    #[test]
+    fn the_four_point_fit_lands_across_a_late_reader_origin() {
+        let idle = 704;
+        let late = 600;
+        let rx = trn2u_after_idle_line(12.4, idle, 3000);
+        let onset = rx.signal_onset().expect("no onset on a line with an idle stretch");
+        assert_eq!(
+            onset,
+            fracdelay::FE_HALF as u64 + idle as u64,
+            "the onset is not where the far end's transmitter came on"
+        );
+        let mut right = trn2u_after_idle_line(12.4, idle, 3000);
+        assert!(
+            right.train_on_trn2u(TRAIN_WINDOW, onset) && right.install_phase_four(),
+            "the fit refused the origin the onset gives it"
+        );
+        let good = right.snr_db();
+        let mut off = trn2u_after_idle_line(12.4, idle, 3000);
+        let took = off.train_on_trn2u(TRAIN_WINDOW, onset + late) && off.install_phase_four();
+        let wrong = off.snr_db();
+        assert!(
+            good > wrong + 6.0,
+            "a reference {late} symbols off 8.7.6's sequence read {wrong:.1} dB against the \
+             origin the onset gives, {good:.1} dB ({took})"
+        );
+    }
+
 
     /// The four-point aim has a signal on a line it is aligned to, and refuses
     /// to answer on one it is not.
