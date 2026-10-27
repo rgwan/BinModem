@@ -472,6 +472,37 @@ pub enum LadderStep {
 /// Eight periods is six milliseconds, which costs a real Ru nothing.
 const HELD_PERIODS: u32 = 8;
 
+/// A window's energy **after its own mean has been taken out of it**:
+/// `sum((x - mean)^2)`, the second moment about the window's mean.
+///
+/// This is the quantity "is there a signal here" is asked with, and it is the
+/// one quantity that separates a constant line from a line carrying something
+/// **by construction** and not by a tuned margin:
+///
+/// * on a constant window every `x - mean` is `0.0` -- exactly, in binary
+///   floating point, when the line carries the same value every time -- so the
+///   energy is exactly `0.0` and no floor, however low, can be reached;
+/// * under a polarity inversion `x -> -x` the mean becomes `-mean` and every
+///   deviation `-(x - mean)`, so every square, and therefore the energy, is
+///   **unchanged**. A reversed signal is not a quieter signal.
+///
+/// Neither of those facts is a number anyone chose, and the floor the result is
+/// compared against is [`AUDIBLE`], which is not new: it is the digital-silence
+/// floor this module has had since `docs/122`. On a DC the quantity is exactly
+/// zero, which is under any floor at all.
+///
+/// The cost is the window's own DC: a signal riding on a bias reads here as the
+/// signal, which is what a detector wants. The samples themselves are **not**
+/// changed, so [`Receiver::signal_onset`] still sees the far end's idle output
+/// exactly as it did (`docs/294` §3.1).
+fn ac_energy(window: &[f64]) -> f64 {
+    if window.is_empty() {
+        return 0.0;
+    }
+    let mean = window.iter().sum::<f64>() / window.len() as f64;
+    window.iter().map(|x| (x - mean) * (x - mean)).sum()
+}
+
 /// The normalised correlation of a window against a template: +1 identical,
 /// -1 inverted, 0 unrelated.
 fn correlate(window: &[f64], template: &[f64; RU_PERIOD]) -> f64 {
@@ -1192,13 +1223,20 @@ pub struct Receiver {
     /// The last `RU_PERIOD` samples' second moment, and the cross moment half
     /// a period back: what tells Ru from Su from silence.
     recent: VecDeque<f64>,
-    /// The line's own mean square, updated once every [`LEVEL_SYMBOLS`] symbols
-    /// from the samples themselves: the level every "is this a signal" gate in
-    /// the hunt is measured against, so that none of them carries the line's
-    /// units (`docs/122`).
+    /// The line's own **variance** -- mean square minus squared mean -- over
+    /// the last [`LEVEL_SYMBOLS`] symbols, updated from the samples themselves:
+    /// the level every "is this a signal" gate in the hunt is measured against,
+    /// so that none of them carries the line's units (`docs/122`).
+    ///
+    /// It is the second moment about the line's mean and not about zero, because
+    /// the window it is compared with is ([`ac_energy`], `docs/295`). A level
+    /// that carried the far end's DC would be the level of something a window
+    /// no longer contains, and over an idle the line *is* its DC -- so the
+    /// quotient would be a signal against a constant.
     level_sq: f64,
-    /// The sum of squares and the count behind the next [`Self::level_sq`].
+    /// The sum and the sum of squares behind the next [`Self::level_sq`].
     level_sum: f64,
+    level_dc: f64,
     level_count: u32,
     products: VecDeque<(f64, f64)>,
     /// Which shape this end is waiting for, when the call's own order says so.
@@ -1317,6 +1355,7 @@ impl Receiver {
             events: VecDeque::new(),
             recent: VecDeque::new(),
             level_sq: 0.0,
+            level_dc: 0.0,
             level_sum: 0.0,
             level_count: 0,
             products: VecDeque::new(),
@@ -1366,10 +1405,16 @@ impl Receiver {
         // The line's own level, in the line's own units: one multiply-add per
         // symbol and one division every [`LEVEL_SYMBOLS`] (see `level_sq`).
         self.level_sum += level * level;
+        self.level_dc += level;
         self.level_count += 1;
         if self.level_count == LEVEL_SYMBOLS {
-            self.level_sq = self.level_sum / f64::from(LEVEL_SYMBOLS);
-            (self.level_sum, self.level_count) = (0.0, 0);
+            // Moment about the line's own mean, and not about zero: on a
+            // constant block this is 0.0 and there is no level to be a share
+            // of, which is the truth about an idle line (`docs/295` §1).
+            let n = f64::from(LEVEL_SYMBOLS);
+            let mean = self.level_dc / n;
+            self.level_sq = (self.level_sum / n - mean * mean).max(0.0);
+            (self.level_sum, self.level_dc, self.level_count) = (0.0, 0.0, 0);
         }
         self.history.push_back(level);
         if self.history.len() > HISTORY {
@@ -2770,22 +2815,36 @@ impl Receiver {
     /// transmit level cancels. [`AUDIBLE`] is kept for the one case a ratio
     /// cannot express: a line of exact zeros, which has no level to be a
     /// fraction of, and which is exactly what a digital network's silence is.
+    ///
+    /// **The quantity is AC energy, not power** (`docs/295`). Power cannot tell
+    /// "no signal" from "a signal with a sign": a DC of -1 has power and no
+    /// shape, and `recognise` anchors its template on the first window that
+    /// matches itself, so a template taken across the step into a constant
+    /// matches every later constant window at 0.913 -- over [`MATCHED`] -- and
+    /// `HELD_PERIODS` later the far end's idle output had been reported as
+    /// `Su`. That is the `Su` at `12.740`, the `CPt` at `15.640` and the `E1u`
+    /// at `15.960` in the HSF call (`docs/294` §2). [`ac_energy`] is exactly
+    /// `0.0` on a constant window **by construction**, so the DC is refused by
+    /// the silence floor that was already here; no number was added and none
+    /// was tuned (`docs/295` §1). And it is unchanged under `x -> -x`, so
+    /// `ru_and_its_reversal_are_found_whatever_the_polarity` is not weakened:
+    /// it is refused a constant, not a polarity.
+    ///
+    /// The ratio's two halves are both AC now, for the reason `docs/122` gives
+    /// for it being a ratio at all -- "the same question in the same units on
+    /// both sides". An AC window against a level that still carried the DC
+    /// would be a fraction of something the window no longer contains, and over
+    /// an idle the level *is* the DC. So `level_sq` is the line's variance over
+    /// its last [`LEVEL_SYMBOLS`] (`Receiver::level_sq`).
     fn audible(&self, window: &[f64]) -> bool {
-        let power: f64 = window.iter().map(|x| x * x).sum();
+        let power = ac_energy(window);
         if !power.is_finite() || power <= AUDIBLE {
             return false;
         }
-        // A constant window is not a signal either, and power cannot say so:
-        // a DC of -1 has power and no shape. `recognise` anchors its template
-        // on the first window that matches itself, and a template taken from a
-        // constant matches every later constant window exactly -- so a far
-        // end's idle output reads as Su, which is what `docs/294` section 2
-        // found at `12.740` in the HSF call. Shape is the variance about the
-        // window's own mean; Ru, Su and their reversals all have it and a
-        // quiet line has none.
         // Thirty decibels under the line's own level is not a signal. Before
-        // `LEVEL_SYMBOLS` of line has been seen there is no level to divide by
-        // and the window stands on the floor alone.
+        // `LEVEL_SYMBOLS` of line has been seen, and on a line that has been a
+        // constant for that long, there is no level to divide by and the
+        // window stands on the floor alone.
         let level = self.level_sq * RU_PERIOD as f64;
         power > AUDIBLE_SHARE * level
     }
@@ -2817,8 +2876,20 @@ impl Receiver {
             return false;
         }
         let window: Vec<f64> = self.recent.iter().copied().collect();
-        if !self.audible(&window) {
-            self.anchor = None;
+        // **Audibility is the acquisition question and only the acquisition
+        // question** (`docs/295` §1). It asks "is there anything here to take
+        // an anchor from", and a constant window is not an answer: it has no
+        // shape to anchor, and a template taken from it matches every later
+        // constant window, which is how the far end's idle became an `Su`.
+        // Holding is a different question -- whether a sequence that was
+        // already on the line has turned over -- and a window in the middle of
+        // a real sequence may be momentarily flat without the sequence ending.
+        // `Ru`'s own `+++---` meeting `R-bar-u`'s `---+++` is six identical
+        // samples: holding that window to the audibility test drops the anchor
+        // exactly where the reversal is, which is what `docs/294` §3.2 measured
+        // as a lost reversal and not as a quiet line. So the gate stays where
+        // an anchor is taken, and the hold path is unchanged from what it was.
+        if self.anchor.is_none() && !self.audible(&window) {
             self.state = Hunt::Searching;
             return false;
         }
@@ -2954,8 +3025,18 @@ impl Receiver {
         // stream of decisions that were never on the line. That turned a Phase
         // 3 E1u's silence -- which is what tells the digital modem the exchange
         // is over (9.6.1.1.4) -- into ones, and the call never left Phase 3.
+        //
+        // "Quiet" is [`ac_energy`] and not power, for the same reason the hunt's
+        // gate is (`docs/295`): a DC of -1 is a line with nothing on it and all
+        // the power in the world, and slicing it hands the reader the two-point
+        // stream it is not -- a constant decision, differentially decoded to a
+        // stream of zeroes, which is the shape `E1u` is counted from. A silence
+        // has no decisions to hand out and neither has a DC; the equaliser is
+        // where it was, and this is its input's second moment about its own
+        // mean.
         let width = self.forward.len();
-        let power: f64 = self.history.iter().rev().take(width).map(|&x| x * x).sum::<f64>() / width as f64;
+        let input: Vec<f64> = self.history.iter().rev().take(width).copied().collect();
+        let power = ac_energy(&input) / width as f64;
         if !(power > AUDIBLE) {
             self.decided.clear();
             let instant = self.count.saturating_sub(self.ahead as u64);
@@ -4427,6 +4508,50 @@ mod tests {
     }
 
     const RU_SYMBOLS_LOCAL: usize = 384;
+
+    /// 3.98 s at 8 kHz: the far end's own pre-`TRN2u` idle, measured once per
+    /// capture in `docs/294` §2 (199 blocks twice, mean -1.000, std 0.000).
+    const IDLE_SYMBOLS_LOCAL: u32 = 31_840;
+
+    /// The far end's idle output is a **constant**, and a constant is not a
+    /// signal -- however long it lasts and whichever way up it is.
+    ///
+    /// This is the `Su` at `12.740` in the HSF call. `recognise` anchors its
+    /// template on the first window that matches itself, and a template taken
+    /// across the step into a constant matches every later constant window at
+    /// 0.913, over [`MATCHED`]'s 0.90 -- so eight [`HELD_PERIODS`] later the
+    /// far end's idle had been reported as `Su`, and `Jp` was sent with an
+    /// epsilon (47634) measured on it (`docs/294` §2). The quantity that
+    /// refuses it is [`ac_energy`]: exactly 0.0 on a constant, unchanged under
+    /// a sign flip, so a constant is refused at either polarity by one gate and
+    /// no signal at either polarity is (`docs/295` §1).
+    ///
+    /// The constant is fed at Ru's own amplitude, which is the sharp version of
+    /// the question: if a line of `-LU` forever is not a signal while `Ru`'s
+    /// `-LU` is, then only the shape decides and the level never did.
+    #[test]
+    fn a_constant_line_is_not_a_su_however_long_it_lasts_or_which_way_up_it_is() {
+        for constant in [-1.0, 1.0] {
+            let mut rx = Receiver::new();
+            // A real Ru first: an anchor taken, the equaliser trained and the
+            // line's level the line's own, which is the state the far end's
+            // idle arrives in.
+            for n in 0..RU_SYMBOLS_LOCAL {
+                rx.feed(ru(n as u64, false) * 8000.0);
+            }
+            let mut su = 0;
+            for _ in 0..IDLE_SYMBOLS_LOCAL {
+                rx.feed(constant);
+                while let Some(event) = rx.heard() {
+                    if matches!(event, Heard::Su { .. } | Heard::SuReversal { .. }) {
+                        su += 1;
+                    }
+                }
+            }
+            assert_eq!(su, 0, "a constant {constant} was read as Su {su} time(s)");
+        }
+    }
+
 
     /// The two numbers [`Receiver::hunt_shares`] hands out, pinned on the thing
     /// this bench actually puts on the line.

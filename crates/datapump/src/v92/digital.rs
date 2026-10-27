@@ -8318,6 +8318,20 @@ impl Modem {
                 }
             }
             Stage::Dil | Stage::Ri | Stage::RiBar => {
+                // A line with nothing on it hands the reader **no bits**. The
+                // receiver says so with `decided: None` -- its equaliser has no
+                // input to decide on, so it emits the quiet symbol and no
+                // decision (`receiver.rs`, `equalise_and_slice`) -- and the
+                // alternative, reading the quiet symbol's `0.0` as a level, is
+                // twelve zeroes in the `CPt`'s own next-repetition slot: an
+                // `E1u` the far end never sent. That is what ended Phase 3 off
+                // the far end's legal pre-`TRN2u` idle in the HSF call
+                // (`docs/294` §2, `docs/295` §1). A real `E1u` is a transmitted
+                // data frame of zeroes and arrives as decided symbols, so it is
+                // not this that refuses it.
+                if symbol.decided.is_none() {
+                    return;
+                }
                 let Some(bit) = self.reader.feed(symbol.value) else {
                     return;
                 };
@@ -9132,6 +9146,13 @@ mod tests {
         /// Whether this far end sends `Su` at all. A far end that sends none is
         /// 9.5.1.2.2's case and nothing else's.
         su: bool,
+        /// Whether the `E1u` that ends the `CPt` series has gone out. 8.5.2
+        /// makes it "a data frame of scrambled, differentially encoded zeroes",
+        /// sent after the last `CPt` on the same chain -- so this Script sends
+        /// it, and does not go quiet where it belongs. Quiet was read as an
+        /// `E1u` by this bench for as long as the reader was fed the receiver's
+        /// quiet symbol, which is the defect `docs/295` §1 names.
+        e1u: bool,
     }
 
     impl Script {
@@ -9153,6 +9174,7 @@ mod tests {
                 ja: Some(ja),
                 cp,
                 second_trn: Trn1u::new(),
+                e1u: false,
                 reverses: true,
                 bar1_at: crate::v92::SU_SYMBOLS as u64,
                 su: true,
@@ -9233,10 +9255,19 @@ mod tests {
             if n < cpt {
                 return self.second_trn.next_symbol();
             }
-            if let Some(cp) = self.cp.as_mut()
-                && let Some(level) = cp.next_symbol()
-            {
-                return level;
+            if let Some(cp) = self.cp.as_mut() {
+                if let Some(level) = cp.next_symbol() {
+                    return level;
+                }
+                // The `CPt` series is over: 8.5.2's twelve zeroes, on the chain
+                // the series was sent on, where the next `CPt` would have begun.
+                if !self.e1u {
+                    self.e1u = true;
+                    cp.push(&[false; E1U_ZEROES]);
+                }
+                if let Some(level) = cp.next_symbol() {
+                    return level;
+                }
             }
             0.0
         }
@@ -9585,6 +9616,109 @@ mod tests {
         assert!(notes.contains("Jp with epsilon"), "no Jp off the window: {notes}");
         assert_eq!(phase3_line(&notes).matches("reversal seen at").count(), 1, "{notes}");
         assert_eq!(modem.stage, Stage::Phase4, "phase {} notes {notes}", modem.phase());
+    }
+
+    /// Where the far end's first `CPt` begins on [`Script`]: `Su` 144T, the
+    /// 24.5T `S-bar-u`, `Su` again, the `S-bar-u` that answers `Jp`, the second
+    /// `TRN1u` at 2400T, and then it.
+    const CPT_START: u64 = SU_START + 144 + 24 + 400 + 40 + 2400;
+
+    /// The far end's idle, at [`Script`]'s own level: the same sample every
+    /// time, so mean = the sample and std 0.000, which is the shape `docs/294`
+    /// §2 measured on the live line (there in the codec's own units, -1 LSB;
+    /// the guard reads the shape, which is scale-free).
+    const IDLE: f64 = -8000.0;
+
+    /// **The three false decisions, pinned.** A reader trained on a real Phase 3
+    /// that has read a real `CPt`, and then the far end's legal idle as what it
+    /// is on this line -- a constant, delivered whole, mean -1.000 and std
+    /// 0.000 -- must decide nothing off it: no `CPt`, no `E1u`, and no `Su`.
+    ///
+    /// This is the live sequence exactly (`docs/294` §2): `CPt drn 9` at 15.640,
+    /// `E1u` at 15.960, both inside the far end's 3.98 s idle, and both of them
+    /// ours. Before `docs/295` §1 the constant was audible (it has power), the
+    /// equaliser sliced it to one repeated decision -- a stream of zeroes, which
+    /// is the shape `E1u` is counted from -- and twelve of them in the `CPt`'s
+    /// own next-repetition slot was `E1u`.
+    #[test]
+    fn the_far_end_s_constant_line_is_not_a_cpt_and_not_an_e1u_and_not_a_su() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let repetition = cp.to_bits_in(Layout::V92, UP_INTERVALS).len() as u64;
+        let mut script = Script::new(&Descriptor::none(), 0x7ffff, Some(cp));
+        let mut modem = Modem::new(settings());
+        let mut n = 0u64;
+        // A real `CPt`, read to the end of one repetition -- `cp_len` is set by
+        // the sequence's own CRC, so this is a `CPt` and not a guess. `E1u` is
+        // only decided out of a state a far end that never sent one cannot
+        // reach, and the false `E1u` at 15.960 was decided out of exactly this
+        // one.
+        while modem.cp_len == 0 && n < CPT_START + 4 * repetition {
+            modem.step(script.next(n) * 8000.0);
+            n += 1;
+        }
+        assert!(modem.cp_len != 0, "no CPt was read, so nothing is pinned");
+        // Then two hundred symbols of the idle before anything is asserted: the
+        // step from a real `CPt` into a constant is one the equaliser's own
+        // window spans, so for the length of that window the line still has
+        // shape in it and deciding there is not what this pins. What is left
+        // after it is the question, and it is the live one: `CPt drn 9` at
+        // 15.640 and `E1u` at 15.960 were 0.32 s -- two thousand five hundred
+        // and sixty symbols -- into the far end's idle, nowhere near a step.
+        for _ in 0..200 {
+            modem.step(IDLE);
+        }
+        let before = modem.clone().take_notes().join("\n");
+        assert!(before.contains("V.92: CPt drn"), "no CPt was read, so nothing is pinned: {before}");
+        // The idle, whole.
+        for _ in 0..IDLE_SYMBOLS_PHASE3 {
+            modem.step(IDLE);
+        }
+        let notes = modem.clone().take_notes().join("\n");
+        let after = &notes[before.len()..];
+        assert!(
+            !after.contains("V.92: E1u"),
+            "E1u was decided on the far end's constant: {after}"
+        );
+        assert!(
+            !after.contains("V.92: CPt drn"),
+            "a CPt was read off the far end's constant: {after}"
+        );
+        assert!(
+            !after.contains("V.92: Su at"),
+            "a Su was read off the far end's constant: {after}"
+        );
+        assert!(!matches!(modem.stage, Stage::RiBar), "the constant ended Phase 3: {after}");
+    }
+
+    /// The same 3.98 s of idle, in symbols at 8 kHz.
+    const IDLE_SYMBOLS_PHASE3: u64 = 31_840;
+
+    /// **And the polarity property, on more than `Ru`.** A whole Phase 3 line
+    /// inverted -- every upstream level negated, `Ru`, `TRN1u`, `Ja`, `Su`, the
+    /// second `TRN1u` and `CPt` -- is still read: the hunt's anchor is its own
+    /// zero point (9.5.1.1.1), so the reversal is seen, `Su` is reported and the
+    /// `CPt`'s CRC still checks out.
+    ///
+    /// This is `ru_and_its_reversal_are_found_whatever_the_polarity` widened
+    /// from the reversal to the three decisions Phase 3 is made of, and it is
+    /// what makes the constant-line refusal safe to ship: the new gate refuses
+    /// a line with no shape, not a line with the other sign (`docs/295` §1).
+    #[test]
+    fn a_polarity_reversed_phase_three_line_is_still_read_to_its_cpt() {
+        let cp = Cp { drn: 16, constellations: vec![(1u128 << 40) - 1], ..Cp::default() };
+        let repetition = cp.to_bits_in(Layout::V92, UP_INTERVALS).len() as u64;
+        let mut script = Script::new(&Descriptor::none(), 0x7ffff, Some(cp));
+        let mut modem = Modem::new(settings());
+        let mut n = 0u64;
+        for _ in 0..CPT_START + repetition + 40 {
+            modem.step(-script.next(n) * 8000.0);
+            n += 1;
+        }
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(notes.contains("V.92: Su at"), "no Su on a reversed line: {notes}");
+        assert!(notes.contains("reversal seen at"), "no reversal on a reversed line: {notes}");
+        assert!(notes.contains("V.92: CPt drn"), "no CPt on a reversed line: {notes}");
+        assert!(notes.contains("V.92: E1u"), "no E1u on a reversed line: {notes}");
     }
 
     /// docs/131 case (b): the **HSF signature** -- one unmodulated tone from
