@@ -2177,6 +2177,17 @@ impl Receiver {
     /// (`digital.rs`, `data_mode_levels`): it is the level set, not this
     /// slicer, that knows whether there is a code grid under it.
     pub fn set_data_mode(&mut self, levels: Vec<f64>) {
+        // A decision is the point it was taken against, so a data-mode re-entry
+        // that hands the slicer the *same* point set is not a new constellation
+        // and the feedback history is still the symbols the fitted taps were
+        // designed to cancel. Keeping it is not a nicety: the fitted feedback
+        // section is a loop whose response is within a per cent of one at the
+        // half-symbol rate (`docs/334` sec 1.4), so it does not forget where it
+        // was started -- on one call's two `B1u` windows, the same waveform to
+        // one count read **226.8 LSB** when the history was thrown away at this
+        // re-entry and **75.6** when it was kept (`docs/334` sec 2). A table
+        // that differs is another alphabet and the history goes with it.
+        let reused = matches!(&self.slicer, Slicer::Levels(old) if *old == levels);
         self.slicer = Slicer::Levels(levels);
         // Diagnostic (`V92_DATA_FB`): what to do with the fitted feedback
         // section once the data mode starts. `off` zeroes it and `scale:K`
@@ -2193,7 +2204,9 @@ impl Receiver {
                 *tap *= scale;
             }
         }
-        self.decided.clear();
+        if !reused {
+            self.decided.clear();
+        }
         self.measured = 0;
         self.anchor_gain = self.gain;
         self.level_by_line = 0.0;
@@ -6092,5 +6105,41 @@ mod su_scale_probe {
             best.1,
             best.1 as f64 / 8000.0
         );
+    }
+
+    /// **A data-mode re-entry on the same point set is not a new constellation.**
+    ///
+    /// `docs/334` sec 1: one call's two `B1u` windows are the same waveform to
+    /// one count of int16, and the second — the re-entry after the far end's
+    /// rate renegotiation, where `begin_b1u` hands `set_data_mode` the *same*
+    /// CPd table the slicer is already on — reads 226.8 LSB where the first
+    /// reads 109.9, and never converges. The feedback history was thrown away
+    /// at the re-entry, which restarts a loop whose fitted response is within a
+    /// per cent of one (docs/334 sec 1.4): the restart state, not the line,
+    /// decides which of the loop's two states the whole window lives in.
+    ///
+    /// Red on `c970ecb`: `assertion `left == right` failed: the same table, and
+    /// the history was thrown away / left: 0 / right: 16`. Green after.
+    #[test]
+    fn a_data_mode_reentry_on_the_same_table_keeps_the_feedback_history() {
+        let levels: Vec<f64> = vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.55];
+        let mut rx = Receiver::new();
+        // One tap, so the slice is a function of the sample and nothing else;
+        // the feedback section itself is left empty, so what is measured here is
+        // the history and not the loop it feeds.
+        rx.forward = vec![1.0, 0.0];
+        rx.set_data_mode(levels.clone());
+        rx.trained = true;
+        for k in 0..40 {
+            rx.feed(if k % 2 == 0 { 0.61 } else { -0.61 });
+            while rx.heard().is_some() {}
+        }
+        assert_eq!(rx.decided.len(), DFE_FEEDBACK, "the history never filled");
+        rx.set_data_mode(levels);
+        assert_eq!(rx.decided.len(), DFE_FEEDBACK, "the same table, and the history was thrown away");
+        // The guard: a *different* point set is another alphabet, and a decision
+        // taken against the old one is not this one's symbol.
+        rx.set_data_mode(vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.60]);
+        assert_eq!(rx.decided.len(), 0, "another table, and the history survived");
     }
 }
