@@ -1394,6 +1394,21 @@ pub struct Receiver {
     /// measurement has settled on.
     measured: u32,
     gain: f64,
+    /// The scale the four-point tiers measured on the window the phase-4
+    /// section was fitted on -- `(1/sqrt 5) / inner`, taken the moment the tier
+    /// has [`MEASURED_MIN`] accepted measurements and held thereafter.
+    ///
+    /// **This is the fit's number, not the tracker's.** `measure_levels` walks
+    /// `gain` toward it a hundredth per accepted measurement, which is the right
+    /// shape for a loop that has to keep up with a line for a whole call and the
+    /// wrong shape for the instant a table is installed: the fit's window is
+    /// over by then and the symbols that follow are read against the scale
+    /// `gain` happens to hold. So the measurement is kept separately and
+    /// `set_data_mode` installs it; what the anchor then tracks is the drift
+    /// after the install and nothing else. `None` before the tier has measured
+    /// and after a change of slicer, because another alphabet is another
+    /// measurement.
+    fitted_scale: Option<f64>,
     /// The gain the training left in place when data mode began: what the
     /// data-mode level anchor is allowed to move away from. The far end sets
     /// its own transmit level and a real line's upstream gain is not fixed, so
@@ -1479,6 +1494,7 @@ impl Receiver {
             outer: 0.0,
             measured: 0,
             gain: 1.0,
+            fitted_scale: None,
             anchor_gain: 1.0,
             level_by_line: 0.0,
             line_by_line: 0.0,
@@ -2156,6 +2172,7 @@ impl Receiver {
         self.inner = 0.0;
         self.outer = 0.0;
         self.gain = 1.0;
+        self.fitted_scale = None;
     }
 
     /// Re-read a kept feedback history on the alphabet the section was fitted
@@ -2274,6 +2291,29 @@ impl Receiver {
             // `V92_DM_HIST=keep` restores the pre-`docs/339` behaviour so the
             // same binary can show both, and it is a diagnostic, not a mode.
             self.rebuild_decided_on_fit_alphabet();
+        }
+        // **The scale the fit has just measured is installed, not tracked in.**
+        //
+        // `docs/334` sec 1 and `docs/339` sec 3 left one term of the install
+        // transient named as a scale: `a = 1.0487` on `value`, applied at the
+        // install and then walked in by `anchor_data_levels` at a hundredth per
+        // update *after* `level_seen` reaches 256 (`docs/333` sec 3) -- a time
+        // constant of ~25 600 symbols, against a `B1u` window of 576 and a
+        // first block of 96. A quantity the fit has just measured is not
+        // something to track in: TRN2u's window is behind this call, the
+        // four-point tier measured the line's scale on it (`docs/298` solved
+        // the fit on that same window), and the symbols that follow are read
+        // against whatever `gain` holds. So it is installed here, and the
+        // anchor is left to do the one thing it is for -- following the drift
+        // of a real loop after the install, around the scale that was
+        // installed (`anchor_gain` below is that scale).
+        //
+        // The bound is `measure_levels`'s own (0.75..1.33): a measured scale
+        // outside it is not a scale this receiver may install, and the walk's
+        // value stands instead. A fitter constant is not replaced by an
+        // unfitted one -- `fitted_scale` is exactly what the tier measured.
+        if let Some(scale) = self.fitted_scale {
+            self.gain = scale.clamp(0.75, 1.33);
         }
         self.measured = 0;
         self.anchor_gain = self.gain;
@@ -3405,8 +3445,14 @@ impl Receiver {
         }
         *sum += 0.004 * (size - *sum);
         self.measured = self.measured.saturating_add(1);
-        if self.measured >= 64 && self.inner > 0.0 {
+        if self.measured >= MEASURED_MIN && self.inner > 0.0 {
             let wanted = inner / self.inner;
+            // Kept as the measurement it is, as well as walked toward: the walk
+            // is what keeps the gain live while the tier is still being read,
+            // and `set_data_mode` installs this number outright (`docs/340`
+            // sec 1). The same gate both ways, so that "measured" means one
+            // thing in the file.
+            self.fitted_scale = Some(wanted);
             self.gain = self.gain.clamp(0.75, 1.33).mul_add(0.99, wanted * 0.01);
         }
     }
@@ -4571,6 +4617,17 @@ impl Receiver {
         self.snr_db.is_finite() && self.snr_db > 0.0
     }
 }
+
+/// How many accepted four-point measurements make the tier's mean a
+/// measurement rather than a sample.
+///
+/// One slow time constant of `measure_levels`' 0.004 average is 250 symbols, so
+/// 64 accepted is a quarter of one: enough that a single badly-decided symbol
+/// moves nothing, which is what the gate is for, and low enough that a TRN2u of
+/// the clause's minimum length reaches it. It gates two things and means the
+/// same in both: the walk `measure_levels` takes on `gain`, and the scale
+/// `set_data_mode` installs (`docs/340` sec 1).
+const MEASURED_MIN: u32 = 64;
 
 /// How far the data-mode anchor may move the training's gain, either way.
 ///
@@ -6217,6 +6274,75 @@ mod su_scale_probe {
         // taken against the old one is not this one's symbol.
         rx.set_data_mode(vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.60]);
         assert_eq!(rx.decided.len(), 0, "another table, and the history survived");
+    }
+
+    /// **The install takes the scale the four-point tier measured; it does not
+    /// walk to it.**
+    ///
+    /// `docs/333` sec 3 and `docs/339` sec 3 name the last term of the install
+    /// transient as a level scale applied at `set_data_mode` and then walked in
+    /// by `anchor_data_levels` a hundredth per update *after* `level_seen`
+    /// reaches 256 -- a time constant of ~25 600 symbols against a first block
+    /// of 96. The four-point tier has already measured that scale: `inner` is
+    /// the mean the inner tier arrived at over TRN2u, the window the phase-4
+    /// section was fitted on (`docs/298`). So the install has nothing to walk
+    /// toward -- `gain` must be exactly `(1/sqrt 5)/inner`, the tier's own
+    /// current number.
+    ///
+    /// The stimulus is the call's own state and then a step: 4000 symbols on a
+    /// line 0.55 % below Table 28 (the call's `inner` is 0.444701 against
+    /// 0.447214, `docs/334` sec 1), which is six time constants of the tier's
+    /// 0.004 average and so a measurement, and then a 2 % step in the far
+    /// end's level -- the one situation the *walk* is for, and the one in which
+    /// it is a lag rather than an answer.
+    ///
+    /// Red on `61fd122`: `the install walked to the tier's scale instead of
+    /// applying it: gain 1.000117 vs the measured 0.994893, 0.53 % still to
+    /// walk inside the window`. Green after.
+    #[test]
+    fn the_install_applies_the_four_point_scale_and_does_not_walk_to_it() {
+        let inner = 1.0 / 5f64.sqrt();
+        let outer = 3.0 / 5f64.sqrt();
+        let low = 0.99455;
+        let mut rx = Receiver::new();
+        rx.forward = vec![1.0, 0.0];
+        rx.set_slicer(Slicer::FourPoint);
+        rx.trained = true;
+        for k in 0..4000 {
+            // The step is on both tiers, which is what a level is, and it is
+            // 160 symbols back -- inside the anchor's first `level_seen` gate.
+            let scale = if k < 3840 { low } else { low * 1.04 };
+            rx.feed(if k % 2 == 0 { inner * scale } else { -outer * scale });
+            while rx.heard().is_some() {}
+        }
+        let (_, _, _, measured) = rx.measured_levels();
+        assert!(measured >= MEASURED_MIN, "the tier never measured ({measured} accepted)");
+        // The tier is reading the line rather than noise: its inner mean is
+        // within a per cent of the magnitude that was fed.
+        let fit = inner / rx.inner;
+        assert!(
+            (fit - 1.0 / low).abs() < 0.05,
+            "the tier's own measurement is not the line's scale: {fit:.6} against {:.6}",
+            1.0 / low
+        );
+        rx.set_data_mode(vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.55]);
+        let (_, _, gain, _) = rx.measured_levels();
+        assert!(
+            (gain - fit).abs() < 1e-12,
+            "the install walked to the tier's scale instead of applying it: gain {gain:.6} vs the \
+             measured {fit:.6}, {:.2} % still to walk inside the window (docs/340 sec 1)",
+            100.0 * (fit - gain).abs() / fit
+        );
+        // The guard: with no measurement behind it the install installs
+        // nothing, rather than dividing by a tier that was never read.
+        let mut fresh = Receiver::new();
+        fresh.set_slicer(Slicer::FourPoint);
+        fresh.set_data_mode(vec![0.20, 0.41, 0.61, 0.81, 1.01, 1.23, 1.39, 1.55]);
+        let (_, _, unmeasured, _) = fresh.measured_levels();
+        assert!(
+            (unmeasured - 1.0).abs() < 1e-12,
+            "a tier that never measured installed a scale anyway: {unmeasured:.6}"
+        );
     }
 
     /// **The kept history is re-read on the alphabet the section was fitted
