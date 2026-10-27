@@ -154,11 +154,11 @@ pub const LEVELSET_VAR: &str = "V92_LEVELSET";
 
 /// The two level sets [`build`] can put out. See [`LEVELSET_VAR`].
 ///
-/// **`Code` is the default** ([`shipped`]), and `Uniform` is kept reachable by
-/// name for the arms that have to reproduce a call made before it -- the
-/// closed-loop harness measures both out of one binary.
+/// **`Uniform` is the default again** ([`shipped`]), and `Code` stays reachable
+/// by name (`V92_LEVELSET=code`), fully implemented, so the closed-loop harness
+/// and the suite exercise both out of one binary.
 ///
-/// # Why `Uniform` can no longer be what a build ships
+/// # `Code` is the arm to reach, and one number holds it off the default
 ///
 /// A uniform declaration is a set the far end **cannot emit**. Its points are
 /// `2 eta + 1` in *index units*; the far end's transmitter is a G.711 codec, so
@@ -176,14 +176,29 @@ pub const LEVELSET_VAR: &str = "V92_LEVELSET";
 /// boundary is `drn 9`, not `drn 3`. It is also why the declaration is a
 /// modelling defect and not a tuning choice -- no loop, scalar or tracker can
 /// make a far end emit a level its codec does not have.
+///
+/// # Why it is not the default *yet* (`docs/312`)
+///
+/// S1 made `Code` the shipped default and lost `drn 1`, the one rung the bench
+/// carries payload at: the call fell back to V.90 with `B1u` at chance (308 of
+/// 576) while the same minute's `abb3b72` + `Uniform` control reached
+/// `CONNECT 24000`. The rule on this project is that a change which breaks a
+/// working call goes back **first**, and the re-argument has to include a call
+/// that passes the class gate *and* carries payload. So the default is
+/// `Uniform` until that call exists; the code declaration itself is untouched
+/// and stays exercised by the two tests below and by `rung`'s pricing tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LevelSet {
-    /// `a(eta) = 2 eta + 1`: the odd lattice. **Undeclarable from LC 32 up**, so
-    /// it is reachable by name (`V92_LEVELSET=uniform`) and never by default.
-    Uniform,
-    /// The far end's own G.711 code values (docs/114 R1). The default: it is the
-    /// only one of the two the far end can emit.
+    /// `a(eta) = 2 eta + 1`: the odd lattice. **Undeclarable from LC 32 up**,
+    /// which is a reason to fix the code arm and not a reason to spend the
+    /// working call -- so this is what ships until the code arm reads the far
+    /// end's scale (`docs/312` sec 1, sec 3).
     #[default]
+    Uniform,
+    /// The far end's own G.711 code values (docs/114 R1): the only one of the
+    /// two the far end *can* emit, and held off the default by one measured
+    /// number -- `K 2.48168 (mask)` on this arm against `K 1.00000` on the
+    /// lattice arm, a level table 2.48x the arriving levels (`docs/312` sec 2).
     Code,
 }
 
@@ -197,8 +212,8 @@ impl LevelSet {
     }
 
     /// What a `V92_LEVELSET` value names, or `None` for a value this build does
-    /// not have. Unset and empty are [`LevelSet::default`] -- the code grid: the
-    /// default is the default, not a value the caller had to write down.
+    /// not have. Unset and empty are [`LevelSet::default`] -- the odd lattice:
+    /// the default is the default, not a value the caller had to write down.
     pub fn named(raw: Option<&str>) -> Option<Self> {
         match raw.map(str::trim) {
             None | Some("") => Some(LevelSet::default()),
@@ -247,6 +262,13 @@ impl LevelSet {
 /// One name for it, so that a test, a log line and the `CPd` cannot disagree
 /// about which set was shipped: the default is a property of the build and not
 /// a value each call site re-reads out of the environment.
+///
+/// **`Uniform`, since `docs/312` sec 1.** S1 had it answer `Code`; the call that
+/// argued for it did not connect (`docs/311` sec 5.1) and the control that did
+/// connect ran this set (`docs/311` sec 5.2). `Code` is unreachable **by
+/// accident** from here -- it is `V92_LEVELSET=code` and nothing else, so
+/// flipping the default back is one line and one commit, which is what
+/// `docs/312` sec 5 asks for once a call carries payload on it.
 pub fn shipped() -> LevelSet {
     LevelSet::named(None).expect("this build has a default level set")
 }
@@ -310,7 +332,7 @@ fn report_ignored(raw: &str) -> bool {
         return false;
     }
     eprintln!(
-        "{LEVELSET_VAR}: {raw:?} is not uniform or code; sending the default, the code grid ({})",
+        "{LEVELSET_VAR}: {raw:?} is not uniform or code; sending the default, the odd lattice ({})",
         shipped().name()
     );
     true
@@ -619,8 +641,16 @@ mod tests {
     /// knob. The code set needs nothing from it: `grid` chose its points under
     /// the power ceiling, so its rms is `TARGET_RMS` to within [`POWER_SLACK`]
     /// and its unit is 1 LSB by construction.
+    /// **The set is named here and not taken from [`shipped`].** Since
+    /// `docs/312` sec 1 the shipped default is the odd lattice again, and both
+    /// tests below are about the *code* declaration: they ask for it by name so
+    /// that which arm a build ships cannot decide whether the code grid is a set
+    /// the far end can emit. That is the point of keeping them -- `Code` is
+    /// implemented and exercised whatever the default is.
+    const DECLARED: LevelSet = LevelSet::Code;
+
     fn lsb_per_point(levels: usize) -> f64 {
-        match shipped() {
+        match DECLARED {
             LevelSet::Code => 1.0,
             LevelSet::Uniform => codegrid::ladder_step(levels) / 2.0,
         }
@@ -629,7 +659,7 @@ mod tests {
     /// The declared set with its points carried onto the line in LSB.
     fn on_the_line(levels: usize) -> Vec<f64> {
         let scale = lsb_per_point(levels);
-        shipped().points(levels).expect("the declared set").iter().map(|&p| scale * f64::from(p)).collect()
+        DECLARED.points(levels).expect("the declared set").iter().map(|&p| scale * f64::from(p)).collect()
     }
 
     /// The rms of levels in LSB, which is the power the set puts on the line.
@@ -731,15 +761,16 @@ mod tests {
         assert!(bad.is_empty(), "the declaration has a residual floor of its own:\n{}", bad.join("\n"));
     }
 
-    /// **The uniform arm is still reachable, by name, and is still the lattice it
-    /// always was** -- and it is no longer what a build ships.
+    /// **The uniform arm is what a build ships again, and it is still the lattice
+    /// it always was** (`docs/312` sec 1).
     ///
-    /// `docs/310` sec 2: `V92_LEVELSET=uniform` is what the closed-loop harness
-    /// measures against, so it has to build the set every call before this change
-    /// sent, field for field: 1, 3, ..., 15 at 24 000, the gain `gain_for(8)`
-    /// exactly, and `Parameters::step` equal to `2 G`. The numbers below are
-    /// unchanged from the build in which this was the default; what changed is
-    /// who gets them without asking.
+    /// It has to build, field for field, the set every call before S1 sent: 1,
+    /// 3, ..., 15 at 24 000, the gain `gain_for(8)` exactly, and
+    /// `Parameters::step` equal to `2 G`. The numbers below are unchanged from
+    /// every build that made this the default; what S1 changed and this restores
+    /// is **who gets them without asking**. Both arms are reachable by name, and
+    /// the test asserts both directions: `uniform` is the default, `code` is one
+    /// word away and builds its own set (the test below).
     #[test]
     fn the_uniform_arm_is_still_the_lattice_it_was_by_name() {
         let design = design_for(1e-9);
@@ -775,10 +806,14 @@ mod tests {
             );
             assert!((parameters.step() - 2.0 * gain_for(lc)).abs() < 1e-4, "drn {drn}: step");
         }
-        // And the arm is reached by *name*: unset is no longer this set. The
-        // default is the code grid, and the lattice is one word away.
+        // **Both directions of the revert.** Unset is this set again, and the
+        // code grid is one word away -- `V92_LEVELSET=code` -- still built, still
+        // the arm the closed-loop harness and the two tests above exercise.
         assert_eq!(LevelSet::named(Some("uniform")), Some(LevelSet::Uniform));
-        assert_eq!(shipped(), LevelSet::Code, "the shipped set is the far end's code grid");
+        assert_eq!(LevelSet::named(None), Some(LevelSet::Uniform), "unset has to be the lattice");
+        assert_eq!(shipped(), LevelSet::Uniform, "the shipped set is the odd lattice again");
+        assert_eq!(LevelSet::named(Some("code")), Some(LevelSet::Code), "the grid has to stay reachable");
+        assert_eq!(resolve(Some("code")), LevelSet::Code, "and resolved, not only named");
         let pinned = pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform).expect("pinnable");
         assert_eq!(pinned.parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
     }
@@ -829,16 +864,16 @@ mod tests {
         assert!((loss + 2.7).abs() < 0.1, "the grid costs {loss:.2} dB, not 2.7");
     }
 
-    /// An unrecognised `V92_LEVELSET` sends the **default** -- the code grid --
-    /// and says so once.
+    /// An unrecognised `V92_LEVELSET` sends the **default** -- the odd lattice,
+    /// since `docs/312` sec 1 -- and says so once.
     ///
     /// The typo does not get a vote on the wire; what it gets is one line, so
     /// that a batch whose log says `levelset uniform` under `V92_LEVELSET=kode`
     /// can be told from one that never set the variable.
     #[test]
     fn an_unrecognised_levelset_sends_the_default_and_is_said_once() {
-        assert_eq!(LevelSet::named(None), Some(LevelSet::Code), "unset is the default");
-        assert_eq!(LevelSet::named(Some("")), Some(LevelSet::Code), "empty is the default");
+        assert_eq!(LevelSet::named(None), Some(LevelSet::Uniform), "unset is the default");
+        assert_eq!(LevelSet::named(Some("")), Some(LevelSet::Uniform), "empty is the default");
         assert_eq!(LevelSet::named(Some("uniform")), Some(LevelSet::Uniform));
         assert_eq!(LevelSet::named(Some("code")), Some(LevelSet::Code));
         assert_eq!(LevelSet::named(Some("uniform ")), Some(LevelSet::Uniform), "trailing space");
@@ -850,11 +885,11 @@ mod tests {
         assert!(!report_ignored("LEVELSET"), "nor a third");
         // The value itself still resolves to the default, by value -- a typo
         // sends what an unset variable sends, and not something of its own.
-        assert_eq!(resolve(Some("kode")), LevelSet::Code);
-        assert_eq!(resolve(None), LevelSet::Code);
+        assert_eq!(resolve(Some("kode")), LevelSet::Uniform);
+        assert_eq!(resolve(None), LevelSet::Uniform);
         let design = design_for(1e-9);
         let parameters = build_with(&design, 1, Trellis::Sixteen, resolve(Some("kode"))).expect("drn 1");
-        assert_eq!(parameters.sets[0], codegrid::grid(8).expect("the grid"), "a typo moved the wire");
+        assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15], "a typo moved the wire");
     }
 
     /// 8.8.3 on the wire: `E[(G v)^2] = 1` for the filters this CPd declares.
