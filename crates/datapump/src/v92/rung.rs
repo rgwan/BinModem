@@ -1677,6 +1677,76 @@ mod tests {
         assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the mean-square model is not tighter");
     }
 
+    /// **LD-1, `docs/306` sec 2: the criterion must price the set the builder
+    /// carries.**
+    ///
+    /// `lc_for_agrees_with_the_builder` already checks that `upchoice::pin`
+    /// builds `lc_for(drn)` positive points. This is the other half of that
+    /// fact: the number `ceiling_rung` compares against has to be the gap of
+    /// **that** set. `threshold` priced `points` instead, which is the widest
+    /// interval's *modulus* and is twice the set at the three rungs 6.4.1 gives
+    /// a spare bit to (`docs/306` sec 2.2), so the criterion and the
+    /// constellation named two different objects and every test stayed green.
+    ///
+    /// Pinned as an equality over the whole ladder rather than as three worked
+    /// examples, so a rung added to the ladder is priced consistently without a
+    /// new assertion.
+    #[test]
+    fn the_criterion_prices_the_set_the_builder_carries() {
+        for drn in 1..=UP_RATES as u8 {
+            let carried = lc_for(drn);
+            let gap = gap_lsb(carried).expect("a gap for a set the ladder asks for");
+            let want = SIGMA_MAX * gap / index_step_lsb();
+            let got = threshold(drn);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "drn {drn}: the set the builder carries is {carried} points, worth {gap} LSB = \
+                 {want:.4} index steps, but the criterion prices {} points at {got:.4}",
+                points(drn)
+            );
+        }
+    }
+
+    /// The three rungs `docs/306` sec 2.2 measured as disagreeing, pinned by
+    /// name -- **`drn 2`, `8` and `14`, and no others**.
+    ///
+    /// `K = 2 (drn + 17)` leaves `spare = 2 (drn - 1) mod 12` spare bits, and a
+    /// set is half its interval's modulus exactly when the spare bits land on
+    /// intervals `0..=2`, i.e. `spare` in `{1, 2, 3}`, which is `drn` in
+    /// `{2, 8, 14}`. At those three the criterion's figure is **not** the
+    /// modulo-based one, so the last assertion of this test fails on the old
+    /// code by construction.
+    #[test]
+    fn the_three_rungs_the_audit_found_are_priced_from_lc_for() {
+        // The ladder itself: no fourth rung has a set half its modulus.
+        let disagreeing: Vec<u8> =
+            (1..=UP_RATES as u8).filter(|&drn| points(drn) != lc_for(drn)).collect();
+        assert_eq!(disagreeing, vec![2, 8, 14], "the disagreement set moved");
+        // The tabulated maximin gaps of the two counts, in LSB: `gap_lsb`'s own
+        // table, written out so that neither figure can be read off the code the
+        // assertion is checking.
+        for (drn, modulo_gap, set_gap) in [(2u8, 128.0, 320.0), (8, 64.0, 128.0), (14, 16.0, 64.0)]
+        {
+            assert_eq!(points(drn), 2 * lc_for(drn), "drn {drn}: the modulus is not twice the set");
+            let modulo_price = SIGMA_MAX * modulo_gap / index_step_lsb();
+            let set_price = SIGMA_MAX * set_gap / index_step_lsb();
+            let got = threshold(drn);
+            // Derived from `lc_for`: the gap of the set the builder carries.
+            assert!(
+                (got - set_price).abs() < 1e-9,
+                "drn {drn}: priced {got:.4} against the set's {set_price:.4}"
+            );
+            // And *not* from the modulus -- the assertion the old code fails.
+            assert!(
+                (got - modulo_price).abs() > 1e-9,
+                "drn {drn}: still priced at the modulo-based {modulo_price:.4}"
+            );
+        }
+        // The number the licence moves to, at the rung the record is about.
+        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
+        assert!((threshold(1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
+    }
+
     /// **The defect this note exists to prevent: a rung licensed by the
     /// mean-square form.**
     ///
