@@ -239,6 +239,28 @@ pub const ROTATION_SYMBOLS: u64 = 40 * TRELLIS_FRAME as u64;
 /// there at all rather than name a class outside its histogram.
 const CLASSES: usize = 16;
 
+/// Which of the twelve intervals of B1u's group the symbol at trellis position
+/// `k` of trellis frame `index` belongs to.
+///
+/// **The one source of truth for the interval assignment, and the invariant it
+/// carries is that the interval is the symbol's own position in B1u** -- not a
+/// count of anything the decoder has collected so far. `feed` slices and
+/// measures with [`super::interval`] of `n`, and frame `index`'s four symbols
+/// arrive at `n = 4 * index .. 4 * index + 3`, so this is the same number for
+/// the frames the decision window hands back.
+///
+/// It is *not* `labels.len()`, and that was the defect (`docs/301` sec 1). A
+/// frame the window declines pushes no labels, so a container's length falls
+/// behind the symbol counter by four: from then on every symbol is named with
+/// the wrong interval's `Mi` *and* the twelve labels of a group are stapled
+/// together across the hole, which is a frame's worth of wrong bits plus an
+/// offset that lasts the rest of B1u. The call's own evidence is exactly that
+/// shape -- the winners' first 160 symbols carry the correct digits and the
+/// call still reads 362/576 (`docs/299`, `docs/300`).
+fn interval_at(index: u64, k: usize) -> usize {
+    super::interval(index * TRELLIS_FRAME as u64 + k as u64)
+}
+
 /// The most bits one data frame carries at the rung the constant rotation was
 /// measured on (drn 1, K = 36). Above it the class map is wider than the
 /// constant was measured at, so the rotation has to be taken off the line.
@@ -272,10 +294,18 @@ struct Measuring {
     /// quantity the far end rotates, so this is the grid it is measured on;
     /// `measure` folds it back to classes with [`Self::folded`].
     half: [[u16; 2 * CLASSES]; 2],
-    /// The class width this rung's moduli name, which is Mi: eight at 24 000
-    /// and sixteen at 32 000. The histogram bins are mod this, not mod the
-    /// array's width -- `CLASSES` is only how wide the array is.
-    classes: usize,
+    /// `radix[k]`: the widest `Mi` any sample at trellis position `k` was
+    /// measured in, so the histogram for that position is cut to a width its
+    /// samples can actually land in.
+    ///
+    /// The binning radix is the **interval's own** `Mi`, per sample
+    /// (`index_to_ki_class`'s modulus, `precoder.rs:430`), which is what 6.4.2
+    /// writes and what `feed` hands `observe`. A position can see two moduli at
+    /// a mixed rung -- at Agere's `drn 2`, `Mi = 16` on intervals 0 and 1 and 8
+    /// on the other ten -- and then the wider samples' bins are the narrower
+    /// ones' free second member: a rotation the narrow intervals cannot name
+    /// is two bins the bar refuses, not a `+-Mi/2` lobe.
+    radix: [usize; TRELLIS_FRAME],
     /// Symbols measured.
     seen: u64,
     /// What the model cost to build, and what the counting cost, for
@@ -296,10 +326,9 @@ impl Measuring {
         let started = std::time::Instant::now();
         let predicted = b1u_classes(bits, &moduli);
         let model_cost = started.elapsed();
-        let classes = usize::from(*moduli.iter().max().expect("twelve moduli"));
         (first < predicted.len()).then(|| Self {
             predicted,
-            classes,
+            radix: [0; TRELLIS_FRAME],
             first,
             counts: [[[0; CLASSES]; TRELLIS_FRAME]; 2],
             half: [[0; 2 * CLASSES]; 2],
@@ -319,12 +348,23 @@ impl Measuring {
         let k = index % TRELLIS_FRAME;
         self.seen += 1;
         let started = std::time::Instant::now();
-        let complement = self.classes as i64 - 1 - i64::from(predicted);
+        // The radix this sample is measured in: the modulus of the interval it
+        // came from, which is what 6.4.1's mixed radix and 6.4.2's class map
+        // are written in (`precoder.rs:430`). Never `self.classes`: at a rung
+        // whose moduli are not all equal that bins a `Mi = 8` interval's class
+        // in radix 16 and splits its samples eight bins apart -- the `+-Mi/2`
+        // secondary peak of `docs/270` sec 1.3, which `docs/272`/`docs/275`
+        // found in the analysis tool (`b1d8223`) and which had this, the
+        // production decoder, as its other instance (`docs/301` sec 2).
+        let radix = usize::from(modulus.max(1));
+        self.radix[k] = self.radix[k].max(radix);
+        let complement = i64::from(modulus.max(1)) - 1 - i64::from(predicted);
         if k == TRELLIS_FRAME - 1 {
             // The half-step grid (see `Self::half`): one index step, not one
             // class, is what the far end rotates at this position, so this is
-            // the count that can name an odd rotation at all.
-            let width = 2 * self.classes as i64;
+            // the count that can name an odd rotation at all. `2 * Mi` wide,
+            // like the class it folds back to.
+            let width = 2 * radix as i64;
             for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
                 let away = (i64::from(eta) - 2 * predicted).rem_euclid(width);
                 self.half[sign][away as usize] += 1;
@@ -332,7 +372,7 @@ impl Measuring {
         } else {
             let class = i64::from(index_to_ki_class(eta, modulus, k));
             for (sign, predicted) in [i64::from(predicted), complement].into_iter().enumerate() {
-                let away = (class - predicted).rem_euclid(self.classes as i64);
+                let away = (class - predicted).rem_euclid(radix as i64);
                 self.counts[sign][k][away as usize] += 1;
             }
         }
@@ -360,7 +400,10 @@ impl Measuring {
     /// `g4`'s `offset = 2` folds back to `22/18` is preserved by this rule,
     /// because `offset = 1` clears first.
     fn folded(&self, union: bool, sign: usize) -> Position {
-        let width = 2 * self.classes;
+        // The half-step grid is `2 * Mi` wide, and `Mi` here is the modulus the
+        // k = 3 samples were measured in -- not the widest modulus on the rung.
+        let radix = self.radix[TRELLIS_FRAME - 1].max(1);
+        let width = 2 * radix;
         let half: Vec<u32> = (0..width)
             .map(|step| {
                 if union {
@@ -379,10 +422,10 @@ impl Measuring {
         // means exactly one thing -- no samples reached this position.
         let mut attempt: Option<(u32, u32)> = None;
         for offset in 0..width {
-            let mut bins: Vec<u32> = (0..self.classes).map(|_| 0).collect();
+            let mut bins: Vec<u32> = (0..radix).map(|_| 0).collect();
             for (step, &count) in half.iter().enumerate() {
                 let shifted = (step as i64 - offset as i64).rem_euclid(width as i64) as usize;
-                bins[(shifted / 2) % self.classes] += count;
+                bins[(shifted / 2) % radix] += count;
             }
             let mut ranked: Vec<(u32, usize)> =
                 bins.iter().enumerate().map(|(class, &count)| (count, class)).collect();
@@ -491,7 +534,10 @@ impl Measuring {
                 positions[k] = self.folded(union, sign);
                 continue;
             }
-            let histogram: Vec<u32> = (0..self.classes)
+            // As wide as the widest modulus this position's samples were
+            // measured in, so that a `Mi = 8` interval is not scored in
+            // radix 16 (`docs/301` sec 2).
+            let histogram: Vec<u32> = (0..self.radix[k].max(1))
                 .map(|class| {
                     if union {
                         u32::from(counts[class]) + u32::from(self.counts[1][k][class])
@@ -992,7 +1038,9 @@ impl Decoder {
         if let Some(fix) = correction() {
             level -= fix.levels[self.n as usize % TRELLIS_FRAME];
         }
-        let interval = super::interval(self.n);
+        // The symbol's own interval, the same number `push_etas` names its Ki
+        // with for this symbol ([`interval_at`], one source of truth).
+        let interval = interval_at(self.n / TRELLIS_FRAME as u64, (self.n % TRELLIS_FRAME as u64) as usize);
         let set: &[u16] = self.params.set_for(interval).unwrap_or(&[]);
         self.frame[self.filled] = Bests::new(&Constellation::new(set), level);
         // Which class this symbol fell into, against B1u's known one, while the
@@ -1319,12 +1367,14 @@ impl Decoder {
         }
         trace_etas(self, index, etas);
         // 8.7.1 and Figure 1: a data frame is three trellis frames, and the
-        // first symbol of B1u begins one. A decision that lands in the middle
-        // of one -- which is every decision until the window has passed -- has
-        // no whole data frame's worth of indices and is dropped.
-        if !self.labels.is_empty() || index.is_multiple_of(3) {
-            self.push_etas(etas);
-        }
+        // first symbol of B1u begins one. Which of the twelve intervals this
+        // frame's four symbols are is a function of the frame's own index
+        // ([`interval_at`]), so the index goes in and the group decides for
+        // itself whether it is filling or waiting: a decision that lands in
+        // the middle of a data frame -- which is every decision until the
+        // window has passed -- has no whole data frame's worth of intervals
+        // and is dropped, and so is one that lands after a hole.
+        self.push_etas(index, etas);
     }
 
     /// The oldest frame in the window, decided from its own four slices.
@@ -1391,10 +1441,29 @@ impl Decoder {
     }
 
     /// One frame's indices to Ki, and twelve symbols' worth to bits.
-    fn push_etas(&mut self, etas: [i32; TRELLIS_FRAME]) {
+    ///
+    /// `index` is the frame's own position in B1u's trellis numbering, which is
+    /// what names its four symbols' intervals ([`interval_at`]).
+    fn push_etas(&mut self, index: u64, etas: [i32; TRELLIS_FRAME]) {
+        // The group this frame continues, from the symbol position and not
+        // from `labels.len()` (see [`interval_at`]). A frame that does not
+        // follow the previous one -- the window declined it, or the window was
+        // restarted rather than decide on noise -- leaves the group short, and
+        // a data frame is twelve *contiguous* symbols: 8.7.1's three trellis
+        // frames, 6.4.1's mixed radix over the twelve Ki. A group stapled
+        // across a hole is a frame of wrong bits and an interval offset for
+        // the rest of B1u, so the partial group is dropped and the next
+        // boundary starts a new one.
+        let interval = interval_at(index, 0);
+        if interval != self.labels.len() {
+            self.labels.clear();
+            if interval != 0 {
+                // Not a boundary: no group can start here. Wait for one.
+                return;
+            }
+        }
         for (k, &eta) in etas.iter().enumerate() {
-            let interval = self.labels.len();
-            let modulus = self.moduli.modulus(interval);
+            let modulus = self.moduli.modulus(interval_at(index, k));
             // The index offset the measurement folded this position by, taken
             // off the index **before** `index_to_ki` applies the class map.
             // That is the whole of the k = 3 half-step fix: at k = 3 the map
@@ -2183,5 +2252,152 @@ mod tests {
         }
         assert_eq!(measuring.measure().table(), [None; TRELLIS_FRAME], "noise was taken for a rotation");
     }
+    /// `docs/301` sec 1. One dropped frame in B1u must not offset the twelve
+    /// interval group for the rest of it.
+    ///
+    /// The group is twelve *contiguous* symbols: 8.7.1's three trellis frames,
+    /// 6.4.1's mixed radix over their twelve `Ki`. A frame the window declines
+    /// (`decide_from_its_own_slice`'s `nearest()` on noise, or `step`'s no
+    /// reachable state) pushes no labels, so a group assembled by counting
+    /// labels is short by four and the two sides of the hole are stapled into
+    /// one frame: a frame's worth of wrong bits *and* every later symbol named
+    /// with the wrong interval's modulus, for the rest of B1u. That is the
+    /// call's shape -- the first 160 symbols carry the right digits and the
+    /// call still reads 362/576.
+    ///
+    /// The rung is Agere's `drn 2` (`[16, 16, 8 x 10]`, `docs/270` sec 1.2) so
+    /// that a mis-attributed interval is visible in the `Ki` itself: index 12
+    /// is `12 mod 16 = 12` on an `Mi = 16` interval and `12 mod 8 = 4` on an
+    /// `Mi = 8` one.
+    #[test]
+    fn a_dropped_frame_does_not_offset_the_twelve_interval_group() {
+        let moduli = [16u8, 16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
+        let mut parameters = parameters(2, Trellis::Sixteen);
+        assert_eq!(up_bits(2), 38, "drn 2's data frame is 38 bits");
+        parameters.moduli = moduli;
+        let mut decoder = Decoder::new(&parameters);
+        let eta = 12;
+        // What frame `frame`'s four labels are when each symbol is read with the
+        // modulus of the interval it actually sits in.
+        let own_intervals = |frame: u64| -> Vec<u8> {
+            (0..TRELLIS_FRAME)
+                .map(|k| index_to_ki(eta, moduli[(frame as usize * TRELLIS_FRAME + k) % UP_INTERVALS], k))
+                .collect()
+        };
+        // B1u's first data frame: frames 0, 1, 2 are intervals 0 .. 11.
+        for index in 0..3u64 {
+            decoder.push_etas(index, [eta; TRELLIS_FRAME]);
+        }
+        assert!(decoder.labels.is_empty(), "the first group decoded: {:?}", decoder.labels);
+        // Frames 3 and 4 arrive, filling intervals 0 .. 3 and 4 .. 7.
+        for index in 3..5u64 {
+            decoder.push_etas(index, [eta; TRELLIS_FRAME]);
+        }
+        assert_eq!(decoder.labels, own_intervals(3).into_iter().chain(own_intervals(4)).collect::<Vec<_>>());
+        // Frame 5 is dropped. Frame 6's first symbol is interval 0 again, so
+        // the group restarts there on twelve contiguous symbols of their own
+        // intervals -- the alternative, which is what the code did, is a
+        // twelve-label "frame" stapled across the hole.
+        decoder.push_etas(6, [eta; TRELLIS_FRAME]);
+        assert_eq!(
+            decoder.labels,
+            own_intervals(6),
+            "the group restarted at frame 6's interval 0 -- the symbols after the \
+             hole are on their own intervals, not stitched to the four before it"
+        );
+        decoder.push_etas(7, [eta; TRELLIS_FRAME]);
+        assert_eq!(decoder.labels.len(), 8, "{:?}", decoder.labels);
+        decoder.push_etas(8, [eta; TRELLIS_FRAME]);
+        assert!(decoder.labels.is_empty(), "frames 6, 7, 8 are one group: {:?}", decoder.labels);
+        // ... and the group after it is on its own intervals too, which is the
+        // part a container-derived interval gets wrong for the rest of B1u.
+        decoder.push_etas(9, [eta; TRELLIS_FRAME]);
+        assert_eq!(decoder.labels, own_intervals(9), "frame 9 begins interval 0");
+        // A frame that does not begin a group is not pushed at all, rather than
+        // starting one mid-interval: 8.7.1's data frame begins at interval 0.
+        decoder.labels.clear();
+        decoder.push_etas(10, [eta; TRELLIS_FRAME]);
+        assert!(decoder.labels.is_empty(), "frame 10 is intervals 4 .. 7, no boundary: {:?}", decoder.labels);
+    }
+
+    /// `docs/301` sec 2. A class is binned modulo the **interval's own `Mi`**,
+    /// not modulo the widest modulus on the rung.
+    ///
+    /// The class map is `Ki = eta mod Mi` at k = 0, 1, 2 and
+    /// `((eta - p) / 2) mod Mi` at k = 3 (`precoder.rs:430-437`, 6.4.1/6.4.2),
+    /// so `Mi` is the period the difference lives in. Binning it mod
+    /// `max(moduli)` is invisible where the moduli are equal -- both verified
+    /// far ends at 24 000, and HSF at any rung it uses -- and wrong wherever
+    /// they are mixed: at Agere's `drn 2` the ten `Mi = 8` intervals have their
+    /// samples split eight bins apart, because a difference of `-1` is `7` in
+    /// radix 8 and `15` in radix 16. That is the `+-Mi/2` lobe `docs/270` sec
+    /// 1.3 printed; `docs/272`/`docs/275` traced it to the analysis tool's
+    /// radix and fixed it there (`b1d8223`), and this was the other instance --
+    /// the receiver's own `Measuring` (`docs/301` sec 2).
+    #[test]
+    fn a_class_is_binned_in_its_own_intervals_radix() {
+        let moduli = [16u8, 16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8];
+        let bits = up_bits(2);
+        let mut measuring = Measuring::new(bits, moduli, 0).expect("Mi <= 16");
+        let predicted = measuring.predicted.clone();
+        assert_eq!(predicted.len(), B1U_FRAMES * UP_INTERVALS);
+        // One rotation for the whole line, seven index steps, which is the
+        // shape that splits: on an `Mi = 8` interval it is `7` one way and `-1`
+        // the other, and those are one bin apart in radix 8 and eight apart in
+        // radix 16.
+        const ROTATION: i32 = 7;
+        for index in 0..ROTATION_SYMBOLS as usize {
+            let k = index % TRELLIS_FRAME;
+            let modulus = moduli[index % UP_INTERVALS];
+            let model = i32::from(predicted[index]);
+            assert!(model < i32::from(modulus), "a class is inside its own interval's Mi");
+            let class = (model + ROTATION).rem_euclid(i32::from(modulus));
+            // Any member of the class will do at k = 0, 1, 2; at k = 3 the
+            // class's members are the adjacent indices `2 Ki`, `2 Ki + 1`.
+            let eta = if k == TRELLIS_FRAME - 1 { 2 * class } else { class };
+            measuring.observe(modulus, eta);
+        }
+        // Every sample of every position is that one rotation, so the reading
+        // is the rotation at all four and the margin is everything to nothing.
+        // Scored in radix 16 the `Mi = 8` samples split, so no position has a
+        // mode at all and nothing is taken: that is the cost of the defect.
+        assert_eq!(
+            measuring.measure().table(),
+            [Some(ROTATION as i64); TRELLIS_FRAME],
+            "one rotation over a mixed rung must read at every position"
+        );
+        // And the lobe itself: no sample of any position sits eight bins away
+        // from that position's mode.
+        for (sign, rows) in measuring.counts.iter().enumerate() {
+            for (k, row) in rows.iter().enumerate() {
+                if k == TRELLIS_FRAME - 1 {
+                    continue;
+                }
+                let away = (ROTATION as usize + 8) % 16;
+                assert_eq!(
+                    row[away], 0,
+                    "sign {sign} position {k}: a class eight bins from its own mode, which is a \
+                     Mi = 8 interval scored in radix 16: {row:?}"
+                );
+            }
+        }
+        // The uniform rungs cannot move: where all twelve `Mi` are equal, the
+        // interval's radix *is* `max(moduli)`, which is the arithmetic
+        // `docs/46` (`Mi = 8`) and `docs/74` (`Mi = 16`) were measured with.
+        // The regression that would matter -- a known-good call moving -- is
+        // `a_rotation_that_is_not_the_constant_is_measured_off_b1u` above,
+        // untouched by this and still green at `drn 1`.
+        for (drn, mi) in [(1u8, 8u8), (7, 16)] {
+            let mut uniform = Measuring::new(up_bits(drn), [mi; UP_INTERVALS], 0).expect("Mi <= 16");
+            for index in 0..ROTATION_SYMBOLS as usize {
+                let model = i32::from(uniform.predicted[index]);
+                let eta = if index % TRELLIS_FRAME == TRELLIS_FRAME - 1 { 2 * model } else { model };
+                uniform.observe(mi, eta);
+            }
+            assert_eq!(uniform.radix, [usize::from(mi); TRELLIS_FRAME], "drn {drn}: the only modulus is the radix");
+            assert_eq!(uniform.measure().table(), [Some(0); TRELLIS_FRAME], "drn {drn}: no rotation reads as no rotation");
+        }
+    }
+
 }
 
