@@ -6288,7 +6288,7 @@ impl Modem {
         // is built with `None` -- which the code arm refuses and the uniform arm
         // does not need -- and re-derived by `CpFamily::Cpu` below, before the
         // `CPd` is released.
-        let law = self.declared_law();
+        let law = Some(self.declaration_law());
         let build_floor = |designed: &Design| pin(designed, SLOWEST_DRN, trellis, 0.0, law);
         let mut floor =
             if let Some(drn) = pinned { pin(&designed, drn, trellis, 0.0, law) } else { build_floor(&designed) };
@@ -6449,14 +6449,14 @@ impl Modem {
         // number about an alphabet: with no law declared there is no set and so
         // no licence, and the honest answer is the slowest rung rather than a
         // µ-law price for an A-law line.
-        let Some(law) = self.declared_law() else {
-            self.note(
-                "V.92: the far end has not declared a companding law (Table 23 bit 35, CPu) yet, so \
-                 no rung can be priced; the slowest rung stands"
-                    .into(),
-            );
-            return (0, RateDecision { measured, ceiling, mask: 0, empty: true });
-        };
+        // **The law is the local one, and no rung is withheld for want of a
+        // declaration** (docs/325 section 2). This used to return the slowest
+        // rung with an empty mask until `CPu` bit 35 arrived, and before that
+        // the *declaration itself* was built with `None`, which the code arm
+        // refuses -- so the `CPd` was withheld for want of a law the far end had
+        // not sent yet while this end has always known its own. A mismatch is
+        // `declaration_law`'s exception, not a silent price on our grid.
+        let law = self.declaration_law();
         let mut mask = 0u32;
         if seen > 0 {
             // The far end's distance from `1/G`, as a fraction: the four-point
@@ -8251,7 +8251,11 @@ impl Modem {
                 // the declaration is re-derived on the law bit 35 names while it
                 // has not gone out, and a bit 35 that arrives after the `CPd` is
                 // a finding rather than a silent re-use.
-                let law = crate::v92::codegrid::law(cp.a_law);
+                // The re-derivation is on the **local** law and is a no-op
+                // when the far end agrees; when it does not, `declaration_law`
+                // raises instead of switching the set to the far end's grid
+                // (docs/325 section 2 -- "do not silently switch").
+                let law = self.declaration_law();
                 self.relaw_declaration(law);
                 self.cpu = Some(cp);
                 if let Some(exchange) = self.exchange.as_mut() {
@@ -8287,6 +8291,50 @@ impl Modem {
     /// sec 2). Nothing below substitutes µ-law for `None`.
     fn declared_law(&self) -> Option<crate::v90::ucode::Law> {
         self.cpu.as_ref().map(|cp| crate::v92::codegrid::law(cp.a_law))
+    }
+
+    /// The companding law the **`CPd` declaration is built on**: this end's own,
+    /// passed explicitly (docs/325 section 2, the user's ruling of 2026-11-03).
+    ///
+    /// `CPd` has **no law field** (`docs/319`, `docs/321`): its points are
+    /// *"linear value of the (v+1)-th constellation point"* [`quoted`,
+    /// `v92.txt:1938`] and the law lives in `CPu`'s Table 23 bit 35
+    /// [`v92.txt:1510`]. So "the `CPd`'s law" operationally means **the code
+    /// grid the declared points are chosen on**, and that grid is the local
+    /// configuration's: we know locally whether this end is A-law or µ-law, and
+    /// there is no path any more that withholds a `CPd` for want of a law.
+    ///
+    /// What it may not do is answer a *different* law than the far end's
+    /// silently. When `CPu` bit 35 has arrived and names the other law, the two
+    /// grids are different alphabets (docs/313 section 2) and neither "send it
+    /// on our grid anyway" nor "switch to theirs" is licensed, so the call
+    /// raises.
+    ///
+    /// TODO(docs/325 section 2, M2b, **deferred**): what a **transcoding
+    /// middle** or a far end whose `CPu` law genuinely differs should get --
+    /// a law-agnostic set, a renegotiation, or a refusal with a cause -- is
+    /// explicitly unresolved research and is not guessed at here.
+    fn declaration_law(&mut self) -> crate::v90::ucode::Law {
+        let local = self.settings.law;
+        if let Some(far) = self.declared_law()
+            && far != local
+        {
+            let bit35 = self.cpu.as_ref().map_or(0u8, |cp| u8::from(cp.a_law));
+            // One line, naming both laws and the bit's value: the artifact has
+            // to say what the exception is about without a debugger.
+            self.note(format!(
+                "V.92: CPd law mismatch -- this end is {local:?} and the far end's CPu Table 23 bit \
+                 35 says {far:?} (bit 35 = {bit35}); the declaration is built on the local law and \
+                 the call stops here rather than sending a set on the wrong grid"
+            ));
+            panic!(
+                "V.92: the CPd's code grid is the local {local:?}-law grid and the far end declared \
+                 {far:?} (CPu Table 23 bit 35 = {bit35}): laws differ. This is the deferred \
+                 question of docs/325 section 2 / M2b -- a transcoding middle, a law-agnostic set \
+                 or a renegotiation -- and it is not answered by proceeding on either law."
+            );
+        }
+        local
     }
 
     /// Re-derive the provisional declaration on the law the far end has just
@@ -9558,6 +9606,54 @@ mod tests {
     }
 
     /// A CPd for drn 1 as `upchoice` would send it, and a `Modem` holding it.
+    /// The `CPd` is declared on the **local** law, and no law withheld it.
+    ///
+    /// docs/325 section 2 (M2b, the user's ruling): `CPd` carries no law
+    /// (`docs/319`, `docs/321`) -- its points are linear values [`quoted`,
+    /// `v92.txt:1938`] and the law lives in `CPu`'s Table 23 bit 35
+    /// [`v92.txt:1510`] -- so the only thing "the `CPd`'s law" can mean is the
+    /// code grid the points are chosen on, and that is this end's own. The call
+    /// here has no `CPu` at all, which is every call up to Phase 4 and the state
+    /// the old code refused to build the code arm in: the declaration was built
+    /// with `None`, the code grid returned no points for `None`, no rung
+    /// remained, and `design_upstream` answered `no upstream design, CPd would
+    /// say nothing`. This is that state, and the declaration is built.
+    #[test]
+    fn the_cpd_is_declared_on_the_local_law_when_the_far_end_has_not_said() {
+        for local in [Law::Mu, Law::A] {
+            let mut settings = settings();
+            settings.law = local;
+            let mut modem = Modem::new(settings);
+            assert!(modem.declared_law().is_none(), "this test is about a call with no CPu");
+            assert_eq!(
+                modem.declaration_law(),
+                local,
+                "the declaration was not built on the local {local:?} law: a CPd with no law to \
+                 price it on is a CPd withheld, which no path is allowed to do"
+            );
+        }
+    }
+
+    /// A far end on the **other** law raises, and the call does not proceed.
+    ///
+    /// Neither answer is licensed when the two ends' laws differ: sending our
+    /// grid at a far end on the other one, and switching our declaration to
+    /// theirs, are both silent and both wrong (`docs/325` section 2). The
+    /// exception names both laws and the bit's value in one log line, and the
+    /// named TODO beside it records that a transcoding middle is deferred.
+    #[test]
+    #[should_panic(expected = "laws differ")]
+    fn a_far_end_on_the_other_law_raises_instead_of_being_sent_our_grid() {
+        let mut settings = settings();
+        settings.law = Law::Mu;
+        let mut modem = Modem::new(settings);
+        let mut cp = Cp::default();
+        cp.a_law = true;
+        modem.cpu = Some(cp);
+        assert_eq!(modem.declared_law(), Some(Law::A), "the far end declared A-law");
+        let _ = modem.declaration_law();
+    }
+
     fn modem_with_cpd() -> Modem {
         let design = crate::v92::design::Design {
             filters: Filters { z2: vec![1.0], ..Filters::default() },
