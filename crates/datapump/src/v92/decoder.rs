@@ -372,6 +372,12 @@ impl Measuring {
             .collect();
         let samples: u32 = half.iter().copied().sum();
         let mut best: Option<Position> = None;
+        // The best mode *any* offset reached, clearing the bar or not. Without
+        // it a position whose histogram has no mode prints the same `0/0` as
+        // one nothing ever reached, and the line then reports a vote as a tie
+        // when there was no vote at all: `docs/299` sec 2. A zero margin now
+        // means exactly one thing -- no samples reached this position.
+        let mut attempt: Option<(u32, u32)> = None;
         for offset in 0..width {
             let mut bins: Vec<u32> = (0..self.classes).map(|_| 0).collect();
             for (step, &count) in half.iter().enumerate() {
@@ -384,16 +390,30 @@ impl Measuring {
             let top = ranked[0];
             let next = ranked.get(1).copied().unwrap_or((0, 0));
             let clear = top.0 > 0 && top.0 * 2 >= samples && top.0 >= next.0 * 2;
+            if attempt.is_none_or(|(reached, _)| top.0 > reached) {
+                attempt = Some((top.0, next.0));
+            }
             if clear && best.as_ref().is_none_or(|&won| top.0 > won.best as u32) {
                 best = Some(Position {
                     rotation: Some(top.1 as i64),
                     best: top.0.min(u32::from(u16::MAX)) as u16,
                     rival: next.0.min(u32::from(u16::MAX)) as u16,
+                    no_mode: false,
                     shift: offset as i32,
                 });
             }
         }
-        best.unwrap_or_default()
+        best.unwrap_or_else(|| {
+            // No verdict, but the evidence stays on the line.
+            let (reached, next) = attempt.unwrap_or((0, 0));
+            Position {
+                rotation: None,
+                best: reached.min(u32::from(u16::MAX)) as u16,
+                rival: next.min(u32::from(u16::MAX)) as u16,
+                no_mode: reached * 2 < samples,
+                shift: 0,
+            }
+        })
     }
 
     /// The rotation at each position where the mode is clear enough to be one,
@@ -491,6 +511,7 @@ impl Measuring {
                 rotation: clear.then_some(best.1 as i64),
                 best: best.0.min(u32::from(u16::MAX)) as u16,
                 rival: next.0.min(u32::from(u16::MAX)) as u16,
+                no_mode: false,
                 shift: 0,
             };
         }
@@ -508,6 +529,14 @@ struct Position {
     best: u16,
     /// Samples that voted for the closest rival class.
     rival: u16,
+    /// Whether this position came back with samples and **no mode at all** --
+    /// no class holding even half of them, at any offset at k = 3 -- as
+    /// opposed to two live hypotheses (a tie), which is evidence of a
+    /// disagreement and is never overridden. Only `folded` sets it: the class
+    /// histogram at k = 0, 1, 2 always names a best and a runner-up, and a
+    /// position there that does not clear the bar has two candidates, not
+    /// none.
+    no_mode: bool,
     /// At k = 3 only: the **index** offset the histograms were folded by, in
     /// steps of 1, before the class map halved them. Zero at the other three
     /// positions, where a class offset is already the whole story and
@@ -537,10 +566,45 @@ struct Measurement {
 }
 
 impl Measurement {
+    /// The one rotation the positions that did carry evidence agree on, when
+    /// at least three of the four did and they are the same number.
+    ///
+    /// This is what a position with no mode of its own falls back to, and the
+    /// reason it is not the constant: k = 3's vote is the only one taken on
+    /// the **half-step index grid** (`Self::folded`, and `Measuring::half`),
+    /// whose class is a single level wide -- 6.4.2's class there is
+    /// `((eta - p) / 2) mod Mi`, so its two members are the adjacent indices
+    /// `2 Ki` and `2 Ki + 1`, where at k = 0, 1, 2 the members are eight
+    /// levels apart. A level table that is close but not exact therefore reads
+    /// k = 0, 1, 2 unanimously and cannot separate k = 3's pairs, which is
+    /// `docs/299` sec 2's `40/0, 40/0, 40/0, 0/0` exactly. Three unanimous
+    /// votes are a measurement of the far end's index map; the constant is a
+    /// measurement of *another* far end, and keeping it in place of an
+    /// absent vote is the thing `docs/287`'s `unpaired=0` and `docs/298`'s
+    /// residual-as-fit have in common. So the fourth position takes the
+    /// number the other three hold, and `line` marks it derived.
+    fn unanimous(&self) -> Option<i64> {
+        let measured: Vec<i64> = self.positions.iter().filter_map(|position| position.rotation).collect();
+        if measured.len() < TRELLIS_FRAME - 1 || measured.iter().any(|&rotation| rotation != measured[0]) {
+            return None;
+        }
+        measured.first().copied()
+    }
+
     /// The rotation in force at each position: the measurement where it was
-    /// clear enough, and nothing where the constant is to be kept.
+    /// clear enough, the other three's number where it was not and they agree,
+    /// and nothing otherwise.
     fn table(&self) -> [Option<i64>; TRELLIS_FRAME] {
-        self.positions.map(|position| position.rotation)
+        let held = self.unanimous();
+        self.positions.map(|position| match (position.rotation, position.no_mode, held) {
+            (Some(rotation), _, _) => Some(rotation),
+            // No vote of its own and no mode to vote on: the rotation the
+            // other three measured is this position's too, because the ratio
+            // is a property of the far end's index map and not of one trellis
+            // position. A *tie* is not this case and keeps the constant.
+            (None, true, Some(rotation)) => Some(rotation),
+            (None, _, _) => None,
+        })
     }
 
     /// The index offset in force at each position: the half-step part of the
@@ -562,11 +626,27 @@ impl Measurement {
     /// there (so the rotation is nearly right), and outside this line nothing
     /// in the transcript says which of the two is short or by how much.
     fn line(&self) -> String {
-        let table: Vec<String> =
-            self.positions.iter().map(|position| position.rotation.map_or("-".to_string(), |r| r.to_string())).collect();
+        let held = self.unanimous();
+        let table: Vec<String> = self
+            .positions
+            .iter()
+            .map(|position| match (position.rotation, position.no_mode, held) {
+                (Some(rotation), _, _) => rotation.to_string(),
+                (None, true, Some(rotation)) => format!("{rotation}*"),
+                (None, _, _) => "-".to_string(),
+            })
+            .collect();
         let margin: Vec<String> =
             self.positions.iter().map(|position| format!("{}/{}", position.best, position.rival)).collect();
-        let verdict = if self.confident() { "confident" } else { "ambiguous, constant kept where unclear" };
+        let verdict = if self.confident() {
+            "confident"
+        } else if self.positions.iter().any(|position| position.no_mode) && held.is_some() {
+            // `*`: taken from the positions that did carry evidence, not from
+            // the constant, and not a tie.
+            "derived where no mode"
+        } else {
+            "ambiguous, constant kept where unclear"
+        };
         format!(
             "rotation {} margin {} ({}) {} over {} symbols from B1u symbol {} ({})",
             table.join(","),
@@ -1716,6 +1796,59 @@ mod tests {
         // position costs the call that position's rotation and not the three
         // that were clear.
         assert!(line.contains("margin 21/19,40/0,40/0,40/0"), "{line}");
+    }
+
+    /// `docs/299` sec 2 and sec 4. The fourth position's vote is the only one
+    /// taken on the half-step **index** grid, whose class is one level wide at
+    /// k = 3 (`((eta - p) / 2) mod Mi`, so its members are the adjacent indices
+    /// `2 Ki` and `2 Ki + 1`) where k = 0, 1, 2's members are eight levels
+    /// apart. A level table that is close but not exact reads the first three
+    /// unanimously and cannot separate the fourth's pairs, so the fourth comes
+    /// back with samples and no mode -- the call's own
+    /// `40/0,40/0,40/0,0/0`, one ticket after the fit reached 33.7 dB.
+    ///
+    /// Two things are asserted, and the first is the one that was wrong: a
+    /// position with samples and no mode must not print the same margin as one
+    /// nothing reached (`0/0` is an absence of evidence and never a tie), and
+    /// the rotation it cannot measure it takes from the three that can, marked
+    /// `*`, instead of keeping the constant -- which is a measurement of some
+    /// other far end.
+    #[test]
+    fn a_k3_position_with_no_mode_takes_the_rotation_the_other_three_hold() {
+        let parameters = parameters(1, Trellis::Sixteen);
+        let mut measuring = Measuring::new(up_bits(parameters.drn), parameters.moduli, 0)
+            .expect("a measurement at drn 1");
+        let predicted = measuring.predicted.clone();
+        for index in 0..ROTATION_SYMBOLS as usize {
+            let k = index % TRELLIS_FRAME;
+            let model = i64::from(predicted[index]);
+            let frame = (index / TRELLIS_FRAME) as i64;
+            // k = 0, 1, 2: the far end's class map is `model + 4`, one index
+            // step, so every sample votes the same.
+            // k = 3: the indices are drawn from the class grid one frame at a
+            // time, which is a far end the half-step fold cannot name.
+            let eta = if k == TRELLIS_FRAME - 1 {
+                (2 * ((model + frame) % 8) + frame % 2) as i32
+            } else {
+                ((model + 4) % 8) as i32
+            };
+            measuring.observe(parameters.moduli[index % UP_INTERVALS], eta);
+        }
+        assert!(measuring.done(), "the measurement did not fill");
+        let measurement = measuring.measure();
+        let line = measurement.line();
+        assert!(
+            measurement.positions[..TRELLIS_FRAME - 1].iter().all(|position| position.rotation == Some(4)),
+            "the three class-grid positions did not read the rotation: {line}"
+        );
+        assert_eq!(measurement.positions[TRELLIS_FRAME - 1].rotation, None, "{line}");
+        assert!(
+            measurement.positions[TRELLIS_FRAME - 1].best > 0,
+            "the absence of a vote was printed as no evidence at all: {line}"
+        );
+        assert!(line.contains("rotation 4,4,4,4*"), "the fourth vote was not derived: {line}");
+        assert!(line.contains("derived where no mode"), "{line}");
+        assert!(!line.contains("margin 40/0,40/0,40/0,0/0"), "{line}");
     }
 
     /// B1u over a synthetic far end whose class map is rotated per trellis
