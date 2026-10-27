@@ -303,18 +303,29 @@ pub fn lc_for(drn: u8) -> usize {
 // The ceiling
 // ---------------------------------------------------------------------------
 
-/// The largest interval modulus a rung's twelve intervals ask for: how many
-/// positive points the *worst* interval of 6.4.1's even-ish spread needs.
+/// **The modulus of the rung's widest interval -- which is not the number of
+/// points the set carries.** Use [`lc_for`] for that, and [`priced_gap_lsb`] to
+/// price a rung.
 ///
-/// `lc_for` answers "how many points is the set", which is the same number only
-/// when `K/12` is exact -- the four rungs this bench has run (36/48/60/72 bits,
-/// three to six a interval, LC 8/16/32/64). One rung further up the ladder, 6.4.1
-/// gives the first `K % 12` intervals one bit more, and a 32-point interval
-/// needs a code-grid gap of 64 LSB where an 8-point one has 320. Pricing
-/// 25 333 at LC = 8 is how a model that says 0.0939 licenses a rung the bench
-/// watched fail ([`threshold`], `docs/240` sec 3c).
+/// 6.4.1 splits `K` bits over twelve intervals, giving the first `K % 12` of
+/// them one bit more, so an interval's modulus is `2^(K/12)` or twice that.
+/// [`lc_for`] then asks what *set* each interval holds: a chord of `2^w` has
+/// `2^(w-1)` positive points because its two halves are the two signs, which
+/// is why a set is [half its interval's modulus](lc_for) -- the moduli
+/// themselves are counted here, halving nowhere.
+///
+/// The two numbers coincide except at `drn 2`, `8` and `14`, where 6.4.1's spare
+/// bit widens interval 0 and leaves the chord `i % 4 == 0` narrowest
+/// (`docs/306` sec 2.2). This function is named for the *modulus* because that
+/// is all it ever was, and because the name `points` is what licensed the
+/// confusion: [`threshold`] priced this number as if it were a point count and
+/// so priced three rungs at twice their set (`docs/306` sec 2, LD-1). The
+/// pricing path no longer takes a count at all -- see [`priced_gap_lsb`] -- so
+/// this number cannot be handed to [`gap_lsb`]; it is used where a *modulus* is
+/// what is wanted, which is the worst-interval error model
+/// ([`symbol_error`] at the interval the rung's widest one holds).
 #[must_use]
-pub fn points(drn: u8) -> usize {
+pub fn widest_modulus(drn: u8) -> usize {
     if !(1..=UP_RATES as u8).contains(&drn) {
         return 0;
     }
@@ -355,7 +366,7 @@ pub const CRITERION: &str = "threshold";
 pub const SCREEN: &str = "sigma_max";
 
 /// The residual, in index steps of the LC = 8 grid, that a rung actually needs:
-/// [`SIGMA_MAX`] scaled by the smallest gap a maximin set of [`points`] codes
+/// [`SIGMA_MAX`] scaled by the smallest gap a maximin set of [`lc_for`] codes
 /// can hold, over one index step.
 ///
 /// **This is the licence** -- [`CRITERION`] names it, [`ceiling_rung`] compares
@@ -386,11 +397,74 @@ pub const SCREEN: &str = "sigma_max";
 /// bench has measured, which is the conservative direction (`docs/240` sec 3c).
 #[must_use]
 pub fn threshold(drn: u8) -> f64 {
-    let points = points(drn);
-    if points < 2 {
+    SIGMA_MAX * priced_gap_lsb(drn) / index_step_lsb()
+}
+
+/// The positive-point count of the set a rung **carries**, as a type [`lc_for`]
+/// is the only thing that can build.
+///
+/// **LD-1 (`docs/306` sec 2) is why this is not a `usize`.** A rung has two
+/// numbers that both read as "how many points": its widest interval's modulus
+/// ([`widest_modulus`]) and the size of the set the builder places in that
+/// interval ([`lc_for`]). At `drn 2`, `8` and `14` the first is twice the
+/// second, which is a factor of two in the gap and in the licence -- and
+/// [`threshold`] spent the whole of this crate's recorded history on the wrong
+/// one, because both were `usize` and nothing at the call site said which.
+///
+/// So [`gap_lsb`] takes *this* and nothing else, and this is built from a `drn`
+/// through [`lc_for`] rather than from a count. Passing the modulus is now a
+/// type error instead of a plausible-looking argument: the wrong call is hard to
+/// write, not merely currently absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarriedPoints(usize);
+
+impl CarriedPoints {
+    /// The set `upchoice::pin` builds at `drn`: [`lc_for`], which
+    /// `lc_for_agrees_with_the_builder` checks against the builder itself.
+    #[must_use]
+    pub fn of(drn: u8) -> Self {
+        Self(lc_for(drn))
+    }
+
+    /// The count, for a caller that has to print it.
+    #[must_use]
+    pub fn count(self) -> usize {
+        self.0
+    }
+}
+
+/// The gap the criterion prices `drn` at, in LSB: **the gap of the set the
+/// builder carries**, and the only function that answers the question.
+///
+/// It takes a `drn` rather than a count so that [`widest_modulus`] and
+/// [`lc_for`] cannot be told apart at the call site -- `docs/306` sec 2 measured
+/// that disagreement at `drn 2`, `8` and `14`, and it is a factor of two in the
+/// licence. Every site that prices a rung -- [`threshold`], the two `Reading`s in
+/// `digital`, and the `gap=` field of the LADDER line -- goes through here, so
+/// a printed gap and a taken decision cannot disagree.
+///
+/// # The clause this number comes from
+///
+/// **[quoted]** `v92.txt:452-454`: "Let the N constellation points be denoted by
+/// `a(η)`, `−N/2 ≤ η < N/2` ... (N is the appropriate constellation length
+/// taken from the CPd sequence, i.e. one of `2*LC1` through `2*LC6` in
+/// Table 30)." So the **alphabet size is `N = 2·LC`** and the *positive* point
+/// count is `LC` -- [`lc_for`], not [`widest_modulus`].
+///
+/// **[quoted]** `v92.txt:458-459`: the class at `k = 3` is
+/// `{a(ηk) | ηk = 2Ki + 2zkMi + ..., zk an integer}`, so that interval needs
+/// `N ≥ 2·Mi`, i.e. `LC ≥ Mi`; the `k ≠ 3` classes step by `Mi`, so there
+/// `LC ≥ ⌈Mi/2⌉` is enough. That is exactly what [`lc_for`] computes and what
+/// `upchoice::build_with` builds, and it is why the modulus (`Mi`, up to twice
+/// the set) is **not** the number [`gap_lsb`]'s positive-point table is indexed
+/// by.
+#[must_use]
+pub fn priced_gap_lsb(drn: u8) -> f64 {
+    let set = CarriedPoints::of(drn);
+    if set.count() < 2 {
         return 0.0;
     }
-    gap_lsb(points).map_or(0.0, |gap| SIGMA_MAX * gap / index_step_lsb())
+    gap_lsb(set).unwrap_or(0.0)
 }
 
 /// The smallest gap a *maximin* set of `points` positive µ-law codes holds, in
@@ -404,16 +478,22 @@ pub fn threshold(drn: u8) -> f64 {
 /// measurement. The four counts the ladder's twelve intervals actually ask for
 /// (8, 16, 32, 64 -- 6.4.1's `2^(K/12)` with the spare bits on the first
 /// intervals) are the ones tabulated; anything else is searched.
+///
+/// **The argument is [`CarriedPoints`], not a count** (`docs/306` sec 2, LD-1):
+/// this table is a table of *positive points*, so it may only be indexed by the
+/// count the set actually has. [`widest_modulus`] is a different number at the
+/// three rungs 6.4.1 gives a spare bit to, and handing it here is a type error.
 #[must_use]
-pub fn gap_lsb(points: usize) -> Option<f64> {
-    let tabulated = match points {
+pub fn gap_lsb(points: CarriedPoints) -> Option<f64> {
+    let count = points.count();
+    let tabulated = match count {
         8 => Some(320.0),
         16 => Some(128.0),
         32 => Some(64.0),
         64 => Some(16.0),
         _ => None,
     };
-    tabulated.or_else(|| crate::v92::codegrid::grid(points).map(|set| crate::v92::codegrid::min_gap(&set)))
+    tabulated.or_else(|| crate::v92::codegrid::grid(count).map(|set| crate::v92::codegrid::min_gap(&set)))
 }
 
 /// The largest measurement, in index steps of the **LC = 8 grid**, that a rung
@@ -997,10 +1077,6 @@ pub struct Reading {
     pub drn: u8,
     /// That rung's LC.
     pub lc: usize,
-    /// The smallest gap between neighbours inside a chord of the rung's own set,
-    /// in LSB, taken from the set itself -- the code grid the far end's codec
-    /// rounds to -- and not from a tabulated maximin, and not from 349.
-    pub min_gap_lsb: f64,
     /// The level the far end actually transmitted at, LSB.
     pub level_lsb: f64,
     /// The `G` the CPd we sent names (bits 35:50).
@@ -1123,7 +1199,11 @@ impl Reading {
             self.level_delta() * 100.0,
             tolerance.plus * wanted,
             tolerance.minus * wanted,
-            self.min_gap_lsb,
+            // **The gap the criterion priced this rung at**, not a number the
+            // caller supplied: `docs/306` sec 2 found the LADDER line printing a
+            // gap while `threshold` used another, so the printed field is now
+            // the criterion's own function (`docs/308` sec 2).
+            priced_gap_lsb(self.drn),
             self.drn,
             threshold(self.drn),
             self.lc,
@@ -1494,12 +1574,17 @@ mod tests {
     /// Each rung's boundary is where its own **gap-corrected** threshold puts
     /// it: a measurement just inside carries the rung, one just outside does
     /// not. The number is `SIGMA_MAX` scaled by the smallest gap of a maximin
-    /// code set of [`points`] points (`docs/240` sec 3c), not `sigma_max(lc)`:
-    /// 25 333 is carried by a 16-point interval and 0.0939 would be a model of a
-    /// set the rung does not have.
+    /// code set of [`lc_for`] points (`docs/240` sec 3c, re-derived in
+    /// `docs/306` sec 2), not `sigma_max(lc)`. 25 333's *interval* has a modulus
+    /// of 16 but the set inside it is 8 points (`docs/306` sec 2.2), so the
+    /// boundary priced here is the 8-point one, 320 LSB.
     #[test]
     fn each_rung_s_boundary_is_where_its_own_threshold_puts_it() {
-        for (drn, lc) in [(1u8, 8usize), (2, 16), (7, 16), (13, 32), (19, 64)] {
+        // `lc` is the set the builder carries, which is what the boundary is
+        // priced on: `drn 2` carries 8 points inside a 16-point interval's
+        // modulus (`docs/306` sec 2.2).
+        for (drn, lc) in [(1u8, 8usize), (2, 8), (7, 16), (13, 32), (19, 64)] {
+            assert_eq!(lc, lc_for(drn), "drn {drn}: the set moved");
             let bound = threshold(drn);
             assert!(bound > 0.0, "drn {drn} has no threshold");
             let inside = Sigma::reading(bound * 0.999, REFERENCE_LC);
@@ -1515,13 +1600,13 @@ mod tests {
             // the rung's own worst interval, and the gap correction only ever
             // tightens the mean-square model -- which is the direction the
             // threshold exists to be wrong in.
-            let at_boundary = Sigma::reading(bound, REFERENCE_LC).error(points(drn));
+            let at_boundary = Sigma::reading(bound, REFERENCE_LC).error(lc);
             assert!(
                 at_boundary <= TARGET * 1.001,
                 "drn {drn}: {at_boundary:e} at its boundary against a target of {TARGET:e}"
             );
             assert!(
-                bound <= sigma_max(points(drn)),
+                bound <= sigma_max(lc),
                 "drn {drn}: threshold {bound:.4} is looser than the mean-square model"
             );
         }
@@ -1570,8 +1655,9 @@ mod tests {
             let mask = apply_ceiling(JA_MASK_ALL, measured);
             for drn in 1..=UP_RATES as u8 {
                 let permitted = mask & (1 << (drn - 1)) != 0;
-                // The rung's own worst interval, which is what the scan prices.
-                let error = measured.error(points(drn));
+                // The rung's own set, which is what the scan prices
+                // (`docs/306` sec 2: `lc_for`, not the interval's modulus).
+                let error = measured.error(lc_for(drn));
                 let budget = threshold(drn);
                 // The permission *is* the scan's comparison, and it is at least
                 // as strict as the error probability -- the gap correction only
@@ -1625,19 +1711,26 @@ mod tests {
 
     /// **The rule the scan exists for, both ways.**
     ///
-    /// Above a rung's threshold that rung is *refused* and the granted `drn` is
-    /// what it was before the scan existed -- today's 0.0690 measures drn 1 and
-    /// nothing higher, and the ladder must not move on it. Below the threshold
-    /// the rung rises to the highest one whose threshold the measurement meets,
-    /// which is the scan doing what the short-circuit could not do at all.
+    /// Above a rung's threshold that rung is *refused*; below it the rung rises
+    /// to the highest one whose threshold the measurement meets, which is the
+    /// scan doing what the short-circuit could not do at all.
+    ///
+    /// **`0.0690` no longer refuses `drn 2`.** `docs/306` sec 2 prices 25 333 on
+    /// the 8-point set it carries, so its licence is `0.0861` and this
+    /// measurement is inside it at `0.80x`; the refusal this test was written
+    /// around is now one rung up, at `drn 3`'s `0.0344`. What does **not** move
+    /// is the rung a call may spend: `cap_to_measured` is the AND after the
+    /// ceiling, so a licensed `drn 2` is still spent as `drn 1`
+    /// (`docs/308` sec 4, `MEASURED_WORKING_MAX_DRN = 1`).
     #[test]
     fn the_scan_refuses_above_a_threshold_and_grants_below_it() {
-        // The ticket's two-sided rule, named after it: `drn 2` = 25 333 has a
+        // The ticket's two-sided rule, named after it: `drn 3` = 26 666 has a
         // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
         let above = Sigma::lower(0.0690, REFERENCE_LC);
-        assert_eq!(ceiling_rung(above), Some(1), "0.0690 was allowed past drn 1");
-        assert!(0.0690 > threshold(2), "the threshold the refutation rests on moved");
-        println!("drn 2 threshold {} at 0.0690 -> {:?}", threshold(2), ceiling_rung(above));
+        assert_eq!(ceiling_rung(above), Some(2), "0.0690 was allowed past drn 2");
+        assert!(0.0690 > threshold(3), "the threshold the refusal rests on moved");
+        assert!(0.0690 <= threshold(2), "drn 2's licence is not the 8-point one");
+        println!("drn 3 threshold {} at 0.0690 -> {:?}", threshold(3), ceiling_rung(above));
 
         // Just inside it, drn 2 is carried -- and so is every rung at or under
         // the same threshold, which is the highest rung the measurement meets.
@@ -1659,22 +1752,52 @@ mod tests {
         assert_eq!(ceiling_rung(dirty), None, "a measurement that refuses 24 000 must refuse all");
     }
 
-    /// The thresholds reproduce `docs/240` sec 3c's verified column, which is
-    /// what stops a later reader from rounding the rung above 24 000 back to the
-    /// mean-square model.
+    /// The thresholds reproduce `docs/240` sec 3c's verified column **as
+    /// corrected by `docs/306` sec 2**, which is what stops a later reader from
+    /// rounding the rung above 24 000 back to the mean-square model.
+    ///
+    /// **This test used to assert `(2, 0.0344)`, i.e. it asserted the pricing
+    /// `docs/306` sec 2 found wrong.** It stayed green beside
+    /// [`lc_for_agrees_with_the_builder`] because the two asserted different
+    /// models of the same rung: the builder places `lc_for(2) = 8` points and the
+    /// criterion priced `widest_modulus(2) = 16`. `docs/306` sec 2.2 ran
+    /// `upchoice::pin` across `1..=19` and found `sets[0].len() == lc_for`
+    /// everywhere, so the builder's model is the one reality agrees with and
+    /// this assertion is **retargeted to the corrected relationship rather than
+    /// deleted** (`docs/308` sec 2). `drn 2`'s licence is now the 8-point one,
+    /// `0.0861`, and `drn 8`/`14` move with it.
     #[test]
     fn the_thresholds_are_the_gap_corrected_ones() {
-        for (drn, want) in [(1u8, 0.0861), (2, 0.0344), (7, 0.0344), (13, 0.0172), (19, 0.0043)] {
+        for (drn, want) in [
+            (1u8, 0.0861),
+            (2, 0.0861),
+            (7, 0.0344),
+            (8, 0.0344),
+            (13, 0.0172),
+            (14, 0.0172),
+            (19, 0.0043),
+        ] {
             let got = threshold(drn);
             assert!((got - want).abs() < 5e-4, "drn {drn}: {got:.4} against {want}");
         }
         // 349 LSB is one index step at LC 8 (`docs/241` sec 0).
         assert!((index_step_lsb() - 349.0).abs() < 1.0, "{}", index_step_lsb());
-        // 25 333's worst interval is 16 points, and an 8-point reading of the
-        // same rung would be 2.7x too generous.
-        assert_eq!(points(2), 16, "25 333's widest interval");
-        assert_eq!(points(1), 8);
-        assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the mean-square model is not tighter");
+        // 25 333's widest *interval* has a modulus of 16; the set inside it is 8
+        // points, and it is the 8-point gap the criterion prices (`docs/306`
+        // sec 2.2). The modulus is still the number the error model wants, which
+        // is why both functions exist.
+        assert_eq!(widest_modulus(2), 16, "25 333's widest interval");
+        assert_eq!(widest_modulus(1), 8);
+        assert_eq!(lc_for(2), 8, "the set the builder carries at 25 333");
+        assert_eq!(
+            threshold(2),
+            threshold(1),
+            "25 333 carries the same 8-point set 24 000 does, so it is priced the same"
+        );
+        // The mean-square screen is still the looser form at every rung, but at
+        // `drn 2` it is looser by 1.09x and not by the 2.7x the modulo-based
+        // price made it look (`docs/306` sec 2).
+        assert!(sigma_max(lc_for(2)) > threshold(2), "the mean-square model is not the looser form");
     }
 
     /// **LD-1, `docs/306` sec 2: the criterion must price the set the builder
@@ -1695,14 +1818,14 @@ mod tests {
     fn the_criterion_prices_the_set_the_builder_carries() {
         for drn in 1..=UP_RATES as u8 {
             let carried = lc_for(drn);
-            let gap = gap_lsb(carried).expect("a gap for a set the ladder asks for");
+            let gap = gap_lsb(CarriedPoints::of(drn)).expect("a gap for a set the ladder asks for");
             let want = SIGMA_MAX * gap / index_step_lsb();
             let got = threshold(drn);
             assert!(
                 (got - want).abs() < 1e-9,
                 "drn {drn}: the set the builder carries is {carried} points, worth {gap} LSB = \
                  {want:.4} index steps, but the criterion prices {} points at {got:.4}",
-                points(drn)
+                widest_modulus(drn)
             );
         }
     }
@@ -1720,14 +1843,18 @@ mod tests {
     fn the_three_rungs_the_audit_found_are_priced_from_lc_for() {
         // The ladder itself: no fourth rung has a set half its modulus.
         let disagreeing: Vec<u8> =
-            (1..=UP_RATES as u8).filter(|&drn| points(drn) != lc_for(drn)).collect();
+            (1..=UP_RATES as u8).filter(|&drn| widest_modulus(drn) != lc_for(drn)).collect();
         assert_eq!(disagreeing, vec![2, 8, 14], "the disagreement set moved");
         // The tabulated maximin gaps of the two counts, in LSB: `gap_lsb`'s own
         // table, written out so that neither figure can be read off the code the
         // assertion is checking.
         for (drn, modulo_gap, set_gap) in [(2u8, 128.0, 320.0), (8, 64.0, 128.0), (14, 16.0, 64.0)]
         {
-            assert_eq!(points(drn), 2 * lc_for(drn), "drn {drn}: the modulus is not twice the set");
+            assert_eq!(
+                widest_modulus(drn),
+                2 * lc_for(drn),
+                "drn {drn}: the modulus is not twice the set"
+            );
             let modulo_price = SIGMA_MAX * modulo_gap / index_step_lsb();
             let set_price = SIGMA_MAX * set_gap / index_step_lsb();
             let got = threshold(drn);
@@ -1747,6 +1874,65 @@ mod tests {
         assert!((threshold(1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
     }
 
+    /// **The invariant `docs/306` sec 2 is about, stated as `6.4.2` states it**
+    /// (`docs/307` sec 3.4: the mandated LC *is* this, and it is not the
+    /// modulus).
+    ///
+    /// **[quoted]** `v92.txt:454`: N, the constellation length, "is one of
+    /// `2*LC1` through `2*LC6` in Table 30"; **`v92.txt:458-459`**: the `k = 3`
+    /// class is `ηk = 2Ki + 2zkMi + ...`, which needs `N ≥ 2·Mi`, so `LC ≥ Mi`
+    /// there, against `LC ≥ ⌈Mi/2⌉` at the other three intervals of each
+    /// constellation frame.
+    ///
+    /// So the set that must exist is fixed by the moduli and by nothing else:
+    /// `lc_for` is the smallest LC that satisfies every interval, and the
+    /// alphabet `2·lc_for` has to carry K bits over twelve symbols. Asserted
+    /// here interval by interval, because that is the only form in which the
+    /// pricing path cannot drift from the clause: at `drn 2`, `8` and `14` the
+    /// bounding condition is the `k = 3` one and the set is *half* the widest
+    /// interval's modulus (`docs/306` sec 2.2).
+    #[test]
+    fn the_declared_set_is_the_one_6_4_2_asks_for_at_every_interval() {
+        for drn in 1..=UP_RATES as u8 {
+            let k = up_bits(drn);
+            let lc = lc_for(drn);
+            let alphabet = 2 * lc;
+            let each = k / UP_INTERVALS as u32;
+            let spare = k % UP_INTERVALS as u32;
+            let mut widest_class = 0usize;
+            for i in 0..UP_INTERVALS {
+                let width = each + u32::from((i as u32) < spare);
+                let modulus = 1usize << width;
+                // `v92.txt:458-459`: the `k = 3` class steps by `2 Mi`.
+                let need = if i % 4 == 3 { modulus } else { modulus.div_ceil(2) };
+                assert!(
+                    lc >= need,
+                    "drn {drn} interval {i}: LC {lc} is short of 6.4.2's {need}"
+                );
+                widest_class = widest_class.max(need);
+            }
+            // The smallest LC that satisfies every interval, not merely one that
+            // does: a `lc_for` larger than necessary would inflate the licence.
+            assert_eq!(lc, widest_class, "drn {drn}: LC is not the binding interval's need");
+            // `N = 2 LC` has to carry K bits over the twelve symbols: the
+            // alphabet is the whole constellation, not the positive half.
+            let shortest = 1usize << (k as f64 / UP_INTERVALS as f64).ceil() as u32;
+            assert!(
+                alphabet >= shortest,
+                "drn {drn}: N = {alphabet} cannot hold the {shortest} needed at its widest interval"
+            );
+            assert!(
+                UP_INTERVALS as u32 * (alphabet as f64).log2() as u32 >= k,
+                "drn {drn}: twelve symbols of an {alphabet}-point alphabet do not carry K = {k}"
+            );
+        }
+        // The three rungs where the two numbers part, named: the binding
+        // interval is a `k = 3` one, so the modulus is exactly twice the set.
+        for drn in [2u8, 8, 14] {
+            assert_eq!(lc_for(drn) * 2, widest_modulus(drn), "drn {drn}");
+        }
+    }
+
     /// **The defect this note exists to prevent: a rung licensed by the
     /// mean-square form.**
     ///
@@ -1756,7 +1942,7 @@ mod tests {
     /// rate**. So: the screen has to be *weaker* than the licence at every rung,
     /// a residual that clears the screen and fails [`threshold`] has to be
     /// **refused**, and the refusal has to **name `threshold`** -- the warning
-    /// in [`points`]' comment, as an assertion rather than a comment.
+    /// in [`widest_modulus`]' comment, as an assertion rather than a comment.
     #[test]
     fn a_measurement_that_clears_the_screen_is_still_refused_by_the_criterion() {
         // The screen is looser than the licence at every rung. That is exactly
@@ -1769,17 +1955,30 @@ mod tests {
                 threshold(drn)
             );
         }
-        // `docs/274` sec 2.2's own reading at `drn 2`, with the level error
-        // removed: the row it read as "0.79x PASSES".
-        let measured = Sigma::reading(0.0744, REFERENCE_LC);
+        // A residual inside the screen and outside the licence, worked at
+        // `drn 7` (32 000) rather than at `drn 2`.
+        //
+        // **Why not `drn 2` any more.** `docs/274` sec 2.2's row was `0.0744`
+        // read against `sigma_max(LC 8) = 0.0939`; the wrong pricing put it
+        // outside `threshold(2) = 0.0344`, and `docs/306` sec 2 moved that
+        // licence to `0.0861`, which `0.0744` is now **inside**. The window
+        // between the screen and the licence at `drn 2` narrowed from 2.7x to
+        // 1.09x, and every residual in it -- `(0.0861, 0.0939]` -- also fails
+        // `threshold(1)`, because 25 333 and 24 000 now carry the *same* 8-point
+        // set. So the screen/refusal pair is demonstrated one rung up, where the
+        // gap is 1.36x: `0.0400` clears `sigma_max(16) = 0.0469` and fails
+        // `threshold(7) = 0.0344`. What 32 000 was refused on is unchanged; what
+        // changed is that `drn 2` is no longer the example (`docs/308` sec 5).
+        let measured = Sigma::reading(0.0400, REFERENCE_LC);
         assert!(
-            0.0744 <= sigma_max(lc_for(2)),
+            0.0400 <= sigma_max(lc_for(7)),
             "the screen has to licence this or the test proves nothing"
         );
-        assert!(sigma_max(lc_for(2)) > 2.5 * threshold(2), "the screen is not the looser form");
-        // Refused: 25 333 was never carried (`docs/266` c4 returned no CONNECT).
-        assert!(0.0744 > threshold(2), "drn 2's licence is not what the refutation rests on");
-        assert_eq!(ceiling_rung(measured), Some(1), "0.0744 was allowed past 24 000");
+        assert!(sigma_max(lc_for(7)) > threshold(7), "the screen is not the looser form");
+        // Refused: 32 000 was measured failing and the call fell back to 24 000
+        // (`docs/266` c4, `the_32_000_measurement_refuses_32_000`).
+        assert!(0.0400 > threshold(7), "drn 7's licence is not what the refusal rests on");
+        assert_eq!(ceiling_rung(measured), Some(2), "0.0400 was allowed past 25 333");
         // And the refusal names the criterion, and says the screen was not
         // consulted. This is the sentence a future reader has to be able to
         // find in the log rather than re-derive.
@@ -1791,13 +1990,12 @@ mod tests {
         assert!(note.contains(SCREEN), "the screen is not printed: {note}");
         assert!(note.contains("not consulted"), "the screen is not labelled unused: {note}");
         assert!(note.contains("PERMITTED"), "the screen's own verdict is not shown: {note}");
-        assert!(note.contains("drn 1"), "the granted rung is not named: {note}");
+        assert!(note.contains("drn 2"), "the granted rung is not named: {note}");
         // The same on a `drn 2` LADDER line, which is the log a bench reader
         // actually sees: the criterion is printed beside the rate verdict.
         let reading = Reading {
             drn: 2,
             lc: lc_for(2),
-            min_gap_lsb: 128.0,
             level_lsb: 1.0 / gain_for(lc_for(2)),
             gain: gain_for(lc_for(2)),
             bin: 1e-2,
@@ -1890,9 +2088,6 @@ mod tests {
         Reading {
             drn,
             lc,
-            min_gap_lsb: crate::v92::codegrid::min_gap(
-                &crate::v92::codegrid::grid(points(drn)).expect("the builder's set"),
-            ),
             level_lsb,
             gain: 1.0 / ideal_level(drn),
             bin,
@@ -2160,6 +2355,56 @@ mod tests {
         // And nothing granted stays nothing: the cap does not invent a rung.
         assert_eq!(cap_to_measured(0), 0);
         assert_eq!(highest_rung(0), None);
+    }
+
+    /// **`docs/308` sec 4: the pricing fix cannot spend a rung.**
+    ///
+    /// `docs/306` sec 2's correction *raises* the licence at `drn 2`, `8` and
+    /// `14`, which is exactly the change that could hand a call a faster rung by
+    /// arithmetic. The safety argument is that a licence is not what is spent:
+    /// `cap_to_measured` ANDs with `measured_mask()` **after** the ceiling, and
+    /// `MEASURED_WORKING_MAX_DRN` is still 1.
+    ///
+    /// Both halves are asserted here, because the distinction is the whole
+    /// argument and it has to be mechanical rather than stated:
+    ///
+    /// * the **licence** moves -- the recorded `drn 2` residual `0.0744` (26.0
+    ///   LSB) is inside the corrected `threshold(2) = 0.0861`, so `ceiling_rung`
+    ///   returns `Some(2)` where the old `0.0344` returned `Some(1)`;
+    /// * the **effective rung** does not -- `cap_to_measured` cuts that grant to
+    ///   `drn 1`, for this residual and for every residual on a dense grid of
+    ///   them, so no measurement can spend the new licence.
+    ///
+    /// The cap moves only on a payload-carrying call above `drn 1`, and none
+    /// exists (`docs/271` sec 1, `docs/305` sec 1): the recorded Agere residual
+    /// being *inside* the licence makes `drn 2` licensed and still **unusable**.
+    #[test]
+    fn the_pricing_fix_moves_the_licence_and_not_the_rung() {
+        assert_eq!(MEASURED_WORKING_MAX_DRN, 1, "the cap is the safety argument, and it is 1");
+        let measured = Sigma::reading(0.0744, REFERENCE_LC);
+        // The licence: inside the corrected 8-point figure.
+        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
+        assert!(0.0744 <= threshold(2), "0.0744 is not inside drn 2's corrected licence");
+        let licensed = ceiling_rung(measured).expect("0.0744 licenses a rung now");
+        assert_eq!(licensed, 2, "the corrected licence is drn 2, and that is the change");
+        // The rung: the same grant, cut to the cap.
+        assert_eq!(
+            highest_rung(cap_to_measured(ceiling_mask(Some(licensed)))),
+            Some(1),
+            "a licensed drn 2 was spent as something above drn 1"
+        );
+        // And not for this one residual: for every residual there is, the rung a
+        // call may spend is `drn 1` or nothing -- the ceiling never reaches the
+        // cap, whatever it grants.
+        for step in 0..=400 {
+            let steps = 0.0005 * f64::from(step);
+            let granted = ceiling_mask(ceiling_rung(Sigma::reading(steps, REFERENCE_LC)));
+            assert_eq!(
+                highest_rung(cap_to_measured(granted)),
+                if steps <= threshold(1) { Some(1) } else { None },
+                "sigma {steps} spent a rung above the cap"
+            );
+        }
     }
 
     /// The per-call lift (`docs/288`): `BINMODEM_V92_MAX_DRN` moves the cap the

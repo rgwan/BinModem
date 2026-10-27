@@ -6448,8 +6448,6 @@ impl Modem {
                 let reading = crate::v92::rung::Reading {
                     drn,
                     lc,
-                    min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(drn))
-                        .unwrap_or(0.0),
                     level_lsb: gain.recip() * (1.0 + delta),
                     gain,
                     bin: 0.0,
@@ -7987,7 +7985,6 @@ impl Modem {
         let reading = crate::v92::rung::Reading {
             drn: parameters.drn,
             lc,
-            min_gap_lsb: crate::v92::rung::gap_lsb(crate::v92::rung::points(parameters.drn)).unwrap_or(0.0),
             level_lsb: gain.recip() * level_gain,
             gain,
             bin: bins.weighted(),

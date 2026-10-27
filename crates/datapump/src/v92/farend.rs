@@ -660,8 +660,14 @@ mod tests {
     #[test]
     fn five_taps_clear_the_finest_half_gap_a_three_tap_inverse_leaves_over_it() {
         let a = 0.24;
-        // The stream's peak at 48 000 and LC 64's finest half-gap (`docs/254`
-        // S5, `rung::gap_lsb(64) / 2`).
+        // The stream's peak at 48 000 and the finest half-gap this bench has to
+        // clear (`docs/254` S5). `drn 19`'s set is 64 positive points
+        // (`rung::lc_for(19) == rung::CarriedPoints::of(19).count()`), whose
+        // tabulated maximin gap is 16 LSB, so the *maximin* half-gap is 8; the
+        // 4.0 taken here is the far end's codec step's half, one step finer, and
+        // is therefore the conservative reading of the same row (`docs/306`
+        // sec 2 prices the set, not the interval's modulus, and at `drn 19` the
+        // two agree).
         let peak = 3772.0;
         let half_gap = 4.0;
         // The residual of a k-tap pre-emphasis, from its own taps: the product
