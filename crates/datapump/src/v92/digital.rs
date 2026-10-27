@@ -5032,8 +5032,17 @@ impl Modem {
             if self.rx.train_on_trn2u(TRAIN_WINDOW, self.trn2u_from) && self.rx.install_phase_four() {
                 let fit_ms = fit_started.elapsed().as_secs_f64() * 1000.0;
                 self.upstream_drop_until = self.now + TRN2U_DROP_AFTER_FIT;
+                // What the fit replaced, on its own window: the four-point
+                // figure and the design's own, side by side, so the call says
+                // which constellation each was measured on instead of leaving
+                // the reader to guess whether the two are comparable.
+                let held = self
+                    .rx
+                    .last_fit_pair()
+                    .map(|(held, _)| format!(", against {held:.1} dB for the design on the same window"))
+                    .unwrap_or_default();
                 self.note(format!(
-                    "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB",
+                    "V.92: phase 4 receiver fitted on TRN2u in {fit_ms:.2} ms, {:.1} dB{held}",
                     self.rx.snr_db()
                 ));
                 // The measurement that chooses the upstream rung exists from
@@ -5044,7 +5053,12 @@ impl Modem {
                 self.decide_upstream_rung();
             } else {
                 self.upstream_drop_until = self.upstream_drop_until.min(self.now);
-                self.note("V.92: no phase 4 fit on TRN2u".into());
+                let pair = self
+                    .rx
+                    .last_fit_pair()
+                    .map(|(held, fitted)| format!(" (the design reads {held:.1} dB on the window, the fit {fitted:.1})"))
+                    .unwrap_or_default();
+                self.note(format!("V.92: no phase 4 fit on TRN2u{pair}"));
             }
         }
         // 9.5.1.1.7-9.5.1.1.8: Jp waits for the phase the receiver has to work
@@ -5875,6 +5889,20 @@ impl Modem {
     /// Put the upstream reader on the line from TRN2u's first symbol
     /// (8.7.6: its scrambler resets there and nowhere else until B1u).
     fn begin_upstream(&mut self) {
+        let from = self.rx.symbols();
+        self.begin_upstream_at(from);
+    }
+
+    /// [`Self::begin_upstream`] with 8.7.6's fiducial named by the caller.
+    ///
+    /// `from` is the absolute symbol index of TRN2u's **first** symbol, which
+    /// is the symbol after the last `E1u` symbol the reader counted. The E1u
+    /// path knows it (`symbol.raw + 1`); every other caller -- a rate
+    /// renegotiation's fiducial, the SCR path, the timetable -- reaches here
+    /// with no symbol in hand and passes the newest sample, which is what this
+    /// took before and is right for them because nothing between them and
+    /// TRN2u is being counted off a centred decision.
+    fn begin_upstream_at(&mut self, from: u64) {
         if self.upstream.is_some() {
             return;
         }
@@ -5890,7 +5918,7 @@ impl Modem {
         // 8.7.6's TRN2u begins at this symbol: the Phase 4 fit is designed on it
         // a little way in, and nothing is given to the finder until that fit is
         // in (see `upstream_drop_until`).
-        let start = self.rx.symbols();
+        let start = from;
         self.trn2u_from = start;
         self.four_at = start + TRN2U_FIT_AFTER;
         self.upstream_drop_until = self.now + TRN2U_FIT_AFTER + TRN2U_DROP_AFTER_FIT;
@@ -8335,7 +8363,7 @@ impl Modem {
                 let Some(bit) = self.reader.feed(symbol.value) else {
                     return;
                 };
-                self.cpt_bit(bit);
+                self.cpt_bit(bit, symbol.raw);
             }
             _ => {}
         }
@@ -8463,7 +8491,7 @@ impl Modem {
         self.descriptor.as_ref().is_some_and(Descriptor::is_empty)
     }
 
-    fn cpt_bit(&mut self, bit: bool) {
+    fn cpt_bit(&mut self, bit: bool, at: u64) {
         self.cp_bits += 1;
         self.cp_ones += u64::from(bit);
         let now = self.now;
@@ -8546,7 +8574,18 @@ impl Modem {
                 // Starting the reader at Phase 4, three seconds of TRN2u later,
                 // leaves the descrambler at an arbitrary point in its sequence
                 // and every bit after it is garbage.
-                self.begin_upstream();
+                //
+                // The first symbol of TRN2u is the one **after** the symbol this
+                // bit arrived on, and that is `symbol.raw`, not the newest
+                // sample: the equaliser is a centred one, so its decision for
+                // the symbol the samples are centred on is only emitted
+                // `ahead` symbols later (`receiver.rs`, `equalise_and_slice`,
+                // `raw: instant = count - ahead`). Taking `rx.symbols()` here is
+                // taking the newest sample and is `ahead` - 1 = 47 symbols late
+                // at 96 forward taps -- which is 20 symbols past the far end of
+                // the alignment the fit can absorb, and is what the HSF call's
+                // `no phase 4 fit on TRN2u` was reading (`docs/297` section 2).
+                self.begin_upstream_at(at.saturating_add(1));
             }
         }
         self.cp_pos += 1;
@@ -11538,6 +11577,55 @@ mod conformance_158 {
     /// One symbol as the receiver would hand it over.
     fn symbol_at(level: f64) -> Symbol {
         Symbol { index: 0, raw: 0, value: level, decided: None, line: level, forward: 0.0 }
+    }
+
+    /// **TRN2u's origin is the symbol the last `E1u` bit arrived on, not the
+    /// newest sample.**
+    ///
+    /// The receiver is a centred fit: `equalise_and_slice` decides the symbol
+    /// the samples are centred on and emits it `ahead` symbols later, with that
+    /// symbol's own index in `Symbol::raw` (`count - ahead`). `cpt_bit` used to
+    /// hand `begin_upstream` `rx.symbols()` -- the newest sample -- so the
+    /// origin was `ahead - 1` symbols late: 47 at 96 forward taps, which is
+    /// outside the +-27 the fit can absorb, and that is the `no phase 4 fit on
+    /// TRN2u` at 16.240 on the HSF call (`docs/297` sections 1 and 2).
+    ///
+    /// Nothing here depends on the value of `ahead`: the symbol spells it out,
+    /// and the assertion is that the origin follows `raw` and not `now`.
+    #[test]
+    fn the_trn2u_origin_is_the_symbol_the_last_e1u_bit_arrived_on() {
+        let mut modem = Modem::default();
+        // A CPt has been found, so the E1u window is open (`cp_len != 0`), and
+        // the reader is in the stage 9.5.2.1.10/11 puts E1u in.
+        modem.cpt = Some(Cp { drn: 16, constellations: Vec::new(), ..Cp::default() });
+        modem.cp_len = 12;
+        modem.cp_pos = 0;
+        modem.e1u_zeroes = 0;
+        modem.since_cpt = 0;
+        modem.stage = Stage::Ri;
+        let ahead = 48u64;
+        let mut fired = None;
+        for step in 0..24u64 {
+            if modem.upstream.is_some() {
+                break;
+            }
+            let raw = 1000 + step;
+            modem.now = raw + ahead;
+            let mut symbol = symbol_at(1.0);
+            symbol.raw = raw;
+            symbol.decided = Some(1.0);
+            modem.symbol(symbol);
+            if modem.upstream.is_some() {
+                fired = Some(raw);
+            }
+        }
+        let raw = fired.expect("twelve zeroes did not open the upstream reader");
+        assert_eq!(
+            modem.trn2u_from,
+            raw + 1,
+            "the origin is {} symbols from the symbol the E1u bit arrived on",
+            modem.trn2u_from as i64 - raw as i64
+        );
     }
 
     /// A CPd for drn 1, as `upchoice` would design it.

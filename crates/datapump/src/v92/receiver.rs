@@ -1331,6 +1331,10 @@ pub struct Receiver {
     trained_at: usize,
     /// The 12-symbol count's origin (9.5.1.1.10), and the symbol count.
     origin: Option<u64>,
+    /// The last TRN2u fit and the figure the filter it would replace measures
+    /// on the same window: `(held, fitted)`. A diagnostic, so a call's log can
+    /// say what was thrown away rather than only that something was.
+    last_on_window: Option<(f64, f64)>,
     count: u64,
     slicer: Slicer,
     /// Decisions recently made, for the error watch.
@@ -1384,6 +1388,7 @@ impl Receiver {
             snr_db: 0.0,
             trained_at: 0,
             origin: None,
+            last_on_window: None,
             count: 0,
             slicer: Slicer::TwoPoint,
             wrong: 0,
@@ -2002,6 +2007,16 @@ impl Receiver {
     #[must_use]
     pub fn snr_db(&self) -> f64 {
         self.snr_db
+    }
+
+    /// The last TRN2u fit as `(what the filter it replaced reads on the same
+    /// window, what the fit itself measures)`, both in decibels against
+    /// 8.7.6's own four points. A diagnostic: a call that refuses the fit can
+    /// then say what it refused, and a call that takes it can say what it
+    /// replaced.
+    #[must_use]
+    pub fn last_fit_pair(&self) -> Option<(f64, f64)> {
+        self.last_on_window
     }
 
     /// Whether there is an equaliser behind the slicer.
@@ -3733,6 +3748,36 @@ impl Receiver {
         let span = window.min(length - start);
         let lag = CHANNEL_DELAY.min(offset);
         let skip = start as i64 - lag as i64 - origin as i64;
+        // What the filter this would replace reads **on this window**, before
+        // it is replaced and before `levels` is handed to the fit.
+        //
+        // `before.snr()` is the figure the incumbent was fitted at, and for
+        // this call it is a two-point `TRN1u` fit's: a different constellation,
+        // a different level set and a stretch of line a second earlier. The two
+        // numbers are not the same quantity, so comparing them -- which is what
+        // this did, `found.snr() > before.snr() - 3.0` -- refuses a four-point
+        // fit that is the best the window can carry and keeps a two-point
+        // filter that then has to read those four points. That is `docs/297`
+        // section 2's second mechanism: the fit was made and thrown away, and
+        // the level table fell back to the design's uniform one.
+        //
+        // What is measured instead is the incumbent equaliser *scored on this
+        // window against this reference* (`score_against`, the same measurement
+        // the second-TRN1u refit's accept test uses), so both figures are
+        // decibels on the same four points, the same window and the same
+        // reference, and the 3 dB margin means one thing on both. When there is
+        // no incumbent to score the fallback is the old figure, which is what
+        // every untrained receiver wants.
+        let held = {
+            let ahead = ahead_of(&self.forward, &self.feedback);
+            let rows = self.forward.len().saturating_sub(1 + ahead);
+            levels
+                .get(skip.max(0) as usize..(skip.max(0) as usize).saturating_add(span))
+                .filter(|reference| reference.len() == span)
+                .and_then(|reference| {
+                    self.score_against(reference, &self.forward, &self.feedback, start, rows)
+                })
+        };
         let mut best: Option<Fitted> = None;
         if skip >= 0 && skip as usize + span <= levels.len() {
             self.pending_levels = Some(levels);
@@ -3742,14 +3787,20 @@ impl Receiver {
                 self.pending_levels = None;
             }
         }
+        self.last_on_window = held.zip(best.as_ref().map(|found| found.snr()));
         if std::env::var_os("V92_REFIT_TRACE").is_some() {
             eprintln!(
-                "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {:?} before {:.1}",
+                "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {:?} \
+                 held {held:?} before {:.1}",
                 best.as_ref().map(Fitted::snr),
                 before.snr()
             );
         }
-        match best.filter(|found| found.snr() > before.snr() - 3.0) {
+        let floor = match held {
+            Some(held) => held - 3.0,
+            None => before.snr() - 3.0,
+        };
+        match best.filter(|found| found.snr() > floor) {
             Some(mut found) => {
                 self.restore(&before);
                 // Which way up the line's TRN2u arrived, decided against the
@@ -5000,6 +5051,59 @@ mod tests {
             "feedback {:.1} dB against linear {linear:.1}: the decision feedback \
              section is not earning its taps",
             rx.snr_db()
+        );
+    }
+
+    /// **The four-point fit is judged on its own window, not against the
+    /// two-point design's figure.**
+    ///
+    /// The accept test used to be `found.snr() > before.snr() - 3.0`, and
+    /// `before.snr()` is whatever the incumbent filter was *fitted* at: on the
+    /// HSF call that is a two-point `TRN1u` design at 34.8 dB, and the fit it
+    /// was compared against is a four-point fit of TRN2u, which is a different
+    /// constellation on a different stretch of line. A four-point figure below
+    /// 31.8 dB is not a worse filter, it is a different measurement -- and it
+    /// was being thrown away, which is what left the level table on the design's
+    /// uniform one (`docs/297` section 2).
+    ///
+    /// Here the incumbent is a filter that scores nothing on this window while
+    /// carrying a figure, 34.8 dB, that the old test treated as a measurement of
+    /// it. The fit measures well under `34.8 - 3` -- the old test refuses it --
+    /// and far above what the incumbent scores here -- the new one takes it.
+    #[test]
+    fn the_trn2u_fit_is_accepted_on_its_own_window() {
+        let bits = reference_from(0, 2 * 3000 + 4, Mode::Answer).expect("a reference");
+        let levels = trn2u_levels(&bits, 3000, 0, 0, false).expect("the four-point sequence");
+        // A deterministic noise at the inner level's own size: this is a line
+        // whose four-point fit is *not* going to beat a two-point figure.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            ((seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+                * 0.30
+        };
+        let mut rx = Receiver::new();
+        for index in 0..levels.len() {
+            rx.feed(levels[index] + next());
+            while rx.heard().is_some() {}
+        }
+        // An incumbent that was fitted somewhere else and reads nothing here.
+        rx.forward = vec![0.5; DFE_FORWARD];
+        rx.feedback = vec![0.0; DFE_FEEDBACK];
+        rx.snr_db = 34.8;
+        let took = rx.train_on_trn2u(TRAIN_WINDOW, 0);
+        let (held, fitted) = rx.last_fit_pair().expect("the pair the accept test used");
+        assert!(
+            fitted < 34.8 - 3.0,
+            "the fit measured {fitted:.1} dB, which the old test would have taken: \
+             this is not the mechanism"
+        );
+        assert!(
+            took && fitted > held,
+            "the fit was refused: it measures {fitted:.1} dB against {held:.1} dB for \
+             the filter it would replace, on the same window and the same reference"
         );
     }
 
