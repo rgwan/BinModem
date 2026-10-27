@@ -389,10 +389,11 @@ pub const SCREEN: &str = "sigma_max";
 ///  19  48000     64       16      0.0043           same
 /// ```
 ///
-/// The first threshold column is what a build **ships** (`LevelSet::Uniform` is
-/// the default again, `docs/312` sec 1): each rung priced at the maximin gap of
-/// the set the builder carries there. The right-hand column is the same rung on
-/// the **code** declaration: `drn 1` and `drn 2` carry an 8-point set, and the
+/// The first threshold column is what a build **shipped before `docs/328`
+/// sec 1** (`LevelSet::Uniform` was the default through `docs/312` sec 1): each
+/// rung priced at the maximin gap of the set the builder carried there. The
+/// right-hand column is the same rung on the **code** declaration:
+/// `drn 1` and `drn 2` carry an 8-point set, and the
 /// best 8-point set inside `[8.8.3]`'s power ceiling on the far end's code grid
 /// holds a 256 LSB minimum gap (`codegrid::grid(8)`), so their licence is 0.0688
 /// where the maximin table says 320 LSB / 0.0861. **Which column a call is
@@ -522,8 +523,8 @@ pub fn priced_gap(levelset: LevelSet, law: Law, drn: u8) -> f64 {
 }
 
 /// The level set a decision inside this module prices, which is the one the
-/// build ships (`docs/312` sec 1). Named once, so that a reader counting
-/// environment reads finds one.
+/// build ships (`docs/328` sec 1: the code grid). Named once, so that a reader
+/// counting environment reads finds one.
 fn level_set() -> LevelSet {
     super::upchoice::levelset()
 }
@@ -784,6 +785,17 @@ impl Sigma {
 /// everything.
 #[must_use]
 pub fn ceiling_rung(law: Law, measured: Sigma) -> Option<u8> {
+    ceiling_rung_of(level_set(), law, measured)
+}
+
+/// [`ceiling_rung`] with the level set named as well as the law.
+///
+/// The same reason [`threshold_of`] exists (`docs/313` sec 4): a test or a log
+/// that reproduces an arm the build does not ship must price **that** arm, and
+/// since `docs/328` sec 1 the shipped arm is the code grid. The plain
+/// [`ceiling_rung`] still follows what a call sends.
+#[must_use]
+pub fn ceiling_rung_of(levelset: LevelSet, law: Law, measured: Sigma) -> Option<u8> {
     // **Scan and decide, for every bound.** The scan used to be skipped for a
     // `Bound::Lower`: the number was spent at drn 1 without asking any rung its
     // own question, so a measurement that carried 25 333 by 2.5x could not say
@@ -795,7 +807,7 @@ pub fn ceiling_rung(law: Law, measured: Sigma) -> Option<u8> {
     // not "allow more": at today's 0.0690 every rung above drn 1 is still
     // refused, and the refusal is now a number in the log rather than a
     // short-circuit (see `digital::decide_upstream_rung`).
-    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold(law, drn))
+    (1..=UP_RATES as u8).rev().find(|&drn| measured.steps <= threshold_of(levelset, law, drn))
 }
 
 /// The mask of rungs at or below `ceiling`, in the layout of Table 20's Ja mask:
@@ -821,8 +833,15 @@ pub fn ceiling_mask(ceiling: Option<u8>) -> u32 {
 /// ```
 #[must_use]
 pub fn apply_ceiling(law: Law, ja: u32, measured: Sigma) -> u32 {
+    apply_ceiling_of(level_set(), law, ja, measured)
+}
+
+/// [`apply_ceiling`] with the level set named, for a caller reproducing an arm
+/// the build does not ship (the uniform-arm records below).
+#[must_use]
+pub fn apply_ceiling_of(levelset: LevelSet, law: Law, ja: u32, measured: Sigma) -> u32 {
     let allowed = if ja == 0 { JA_MASK_ALL } else { ja };
-    allowed & ceiling_mask(ceiling_rung(law, measured))
+    allowed & ceiling_mask(ceiling_rung_of(levelset, law, measured))
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,7 +1728,11 @@ mod tests {
     #[test]
     fn the_32_000_measurement_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_32, 16);
-        let ceiling = ceiling_rung(Law::Mu, measured).expect("the fallback is still a rung");
+        // The arm this stream was recorded on: the uniform lattice
+        // (`docs/328` sec 1 moved the shipped default to the code grid, whose
+        // 24 LSB licence refuses even drn 1 at this residual).
+        let ceiling = ceiling_rung_of(LevelSet::Uniform, Law::Mu, measured)
+            .expect("the fallback is still a rung on the arm it was recorded on");
         assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_32} index-step residual");
         assert!(ceiling >= 1, "the measurement refuses even 24 000, which the call went on to use");
         // On the reference grid the same absolute residual is half as many
@@ -1801,17 +1824,36 @@ mod tests {
         // The ticket's two-sided rule, named after it: `drn 3` = 26 666 has a
         // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
         let above = Sigma::lower(0.0690, REFERENCE_LC);
-        assert_eq!(ceiling_rung(Law::Mu, above), Some(2), "0.0690 was allowed past drn 2");
-        assert!(0.0690 > threshold(Law::Mu, 3), "the threshold the refusal rests on moved");
-        assert!(0.0690 <= threshold(Law::Mu, 2), "drn 2's licence is not the 8-point one");
-        println!("drn 3 threshold {} at 0.0690 -> {:?}", threshold(Law::Mu, 3), ceiling_rung(Law::Mu, above));
+        // The uniform arm: this scan's two-sided rule predates `docs/328` sec 1
+        // and is the record of the maximin 8-point licence, 0.0861.
+        assert_eq!(
+            ceiling_rung_of(LevelSet::Uniform, Law::Mu, above),
+            Some(2),
+            "0.0690 was allowed past drn 2 on the uniform arm"
+        );
+        assert!(
+            0.0690 > threshold_of(LevelSet::Uniform, Law::Mu, 3),
+            "the threshold the refusal rests on moved"
+        );
+        assert!(
+            0.0690 <= threshold_of(LevelSet::Uniform, Law::Mu, 2),
+            "drn 2's licence is not the 8-point one"
+        );
+        println!(
+            "drn 3 threshold {} at 0.0690 -> {:?}",
+            threshold_of(LevelSet::Uniform, Law::Mu, 3),
+            ceiling_rung_of(LevelSet::Uniform, Law::Mu, above)
+        );
 
         // Just inside it, drn 2 is carried -- and so is every rung at or under
         // the same threshold, which is the highest rung the measurement meets.
         let below = Sigma::lower(0.0344 * 0.999, REFERENCE_LC);
-        let granted = ceiling_rung(Law::Mu, below).expect("0.0339 must carry a rung");
+        let granted =
+            ceiling_rung_of(LevelSet::Uniform, Law::Mu, below).expect("0.0339 must carry a rung");
         assert!(granted >= 2, "drn 2 was refused at 0.0339: {granted}");
-        let expected = (1..=UP_RATES as u8).rev().find(|&drn| 0.0344 * 0.999 <= threshold(Law::Mu, drn));
+        let expected = (1..=UP_RATES as u8)
+            .rev()
+            .find(|&drn| 0.0344 * 0.999 <= threshold_of(LevelSet::Uniform, Law::Mu, drn));
         assert_eq!(Some(granted), expected, "the scan did not take the highest rung met");
         println!("0.0339 -> drn {granted} ({})", up_rate(granted));
 
@@ -1820,10 +1862,18 @@ mod tests {
         // still does is travel in the log (`docs/242` sec 4).
         for bound in [Bound::Reading, Bound::Upper, Bound::Lower] {
             let measured = Sigma { bound, ..Sigma::reading(0.0344 * 0.999, REFERENCE_LC) };
-            assert_eq!(ceiling_rung(Law::Mu, measured), Some(granted), "{bound:?} read differently");
+            assert_eq!(
+                ceiling_rung_of(LevelSet::Uniform, Law::Mu, measured),
+                Some(granted),
+                "{bound:?} read differently"
+            );
         }
         let dirty = Sigma::lower(1.0, REFERENCE_LC);
-        assert_eq!(ceiling_rung(Law::Mu, dirty), None, "a measurement that refuses 24 000 must refuse all");
+        assert_eq!(
+            ceiling_rung_of(LevelSet::Uniform, Law::Mu, dirty),
+            None,
+            "a measurement that refuses 24 000 must refuse all"
+        );
     }
 
     /// The thresholds reproduce `docs/240` sec 3c's verified column **as
@@ -1851,7 +1901,9 @@ mod tests {
             (14, 0.0172),
             (19, 0.0043),
         ] {
-            let got = threshold(Law::Mu, drn);
+            // The uniform arm's column: `docs/328` sec 1 made the code grid the
+            // shipped set, and this record is about the maximin gaps.
+            let got = threshold_of(LevelSet::Uniform, Law::Mu, drn);
             assert!((got - want).abs() < 5e-4, "drn {drn}: {got:.4} against {want}");
         }
         // 349 LSB is one index step at LC 8 (`docs/241` sec 0).
@@ -1864,14 +1916,17 @@ mod tests {
         assert_eq!(widest_modulus(1), 8);
         assert_eq!(lc_for(2), 8, "the set the builder carries at 25 333");
         assert_eq!(
-            threshold(Law::Mu, 2),
-            threshold(Law::Mu, 1),
+            threshold_of(LevelSet::Uniform, Law::Mu, 2),
+            threshold_of(LevelSet::Uniform, Law::Mu, 1),
             "25 333 carries the same 8-point set 24 000 does, so it is priced the same"
         );
         // The mean-square screen is still the looser form at every rung, but at
         // `drn 2` it is looser by 1.09x and not by the 2.7x the modulo-based
         // price made it look (`docs/306` sec 2).
-        assert!(sigma_max(lc_for(2)) > threshold(Law::Mu, 2), "the mean-square model is not the looser form");
+        assert!(
+            sigma_max(lc_for(2)) > threshold_of(LevelSet::Uniform, Law::Mu, 2),
+            "the mean-square model is not the looser form"
+        );
     }
 
     /// **LD-1, `docs/306` sec 2: the criterion must price the set the builder
@@ -1894,7 +1949,8 @@ mod tests {
             let carried = lc_for(drn);
             let gap = gap_lsb(CarriedPoints::of(drn)).expect("a gap for a set the ladder asks for");
             let want = SIGMA_MAX * gap / index_step_lsb();
-            let got = threshold(Law::Mu, drn);
+            // The uniform arm (`gap_lsb`'s maximin table is its price).
+            let got = threshold_of(LevelSet::Uniform, Law::Mu, drn);
             assert!(
                 (got - want).abs() < 1e-9,
                 "drn {drn}: the set the builder carries is {carried} points, worth {gap} LSB = \
@@ -1931,7 +1987,7 @@ mod tests {
             );
             let modulo_price = SIGMA_MAX * modulo_gap / index_step_lsb();
             let set_price = SIGMA_MAX * set_gap / index_step_lsb();
-            let got = threshold(Law::Mu, drn);
+            let got = threshold_of(LevelSet::Uniform, Law::Mu, drn);
             // Derived from `lc_for`: the gap of the set the builder carries.
             assert!(
                 (got - set_price).abs() < 1e-9,
@@ -1944,8 +2000,15 @@ mod tests {
             );
         }
         // The number the licence moves to, at the rung the record is about.
-        assert!((threshold(Law::Mu, 2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(Law::Mu, 2));
-        assert!((threshold(Law::Mu, 1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
+        assert!(
+            (threshold_of(LevelSet::Uniform, Law::Mu, 2) - 0.0861).abs() < 5e-4,
+            "drn 2's licence is {}",
+            threshold_of(LevelSet::Uniform, Law::Mu, 2)
+        );
+        assert!(
+            (threshold_of(LevelSet::Uniform, Law::Mu, 1) - 0.0861).abs() < 5e-4,
+            "drn 1's licence moved"
+        );
     }
 
     /// **The invariant `docs/306` sec 2 is about, stated as `6.4.2` states it**
@@ -2125,8 +2188,10 @@ mod tests {
         for (text, lc, recorded) in [TWENTY_FOUR, THIRTY_TWO] {
             let measured = sigma_from_stream(text, lc).expect("a score run");
             assert_eq!(measured.bound(), Bound::Reading);
-            let ceiling = ceiling_rung(Law::Mu, measured).expect("the slowest rung survives both");
-            let mask = apply_ceiling(Law::Mu, JA_MASK_ALL, measured);
+            // Both streams were recorded on the uniform arm.
+            let ceiling = ceiling_rung_of(LevelSet::Uniform, Law::Mu, measured)
+                .expect("the slowest rung survives both");
+            let mask = apply_ceiling_of(LevelSet::Uniform, Law::Mu, JA_MASK_ALL, measured);
             println!(
                 "recorded at drn {recorded} (LC {lc}): sigma {:.4} index steps, {:.4} on the LC = 8 grid, \
                  ceiling drn {ceiling}, mask {mask:#b}",
@@ -2457,9 +2522,17 @@ mod tests {
         assert_eq!(MEASURED_WORKING_MAX_DRN, 1, "the cap is the safety argument, and it is 1");
         let measured = Sigma::reading(0.0744, REFERENCE_LC);
         // The licence: inside the corrected 8-point figure.
-        assert!((threshold(Law::Mu, 2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(Law::Mu, 2));
-        assert!(0.0744 <= threshold(Law::Mu, 2), "0.0744 is not inside drn 2's corrected licence");
-        let licensed = ceiling_rung(Law::Mu, measured).expect("0.0744 licenses a rung now");
+        assert!(
+            (threshold_of(LevelSet::Uniform, Law::Mu, 2) - 0.0861).abs() < 5e-4,
+            "drn 2's licence is {}",
+            threshold_of(LevelSet::Uniform, Law::Mu, 2)
+        );
+        assert!(
+            0.0744 <= threshold_of(LevelSet::Uniform, Law::Mu, 2),
+            "0.0744 is not inside drn 2's corrected licence"
+        );
+        let licensed =
+            ceiling_rung_of(LevelSet::Uniform, Law::Mu, measured).expect("0.0744 licenses a rung now");
         assert_eq!(licensed, 2, "the corrected licence is drn 2, and that is the change");
         // The rung: the same grant, cut to the cap.
         assert_eq!(
