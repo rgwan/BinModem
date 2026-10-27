@@ -6515,19 +6515,14 @@ impl Modem {
         } else {
             // The one branch in which the old sigma criterion still decides,
             // and the cap binds it exactly as it binds the ladder.
-            let granted = match self.declared_law() {
-                Some(law) => apply_ceiling(law, ja, measured),
-                // No bit 35 yet: no licence, so nothing is granted by a price
-                // this end has not been given (docs/313 sec 2).
-                None => {
-                    self.note(
-                        "V.92: no CPu bit 35, so no rung is priced; the mask is left empty for the \
-                         slowest-rung floor"
-                            .into(),
-                    );
-                    0
-                }
-            };
+            // The same law the rung above is built on: this branch used to price
+            // the mask on `declared_law()` and so granted nothing until `CPu`
+            // arrived, which is the same withhold `docs/325` section 2 removed
+            // from the four-point branch -- a price of **our** declaration
+            // computed on **their** law. The cap still binds it (`cap_to_measured`
+            // below), so no rung above `MEASURED_WORKING_MAX_DRN` is reachable
+            // from here.
+            let granted = apply_ceiling(law, ja, measured);
             mask = crate::v92::rung::cap_to_measured(granted);
             self.note(
                 "V.92: no four-point level to judge (the ladder needs one); the sigma mask stands, and \
@@ -6564,16 +6559,22 @@ impl Modem {
         // evidence a rung may be spent on: `docs/264` sec 2 keeps the number and
         // its refusals in the log as an *advisory* and stops it from deciding.
         // What decides is the ladder below.
-        // The law the far end declared, if it has: the ceiling and the advisory
-        // are prices of a declared set, so with no declaration there is none
-        // (`ceiling: None`, and the advisory keeps the Ja mask) rather than a
-        // µ-law ceiling applied to an undeclared line.
-        let law = self.declared_law();
-        let ceiling = law.and_then(|law| ceiling_rung(law, measured));
-        let advisory = match law {
-            Some(law) => apply_ceiling(law, ja, measured),
-            None => ja,
-        };
+        // **The law is the local one** -- `declaration_law`, the law every part
+        // of the `CPd` is built on (`docs/325` section 2, the user's ruling) --
+        // and it is taken here because this function is where the rung is
+        // *built*. It used to take `declared_law`, the **far end's** law from
+        // `CPu` bit 35, which is `None` until Phase 4 and is a refusal on the
+        // code arm (`docs/313` section 2): every rung then failed to rebuild,
+        // the provisional `drn 1` stood, and a lifted cap could never reach the
+        // wire (`docs/328` section 3). The ladder, the ceiling and the advisory
+        // are all prices of the set this call **declares**, so they are all on
+        // the declaring end's law; `declared_law`'s one remaining use is the
+        // mismatch comparison in `declaration_law` itself, which raises rather
+        // than pricing one end's grid for the other (`TODO(docs/325 section 2,
+        // M2b, deferred)`).
+        let law = self.declaration_law();
+        let ceiling = ceiling_rung(law, measured);
+        let advisory = apply_ceiling(law, ja, measured);
         let (allowed, decision) = self.upstream_ladder(ja, measured, ceiling);
         // A ceiling that leaves nothing does not license a rung below the
         // ladder's slowest: 24 000 is what a measurement that permits nothing
@@ -6582,10 +6583,10 @@ impl Modem {
         let (mask, empty) = if allowed == 0 { (1u32, true) } else { (allowed, false) };
         let decision = RateDecision { empty, ..decision };
         let found = if empty {
-            pin(&designed, 1, trellis, noise, law)
+            pin(&designed, 1, trellis, noise, Some(law))
         } else {
-            choose(&designed, noise, mask, trellis, law)
-                .or_else(|| pin(&designed, 1, trellis, noise, law))
+            choose(&designed, noise, mask, trellis, Some(law))
+                .or_else(|| pin(&designed, 1, trellis, noise, Some(law)))
         };
         let Some(choice) = found else {
             self.note(
@@ -6618,9 +6619,9 @@ impl Modem {
             // mean-square screen would have said instead (`docs/277` sec 1).
             // A reader who compares a residual with `sigma_max` can see here
             // that it decided nothing -- the defect `docs/274` sec 2.2 was.
-            law.map_or("criterion=none (no CPu bit 35, no licence)".to_owned(), |law| {
-                decision.measured.ceiling_note(law)
-            }),
+            // The law is the local one and it is total, so there is no
+            // "no licence" arm any more: every call has a criterion by name.
+            decision.measured.ceiling_note(law),
         ));
         if decision.empty {
             // The event the ceiling exists to make visible: every rung the far
@@ -9652,6 +9653,96 @@ mod tests {
         modem.cpu = Some(cp);
         assert_eq!(modem.declared_law(), Some(Law::A), "the far end declared A-law");
         let _ = modem.declaration_law();
+    }
+
+    /// A design flat enough that every rung of the ladder is buildable from it:
+    /// the same shape `modem_with_cpd` pins `drn 1` from.
+    fn flat_design() -> Design {
+        Design {
+            filters: Filters { z2: vec![1.0], ..Filters::default() },
+            residual: 0.0,
+            scale: 1.0,
+            limited: false,
+            delay: 0,
+        }
+    }
+
+    /// **The ladder builds its rung on the local law, so a rung above the cap
+    /// is declared while `CPu` is still outstanding.**
+    ///
+    /// `decide_upstream_rung` is the one place a rung is chosen on a
+    /// measurement, and it used to hand `choose`/`pin` the **far end's** law
+    /// (`declared_law`), which is `None` until `CPu` bit 35 arrives. A code set
+    /// with no law refuses (`docs/313` section 2: there is no law-free code
+    /// value), so on the code arm **every** rung failed to rebuild, the call
+    /// kept the provisional `drn 1`, and a lifted cap could not put `drn 2` on
+    /// the wire (`docs/328` section 3). The declaration itself was already
+    /// built on `declaration_law` -- the local law -- by `design_upstream` and
+    /// by `upstream_ladder` (`docs/325` section 2, the user's ruling), so the
+    /// ladder and the declaration asked two different questions about one set.
+    ///
+    /// The rung this pins is **above `MEASURED_WORKING_MAX_DRN`**: `drn 2` is
+    /// the rung a lifted cap spends, and it is the rung whose build the
+    /// lawless hand-over refused. Both halves are asserted: a lawless `drn 2`
+    /// still refuses (nothing here weakens `docs/313` section 2), and a `drn 2`
+    /// priced on the local law builds.
+    #[test]
+    fn a_rung_above_the_cap_is_built_on_the_local_law_before_cpu_arrives() {
+        let mut settings = settings();
+        settings.law = Law::Mu;
+        let mut modem = Modem::new(settings);
+        assert!(modem.declared_law().is_none(), "this test is about a call with no CPu yet");
+        let design = flat_design();
+        assert!(
+            crate::v92::upchoice::pin_with(&design, 2, Trellis::Sixteen, 1e-9, LevelSet::Code, None)
+                .is_none(),
+            "a code set with no law must still refuse: docs/313 section 2 is not weakened here"
+        );
+        assert!(
+            crate::v92::upchoice::pin_with(
+                &design,
+                2,
+                Trellis::Sixteen,
+                1e-9,
+                LevelSet::Code,
+                Some(modem.declaration_law())
+            )
+            .is_some(),
+            "drn 2, the rung a lifted cap spends, must build on the local law"
+        );
+        // The live decision, in the state the bench call was in: the design is
+        // waiting for the four-point fit and no `CPu` has been decoded.
+        modem.upstream_plan = Some(design);
+        modem.decide_upstream_rung();
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(
+            !notes.contains("no rung of the ladder could be built"),
+            "the ladder could not build a rung with the far end's law outstanding, so the \
+             provisional rung stood and a lifted cap could not reach the wire: {notes}"
+        );
+        assert!(modem.cpd.is_some(), "no declaration was built from the ladder's own rung: {notes}");
+    }
+
+    /// **The rung decision raises when `CPu` names the other law.**
+    ///
+    /// `declared_law`'s one legitimate use is the mismatch comparison
+    /// (`docs/325` section 2, M2b, deferred): the ladder may not quietly price
+    /// a declaration on the far end's alphabet, and it may not quietly proceed
+    /// on ours either. Reaching `declaration_law` from `decide_upstream_rung`
+    /// is what puts the exception on the path a real call takes -- before this
+    /// the rung decision never asked it, so a differing far end would have been
+    /// handed a set built on the law it did not name.
+    #[test]
+    #[should_panic(expected = "laws differ")]
+    fn the_rung_decision_raises_when_the_far_end_names_the_other_law() {
+        let mut settings = settings();
+        settings.law = Law::Mu;
+        let mut modem = Modem::new(settings);
+        let mut cp = Cp::default();
+        cp.a_law = true;
+        modem.cpu = Some(cp);
+        modem.upstream_plan = Some(flat_design());
+        modem.decide_upstream_rung();
     }
 
     fn modem_with_cpd() -> Modem {
