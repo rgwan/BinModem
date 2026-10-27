@@ -1632,7 +1632,7 @@ fn build(bests: &[Bests; TRELLIS_FRAME], code: Code) -> Stage {
 mod tests {
     use super::*;
     use crate::v92::CONSTELLATION_FRAME;
-    use crate::v92::precoder::Chain;
+    use crate::v92::precoder::{Chain, Class};
     use crate::v92::upstream::UpEncoder;
     use crate::v92::{Filters, Trellis};
 
@@ -1651,6 +1651,110 @@ mod tests {
             indices: [0; CONSTELLATION_FRAME],
             levelset: crate::v92::LevelSet::Uniform,
         law: None, }
+    }
+
+    /// **Is 6.4.2's `k = 3` class taken against the declared points?**
+    ///
+    /// `[quoted]` `v92.txt:452-459`: "Let the N constellation points be denoted
+    /// by `a(eta)`, `-N/2 <= eta < N/2`, where the indices are in the same order
+    /// as the levels ... E(Ki) = {a(eta_k) | eta_k = 2 Ki + 2 z_k Mi + (eta_0 +
+    /// eta_1 + eta_2 + Y0) mod 2, z_k an integer} for k = 3."
+    ///
+    /// The class is a **congruence on the index**: `eta -> ((eta - eta mod 2) /
+    /// 2) mod Mi`, which is [`index_to_ki_class`] and is what the decoder runs
+    /// (`decoder.rs`, `index_to_ki` at the Ki of every decided frame). The level
+    /// geometry enters only through `a(eta)`, so the *boundary* between two
+    /// adjacent declared points is wherever the declaration puts them -- their
+    /// midpoint -- and a boundary table stepped out of `min_gap` is not it,
+    /// because at `drn 1` the declared gaps are `256 ... 352` LSB, widest over
+    /// narrowest `1.375`.
+    ///
+    /// The uniform arm is the control: there the declared gaps *are* one number,
+    /// so its midpoints stay equally spaced and its behaviour is unchanged.
+    ///
+    /// The set is the `drn 1` code arm's declaration as `docs/314` sec 1
+    /// measured it; every expectation below is computed from that set and from
+    /// the clause, never tabulated.
+    #[test]
+    fn the_class_at_k3_is_taken_against_the_declared_points() {
+        // `drn 1` is 36 bits over 12 intervals, 3 bits each, so every Mi is 8
+        // and the `k = 3` class steps by 2 x Mi = 16 = N: one member a class.
+        let modulus = 1u8 << (up_bits(1) / UP_INTERVALS as u32);
+        assert_eq!(modulus, 8);
+
+        // CPd's LC ascending "linear value" words, `docs/314` sec 1.
+        let declared: [u16; 8] = [324, 652, 988, 1308, 1628, 1980, 2236, 2492];
+        // The uniform arm as it ships: 6.4.2's odd lattice a(eta) = 2 eta + 1.
+        let uniform: Vec<u16> = (0..8).map(|i| (2 * i + 1) as u16).collect();
+
+        let decide = |set: &[u16], level: f64| -> i32 {
+            Bests::new(&Constellation::new(set), level)
+                .nearest()
+                .expect("a declared point is nearest to every level")
+        };
+        let class = |index: i32| index_to_ki_class(index, modulus, TRELLIS_FRAME - 1);
+
+        // The gaps of the declaration are not one number, which is the whole
+        // reason a lattice-stepped boundary cannot be the declared one.
+        let mut gaps: Vec<u16> = declared.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.sort_unstable();
+        assert_eq!((gaps[0], gaps[gaps.len() - 1]), (256, 352));
+
+        // **The property, on both arms, computed from the declaration.**
+        for set in [&declared[..], uniform.as_slice()] {
+            let points: Vec<f64> = set.iter().map(|&p| f64::from(p)).collect();
+            for i in 0..points.len() - 1 {
+                let mid = 0.5 * (points[i] + points[i + 1]);
+                let below = decide(set, mid - 1e-6);
+                let above = decide(set, mid + 1e-6);
+                // Below the midpoint the decision is index `i`, above it `i+1`:
+                // the boundary is where the declaration puts it.
+                assert_eq!(below, i as i32, "{set:?}: just below {mid}");
+                assert_eq!(above, i as i32 + 1, "{set:?}: just above {mid}");
+                // 6.4.2 at k = 3 pairs a(i) with a(i+1) inside one class, so
+                // the class changes at the declared midpoints whose lower index
+                // is odd and at no other -- the positions still come from the
+                // declaration.
+                assert_eq!(class(below) != class(above), i % 2 == 1, "{set:?} i {i}");
+            }
+        }
+
+        // **Not a lattice.** `min_gap` is 256 here; a table stepped out of it
+        // lands between two declared points (`324 + 256 = 580`), where the
+        // decision does not change, and misses 820, which does.
+        assert_eq!(codegrid::min_gap(&declared), 256.0);
+        assert_eq!(decide(&declared, 580.0 - 1e-6), 1);
+        assert_eq!(decide(&declared, 580.0 + 1e-6), 1);
+        assert_eq!(decide(&declared, 820.0 - 1e-6), 1);
+        assert_eq!(decide(&declared, 820.0 + 1e-6), 2);
+
+        // The control: one declared gap, equally spaced boundaries, the arm's
+        // behaviour exactly as it was.
+        let uniform_gap = codegrid::min_gap(&uniform);
+        assert_eq!(uniform_gap, 2.0);
+        let boundaries: Vec<f64> = uniform
+            .windows(2)
+            .map(|w| 0.5 * (f64::from(w[0]) + f64::from(w[1])))
+            .collect();
+        for (i, boundary) in boundaries.iter().enumerate() {
+            assert_eq!(decide(&uniform, boundary - 1e-6), i as i32);
+            assert_eq!(decide(&uniform, boundary + 1e-6), i as i32 + 1);
+        }
+        let steps: Vec<f64> = boundaries.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().all(|&step| step == uniform_gap), "{steps:?}");
+
+        // The zero-margin fact, counted against the declared alphabet rather
+        // than assumed: `2 x Mi = 16 = N` at `drn 1`, so a `k = 3` class holds
+        // exactly one index per trellis parity and that index reads back as its
+        // own Ki. One member is no slack, and it is legal (`N >= 2 Mi`).
+        for ki in 0..=7u8 {
+            for parity in [false, true] {
+                let class_span = Class::for_interval(ki, modulus, TRELLIS_FRAME - 1, parity);
+                let members: Vec<i32> = (-8..=7).filter(|&eta| class_span.holds(eta)).collect();
+                assert_eq!(members.len(), 1, "Ki {ki} parity {parity}");
+                assert_eq!(class(members[0]), ki, "Ki {ki} parity {parity}");
+            }
+        }
     }
 
     /// A deterministic bit source.
