@@ -253,6 +253,40 @@ const LAG_STEP_COARSE: i64 = 16;
 const LAG_FINE: i64 = 8;
 const LAG_STEP_FINE: i64 = 2;
 
+/// How far below the window's own peak an alignment can read and still be the
+/// *same answer* as the peak, in decibels.
+///
+/// Derived, and from the fit's own resolution rather than from a measurement
+/// of the arm it was written for: it is the **3 dB the accept test below has
+/// called "the same figure" since `docs/298`** (`found.snr() > max(held, peak)
+/// - 3.0`). A fit 3 dB below the window's best is refused as a residual; a fit
+/// *within* 3 dB of it is by that same rule not distinguishable from the best,
+/// so nothing in the fit's own residual can choose between them. The number is
+/// therefore not a new constant at all -- it is the accept margin, given the
+/// meaning it already had, and it is used for both so the two cannot drift.
+///
+/// Between two alignments that are the same answer, the one nearest
+/// [`CHANNEL_DELAY`] wins, because that is the alignment **every other part of
+/// Phase 4 still reads at** (`trn2u_window`, the design's `skip`, the level
+/// table, the sign resolver): a filter fitted at one alignment and read at
+/// another is not a slightly worse filter, it is the wrong filter.
+///
+/// **This is a stop-gap, not the repair.** The repair (docs/325 section 1,
+/// option (a)) is to make every consumer take the *solved* alignment: the
+/// reader's decision instant becomes `lag` rather than a function of the tap
+/// layout alone, `trn2u_window`'s `CHANNEL_DELAY.min(offset)` takes the solved
+/// lag, and the sign resolver is scored at it. What this constant buys is that
+/// the plateau cannot be walked off by `argmax` while that framing is missing;
+/// what it cannot buy is a call whose true alignment is off the constant.
+///
+/// **What would falsify it:** an alignment within `LAG_TIE_DB` of the peak at
+/// which the incumbent's filter carries payload and the peak's does not, or the
+/// reverse -- a call where the two are the same answer to the residual and not
+/// to the line. `docs/298`'s HSF call is the other side of the rule and stays
+/// as it was: there the peak is 26 instants from the constant and the design
+/// reads -6.0 dB, far outside any tie.
+const LAG_TIE_DB: f64 = 3.0;
+
 /// Samples either side of [`CHANNEL_DELAY`] the Phase 4 design searches for the
 /// alignment, and symbols either side of the anchor it correlates to find where
 /// TRN1u begins.
@@ -3836,7 +3870,10 @@ impl Receiver {
         // the stall `docs/297` removed.
         let start = p;
         let span = window.min(length - start);
-        let mut best: Option<(Fitted, i64)> = None;
+        // Every alignment that fitted, with its figure, rather than only the
+        // best one: which of them is *the* alignment is decided below, and it
+        // is not `argmax` (docs/325 section 1).
+        let mut candidates: Vec<(Fitted, i64)> = Vec::new();
         let mut peak: Option<(f64, i64)> = None;
         let mut tried = 0usize;
         let mut lags: Vec<i64> = (-LAG_SCAN..=LAG_SCAN)
@@ -3861,9 +3898,7 @@ impl Receiver {
                 if peak.is_none_or(|(seen, _)| snr > seen) {
                     peak = Some((snr, lag));
                 }
-                if best.as_ref().is_none_or(|(seen, _)| snr > seen.snr()) {
-                    best = Some((self.fitted(), lag));
-                }
+                candidates.push((self.fitted(), lag));
             }
             if pass == 0 {
                 let Some((_, at)) = peak else { break };
@@ -3881,8 +3916,55 @@ impl Receiver {
         // call that hits this says where the search stopped instead of
         // presenting the residual as a design.
         let edge = LAG_SCAN - LAG_STEP_COARSE;
-        let reached = best.as_ref().map(|(found, lag)| (found.snr(), *lag));
-        let accept = best.take().filter(|(_, lag)| (lag - CHANNEL_DELAY as i64).abs() < edge);
+        // Which of the alignments that fitted is the alignment the fit is
+        // installed at.
+        //
+        // `argmax` used to be the whole rule, and on the Agere arm it walked
+        // off the plateau: the window peaks at 36.2 dB on a rival alignment
+        // while the incumbent reads 35.7 dB, the fit went to the rival at -3,
+        // and the rest of Phase 4 -- the reader's decision instant, the level
+        // table, the sign resolver -- went on reading at `CHANNEL_DELAY`,
+        // sixteen samples away. The fit's own residual cannot see the
+        // difference (`docs/325` section 1); the line can, and the measure of
+        // it is that the two figures are within `LAG_TIE_DB`.
+        if std::env::var_os("V92_REFIT_TRACE").is_some() {
+            let table: Vec<String> = candidates
+                .iter()
+                .map(|(found, lag)| format!("{lag}:{:.2}", found.snr()))
+                .collect();
+            eprintln!("V92TRACE: alignments {}", table.join(" "));
+        }
+        let chosen = candidates.into_iter().reduce(|keep, rival| {
+            let (kept, rivalled) = (keep.0.snr(), rival.0.snr());
+            let nearer = |a: i64, b: i64| {
+                (a - CHANNEL_DELAY as i64).abs() <= (b - CHANNEL_DELAY as i64).abs()
+            };
+            if rivalled > kept + LAG_TIE_DB {
+                rival
+            } else if kept > rivalled + LAG_TIE_DB {
+                keep
+            } else if nearer(rival.1, keep.1) {
+                rival
+            } else {
+                keep
+            }
+        });
+        let reached = chosen.as_ref().map(|(found, lag)| (found.snr(), *lag));
+        // ...and it is asked of the **peak**, not of the lag the fit installs.
+        //
+        // The refusal exists because a maximum on the boundary says the true
+        // alignment is outside the range that was searched, and that is a
+        // statement about the window's best -- not about which of two tied
+        // alignments the tie rule picked. Asked of the installed lag it would
+        // let an incumbent at `CHANNEL_DELAY` hide a peak on the boundary,
+        // which is precisely the window the refusal is for: the late-origin
+        // window of `the_trn2u_fit_solves_the_alignment_and_refuses_a_residual`
+        // peaks at 93 = `CHANNEL_DELAY + edge` on 0.5 dB, and installing the
+        // tie's alignment there would put a residual in the receiver.
+        let on_the_edge = peak.is_some_and(|(_, lag)| (lag - CHANNEL_DELAY as i64).abs() >= edge);
+        let accept = chosen.filter(|(_, lag)| {
+            !on_the_edge && (lag - CHANNEL_DELAY as i64).abs() < edge
+        });
         // What the filter this would replace reads **on this window, against
         // the reference the solved alignment named**, before it is replaced.
         //
@@ -3903,21 +3985,40 @@ impl Receiver {
         // reference, and the margin means one thing on both. When there is no
         // incumbent to score the fallback is the old figure, which is what
         // every untrained receiver wants.
-        let held = {
-            let align = reached.map_or(CHANNEL_DELAY as i64, |(_, lag)| lag);
+        //
+        // **Both** alignments the rule weighed are scored, and the better of the
+        // two is the incumbent's figure (docs/325 section 1). The tie rule
+        // above installed the fit at the alignment nearest `CHANNEL_DELAY`
+        // rather than at the window's peak, and if the incumbent were scored
+        // only at the chosen one, then `argmax` and the tie rule would answer
+        // the *accept* question differently on a window where the two
+        // alignments are the same answer to the residual -- which is the one
+        // thing a tie must not do (`the_trn2u_fit_solves_the_alignment_and_
+        // refuses_a_residual`: the late-origin window's residual was installed
+        // because the incumbent, scored 48 symbols away, read as nothing).
+        // Giving the incumbent the alignment that reads it best is also the
+        // conservative direction: it can only make the fit harder to install.
+        let held_at = |align: i64| -> Option<f64> {
             let skip = start as i64 - align - origin as i64;
             let ahead = ahead_of(&self.forward, &self.feedback);
             let rows = self.forward.len().saturating_sub(1 + ahead);
             if skip < 0 {
-                None
-            } else {
-                let skip = skip as usize;
-                levels
-                    .get(skip..skip.saturating_add(span))
-                    .filter(|reference| reference.len() == span)
-                    .and_then(|reference| {
-                        self.score_against(reference, &self.forward, &self.feedback, start, rows)
-                    })
+                return None;
+            }
+            let skip = skip as usize;
+            levels
+                .get(skip..skip.saturating_add(span))
+                .filter(|reference| reference.len() == span)
+                .and_then(|reference| {
+                    self.score_against(reference, &self.forward, &self.feedback, start, rows)
+                })
+        };
+        let held = {
+            let at_chosen = reached.map(|(_, lag)| lag).and_then(&held_at);
+            let at_peak = peak.map(|(_, lag)| lag).and_then(&held_at);
+            match (at_chosen, at_peak) {
+                (Some(chosen), Some(peak)) => Some(chosen.max(peak)),
+                (chosen, at_peak) => chosen.or(at_peak),
             }
         };
         let fitted = accept.as_ref().map(|(found, _)| found.snr());
@@ -3931,7 +4032,8 @@ impl Receiver {
         if std::env::var_os("V92_REFIT_TRACE").is_some() {
             eprintln!(
                 "V92TRACE: train_on_trn2u window {window} from {trn2u_from} offset {offset} best {fitted:?} \
-                 at {reached:?} peak {peak:?} over {tried} held {held:?} before {:.1}",
+                 at {reached:?} peak {peak:?} over {tried} held {held:?} before {:.1} \
+                 tie {LAG_TIE_DB} dB",
                 before.snr()
             );
         }
@@ -5315,6 +5417,59 @@ mod tests {
             rx.phase_four.is_none(),
             "a {peak:.1} dB residual was installed as the phase 4 fit: the accept test compares \
              it with the design and with nothing that says what a four-point fit is worth"
+        );
+    }
+
+    /// The fit is installed at the alignment **the rest of Phase 4 reads at**,
+    /// and it is the window's residual -- not `argmax` -- that is allowed to
+    /// overrule that.
+    ///
+    /// This is `docs/325` section 1 as a property of the code. On the Agere arm
+    /// the four-point window is a **plateau**: the call of `68de182` fitted at
+    /// **36.2 dB, alignment -3 of 22**, while the incumbent alignment read
+    /// 35.7 dB, and the fit went to the rallying alignment -- 16 samples away
+    /// from `CHANNEL_DELAY`, which is where the reader's decision instant, the
+    /// level table and the sign resolver all still point. A filter fitted at
+    /// one alignment and read at another is not a slightly worse filter; `B1u`
+    /// then decodes at about half and the call carries nothing.
+    ///
+    /// A synthesised line shows the same plateau without a bench: at
+    /// `12.4` samples of fractional delay the alignments `-3`, `13` and `29`
+    /// read **79.28 / 79.17 / 79.22 dB** -- one answer, three numbers, the
+    /// scatter being noise (`[verified]`, the candidate table behind
+    /// `V92_REFIT_TRACE`). `argmax` takes `-3`; the rule takes `13`, because a
+    /// figure within [`LAG_TIE_DB`] of the peak is not distinguishable from it
+    /// and between indistinguishable aligns the one the rest of Phase 4 reads
+    /// at wins. The fit must still be installed: the tuned alignment is within
+    /// the accept floor of the peak, so this is a choice between fits and not a
+    /// refusal.
+    #[test]
+    fn the_trn2u_fit_prefers_the_alignment_the_rest_of_phase_four_reads() {
+        let rx = trn2u_after_idle_line(12.4, 704, 3000);
+        let onset = rx.signal_onset().expect("no onset on a line with an idle stretch");
+        let mut rx = trn2u_after_idle_line(12.4, 704, 3000);
+        assert!(
+            rx.train_on_trn2u(TRAIN_WINDOW, onset) && rx.install_phase_four(),
+            "no fit on the plateau line this test is about"
+        );
+        let (lag, peak, tried) = rx.last_alignment().expect("an alignment was solved");
+        let (_, fitted) = rx.last_fit_pair().expect("the pair the accept test used");
+        assert!(tried > 8, "the alignment was not searched: {tried} alignment(s) tried");
+        assert_eq!(
+            lag, CHANNEL_DELAY as i64,
+            "the fit was installed at alignment {lag} while the reader, the level table and the \
+             sign resolver all read at {CHANNEL_DELAY}: fitted at {fitted:.2} dB against the \
+             window's own best {peak:.2} dB, which `argmax` takes and the rest of Phase 4 does not"
+        );
+        assert!(
+            fitted < peak,
+            "the incumbent alignment is the window's own best ({fitted:.2} dB): nothing was tied \
+             here, so the assertion above proves nothing"
+        );
+        assert!(
+            fitted > peak - LAG_TIE_DB,
+            "the incumbent alignment reads {fitted:.2} dB against {peak:.2} dB for the peak, which \
+             is outside the {LAG_TIE_DB} dB the accept test calls the same figure"
         );
     }
 
