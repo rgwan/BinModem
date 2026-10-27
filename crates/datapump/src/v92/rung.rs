@@ -380,13 +380,21 @@ pub const SCREEN: &str = "sigma_max";
 /// it is a screen.
 ///
 /// ```text
-/// drn   rate   points  gap(LSB)  threshold
-///   1  24000      8      320      0.0861
-///   2  25333     16      128      0.0344
+/// drn   rate   points  gap(LSB)  threshold   (this build: the code grid's gap)
+///   1  24000      8      256      0.0689
+///   2  25333      8      256      0.0689
 ///   7  32000     16      128      0.0344
 ///  13  40000     32       64      0.0172
 ///  19  48000     64       16      0.0043
 /// ```
+///
+/// The 8-point rows read **256**, not the 320 a maximin table gives: what is
+/// priced is the set `CPd` declares, and on the far end's code grid the best
+/// 8-point set inside `[8.8.3]`'s power ceiling holds a 256 LSB minimum gap
+/// (`docs/310` sec 1.1: the tree's own `codegrid::grid(8)`, printed by
+/// `the_declared_set_is_priced_by_its_own_gap` below). The licence at `drn 1`/`2`
+/// therefore tightens by 1.25x (1.9 dB) relative to `abb3b72`, which is a
+/// statement about the declaration and not about the line.
 ///
 /// `sigma_max(lc)` answers a different question -- what the *mean square* of a
 /// `lc`-point set buys -- and for a rung whose set is carried by an interval one
@@ -464,12 +472,35 @@ pub fn priced_gap_lsb(drn: u8) -> f64 {
     if set.count() < 2 {
         return 0.0;
     }
-    gap_lsb(set).unwrap_or(0.0)
+    // **The declared set's own gap, price as declared.** The far end can only
+    // emit code values, so on the code grid the minimum gap of *that set* is
+    // what a decision is taken against -- `codegrid::min_gap` of the very points
+    // `upchoice::build` puts in `CPd`. The number moves: **256 LSB at `drn 1`
+    // and `drn 2`, not the 320 the maximin table gives**, because a code
+    // lattice's minimum gap is what the far end can actually emit rather than
+    // what some other 8-point set inside the same power ceiling could.
+    //
+    // The uniform arm is priced from the tabulated maximin gap, because there the
+    // declaration is *not* on the grid: the far end snaps it, and what survives
+    // the snapping is a maximin code set of that size -- which is the number
+    // every call before this change was priced at, kept so the old arm's log
+    // stays comparable with its own history.
+    match super::upchoice::levelset() {
+        super::upchoice::LevelSet::Code => {
+            super::upchoice::declared_gap_lsb(set.count()).unwrap_or_else(|| gap_lsb(set).unwrap_or(0.0))
+        }
+        super::upchoice::LevelSet::Uniform => gap_lsb(set).unwrap_or(0.0),
+    }
 }
 
 /// The smallest gap a *maximin* set of `points` positive µ-law codes holds, in
 /// the codec's LSB, at the power `[8.8.3]` sets (`docs/116` sec 7, re-derived in
 /// `docs/240` sec 3c's gap column).
+///
+/// **This is the uniform arm's price**, not the code grid's: it is what survives
+/// the far end's quantiser when a declaration that is *not* on the grid is
+/// snapped onto it. [`priced_gap_lsb`] prices the code declaration from
+/// [`crate::v92::codegrid::min_gap`] of the declared set itself.
 ///
 /// Taken from that column rather than searched here, because the search this
 /// crate has ([`crate::v92::codegrid::grid`]) is greedy from the bottom and
@@ -1635,13 +1666,27 @@ mod tests {
     #[test]
     fn the_32_000_measurement_refuses_32_000() {
         let measured = Sigma::reading(MEASURED_32, 16);
-        let ceiling = ceiling_rung(measured).expect("the fallback is still a rung");
-        assert!(ceiling < 7, "32 000 was permitted on a {MEASURED_32} index-step residual");
-        assert!(ceiling >= 1, "the measurement refuses even 24 000, which the call went on to use");
+        // **The ceiling is now empty, and that is the declared set's doing.**
+        // 0.1602 index steps on LC 16's grid is 0.0801 on the reference grid,
+        // which cleared `drn 1`'s *maximin* licence (0.0861) and does not clear
+        // the licence of the set `CPd` declares on the code grid (0.0688: the
+        // 8-point set's 256 LSB gap, `priced_gap_lsb`). So this stream refuses
+        // **every** rung, which is strictly more than refusing 32 000.
+        //
+        // The call went on to use 24 000 anyway and still does: the floor is the
+        // cap (`MEASURED_WORKING_MAX_DRN`) and the empty-mask rule in
+        // `digital::decide_upstream_rung`, not the licence. That separation is
+        // what `the_pricing_fix_moves_the_licence_and_not_the_rung` pins.
+        let ceiling = ceiling_rung(measured);
+        assert_eq!(ceiling, None, "a {MEASURED_32} index-step residual was licensed on some rung");
         // On the reference grid the same absolute residual is half as many
         // index steps, because LC = 16's G is half LC = 8's.
         assert!((measured.steps() - MEASURED_32 / 2.0).abs() < 1e-3, "{} against {}", measured.steps(), MEASURED_32 / 2.0);
-        println!("32 000 arm: sigma {MEASURED_32} -> sigma(LC 8) {} -> ceiling {ceiling}", measured.steps());
+        println!(
+            "32 000 arm: sigma {MEASURED_32} -> sigma(LC 8) {} -> ceiling {ceiling:?}, and the live \
+             rung floor is the cap, not this",
+            measured.steps()
+        );
     }
 
     /// Every rung the ceiling permits has a predicted symbol error at or under
@@ -1724,13 +1769,26 @@ mod tests {
     /// (`docs/308` sec 4, `MEASURED_WORKING_MAX_DRN = 1`).
     #[test]
     fn the_scan_refuses_above_a_threshold_and_grants_below_it() {
-        // The ticket's two-sided rule, named after it: `drn 3` = 26 666 has a
-        // threshold of 0.0344 (`docs/240` sec 3c), and 0.0690 does not clear it.
+        // The ticket's two-sided rule, named after it. **The refusal moved one
+        // rung down** when the licence became the declared set's: `drn 1`/`2`
+        // are priced at the code grid's 256 LSB, not the maximin table's 320, so
+        // their licence is 0.0688 and 0.0690 no longer clears it. The rule the
+        // test is about is unchanged -- above a rung's threshold that rung is
+        // refused, below it the scan rises to the highest rung met.
         let above = Sigma::lower(0.0690, REFERENCE_LC);
-        assert_eq!(ceiling_rung(above), Some(2), "0.0690 was allowed past drn 2");
         assert!(0.0690 > threshold(3), "the threshold the refusal rests on moved");
-        assert!(0.0690 <= threshold(2), "drn 2's licence is not the 8-point one");
-        println!("drn 3 threshold {} at 0.0690 -> {:?}", threshold(3), ceiling_rung(above));
+        // `drn 1` and `drn 2` carry the same 8-point set, so they share one
+        // licence, and 0.0690 is above it: the scan stops below the slowest rung.
+        assert_eq!(threshold(1), threshold(2), "24 000 and 25 333 carry the same set");
+        assert!(0.0690 > threshold(2), "drn 2's licence is not the declared 8-point set's");
+        assert_eq!(ceiling_rung(above), None, "0.0690 was allowed some rung");
+        println!("drn 2 threshold {} at 0.0690 -> {:?}", threshold(2), ceiling_rung(above));
+
+        // Just inside `drn 2`'s own licence, `drn 2` is carried -- and `drn 3`,
+        // whose set is 16 points and whose licence is half, is not.
+        let carried = Sigma::lower(threshold(2) * 0.99, REFERENCE_LC);
+        assert_eq!(ceiling_rung(carried), Some(2), "0.99 of drn 2's licence must carry drn 2");
+        assert!(threshold(2) * 0.99 > threshold(3), "drn 3's licence is not the tighter one");
 
         // Just inside it, drn 2 is carried -- and so is every rung at or under
         // the same threshold, which is the highest rung the measurement meets.
@@ -1769,8 +1827,12 @@ mod tests {
     #[test]
     fn the_thresholds_are_the_gap_corrected_ones() {
         for (drn, want) in [
-            (1u8, 0.0861),
-            (2, 0.0861),
+            // The 8-point rows are **0.0688**, not `abb3b72`'s 0.0861: the gap
+            // priced is the declared code set's 256 LSB, not the maximin table's
+            // 320 (`docs/310` sec 1.1). A code lattice's minimum gap is what the
+            // far end can actually emit; the maximin set is a different set.
+            (1u8, 0.0688),
+            (2, 0.0688),
             (7, 0.0344),
             (8, 0.0344),
             (13, 0.0172),
@@ -1816,9 +1878,21 @@ mod tests {
     /// new assertion.
     #[test]
     fn the_criterion_prices_the_set_the_builder_carries() {
+        //
+        // **And since `docs/310` sec 2 it is priced from the set itself**, not
+        // from a table of sets of that size: `priced_gap_lsb` reads
+        // `codegrid::min_gap` of the points `build` puts in `CPd`, so the gap a
+        // decision is taken against and the gap the far end must emit are the
+        // same object. This asserts that by **building the rung** and pricing
+        // what came back, so a declaration that changed the set without changing
+        // the price (or the other way round) fails here.
+        let design = design_for(0.0);
         for drn in 1..=UP_RATES as u8 {
+            let Some(choice) = pin(&design, drn, Trellis::Sixteen, 1e-9) else { continue };
+            let parameters = &choice.parameters;
             let carried = lc_for(drn);
-            let gap = gap_lsb(CarriedPoints::of(drn)).expect("a gap for a set the ladder asks for");
+            assert_eq!(parameters.sets[0].len(), carried, "drn {drn}: the builder's set");
+            let gap = crate::v92::codegrid::min_gap(&parameters.sets[0]);
             let want = SIGMA_MAX * gap / index_step_lsb();
             let got = threshold(drn);
             assert!(
@@ -1826,6 +1900,14 @@ mod tests {
                 "drn {drn}: the set the builder carries is {carried} points, worth {gap} LSB = \
                  {want:.4} index steps, but the criterion prices {} points at {got:.4}",
                 widest_modulus(drn)
+            );
+            // The declaration's own gain, so that the level the LADDER line
+            // prints and the gain `CPd` carries cannot disagree either.
+            let declared =
+                crate::v92::upchoice::declared_gain(carried).expect("the declared set has a gain");
+            assert!(
+                (declared - parameters.levelset.gain(&parameters.sets[0])).abs() < 1e-15,
+                "drn {drn}: the ladder's gain is not the declaration's"
             );
         }
     }
@@ -1848,7 +1930,9 @@ mod tests {
         // The tabulated maximin gaps of the two counts, in LSB: `gap_lsb`'s own
         // table, written out so that neither figure can be read off the code the
         // assertion is checking.
-        for (drn, modulo_gap, set_gap) in [(2u8, 128.0, 320.0), (8, 64.0, 128.0), (14, 16.0, 64.0)]
+        // The third column is the **declared** set's gap on the code grid: 256
+        // LSB at LC 8 (not the maximin table's 320), 128 at LC 16, 64 at LC 32.
+        for (drn, modulo_gap, set_gap) in [(2u8, 128.0, 256.0), (8, 64.0, 128.0), (14, 16.0, 64.0)]
         {
             assert_eq!(
                 widest_modulus(drn),
@@ -1870,8 +1954,8 @@ mod tests {
             );
         }
         // The number the licence moves to, at the rung the record is about.
-        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
-        assert!((threshold(1) - 0.0861).abs() < 5e-4, "drn 1's licence moved");
+        assert!((threshold(2) - 0.0688).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
+        assert!((threshold(1) - 0.0688).abs() < 5e-4, "drn 1's licence moved");
     }
 
     /// **The invariant `docs/306` sec 2 is about, stated as `6.4.2` states it**
@@ -2051,23 +2135,29 @@ mod tests {
         for (text, lc, recorded) in [TWENTY_FOUR, THIRTY_TWO] {
             let measured = sigma_from_stream(text, lc).expect("a score run");
             assert_eq!(measured.bound(), Bound::Reading);
-            let ceiling = ceiling_rung(measured).expect("the slowest rung survives both");
+            let ceiling = ceiling_rung(measured);
             let mask = apply_ceiling(JA_MASK_ALL, measured);
             println!(
                 "recorded at drn {recorded} (LC {lc}): sigma {:.4} index steps, {:.4} on the LC = 8 grid, \
-                 ceiling drn {ceiling}, mask {mask:#b}",
+                 ceiling drn {ceiling:?}, mask {mask:#b}",
                 measured.at(lc),
                 measured.steps()
             );
             if recorded == 1 {
+                // 0.0513 clears the declared 8-point set's 0.0688, so 24 000 is
+                // carried -- and so is 25 333, which carries the same set.
+                assert_eq!(ceiling, Some(2), "the 24 000 stream does not carry 24 000");
                 assert!(mask & 1 != 0, "the 24 000 stream does not even carry 24 000");
             } else {
-                assert!(
-                    mask & (1 << (recorded - 1)) == 0,
-                    "the stream recorded at drn {recorded} permits drn {recorded}, which is not what happened"
-                );
+                // **0.0801 on the reference grid, against a 0.0688 LC 8 licence.**
+                // The 32 000 stream now refuses every rung, which is strictly more
+                // than "permits 32 000 and not 32 000"; the 24 000 floor a call
+                // keeps in that case is the cap's business, not the licence's
+                // (`the_pricing_fix_moves_the_licence_and_not_the_rung`).
+                assert_eq!(ceiling, None, "the 32 000 stream licensed a rung");
+                assert_eq!(mask, 0, "the 32 000 stream left bits in its mask");
             }
-            assert!(ceiling < 7, "the stream recorded at drn {recorded} permits 32 000");
+            assert!(ceiling.map_or(true, |drn| drn < 7), "the stream recorded at drn {recorded} permits 32 000");
         }
         // The numbers in the module comment, from the files.
         let a = sigma_from_stream(TWENTY_FOUR.0, TWENTY_FOUR.1).expect("a score run");
@@ -2382,16 +2472,33 @@ mod tests {
     fn the_pricing_fix_moves_the_licence_and_not_the_rung() {
         assert_eq!(MEASURED_WORKING_MAX_DRN, 1, "the cap is the safety argument, and it is 1");
         let measured = Sigma::reading(0.0744, REFERENCE_LC);
-        // The licence: inside the corrected 8-point figure.
-        assert!((threshold(2) - 0.0861).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
-        assert!(0.0744 <= threshold(2), "0.0744 is not inside drn 2's corrected licence");
-        let licensed = ceiling_rung(measured).expect("0.0744 licenses a rung now");
-        assert_eq!(licensed, 2, "the corrected licence is drn 2, and that is the change");
-        // The rung: the same grant, cut to the cap.
+        // **The licence moves a second time, and down.** `abb3b72` priced the
+        // 8-point set at the maximin table's 320 LSB (0.0861, and 0.0744 was
+        // inside). The set `CPd` declares on the far end's code grid holds a
+        // 256 LSB gap, so the licence is 0.0688 and 0.0744 is **outside** it:
+        // that maximin licence was a licence for a set we do not send.
+        assert!((threshold(2) - 0.0688).abs() < 5e-4, "drn 2's licence is {}", threshold(2));
+        assert!(0.0744 > threshold(2), "0.0744 is inside drn 2's declared-set licence");
         assert_eq!(
-            highest_rung(cap_to_measured(ceiling_mask(Some(licensed)))),
+            ceiling_rung(measured),
+            None,
+            "0.0744 clears a rung the licence of the declared set does not licence"
+        );
+        // **The rung does not move, and it never did.** The effective rung was
+        // never the licence's to spend: it is the cap, and the empty-mask rule
+        // that pins `drn 1` when the instruments grant nothing. Both are the same
+        // two mechanisms `abb3b72` relied on -- a new licence, the same safety
+        // property, and no way for a looser *or* a tighter figure to spend a rung.
+        assert_eq!(cap_to_measured(1), 1, "the cap still spends drn 1");
+        assert_eq!(
+            highest_rung(cap_to_measured(ceiling_mask(Some(1)))),
             Some(1),
-            "a licensed drn 2 was spent as something above drn 1"
+            "the effective rung with an empty grant is drn 1"
+        );
+        assert_eq!(
+            highest_rung(cap_to_measured(ceiling_mask(ceiling_rung(measured)))),
+            None,
+            "an empty grant stays empty, and `digital` pins drn 1 on it"
         );
         // And not for this one residual: for every residual there is, the rung a
         // call may spend is `drn 1` or nothing -- the ceiling never reaches the

@@ -6441,10 +6441,19 @@ impl Modem {
                     continue;
                 }
                 let lc = crate::v92::rung::lc_for(drn);
-                // The design's own `G` for this rung, which is the number `CPd`
-                // carries: `1/G` is then the level the tolerance is measured
-                // from, and `delta` is the same relative error at every rung.
-                let gain = crate::v92::upchoice::gain_for(lc);
+                // The declared set's own `G` for this rung, which is the number
+                // `CPd` carries: `1/G` is then the level the tolerance is
+                // measured from, and `delta` is the same relative error at every
+                // rung. Taken from the declaration rather than from the odd
+                // lattice's closed form, so the `level=` and `1/G=` fields on the
+                // LADDER line are in the same currency as the set that goes out
+                // (`docs/310` sec 2.1: at 24 000 the code grid asks for 1/G of
+                // 1 620 LSB where the lattice's closed form names 9.22 index
+                // units). The *verdict* does not move: `level_lsb` is built from
+                // the same gain, so `delta` -- and the tolerance it is compared
+                // with -- is the same number either way.
+                let gain = crate::v92::upchoice::declared_gain(lc)
+                    .unwrap_or_else(|| crate::v92::upchoice::gain_for(lc));
                 let reading = crate::v92::rung::Reading {
                     drn,
                     lc,

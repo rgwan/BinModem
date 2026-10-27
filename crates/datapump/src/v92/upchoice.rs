@@ -103,13 +103,18 @@ pub const E2U_SYMBOLS: usize = UP_INTERVALS + if EXTEND_E2U { 1 } else { 0 };
 /// A uniform alphabet at 1, 3, ..., 2 LC - 1 has a mean square of
 /// ((2 LC)^2 - 1) / 3, and G is its reciprocal square root.
 ///
-/// This is the *odd lattice's* gain, and the gain of the default level set
-/// ([`LevelSet::Uniform`]). A design on the far end's code grid takes its gain
-/// from the code ladder's own mean square ([`codegrid::gain_for`]), which is a
-/// different number for the same transmit power: at 24 000 the odd lattice asks
-/// for G = 0.1085 and the code ladder for G = 6.17e-4. Both are kept here
-/// because the selector between them is [`LEVELSET_VAR`], and a reader comparing
-/// the two arms needs both numbers side by side.
+/// This is the *odd lattice's* gain: `LevelSet::Uniform`'s, which is reachable
+/// by name and is not what a build ships. A design on the far end's code grid
+/// takes its gain from the code ladder's own mean square
+/// ([`codegrid::gain_for`]), which is a different number for the same transmit
+/// power: at 24 000 the odd lattice asks for G = 0.1085 and the code ladder for
+/// G = 6.17e-4 ([`declared_gain`] is the one to call for the set on the wire).
+/// Both are kept here because the selector between them is [`LEVELSET_VAR`], and
+/// a reader comparing the two arms needs both numbers side by side.
+///
+/// It is also the unit of [`rung`](super::rung)'s measurement: one index step of
+/// the LC = 8 odd lattice is `2 G` at 349 LSB, and every residual in that module
+/// is quoted in those steps whatever the declaration is.
 pub fn gain_for(levels: usize) -> f64 {
     let span = 2.0 * levels as f64;
     (3.0 / (span * span - 1.0).max(1.0)).sqrt()
@@ -117,22 +122,30 @@ pub fn gain_for(levels: usize) -> f64 {
 
 /// Which constellation level set [`build`] puts out: `V92_LEVELSET`.
 ///
-/// `uniform` -- the odd lattice `a(eta) = 2 eta + 1` with [`gain_for`]'s gain --
-/// is the default, and is the set every call made before docs/114 R1 asked the
-/// far end for, field for field. `code` is docs/114 R1's far end G.711 code grid
-/// ([`codegrid::grid`]) with the set's own gain ([`codegrid::gain_for`]).
+/// `code` -- docs/114 R1's far end G.711 code grid ([`codegrid::grid`]) with the
+/// set's own gain ([`codegrid::gain_for`]) -- is **the default**. It is the only
+/// one of the two that is a set the far end can emit: the far end's transmitter
+/// is a codec, so a level that is not a code value is not a level. `uniform` --
+/// the odd lattice `a(eta) = 2 eta + 1` with [`gain_for`]'s gain -- is kept
+/// reachable by name for the arms that reproduce a call made before this change.
 ///
-/// # Why it is a switch and not a default
+/// # Why the default moved, and what it costs
 ///
-/// The code grid's benefit is a *snapping* offset, and it is unproven: on the
-/// replay corpus there is no per-level systematic offset to remove (per-level
-/// means within 1.6 LSB of zero, 19-23 sigma away from the offsets the grid
-/// predicts), so "the code grid is better" is a hypothesis only a live A/B can
-/// settle. What the grid certainly costs is minimum gap, because a maximin code
-/// set inside the power ceiling is coarser than the odd lattice at the same
+/// The old default was the odd lattice, on the ground that "the code grid is
+/// better" was an unproven A/B. That question was the wrong one. A uniform
+/// declaration is not a *worse* set, it is **not a set at all** above LC 16:
+/// its points are index units, the far end rounds each to a code, and from LC 32
+/// up two of them round to the same code -- 3 of 32 at LC 32 and 20 of 64 at LC
+/// 64 [verified, `the_set_the_cpd_declares_is_a_set_the_far_end_can_emit`]. Below
+/// that it is a cost, and `docs/310` sec 1.2 prices it: 19.2 LSB of residual at
+/// LC 8, 50.0 at 16, 93.9 at 32, 184.9 at 64, all of it the declaration's own and
+/// none of it the line's.
+///
+/// What the code grid certainly costs is minimum gap, because a maximin code set
+/// inside `[8.8.3]`'s power ceiling is coarser than the odd lattice at the same
 /// power: 349 -> 256 LSB at 24 000 (-2.7 dB) and 43.6 -> 16 LSB at 48 000
-/// (-8.7 dB). So the default is the set the line has been shown to carry, and
-/// the bench compares the two arms out of one binary.
+/// (-8.7 dB). That is what the licence has to pay, and the criterion now prices
+/// it (`rung::priced_gap_lsb`).
 ///
 /// A variable of its own, and deliberately **not** `V92_CODE_GRID`: that one
 /// arms the one-per-call field dump (docs/114 R6), and a dump switch that moved
@@ -140,11 +153,37 @@ pub fn gain_for(levels: usize) -> f64 {
 pub const LEVELSET_VAR: &str = "V92_LEVELSET";
 
 /// The two level sets [`build`] can put out. See [`LEVELSET_VAR`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// **`Code` is the default** ([`shipped`]), and `Uniform` is kept reachable by
+/// name for the arms that have to reproduce a call made before it -- the
+/// closed-loop harness measures both out of one binary.
+///
+/// # Why `Uniform` can no longer be what a build ships
+///
+/// A uniform declaration is a set the far end **cannot emit**. Its points are
+/// `2 eta + 1` in *index units*; the far end's transmitter is a G.711 codec, so
+/// every one of them is rounded by its quantiser to a code value. Up to LC 16
+/// that is only a cost: each level still lands in a cell of its own, and the
+/// rounding is the residual `docs/310` sec 1.2 priced at 19.2 LSB (LC 8). From
+/// **LC 32 up it is a failure**: two declared levels land in the same code cell,
+/// so one of the pair is never transmitted at all and the receiver is asked to
+/// decide between two points that arrived as one.
+///
+/// [verified] `the_set_the_cpd_declares_is_a_set_the_far_end_can_emit` prints
+/// the table: LC 8/16 hold 0 collisions, **LC 32 collides 3 of 32** (`drn 9` to
+/// `drn 14`) and **LC 64 collides 20 of 64** (`drn 15` to `drn 19`). That is why
+/// `docs/307` sec 3.1's "from LC = 16 up" is corrected to **from LC 32**: the
+/// boundary is `drn 9`, not `drn 3`. It is also why the declaration is a
+/// modelling defect and not a tuning choice -- no loop, scalar or tracker can
+/// make a far end emit a level its codec does not have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LevelSet {
-    /// `a(eta) = 2 eta + 1`: the odd lattice. The default.
+    /// `a(eta) = 2 eta + 1`: the odd lattice. **Undeclarable from LC 32 up**, so
+    /// it is reachable by name (`V92_LEVELSET=uniform`) and never by default.
     Uniform,
-    /// The far end's own G.711 code values (docs/114 R1).
+    /// The far end's own G.711 code values (docs/114 R1). The default: it is the
+    /// only one of the two the far end can emit.
+    #[default]
     Code,
 }
 
@@ -158,11 +197,12 @@ impl LevelSet {
     }
 
     /// What a `V92_LEVELSET` value names, or `None` for a value this build does
-    /// not have. Unset and empty are `uniform`: the default is the default, not
-    /// a value the caller had to write down.
+    /// not have. Unset and empty are [`LevelSet::default`] -- the code grid: the
+    /// default is the default, not a value the caller had to write down.
     pub fn named(raw: Option<&str>) -> Option<Self> {
         match raw.map(str::trim) {
-            None | Some("") | Some("uniform") => Some(LevelSet::Uniform),
+            None | Some("") => Some(LevelSet::default()),
+            Some("uniform") => Some(LevelSet::Uniform),
             Some("code") => Some(LevelSet::Code),
             Some(_) => None,
         }
@@ -170,10 +210,14 @@ impl LevelSet {
 
     /// One constellation set's `levels` positive points.
     ///
-    /// `uniform` cannot fail for any `levels` [`build`] admits; `code` can, and
-    /// does at 48 000, where the grid has no 64-point set with a usable gap
-    /// (docs/103 §3). That is a rung-specific refusal and not a clamp: [`build`]
-    /// returns `None` and the ladder steps down.
+    /// `uniform` cannot fail for any `levels` [`build`] admits. `code` fails only
+    /// for a count the grid cannot hold at all (`levels + 1 > UCODES`, or none
+    /// inside the power ceiling), and in particular it does **not** fail at
+    /// 48 000: `codegrid::grid(64)` returns 64 points with a 16 LSB gap and an
+    /// outermost point of 3 772 LSB, which is the best a 64-point set inside
+    /// `[8.8.3]`'s power ceiling can do and not a refusal. A comment here used
+    /// to say `build` "returns `None` and the ladder steps down" at 48 000; that
+    /// was false, and it is the trap `docs/310` sec 0.3 recorded.
     pub fn points(self, levels: usize) -> Option<Vec<u16>> {
         match self {
             LevelSet::Uniform => Some((0..levels).map(|index| (2 * index + 1) as u16).collect()),
@@ -196,12 +240,50 @@ impl LevelSet {
     }
 }
 
+/// The level set this build declares **when nothing says otherwise**: what a
+/// call with [`LEVELSET_VAR`] unset puts on the wire, and therefore the set the
+/// criterion prices ([`rung::priced_gap_lsb`](super::rung::priced_gap_lsb)).
+///
+/// One name for it, so that a test, a log line and the `CPd` cannot disagree
+/// about which set was shipped: the default is a property of the build and not
+/// a value each call site re-reads out of the environment.
+pub fn shipped() -> LevelSet {
+    LevelSet::named(None).expect("this build has a default level set")
+}
+
+/// The gain of the set this call declares at `levels` (8.8.3): the number the
+/// receiver builds its expectation from, and the one `CPd` bits 35:50 carry up
+/// to the sent section's energy.
+///
+/// This is the *declared set's* gain and not the odd lattice's closed form, so a
+/// printed level cannot disagree with the declaration: at 24 000 on the code grid
+/// `1/G` is 1 620 LSB, the level the bench actually reads, where the lattice's
+/// `gain_for(8)` names 9.22 index units. `None` when the declared set cannot be
+/// built at that count, which [`LevelSet::Code`] answers with `None` only when the
+/// grid cannot hold it.
+#[must_use]
+pub fn declared_gain(levels: usize) -> Option<f64> {
+    let set = levelset();
+    Some(set.gain(&set.points(levels)?))
+}
+
+/// The smallest adjacent gap of the set this call declares at `levels`, in LSB.
+///
+/// The same object [`declared_gain`] is taken from, for the criterion: what the
+/// far end can actually emit, in the currency a licence is spent in
+/// ([`rung::priced_gap_lsb`](super::rung::priced_gap_lsb) is the caller).
+#[must_use]
+pub fn declared_gap_lsb(levels: usize) -> Option<f64> {
+    let points = levelset().points(levels)?;
+    Some(codegrid::min_gap(&points))
+}
+
 /// `V92_LEVELSET`'s value for this call.
 pub fn levelset() -> LevelSet {
     resolve(std::env::var(LEVELSET_VAR).ok().as_deref())
 }
 
-/// [`levelset`] for one value. An unrecognised value sends `uniform` -- a typo
+/// [`levelset`] for one value. An unrecognised value sends [`shipped`] -- a typo
 /// does not get to move the wire -- and the value it ignored is said out loud
 /// once per process, so a batch's log can tell a typo from an environment that
 /// never set the variable at all.
@@ -210,7 +292,7 @@ pub fn resolve(raw: Option<&str>) -> LevelSet {
         Some(set) => set,
         None => {
             report_ignored(raw.unwrap_or_default());
-            LevelSet::Uniform
+            shipped()
         }
     }
 }
@@ -227,7 +309,10 @@ fn report_ignored(raw: &str) -> bool {
     if SAID.swap(true, Ordering::Relaxed) {
         return false;
     }
-    eprintln!("{LEVELSET_VAR}: {raw:?} is not uniform or code; sending the odd lattice (uniform)");
+    eprintln!(
+        "{LEVELSET_VAR}: {raw:?} is not uniform or code; sending the default, the code grid ({})",
+        shipped().name()
+    );
     true
 }
 
@@ -367,12 +452,12 @@ fn build_with(design: &Design, drn: u8, trellis: Trellis, levelset: LevelSet) ->
     // LC, unchanged, so the class arithmetic and the moduli above are the same
     // for both sets: what differs is where the points sit.
     //
-    // `uniform` is `a(eta) = 2 eta + 1`, the set every call before docs/114 R1
-    // asked for. `code` is docs/114 R1: the far end's own G.711 code values, on
-    // the ground that a codec can only emit codes, so a request at a code value
-    // makes its rounding a no-op and leaves a static per-point offset instead.
-    // That offset is what a live A/B has to settle, and it is why this is a
-    // switch with the old set as its default rather than a new truth.
+    // `code` is docs/114 R1: the far end's own G.711 code values, and the
+    // default, because a codec can only emit codes -- a request at a code value
+    // makes its quantiser a no-op instead of a half-cell error on every symbol.
+    // `uniform` is `a(eta) = 2 eta + 1`, the set every call before this one
+    // asked for; it is still buildable by name, and above LC 16 it is a set the
+    // far end cannot emit (`LevelSet`'s own comment has the collision counts).
     let set = levelset.points(levels)?;
     // 8.8.3: "The digital modem shall design the modulation parameters assuming
     // that, when the prefilter output multiplied by G has a mean-square value
@@ -514,16 +599,149 @@ mod tests {
         }
     }
 
-    /// The default level set is the odd lattice, by value: the eight points at
-    /// 24 000 are 1, 3, ..., 15, the gain is `gain_for(8)` exactly, and
-    /// `Parameters::step` is `2 G` as it was before the code grid existed.
+    /// How many LSB one point of the declared set is worth -- the set's own unit,
+    /// and the whole of the difference between the two arms.
     ///
-    /// This is the half of the switch that has to be a *restoration* rather
-    /// than a new behaviour: a call made with `V92_LEVELSET` unset is the call
-    /// every earlier build made, and the numbers below are the ones this crate
-    /// sent then.
+    /// * [`LevelSet::Code`]: **one.** The points are G.711 decode values, which
+    ///   are the codec's int16 domain; that is what "the far end emits
+    ///   `codegrid::value(code)`" means, and it is why `--levelset code --lu 0`
+    ///   reads `0.0000` (`docs/276`:147). Rescaling those points to
+    ///   [`TARGET_RMS`] by `1609 / rms` would move every one of them off the codes
+    ///   it was chosen to be -- that is a *scale*, and the tree measures scales
+    ///   (`codegrid::estimate`, `k`) rather than assuming one.
+    /// * [`LevelSet::Uniform`]: **half an index step**, `ladder_step(lc) / 2` --
+    ///   174.5 LSB at LC 8. Its points are `2 eta + 1` in index units and the
+    ///   lattice's step is two of them, so this is exactly the scale that puts the
+    ///   set's mean square at `TARGET_RMS`: 9.22 index units x 174.5 LSB = 1609.
+    ///
+    /// Both are the same statement -- *one point of this set, in LSB* -- and
+    /// `[8.8.3]`'s power identity is what makes the second a number rather than a
+    /// knob. The code set needs nothing from it: `grid` chose its points under
+    /// the power ceiling, so its rms is `TARGET_RMS` to within [`POWER_SLACK`]
+    /// and its unit is 1 LSB by construction.
+    fn lsb_per_point(levels: usize) -> f64 {
+        match shipped() {
+            LevelSet::Code => 1.0,
+            LevelSet::Uniform => codegrid::ladder_step(levels) / 2.0,
+        }
+    }
+
+    /// The declared set with its points carried onto the line in LSB.
+    fn on_the_line(levels: usize) -> Vec<f64> {
+        let scale = lsb_per_point(levels);
+        shipped().points(levels).expect("the declared set").iter().map(|&p| scale * f64::from(p)).collect()
+    }
+
+    /// The rms of levels in LSB, which is the power the set puts on the line.
+    fn levels_rms(levels: &[f64]) -> f64 {
+        (levels.iter().map(|level| level * level).sum::<f64>() / levels.len() as f64).sqrt()
+    }
+
+    /// **The set the CPd declares has to be a set the far end can emit.**
+    ///
+    /// The far end's transmitter is a G.711 codec, so the only levels it can put
+    /// on the line are code values: a declared level between two codes is
+    /// rounded by the far end's quantiser and arrives as a code we did not ask
+    /// for. A declared set whose levels share a code is worse than that -- one of
+    /// the two levels is **never transmitted at all**, and the receiver is asked
+    /// to decide between two points that arrived as one (`docs/310` sec 1.2).
+    ///
+    /// So: for every rung, take the declared set in LSB, map each level through
+    /// the far end's own quantiser ([`codegrid::nearest_code`]), and require `lc`
+    /// **distinct** codes back.
     #[test]
-    fn the_default_level_set_is_the_odd_lattice_it_replaced() {
+    fn the_set_the_cpd_declares_is_a_set_the_far_end_can_emit() {
+        // Collected over the whole ladder and asserted at the end, so that one
+        // run prints the *table* rather than stopping at the first bad rung.
+        let mut bad: Vec<String> = Vec::new();
+        for drn in 1..=UP_RATES as u8 {
+            let lc = crate::v92::rung::lc_for(drn);
+            let levels = on_the_line(lc);
+            let mut distinct: Vec<u8> =
+                levels.iter().map(|&level| codegrid::nearest_code(level)).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let shared = lc - distinct.len();
+            println!(
+                "drn {drn:2} LC {lc:3} N {:3}: {} distinct codes of {lc}{}",
+                2 * lc,
+                distinct.len(),
+                if shared > 0 { format!(", {shared} levels never transmitted") } else { String::new() }
+            );
+            if shared > 0 {
+                bad.push(format!(
+                    "drn {drn} (LC {lc}): {shared} of {lc} declared levels share a code with another, \
+                     so at most {} of them can ever be transmitted",
+                    distinct.len()
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "the declaration is not a set the far end can emit:\n{}", bad.join("\n"));
+    }
+
+    /// **The declaration's own residual floor, in LSB, for every rung.**
+    ///
+    /// The companion to the test above, in the currency the licence is spent in:
+    /// how far the declared level sits from the code value the far end will
+    /// actually emit. `0` means the far end's quantiser is a no-op on the
+    /// declaration -- nothing left for the line to explain. Anything else is a
+    /// deterministic, zero-mean, per-symbol error the declaration alone created,
+    /// and it is not noise: `docs/274`:57 measured its bias at `-0.0007` index
+    /// steps, and `--levelset code --lu 0` reads `0.0000` where the declaration
+    /// is on the grid (`docs/276`:147).
+    ///
+    /// What is left after the change is a **scale** and not a floor, and the line
+    /// printed per rung says so: the declared set's rms against `TARGET_RMS`.
+    /// The code grid's rms is inside [`POWER_SLACK`] of it because `grid` chose
+    /// its points under the power ceiling; a scale is one number the far end
+    /// obeys and `codegrid::estimate` measures, which is a different object from
+    /// a per-symbol offset and is what `tolerance` (`rung.rs:977`) is about.
+    #[test]
+    fn the_declarations_own_residual_floor_is_zero() {
+        let step = crate::v92::rung::index_step_lsb();
+        let mut bad: Vec<String> = Vec::new();
+        for drn in 1..=UP_RATES as u8 {
+            let lc = crate::v92::rung::lc_for(drn);
+            let levels = on_the_line(lc);
+            let floor_lsb = levels
+                .iter()
+                .map(|&level| (level - f64::from(codegrid::value(codegrid::nearest_code(level)))).abs())
+                .fold(0.0f64, f64::max);
+            let floor = floor_lsb / step;
+            println!(
+                "drn {drn:2} LC {lc:3} N {:3}: unit {:6.1} LSB, rms {:7.1} ({:+.1}% of TARGET_RMS), \
+                 floor {floor_lsb:7.2} LSB = {floor:.4} index steps",
+                2 * lc,
+                lsb_per_point(lc),
+                levels_rms(&levels),
+                100.0 * (levels_rms(&levels) / codegrid::TARGET_RMS - 1.0),
+            );
+            assert!(
+                (levels_rms(&levels) / codegrid::TARGET_RMS - 1.0).abs() <= codegrid::POWER_SLACK + 0.02,
+                "drn {drn}: the declared set is not at the power the line carries"
+            );
+            if floor != 0.0 {
+                bad.push(format!(
+                    "drn {drn} (LC {lc}): {floor_lsb:.2} LSB ({floor:.4} index steps) off the code \
+                     grid, against a licence of {:.4}",
+                    crate::v92::rung::threshold(drn)
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "the declaration has a residual floor of its own:\n{}", bad.join("\n"));
+    }
+
+    /// **The uniform arm is still reachable, by name, and is still the lattice it
+    /// always was** -- and it is no longer what a build ships.
+    ///
+    /// `docs/310` sec 2: `V92_LEVELSET=uniform` is what the closed-loop harness
+    /// measures against, so it has to build the set every call before this change
+    /// sent, field for field: 1, 3, ..., 15 at 24 000, the gain `gain_for(8)`
+    /// exactly, and `Parameters::step` equal to `2 G`. The numbers below are
+    /// unchanged from the build in which this was the default; what changed is
+    /// who gets them without asking.
+    #[test]
+    fn the_uniform_arm_is_still_the_lattice_it_was_by_name() {
         let design = design_for(1e-9);
         let parameters = build_with(&design, 1, Trellis::Sixteen, LevelSet::Uniform).expect("drn 1 builds");
         // LC = 8 at 24 000, and the points are the odd lattice itself.
@@ -557,9 +775,10 @@ mod tests {
             );
             assert!((parameters.step() - 2.0 * gain_for(lc)).abs() < 1e-4, "drn {drn}: step");
         }
-        // And the two public entry points, unset environment and all, agree
-        // with it: `levelset()` is `uniform` when nothing says otherwise.
-        assert_eq!(levelset(), LevelSet::Uniform);
+        // And the arm is reached by *name*: unset is no longer this set. The
+        // default is the code grid, and the lattice is one word away.
+        assert_eq!(LevelSet::named(Some("uniform")), Some(LevelSet::Uniform));
+        assert_eq!(shipped(), LevelSet::Code, "the shipped set is the far end's code grid");
         let pinned = pin_with(&design, 1, Trellis::Sixteen, 1e-9, LevelSet::Uniform).expect("pinnable");
         assert_eq!(pinned.parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15]);
     }
@@ -610,15 +829,16 @@ mod tests {
         assert!((loss + 2.7).abs() < 0.1, "the grid costs {loss:.2} dB, not 2.7");
     }
 
-    /// An unrecognised `V92_LEVELSET` sends the odd lattice and says so once.
+    /// An unrecognised `V92_LEVELSET` sends the **default** -- the code grid --
+    /// and says so once.
     ///
     /// The typo does not get a vote on the wire; what it gets is one line, so
     /// that a batch whose log says `levelset uniform` under `V92_LEVELSET=kode`
     /// can be told from one that never set the variable.
     #[test]
-    fn an_unrecognised_levelset_is_uniform_and_is_said_once() {
-        assert_eq!(LevelSet::named(None), Some(LevelSet::Uniform), "unset is the default");
-        assert_eq!(LevelSet::named(Some("")), Some(LevelSet::Uniform), "empty is the default");
+    fn an_unrecognised_levelset_sends_the_default_and_is_said_once() {
+        assert_eq!(LevelSet::named(None), Some(LevelSet::Code), "unset is the default");
+        assert_eq!(LevelSet::named(Some("")), Some(LevelSet::Code), "empty is the default");
         assert_eq!(LevelSet::named(Some("uniform")), Some(LevelSet::Uniform));
         assert_eq!(LevelSet::named(Some("code")), Some(LevelSet::Code));
         assert_eq!(LevelSet::named(Some("uniform ")), Some(LevelSet::Uniform), "trailing space");
@@ -628,11 +848,13 @@ mod tests {
         assert!(report_ignored("kode"), "the first unrecognised value is reported");
         assert!(!report_ignored("kode"), "and the second is not");
         assert!(!report_ignored("LEVELSET"), "nor a third");
-        // The value itself still resolves to the old set, by value.
-        assert_eq!(resolve(Some("kode")), LevelSet::Uniform);
+        // The value itself still resolves to the default, by value -- a typo
+        // sends what an unset variable sends, and not something of its own.
+        assert_eq!(resolve(Some("kode")), LevelSet::Code);
+        assert_eq!(resolve(None), LevelSet::Code);
         let design = design_for(1e-9);
         let parameters = build_with(&design, 1, Trellis::Sixteen, resolve(Some("kode"))).expect("drn 1");
-        assert_eq!(parameters.sets[0], vec![1, 3, 5, 7, 9, 11, 13, 15], "a typo moved the wire");
+        assert_eq!(parameters.sets[0], codegrid::grid(8).expect("the grid"), "a typo moved the wire");
     }
 
     /// 8.8.3 on the wire: `E[(G v)^2] = 1` for the filters this CPd declares.
