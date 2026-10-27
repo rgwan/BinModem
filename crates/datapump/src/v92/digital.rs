@@ -8243,28 +8243,36 @@ impl Modem {
             .map(|&ucode| crate::v92::codegrid::value_in(law, ucode))
             .filter(|&value| value > 0)
             .collect();
-        // The fit and the bit-128 fallback, in the code arm only.
-        if parameters.levelset == LevelSet::Uniform {
-            self.up_scale = 1.0;
-            self.up_scale_source = "design (uniform)";
-        } else {
-            let fitted =
-                if cp.codec.is_some() { None } else { crate::v92::codegrid::estimate_from_mask(set, &codes) };
-            match fitted {
-                Some(k) if k.is_finite() && k > 0.0 => {
-                    self.up_scale = k;
-                    self.up_scale_source = "mask";
-                }
-                _ if cp.codec.is_some() => {
-                    self.up_scale = 1.0;
-                    self.up_scale_source = "design (bit 128)";
-                }
-                _ => {
-                    self.up_scale = 1.0;
-                    self.up_scale_source = "design (no mask)";
-                }
-            }
-        }
+        // **No fit is taken, on either arm, and this is the fix** (`docs/312`
+        // sec 2.1). `codes` above is the CPu mask: bits 136:271+gamma of Table
+        // 23, the constellations **this end** is to transmit downstream -- bits
+        // 21:25 carry "selected digital modem to analogue modem data signalling
+        // rate" (`/tmp/v92.txt:1492-1494`) and bit 128 is about "the
+        // constellations at the transmitter" against "the output to the codec's
+        // D/A converter" (`:1557`, `:1584-1590`). `set` is CPd's declaration of
+        // the **upstream** constellation the far end is to transmit
+        // (`:1789-1791`, `[8.8.3]`). A slope between two different
+        // constellations in two opposite directions is not a scale, and the
+        // number it produced was not one: `K 2.48168 (mask)` at `drn 1` against
+        // `K 1.00000` on the lattice arm (`docs/311` sec 5.1), where the same
+        // call's own upstream measurements read gain **1.022** and level
+        // **+0.01 %** (`docs/312` sec 2).
+        //
+        // So the scale is the one `[8.8.3]` gives, and it is the declaration's:
+        // the far end transmits the codes CPd names, its codec's elements *are*
+        // those codes so its quantiser is a no-op, and `G` (bits 35:50) is the
+        // clause's one number for putting the set's power where the line wants
+        // it. On the odd lattice that same statement is `K = 1` against
+        // `a(eta) = 2 eta + 1`, which is the path every call before the code
+        // grid took and the one `docs/257` restored. A residual scale, if a far
+        // end has one, is a *measurement* -- `docs/114` R2b's received-level fit,
+        // which this tree already runs (the upstream four-point measure under
+        // `V92_UP_RATE`) -- and not a report about the other direction.
+        self.up_scale = 1.0;
+        self.up_scale_source = match parameters.levelset {
+            LevelSet::Uniform => "design (uniform)",
+            LevelSet::Code => "design (code grid)",
+        };
         if !first || !code_grid_log() {
             return;
         }
@@ -8274,7 +8282,8 @@ impl Modem {
         let highest = 127 - union.leading_zeros().min(127);
         eprintln!(
             "V92_CODE_GRID: bit35 codec {} bit128 {} bit52:67 {} ({} x TRN1d at the codec's D/A) \
-             SUVu27:31 {} mask {} blocks [{}] popcount {} max Ucode {} design LC {} fit K {:.5} ({}) codes {}",
+             SUVu27:31 {} mask {} blocks [{}] popcount {} max Ucode {} design LC {} \
+             scale n/a (mask is downstream, CPd upstream: no ratio) codes {}",
             if cp.a_law { "A-law" } else { "mu-law" },
             if cp.codec.is_some() { "set" } else { "clear" },
             cp.trn1d_ratio,
@@ -8288,8 +8297,6 @@ impl Modem {
             popcount,
             highest,
             set.len(),
-            self.up_scale,
-            self.up_scale_source,
             codes.len()
         );
     }
@@ -9476,9 +9483,13 @@ mod tests {
 
         modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, true)));
         let notes = modem.clone().take_notes().join("\n");
-        assert!(notes.contains("bit 128 set"), "the fallback has to name itself: {notes}");
+        assert!(notes.contains("bit 128 set"), "the report has to name itself: {notes}");
         assert_eq!(modem.up_scale, 1.0, "bit 128 must not move the slicer's scale");
-        assert_eq!(modem.up_scale_source, "design (bit 128)");
+        // The scale is the declaration's whether bit 128 is set or not: since
+        // `docs/312` sec 2.1 no mask moves it, so there is no "fallback" to name
+        // and bit 128 is kept as the *report* it is (docs/114 R3's obligation on
+        // the far end is unchanged; what we do with the report is our choice).
+        assert_eq!(modem.up_scale_source, "design (code grid)");
         // And with K = 1 the table is the design's own, point for point: this is
         // what "the slice path is unchanged" means in code.
         assert_eq!(codegrid::scaled(&set, modem.up_scale), set, "the fallback changed the levels");
@@ -9489,9 +9500,19 @@ mod tests {
         assert_eq!(again.matches("bit 128 set").count(), 1, "{again}");
     }
 
-    /// docs/114 R2a/R4: with bit 128 clear the mask *is* about the far end's
-    /// transmitter, so `K` is fitted from it and the slicer's table is built at
-    /// that scale rather than at one.
+    /// **The mask sets nothing; the declaration sets the table, and a `K` that
+    /// exists would be built into it** (`docs/312` sec 2.1).
+    ///
+    /// This test used to assert `docs/114` R2a -- that `K` is fitted from the CPu
+    /// mask -- and R2a is the misreading this arm fixed: the mask at
+    /// `v92.txt:137-271` is the constellation **this end** transmits downstream
+    /// (bits 21:25, `:1492-1494`; bit 128, `:1557`), so dividing it by CPd's
+    /// upstream declaration is a ratio across two directions and not a scale.
+    /// What survives R4 is the table builder: where a `K` does exist, the levels
+    /// are `round(K a(eta))` and not `a(eta)` -- asserted here directly, so the
+    /// mechanism R4 describes is still covered -- while the read path that used
+    /// to invent that `K` from the other direction now refuses to (the test after
+    /// this one pins the refusal).
     #[test]
     fn a_code_transparent_mask_sets_k_and_the_table_follows_it() {
         use crate::v92::codegrid;
@@ -9507,17 +9528,81 @@ mod tests {
             codes.dedup();
             modem.cpu = None;
             modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&codes, false)));
-            assert_eq!(modem.up_scale_source, "mask", "k {k}: no fit was taken");
-            assert!((modem.up_scale - k).abs() < 0.05 * k, "k {k} came back as {}", modem.up_scale);
+            // The mask cannot move the scale, in either direction of the
+            // question: the source names the declaration and the scale is one.
+            assert_eq!(modem.up_scale_source, "design (code grid)", "k {k}: the mask moved the scale");
+            assert_eq!(modem.up_scale, 1.0, "k {k} came back as {}", modem.up_scale);
+            // R4 itself, on the builder: at a `K` the table is `round(K a(eta))`.
+            let table_at_k = crate::v92::codegrid::scaled(&set, k);
+            if (k - 1.0).abs() > 0.05 {
+                assert_ne!(table_at_k, set, "k {k}: the table did not move");
+            }
             // The table is `round(K a(eta))`, and at K = 1 it is the design's own
             // -- so a call whose far end is on this end's scale is untouched.
-            let table = codegrid::scaled(&set, modem.up_scale);
-            if k == 1.0 {
-                assert_eq!(table, set);
-            } else {
-                assert_ne!(table, set, "k {k}: the table did not move");
-            }
+            // And at the scale the call carries, the table *is* the design.
+            assert_eq!(codegrid::scaled(&set, modem.up_scale), set, "k {k}: the call's table");
         }
+    }
+
+    /// **A mask and a declaration from different directions must not produce a
+    /// scale** (`docs/312` sec 2.1).
+    ///
+    /// The CPu mask is the constellation **this end** transmits downstream: bits
+    /// 21:25 of Table 23 are "Selected digital modem to analogue modem data
+    /// signalling rate, an integer, drn" (`v92.txt:1492-1494`), and bit 128 is
+    /// about "the constellations at the transmitter" against "the output to the
+    /// codec's D/A converter" (`v92.txt:1557`, `:1584-1590`). CPd's set is the
+    /// constellation the **far end** transmits upstream (`v92.txt:1789-1791`).
+    /// A ratio between the two is not a scale, so this receiver must not report
+    /// one at all: the level table is the declaration's, and `K` says where it
+    /// came from.
+    ///
+    /// The mask below is the one `docs/114` sec 1.6 recorded off an Agere at
+    /// 45 333 -- 32 positive Ucodes, outermost Ucode 90 = 6 652 LSB -- against
+    /// `drn 1`'s eight-point declaration, whose outermost point is 2 492 LSB.
+    /// Divided across the two directions it returns **2.4004**; the call that
+    /// read **2.48168** (`docs/311` sec 5.1) differs only in which mask its drn
+    /// 20 constellation carried, and the fit is monotone in that mask's span
+    /// (`docs/312` sec 2). Neither number is a scale: the same call's own
+    /// upstream measurements read gain **1.022** and level **+0.01 %**.
+    #[test]
+    fn a_downstream_mask_cannot_set_the_upstream_scale() {
+        use crate::v92::codegrid;
+        use crate::v92::sequences::CpFamily;
+        let mut modem = modem_with_cpd();
+        let set = modem.parameters.clone().expect("a CPd").sets[0].clone();
+        assert_eq!(set, codegrid::grid(8).expect("the grid"), "not the code declaration");
+        assert_eq!(*set.last().expect("eight points"), 2492, "the declaration's outermost point");
+        let downstream: [u8; 32] = [
+            16, 32, 40, 48, 52, 56, 60, 64, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 80,
+            81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+        ];
+        modem.up_sequence(CpFamily::Cpu(cpu_with_mask(&downstream, false)));
+        // `drn 1`'s level tolerance is +-3.0 % (+-48.6 LSB on 1 639.3), and this
+        // is the scale the level table is built at.
+        assert!(
+            (modem.up_scale - 1.0).abs() <= 0.03,
+            "a downstream mask set the upstream scale to {} -- the table is {:.2}x the declaration",
+            modem.up_scale,
+            modem.up_scale
+        );
+        // And not by a smaller margin either: the number the code arm printed was
+        // 2.48x, so anything near it is the same error.
+        assert!(modem.up_scale < 1.5, "the level table is built {:.3}x wide", modem.up_scale);
+        assert_eq!(
+            codegrid::scaled(&set, modem.up_scale),
+            set,
+            "the table moved off the declaration"
+        );
+        assert!(
+            modem.up_scale_source.contains("design"),
+            "the scale has to name the declaration, not the mask: {}",
+            modem.up_scale_source
+        );
+        // The mask is still *reported* (`docs/114` R6): refusing to divide it by
+        // the declaration is not refusing to read it.
+        let notes = modem.clone().take_notes().join("\n");
+        assert!(!notes.contains("level table at K 2"), "{notes}");
     }
 
     /// The gate: the uniform arm never consults the `K` table.
@@ -9593,7 +9678,8 @@ mod tests {
         // makes the assertion above a property of the level set and not of
         // `read_code_grid` having stopped working altogether.
         let (code_k, code_source) = read(LevelSet::Code);
-        assert_eq!(code_source, "mask", "the code arm must still fit");
+        assert_eq!(code_source, "design (code grid)", "the code arm reads the declaration too");
+        assert_eq!(code_k, 1.0, "a downstream mask set the upstream scale");
         // What the fit makes of the corpus mask against the *uniform* set is the
         // number the regression sliced at: eight points of `2 eta + 1` against
         // codes that run 256 to 2000 is a slope in the hundreds, and it is not
